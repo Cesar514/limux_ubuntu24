@@ -1505,6 +1505,25 @@ fn tab_drag_workspace_seed(
     }
 }
 
+fn next_active_workspace_index(
+    remaining_workspace_ids: &[&str],
+    preferred_active_workspace_id: Option<&str>,
+    removed_idx: usize,
+) -> usize {
+    if remaining_workspace_ids.is_empty() {
+        return 0;
+    }
+    if let Some(preferred_id) = preferred_active_workspace_id {
+        if let Some(idx) = remaining_workspace_ids
+            .iter()
+            .position(|workspace_id| *workspace_id == preferred_id)
+        {
+            return idx;
+        }
+    }
+    removed_idx.min(remaining_workspace_ids.len() - 1)
+}
+
 fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::ListBoxRow) {
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     menu_box.set_margin_top(4);
@@ -1902,7 +1921,9 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         return false;
     };
 
-    let title = pane::tab_title(&source_pane, tab_id).unwrap_or_else(|| "Workspace".to_string());
+    let Some(title) = pane::tab_title(&source_pane, tab_id) else {
+        return false;
+    };
     let tab_cwd = pane::tab_working_directory(&source_pane, tab_id);
     let seed = {
         let app_state = state.borrow();
@@ -1917,6 +1938,12 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
                 workspace_folder_path: None,
             });
         tab_drag_workspace_seed(source, &title, tab_cwd)
+    };
+    let previous_active_workspace_id = {
+        let app_state = state.borrow();
+        app_state
+            .active_workspace()
+            .map(|workspace| workspace.id.clone())
     };
 
     let shortcuts = {
@@ -1971,6 +1998,12 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         request_session_save(state);
         return true;
     }
+    close_workspace_by_id_internal(
+        state,
+        &new_workspace_id,
+        false,
+        previous_active_workspace_id.as_deref(),
+    );
     false
 }
 
@@ -2383,10 +2416,22 @@ fn close_workspace(state: &State) {
 }
 
 fn close_workspace_by_id(state: &State, id: &str) {
+    close_workspace_by_id_internal(state, id, true, None);
+}
+
+fn close_workspace_by_id_internal(
+    state: &State,
+    id: &str,
+    persist: bool,
+    preferred_active_workspace_id: Option<&str>,
+) {
     let mut s = state.borrow_mut();
     let Some(idx) = s.workspaces.iter().position(|w| w.id == id) else {
         return;
     };
+    let desired_active_workspace_id = preferred_active_workspace_id
+        .map(ToOwned::to_owned)
+        .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
 
     let ws = s.workspaces.remove(idx);
     s.stack.remove(&ws.root);
@@ -2395,11 +2440,22 @@ fn close_workspace_by_id(state: &State, id: &str) {
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
-        request_session_save(state);
+        if persist {
+            request_session_save(state);
+        }
         return;
     }
 
-    let new_idx = idx.min(s.workspaces.len() - 1);
+    let remaining_workspace_ids: Vec<&str> = s
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.as_str())
+        .collect();
+    let new_idx = next_active_workspace_index(
+        &remaining_workspace_ids,
+        desired_active_workspace_id.as_deref(),
+        idx,
+    );
     s.active_idx = new_idx;
 
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
@@ -2410,7 +2466,9 @@ fn close_workspace_by_id(state: &State, id: &str) {
     drop(s);
 
     sidebar_list.select_row(Some(&row));
-    request_session_save(state);
+    if persist {
+        request_session_save(state);
+    }
 }
 
 fn switch_workspace(state: &State, idx: usize) {
@@ -2776,6 +2834,9 @@ fn handle_split_with_tab(
     tab_id: &str,
     new_pane_first: bool,
 ) {
+    if pane::tab_title(source_pane, tab_id).is_none() {
+        return;
+    }
     let new_pane = split_pane(
         state,
         ws_id,
@@ -3126,9 +3187,10 @@ mod tests {
     use super::gtk::gdk;
     use super::{
         clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
-        workspace_drop_layout_path, EditableCaptureContext, WorkspaceSeedSource,
+        next_active_workspace_index, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, tab_drag_workspace_seed, workspace_drop_layout_path,
+        EditableCaptureContext, WorkspaceSeedSource,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -3408,6 +3470,21 @@ mod tests {
         });
 
         assert_eq!(workspace_drop_layout_path(&layout), vec![true, true]);
+    }
+
+    #[test]
+    fn next_active_workspace_index_preserves_current_active_workspace() {
+        let remaining = ["source-b", "destination", "other"];
+        assert_eq!(
+            next_active_workspace_index(&remaining, Some("destination"), 0),
+            1
+        );
+    }
+
+    #[test]
+    fn next_active_workspace_index_falls_back_to_removed_slot_when_active_is_gone() {
+        let remaining = ["left", "right"];
+        assert_eq!(next_active_workspace_index(&remaining, Some("gone"), 1), 1);
     }
 
     #[test]
