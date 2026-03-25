@@ -252,7 +252,6 @@ Launch Limux and verify:
 - `Ctrl+Shift+D` splits down
 - `Ctrl+W` closes the focused pane
 - `Ctrl+Page_Down` and `Ctrl+Page_Up` switch workspaces
-- sidebar tooltips show `Ctrl+M`
 - pane button tooltips show the default shortcut suffixes where applicable
 - `Ctrl+Q` quits Limux
 - `Ctrl+Alt+N` opens a second Limux instance
@@ -275,7 +274,6 @@ Restart Limux and verify:
 
 - `Ctrl+Alt+B` toggles the sidebar
 - `Ctrl+M` no longer toggles the sidebar
-- sidebar tooltips show `Ctrl+Alt+B`
 
 ### 3. Unbind One Shortcut
 

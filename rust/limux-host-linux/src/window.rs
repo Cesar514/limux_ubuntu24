@@ -536,31 +536,6 @@ row:selected .limux-ws-star-btn {
 row:selected .limux-ws-path {
     color: rgba(255, 255, 255, 0.5);
 }
-.limux-sidebar-collapse {
-    color: rgba(255, 255, 255, 0.4);
-    border: none;
-    min-height: 0;
-    min-width: 0;
-    padding: 0 6px;
-    font-size: 14px;
-}
-.limux-sidebar-collapse:hover {
-    color: rgba(255, 255, 255, 0.9);
-}
-.limux-sidebar-expand {
-    background-color: rgba(25, 25, 25, 1);
-    color: rgba(255, 255, 255, 0.5);
-    border: none;
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
-    min-width: 0;
-    padding: 8px 4px;
-    font-size: 13px;
-}
-.limux-sidebar-expand:hover {
-    background-color: rgba(40, 40, 40, 1);
-    color: white;
-}
 .limux-content {
     background-color: rgba(23, 23, 23, 1);
 }
@@ -1215,15 +1190,6 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
     }
 }
 
-fn sidebar_toggle_tooltip(shortcuts: &ResolvedShortcutConfig, visible: bool) -> String {
-    let base = if visible {
-        "Hide sidebar"
-    } else {
-        "Show sidebar"
-    };
-    shortcuts.tooltip_text(ShortcutId::ToggleSidebar, base)
-}
-
 fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedShortcutConfig) {
     for (action_name, accels) in shortcuts.gtk_accel_entries() {
         let accel_refs: Vec<&str> = accels.iter().map(String::as_str).collect();
@@ -1232,13 +1198,11 @@ fn apply_shortcuts_to_application(app: &adw::Application, shortcuts: &ResolvedSh
 }
 
 fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
-    let (app, collapse_btn, expand_btn, workspace_roots, shortcuts_rc) = {
+    let (app, workspace_roots, shortcuts_rc) = {
         let mut s = state.borrow_mut();
         s.shortcuts = Rc::new(shortcuts);
         (
             s.app.clone(),
-            s.collapse_btn.clone(),
-            s.expand_btn.clone(),
             s.workspaces
                 .iter()
                 .map(|ws| ws.root.clone())
@@ -1248,8 +1212,6 @@ fn apply_shortcut_config(state: &State, shortcuts: ResolvedShortcutConfig) {
     };
 
     apply_shortcuts_to_application(&app, &shortcuts_rc);
-    collapse_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, true)));
-    expand_btn.set_tooltip_text(Some(&sidebar_toggle_tooltip(&shortcuts_rc, false)));
     for root in workspace_roots {
         refresh_shortcut_tooltips_in_layout(&root, &shortcuts_rc);
     }
@@ -2226,7 +2188,7 @@ fn toggle_fullscreen(state: &State) {
 }
 
 fn toggle_sidebar(state: &State) {
-    let (paned, expand_btn, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
+    let (paned, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
         let mut s = state.borrow_mut();
         let Some(sidebar) = s.paned.start_child() else {
             return;
@@ -2241,7 +2203,6 @@ fn toggle_sidebar(state: &State) {
         s.sidebar_animation_epoch = s.sidebar_animation_epoch.wrapping_add(1);
         (
             s.paned.clone(),
-            s.expand_btn.clone(),
             sidebar,
             current,
             is_visible,
@@ -2256,8 +2217,7 @@ fn toggle_sidebar(state: &State) {
     }
 
     if is_visible {
-        // Collapse: animate position to 0, then hide sidebar, show expand button
-        expand_btn.set_visible(true);
+        // Collapse: animate position to 0, then hide sidebar.
         let target = adw::CallbackAnimationTarget::new({
             let p = paned.clone();
             move |value| {
@@ -2273,7 +2233,6 @@ fn toggle_sidebar(state: &State) {
             .target(&target)
             .build();
         let state_for_done = state.clone();
-        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
             let is_current = {
                 let mut s = state_for_done.borrow_mut();
@@ -2286,14 +2245,13 @@ fn toggle_sidebar(state: &State) {
             };
             if is_current {
                 sidebar.set_visible(false);
-                expand_btn_for_done.set_visible(true);
                 request_session_save(&state_for_done);
             }
         });
         state.borrow_mut().sidebar_animation = Some(animation.clone());
         animation.play();
     } else {
-        // Expand: make sidebar visible, then animate position from 0 to remembered width
+        // Expand: make sidebar visible, then animate position from 0 to remembered width.
         sidebar.set_visible(true);
         paned.set_position(0);
         let target = adw::CallbackAnimationTarget::new({
@@ -2311,7 +2269,6 @@ fn toggle_sidebar(state: &State) {
             .target(&target)
             .build();
         let state_for_done = state.clone();
-        let expand_btn_for_done = expand_btn.clone();
         animation.connect_done(move |_| {
             let is_current = {
                 let mut s = state_for_done.borrow_mut();
@@ -2323,7 +2280,6 @@ fn toggle_sidebar(state: &State) {
                 }
             };
             if is_current {
-                expand_btn_for_done.set_visible(false);
                 request_session_save(&state_for_done);
             }
         });
@@ -2811,8 +2767,7 @@ mod tests {
     use super::{
         clamp_workspace_insert_index_for_pinning, favorites_prefix_len,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, sidebar_toggle_tooltip,
-        EditableCaptureContext,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation, EditableCaptureContext,
     };
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
@@ -3074,41 +3029,5 @@ mod tests {
         assert!(!shortcut_allowed_while_browser_find_active(
             ShortcutCommand::SurfaceFind
         ));
-    }
-
-    #[test]
-    fn sidebar_toggle_tooltip_reflects_remaps_and_unbinds() {
-        let defaults = default_shortcuts();
-        assert_eq!(
-            sidebar_toggle_tooltip(&defaults, true),
-            "Hide sidebar (Ctrl+M)"
-        );
-        assert_eq!(
-            sidebar_toggle_tooltip(&defaults, false),
-            "Show sidebar (Ctrl+M)"
-        );
-
-        let remapped = resolve_shortcuts_from_str(
-            r#"{
-                "shortcuts": {
-                    "toggle_sidebar": "<Ctrl><Alt>b"
-                }
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(
-            sidebar_toggle_tooltip(&remapped, true),
-            "Hide sidebar (Ctrl+Alt+B)"
-        );
-
-        let unbound = resolve_shortcuts_from_str(
-            r#"{
-                "shortcuts": {
-                    "toggle_sidebar": null
-                }
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(sidebar_toggle_tooltip(&unbound, false), "Show sidebar");
     }
 }
