@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 pub const CONFIG_DIR_NAME: &str = "limux";
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -118,8 +120,79 @@ pub enum ShortcutConfigError {
         second: ShortcutId,
         accel: String,
     },
+    BaseModifierRequired {
+        shortcut_id: String,
+        input: String,
+    },
+    ModifierOnlyBinding {
+        shortcut_id: String,
+        input: String,
+    },
     InvalidJson(String),
 }
+
+#[derive(Debug)]
+pub enum ShortcutConfigWriteError {
+    InvalidExistingJson {
+        path: PathBuf,
+        reason: String,
+    },
+    InvalidExistingRoot {
+        path: PathBuf,
+    },
+    CreateParentDir {
+        path: PathBuf,
+        reason: String,
+    },
+    WriteTempFile {
+        path: PathBuf,
+        reason: String,
+    },
+    PersistTempFile {
+        from: PathBuf,
+        to: PathBuf,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ShortcutConfigWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidExistingJson { path, reason } => {
+                write!(f, "invalid existing config `{}`: {reason}", path.display())
+            }
+            Self::InvalidExistingRoot { path } => {
+                write!(
+                    f,
+                    "existing config `{}` is not a JSON object",
+                    path.display()
+                )
+            }
+            Self::CreateParentDir { path, reason } => {
+                write!(
+                    f,
+                    "failed to create config directory `{}`: {reason}",
+                    path.display()
+                )
+            }
+            Self::WriteTempFile { path, reason } => {
+                write!(
+                    f,
+                    "failed to write temp config `{}`: {reason}",
+                    path.display()
+                )
+            }
+            Self::PersistTempFile { from, to, reason } => write!(
+                f,
+                "failed to persist temp config `{}` -> `{}`: {reason}",
+                from.display(),
+                to.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShortcutConfigWriteError {}
 
 #[derive(Debug, Default, Deserialize)]
 struct ShortcutConfigFile {
@@ -433,6 +506,22 @@ impl NormalizedShortcut {
         })
     }
 
+    pub fn validate_host_binding(&self, shortcut_id: &str) -> Result<(), ShortcutConfigError> {
+        if is_modifier_only_key(&self.key) {
+            return Err(ShortcutConfigError::ModifierOnlyBinding {
+                shortcut_id: shortcut_id.to_string(),
+                input: self.to_gtk_accel(),
+            });
+        }
+        if !self.ctrl && !self.alt {
+            return Err(ShortcutConfigError::BaseModifierRequired {
+                shortcut_id: shortcut_id.to_string(),
+                input: self.to_gtk_accel(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn to_gtk_accel(&self) -> String {
         let mut accel = String::new();
         if self.ctrl {
@@ -507,6 +596,16 @@ impl ResolvedShortcut {
             .as_ref()
             .map(NormalizedShortcut::to_runtime_combo)
     }
+
+    pub fn display_label(&self) -> Option<String> {
+        self.binding
+            .as_ref()
+            .map(NormalizedShortcut::to_display_label)
+    }
+
+    pub fn default_display_label(&self) -> String {
+        self.definition.default_display_label()
+    }
 }
 
 impl ResolvedShortcutConfig {
@@ -528,8 +627,12 @@ impl ResolvedShortcutConfig {
 
     pub fn display_label_for_id(&self, id: ShortcutId) -> Option<String> {
         self.find_by_id(id)
-            .and_then(|shortcut| shortcut.binding.as_ref())
-            .map(NormalizedShortcut::to_display_label)
+            .and_then(ResolvedShortcut::display_label)
+    }
+
+    pub fn default_display_label_for_id(&self, id: ShortcutId) -> Option<String> {
+        self.find_by_id(id)
+            .map(ResolvedShortcut::default_display_label)
     }
 
     pub fn tooltip_text(&self, id: ShortcutId, base: &str) -> String {
@@ -549,10 +652,37 @@ impl ResolvedShortcutConfig {
             .iter()
             .find(|shortcut| shortcut.runtime_combo().as_deref() == Some(combo))
     }
+
+    pub fn override_bindings_json(&self) -> Map<String, Value> {
+        self.shortcuts
+            .iter()
+            .filter_map(|shortcut| {
+                let default_binding = shortcut.definition.default_binding();
+                match &shortcut.binding {
+                    Some(binding) if binding == &default_binding => None,
+                    Some(binding) => Some((
+                        shortcut.definition.config_key.to_string(),
+                        Value::String(binding.to_gtk_accel()),
+                    )),
+                    None => Some((shortcut.definition.config_key.to_string(), Value::Null)),
+                }
+            })
+            .collect()
+    }
 }
 
 pub fn definitions() -> &'static [ShortcutDefinition] {
     &SHORTCUT_DEFINITIONS
+}
+
+impl ShortcutDefinition {
+    pub fn default_binding(&self) -> NormalizedShortcut {
+        NormalizedShortcut::parse(self.default_accel).expect("default shortcuts should be valid")
+    }
+
+    pub fn default_display_label(&self) -> String {
+        self.default_binding().to_display_label()
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -569,10 +699,7 @@ pub fn default_shortcuts() -> ResolvedShortcutConfig {
             .iter()
             .map(|definition| ResolvedShortcut {
                 definition,
-                binding: Some(
-                    NormalizedShortcut::parse(definition.default_accel)
-                        .expect("default shortcuts should be valid"),
-                ),
+                binding: Some(definition.default_binding()),
             })
             .collect(),
         warnings: Vec::new(),
@@ -628,6 +755,20 @@ pub fn load_shortcuts() -> ResolvedShortcutConfig {
     load_shortcuts_or_default(&path)
 }
 
+pub fn write_shortcuts(
+    path: &Path,
+    shortcuts: &ResolvedShortcutConfig,
+) -> Result<(), ShortcutConfigWriteError> {
+    let mut root = read_existing_config_root(path)?;
+    let overrides = shortcuts.override_bindings_json();
+    if overrides.is_empty() {
+        root.remove("shortcuts");
+    } else {
+        root.insert("shortcuts".to_string(), Value::Object(overrides));
+    }
+    write_config_root_atomically(path, root)
+}
+
 fn resolve_shortcuts_from_file(
     parsed: ShortcutConfigFile,
 ) -> Result<ResolvedShortcutConfig, ShortcutConfigError> {
@@ -667,18 +808,17 @@ fn resolve_shortcuts_from_file(
         }
     }
 
-    ensure_unique_active_bindings(&resolved.shortcuts)?;
+    ensure_valid_active_bindings(&resolved.shortcuts)?;
     Ok(resolved)
 }
 
-fn ensure_unique_active_bindings(
-    shortcuts: &[ResolvedShortcut],
-) -> Result<(), ShortcutConfigError> {
+fn ensure_valid_active_bindings(shortcuts: &[ResolvedShortcut]) -> Result<(), ShortcutConfigError> {
     let mut active: HashMap<NormalizedShortcut, ShortcutId> = HashMap::new();
     for shortcut in shortcuts {
         let Some(binding) = shortcut.binding.clone() else {
             continue;
         };
+        binding.validate_host_binding(shortcut.definition.config_key)?;
         if let Some(existing) = active.insert(binding.clone(), shortcut.definition.id) {
             return Err(ShortcutConfigError::DuplicateBinding {
                 first: existing,
@@ -688,6 +828,81 @@ fn ensure_unique_active_bindings(
         }
     }
     Ok(())
+}
+
+fn read_existing_config_root(path: &Path) -> Result<Map<String, Value>, ShortcutConfigWriteError> {
+    if !path.exists() {
+        return Ok(Map::new());
+    }
+
+    let raw =
+        fs::read_to_string(path).map_err(|err| ShortcutConfigWriteError::InvalidExistingJson {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+
+    let root: Value = serde_json::from_str(&raw).map_err(|err| {
+        ShortcutConfigWriteError::InvalidExistingJson {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        }
+    })?;
+
+    match root {
+        Value::Object(map) => Ok(map),
+        _ => Err(ShortcutConfigWriteError::InvalidExistingRoot {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+fn write_config_root_atomically(
+    path: &Path,
+    root: Map<String, Value>,
+) -> Result<(), ShortcutConfigWriteError> {
+    let Some(parent) = path.parent() else {
+        return Err(ShortcutConfigWriteError::CreateParentDir {
+            path: path.to_path_buf(),
+            reason: "config path has no parent directory".to_string(),
+        });
+    };
+    fs::create_dir_all(parent).map_err(|err| ShortcutConfigWriteError::CreateParentDir {
+        path: parent.to_path_buf(),
+        reason: err.to_string(),
+    })?;
+
+    let temp_path = temp_config_path(path);
+    let serialized = serde_json::to_string_pretty(&Value::Object(root))
+        .expect("shortcut config root should always serialize");
+    if let Err(err) = fs::write(&temp_path, format!("{serialized}\n")) {
+        return Err(ShortcutConfigWriteError::WriteTempFile {
+            path: temp_path,
+            reason: err.to_string(),
+        });
+    }
+
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ShortcutConfigWriteError::PersistTempFile {
+            from: temp_path,
+            to: path.to_path_buf(),
+            reason: err.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn temp_config_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(CONFIG_FILE_NAME);
+    path.with_file_name(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()))
 }
 
 fn definition_by_config_key(config_key: &str) -> Option<&'static ShortcutDefinition> {
@@ -960,6 +1175,99 @@ mod tests {
     }
 
     #[test]
+    fn resolved_shortcuts_expose_default_display_labels_for_editor_rows() {
+        let resolved = default_shortcuts();
+
+        assert_eq!(
+            resolved
+                .default_display_label_for_id(ShortcutId::SplitRight)
+                .as_deref(),
+            Some("Ctrl+D")
+        );
+        assert_eq!(
+            resolved
+                .find_by_id(ShortcutId::SplitRight)
+                .map(ResolvedShortcut::default_display_label)
+                .as_deref(),
+            Some("Ctrl+D")
+        );
+    }
+
+    #[test]
+    fn override_bindings_json_only_serializes_non_default_bindings() {
+        let resolved = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>h",
+                    "close_focused_pane": null
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let overrides = resolved.override_bindings_json();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(
+            overrides.get("split_right"),
+            Some(&Value::String("<Ctrl>h".to_string()))
+        );
+        assert_eq!(overrides.get("close_focused_pane"), Some(&Value::Null));
+        assert!(!overrides.contains_key("toggle_sidebar"));
+    }
+
+    #[test]
+    fn write_shortcuts_preserves_unrelated_top_level_config_keys() {
+        let dir = tempdir().unwrap();
+        let path = config_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "appearance": {
+                    "theme": "solarized"
+                },
+                "shortcuts": {
+                    "toggle_sidebar": "<Ctrl><Alt>b"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>h"
+                }
+            }"#,
+        )
+        .unwrap();
+        write_shortcuts(&path, &resolved).unwrap();
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["appearance"]["theme"], "solarized");
+        assert_eq!(saved["shortcuts"]["split_right"], "<Ctrl>h");
+        assert!(saved["shortcuts"].get("toggle_sidebar").is_none());
+    }
+
+    #[test]
+    fn write_shortcuts_rejects_invalid_existing_json_without_clobbering_file() {
+        let dir = tempdir().unwrap();
+        let path = config_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ invalid").unwrap();
+
+        let original = fs::read_to_string(&path).unwrap();
+        let resolved = default_shortcuts();
+        let err = write_shortcuts(&path, &resolved).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShortcutConfigWriteError::InvalidExistingJson { .. }
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
     fn resolved_shortcuts_format_tooltip_text_and_omit_unbound_suffixes() {
         let defaults = default_shortcuts();
         assert_eq!(
@@ -992,5 +1300,104 @@ mod tests {
             unbound.tooltip_text(ShortcutId::ToggleSidebar, "Toggle Sidebar"),
             "Toggle Sidebar"
         );
+    }
+
+    #[test]
+    fn resolve_shortcuts_from_str_rejects_bindings_without_ctrl_or_alt() {
+        let err = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Shift>h"
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShortcutConfigError::BaseModifierRequired { shortcut_id, .. }
+                if shortcut_id == "split_right"
+        ));
+    }
+
+    #[test]
+    fn resolve_shortcuts_from_str_rejects_modifier_only_keys() {
+        let err = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>Control_L"
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ShortcutConfigError::ModifierOnlyBinding { shortcut_id, .. }
+                if shortcut_id == "split_right"
+        ));
+    }
+
+    #[test]
+    fn write_shortcuts_omits_defaults_and_preserves_unrelated_settings() {
+        let dir = tempdir().unwrap();
+        let path = config_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "theme": "nord",
+                "shortcuts": {
+                    "split_right": "<Ctrl>d"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let updated = resolve_shortcuts_from_str(
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl><Alt>h",
+                    "close_focused_pane": null
+                }
+            }"#,
+        )
+        .unwrap();
+
+        write_shortcuts(&path, &updated).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["theme"], "nord");
+        assert_eq!(written["shortcuts"]["split_right"], "<Ctrl><Alt>h");
+        assert_eq!(
+            written["shortcuts"]["close_focused_pane"],
+            serde_json::Value::Null
+        );
+        assert!(written["shortcuts"].get("toggle_sidebar").is_none());
+    }
+
+    #[test]
+    fn write_shortcuts_removes_shortcuts_section_when_all_bindings_match_defaults() {
+        let dir = tempdir().unwrap();
+        let path = config_path_in(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "theme": "nord",
+                "shortcuts": {
+                    "split_right": "<Ctrl><Alt>h"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        write_shortcuts(&path, &default_shortcuts()).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["theme"], "nord");
+        assert!(written.get("shortcuts").is_none());
     }
 }
