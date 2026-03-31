@@ -2661,7 +2661,9 @@ fn create_browser_widget(
         url_entry.connect_activate(move |entry| {
             let mut url = entry.text().to_string();
             if !url.starts_with("http://") && !url.starts_with("https://") {
-                if url.contains('.') {
+                if url.starts_with("localhost") {
+                    url = format!("http://{url}");
+                } else if url.contains('.') {
                     url = format!("https://{url}");
                 } else {
                     url = format!("https://www.google.com/search?q={}", url.replace(' ', "+"));
