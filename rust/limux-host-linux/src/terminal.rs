@@ -10,7 +10,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ unsafe impl Sync for GhosttyState {}
 
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
+static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -436,11 +437,25 @@ pub fn sync_color_scheme(dark: bool) {
 // Runtime callbacks (C ABI)
 // ---------------------------------------------------------------------------
 
+fn claim_wakeup_idle_slot(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+fn release_wakeup_idle_slot(flag: &AtomicBool) {
+    flag.store(false, Ordering::Release);
+}
+
 unsafe extern "C" fn ghostty_wakeup_cb(_userdata: *mut c_void) {
-    glib::idle_add_once(|| {
-        let app = ghostty_app();
-        unsafe { ghostty_app_tick(app) };
-    });
+    // Collapse renderer wakeups to a single pending idle source so text floods
+    // do not enqueue unbounded GTK callbacks on the main thread.
+    if claim_wakeup_idle_slot(&WAKEUP_IDLE_QUEUED) {
+        glib::idle_add_once(|| {
+            release_wakeup_idle_slot(&WAKEUP_IDLE_QUEUED);
+            let app = ghostty_app();
+            unsafe { ghostty_app_tick(app) };
+        });
+    }
+    glib::MainContext::default().wakeup();
 }
 
 unsafe extern "C" fn ghostty_action_cb(
@@ -1915,5 +1930,17 @@ mod tests {
     #[test]
     fn shell_escape_joined_bytes_rejects_empty_input() {
         assert!(shell_escape_joined_bytes(std::iter::empty::<&[u8]>()).is_none());
+    }
+
+    #[test]
+    fn wakeup_idle_slot_coalesces_until_released() {
+        let flag = AtomicBool::new(false);
+
+        assert!(claim_wakeup_idle_slot(&flag));
+        assert!(!claim_wakeup_idle_slot(&flag));
+
+        release_wakeup_idle_slot(&flag);
+
+        assert!(claim_wakeup_idle_slot(&flag));
     }
 }
