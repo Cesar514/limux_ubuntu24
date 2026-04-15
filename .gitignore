@@ -3,6 +3,7 @@ zig/.zig-cache/
 zig/zig-out/
 dist/
 .tools/
+.scplus/
 *.tar.gz
 .worktrees/
 linux/
