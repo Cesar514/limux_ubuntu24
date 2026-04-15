@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-04-15T20:42:40Z Move completed tasks into TODO_COMPLETED.md and push the git change to the user's fork. \
 [x] 2026-04-15T20:41:49Z Verify that `limux` now resolves to the updated installed version rather than the old `0.1.12` package. \
 [x] 2026-04-15T20:41:49Z Upgrade the installed Debian Limux package on this Ubuntu 24.04 machine to the freshly built `0.1.13` artifact from this repo. \
 [x] 2026-04-15T20:41:49Z Ignore `.scplus/` in the repo and prepare the git change for commit. \
