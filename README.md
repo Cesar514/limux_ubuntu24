@@ -64,6 +64,24 @@ sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
 
 ## Build from source
 
+### Ubuntu 24.04 bootstrap
+
+Use the repo bootstrap when building from a fresh Ubuntu 24.04 checkout. It
+installs missing apt packages, initializes the Ghostty submodule, provisions a
+repo-local Zig toolchain plus Blueprint compiler, and then runs the release
+packaging flow:
+
+```bash
+./scripts/bootstrap_ubuntu24.sh
+```
+
+Add `--with-checks` to run the full repository quality gate after the package
+build:
+
+```bash
+./scripts/bootstrap_ubuntu24.sh --with-checks
+```
+
 ### Prerequisites
 
 - Rust toolchain (stable)
@@ -94,6 +112,8 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 
 This builds the binary, bundles `libghostty.so`, icons, and an install script into a tarball.
 `package.sh` also rebuilds `libghostty.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig and the initialized Ghostty submodule must be present.
+On Ubuntu 24.04, prefer `./scripts/bootstrap_ubuntu24.sh`, which provisions the
+required Zig and Blueprint compiler versions before calling `package.sh`.
 
 ## Development
 

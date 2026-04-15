@@ -2,6 +2,7 @@ target/
 zig/.zig-cache/
 zig/zig-out/
 dist/
+.tools/
 *.tar.gz
 .worktrees/
 linux/
