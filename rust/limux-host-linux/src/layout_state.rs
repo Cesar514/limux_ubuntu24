@@ -1,3 +1,8 @@
+// summary: Define Limux session persistence structures and migration helpers.
+// purpose: Load, normalize, and save workspace layouts from canonical and legacy user data.
+// inputs: XDG data paths plus JSON session and legacy workspace files.
+// returns/effects: Produces normalized session state and writes canonical session files atomically.
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -209,27 +214,16 @@ pub fn load_session() -> LoadedSession {
     load_session_from_dir(&persistence_dir())
 }
 
+// purpose: Load canonical session data, recovering legacy workspace rows if canonical is empty.
+// inputs: Persistence directory containing session.json and optionally workspaces.json.
+// returns/effects: Returns normalized session state with its source without mutating disk.
 pub fn load_session_from_dir(dir: &Path) -> LoadedSession {
     let canonical_path = canonical_session_path_in(dir);
     if canonical_path.exists() {
-        let state = fs::read_to_string(&canonical_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<AppSessionState>(&raw).ok())
-            .map(normalize_session)
-            .unwrap_or_default();
-        return LoadedSession {
-            state,
-            source: SessionLoadSource::Canonical,
-        };
+        return load_canonical_session(dir, &canonical_path);
     }
 
-    let legacy_path = legacy_workspaces_path_in(dir);
-    if legacy_path.exists() {
-        let state = fs::read_to_string(&legacy_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<LegacySavedWorkspace>>(&raw).ok())
-            .map(AppSessionState::from_legacy)
-            .unwrap_or_default();
+    if let Some(state) = load_legacy_session(dir) {
         return LoadedSession {
             state,
             source: SessionLoadSource::Legacy,
@@ -240,6 +234,57 @@ pub fn load_session_from_dir(dir: &Path) -> LoadedSession {
         state: AppSessionState::default(),
         source: SessionLoadSource::Empty,
     }
+}
+
+// purpose: Read the canonical session and recover legacy rows when it has no workspaces.
+// inputs: Persistence directory plus the canonical session file path.
+// returns/effects: Returns canonical or legacy-loaded state without writing files.
+fn load_canonical_session(dir: &Path, canonical_path: &Path) -> LoadedSession {
+    let state = fs::read_to_string(canonical_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AppSessionState>(&raw).ok())
+        .map(normalize_session)
+        .unwrap_or_default();
+    if !state.workspaces.is_empty() {
+        return LoadedSession {
+            state,
+            source: SessionLoadSource::Canonical,
+        };
+    }
+
+    match load_nonempty_legacy_session(dir) {
+        Some(state) => LoadedSession {
+            state,
+            source: SessionLoadSource::Legacy,
+        },
+        None => LoadedSession {
+            state,
+            source: SessionLoadSource::Canonical,
+        },
+    }
+}
+
+// purpose: Read the legacy workspace list and convert it into canonical session state.
+// inputs: Persistence directory that may contain workspaces.json.
+// returns/effects: Returns parsed legacy session state when the legacy file exists.
+fn load_legacy_session(dir: &Path) -> Option<AppSessionState> {
+    let legacy_path = legacy_workspaces_path_in(dir);
+    if !legacy_path.exists() {
+        return None;
+    }
+    let state = fs::read_to_string(&legacy_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<LegacySavedWorkspace>>(&raw).ok())
+        .map(AppSessionState::from_legacy)
+        .unwrap_or_default();
+    Some(state)
+}
+
+// purpose: Recover workspace rows from legacy data only when it contains visible workspaces.
+// inputs: Persistence directory checked during canonical session loading.
+// returns/effects: Returns non-empty legacy session state or None without mutating disk.
+fn load_nonempty_legacy_session(dir: &Path) -> Option<AppSessionState> {
+    load_legacy_session(dir).filter(|state| !state.workspaces.is_empty())
 }
 
 pub fn save_session_atomic(state: &AppSessionState) -> io::Result<PathBuf> {
@@ -493,6 +538,34 @@ mod tests {
         let loaded = load_session_from_dir(dir.path());
         assert_eq!(loaded.source, SessionLoadSource::Canonical);
         assert_eq!(loaded.state.workspaces[0].name, "canonical");
+    }
+
+    #[test]
+    fn load_recovers_legacy_workspaces_when_canonical_is_empty() {
+        let dir = tempdir().expect("tempdir");
+        let canonical_path = canonical_session_path_in(dir.path());
+        let legacy_path = legacy_workspaces_path_in(dir.path());
+        fs::write(
+            &canonical_path,
+            serde_json::to_string_pretty(&AppSessionState::default()).expect("canonical json"),
+        )
+        .expect("write canonical");
+        fs::write(
+            &legacy_path,
+            serde_json::to_string_pretty(&vec![LegacySavedWorkspace {
+                name: "recovered".to_string(),
+                favorite: true,
+                cwd: Some("/tmp/recovered".to_string()),
+                folder_path: Some("/tmp/recovered".to_string()),
+            }])
+            .expect("legacy json"),
+        )
+        .expect("write legacy");
+
+        let loaded = load_session_from_dir(dir.path());
+        assert_eq!(loaded.source, SessionLoadSource::Legacy);
+        assert_eq!(loaded.state.workspaces.len(), 1);
+        assert_eq!(loaded.state.workspaces[0].name, "recovered");
     }
 
     #[test]

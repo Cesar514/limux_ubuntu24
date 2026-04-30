@@ -1,3 +1,8 @@
+// summary: Build and coordinate the GTK application window for Limux.
+// purpose: Manage workspaces, panes, shortcuts, persistence, styling, and control dispatch.
+// inputs: GTK application activation, user session files, settings, and control socket commands.
+// returns/effects: Presents the main window and persists workspace/session changes.
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -544,41 +549,25 @@ const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
 
 const BASE_CSS: &str = r#"
-:root {
-    --limux-host-entry-bg: rgba(255, 255, 255, 0.98);
-    --limux-host-entry-fg: rgba(15, 23, 42, 0.96);
-    --limux-host-entry-border: rgba(15, 23, 42, 0.16);
-    --limux-host-entry-border-focus: rgba(0, 145, 255, 0.72);
-    --limux-host-entry-placeholder: rgba(15, 23, 42, 0.5);
-}
-@media (prefers-color-scheme: dark) {
-    :root {
-        --limux-host-entry-bg: rgba(44, 44, 48, 0.98);
-        --limux-host-entry-fg: rgba(255, 255, 255, 0.96);
-        --limux-host-entry-border: rgba(255, 255, 255, 0.14);
-        --limux-host-entry-border-focus: rgba(0, 145, 255, 0.78);
-        --limux-host-entry-placeholder: rgba(255, 255, 255, 0.48);
-    }
-}
 .limux-host-entry {
-    background-color: var(--limux-host-entry-bg);
-    color: var(--limux-host-entry-fg);
-    border: 1px solid var(--limux-host-entry-border);
+    background-color: alpha(@window_bg_color, 0.98);
+    color: @window_fg_color;
+    border: 1px solid alpha(@window_fg_color, 0.16);
     border-radius: 6px;
     caret-color: currentColor;
 }
 .limux-host-entry:focus-within {
-    border-color: var(--limux-host-entry-border-focus);
+    border-color: alpha(@accent_bg_color, 0.76);
 }
 .limux-host-entry text {
     background-color: transparent;
-    color: var(--limux-host-entry-fg);
+    color: @window_fg_color;
 }
 .limux-host-entry text placeholder {
-    color: var(--limux-host-entry-placeholder);
+    color: alpha(@window_fg_color, 0.5);
 }
 .limux-host-entry image {
-    color: var(--limux-host-entry-placeholder);
+    color: alpha(@window_fg_color, 0.5);
 }
 .limux-sidebar {
     background-color: @window_bg_color;
@@ -4399,9 +4388,8 @@ mod tests {
 
     #[test]
     fn base_css_defines_theme_aware_host_entry_styles() {
-        assert!(BASE_CSS.contains(":root"));
-        assert!(BASE_CSS.contains("@media (prefers-color-scheme: dark)"));
         assert!(BASE_CSS.contains(".limux-host-entry"));
+        assert!(!BASE_CSS.contains("var("));
         assert!(BASE_CSS.contains(".limux-host-entry text"));
         assert!(BASE_CSS.contains(".limux-host-entry text placeholder"));
         assert!(BASE_CSS.contains("caret-color: currentColor;"));

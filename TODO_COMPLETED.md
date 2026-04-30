@@ -2,6 +2,10 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-04-30T08:36:47Z Verify Limux loads and renders the recovered workspace list through the control socket. \
+[x] 2026-04-30T08:36:47Z Apply the session recovery and GTK CSS parser fixes without adding silent runtime fallbacks. \
+[x] 2026-04-30T08:36:47Z Identify that an empty canonical session.json was masking the non-empty legacy workspaces.json file. \
+[x] 2026-04-30T08:36:47Z Reproduce the Limux startup and empty workspace/session state on this machine. \
 [x] 2026-04-15T20:42:40Z Move completed tasks into TODO_COMPLETED.md and push the git change to the user's fork. \
 [x] 2026-04-15T20:41:49Z Verify that `limux` now resolves to the updated installed version rather than the old `0.1.12` package. \
 [x] 2026-04-15T20:41:49Z Upgrade the installed Debian Limux package on this Ubuntu 24.04 machine to the freshly built `0.1.13` artifact from this repo. \
