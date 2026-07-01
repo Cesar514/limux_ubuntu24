@@ -89,6 +89,16 @@ const METHODS: &[&str] = &[
     "browser.get.box",
     "browser.get.html",
     "browser.get.styles",
+    "browser.find.role",
+    "browser.find.text",
+    "browser.find.label",
+    "browser.find.placeholder",
+    "browser.find.alt",
+    "browser.find.title",
+    "browser.find.testid",
+    "browser.find.first",
+    "browser.find.last",
+    "browser.find.nth",
     "browser.snapshot",
     "browser.wait",
     "browser.addscript",
@@ -240,6 +250,14 @@ pub enum BrowserAction {
     GetStyles {
         selector: String,
         property: Option<String>,
+    },
+    Find {
+        locator: String,
+        selector: Option<String>,
+        query: Option<String>,
+        role: Option<String>,
+        name: Option<String>,
+        index: Option<usize>,
     },
     Snapshot {
         interactive: bool,
@@ -693,6 +711,112 @@ fn browser_storage_type(params: &Map<String, Value>) -> Result<String, BridgeErr
             "unsupported browser storage type: {other}"
         ))),
     }
+}
+
+// purpose: Parse CMUX browser locator methods into one live bridge action.
+// inputs: Fully-qualified browser.find.* method and its JSON parameter map.
+// returns/effects: Returns a validated Find action or invalid_params for incomplete locators.
+fn parse_browser_find_action(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<BrowserAction, BridgeError> {
+    let locator = method
+        .strip_prefix("browser.find.")
+        .ok_or_else(|| BridgeError::invalid_params("invalid browser find method"))?
+        .to_string();
+    match locator.as_str() {
+        "role" => browser_find_role_action(method, params, locator),
+        "first" | "last" => browser_find_selector_action(method, params, locator, None),
+        "nth" => browser_find_nth_action(method, params, locator),
+        "text" | "label" | "placeholder" | "alt" | "title" | "testid" => {
+            browser_find_query_action(method, params, locator)
+        }
+        _ => Err(BridgeError::invalid_params(format!(
+            "unsupported browser find locator: {locator}"
+        ))),
+    }
+}
+
+// purpose: Build a role-based CMUX browser finder action.
+// inputs: Browser find method, params, and parsed locator name.
+// returns/effects: Returns a validated role finder action.
+fn browser_find_role_action(
+    method: &str,
+    params: &Map<String, Value>,
+    locator: String,
+) -> Result<BrowserAction, BridgeError> {
+    Ok(BrowserAction::Find {
+        locator,
+        selector: None,
+        query: None,
+        role: Some(required_browser_field(method, params, &["role"])?),
+        name: optional_string(params, &["name"]),
+        index: None,
+    })
+}
+
+// purpose: Build a selector-based CMUX browser finder action.
+// inputs: Browser find method, params, parsed locator name, and optional index.
+// returns/effects: Returns a validated first/last/nth finder action.
+fn browser_find_selector_action(
+    method: &str,
+    params: &Map<String, Value>,
+    locator: String,
+    index: Option<usize>,
+) -> Result<BrowserAction, BridgeError> {
+    Ok(BrowserAction::Find {
+        locator,
+        selector: Some(required_browser_field(method, params, &["selector"])?),
+        query: None,
+        role: None,
+        name: None,
+        index,
+    })
+}
+
+// purpose: Build a selector-and-index CMUX browser finder action.
+// inputs: Browser find method, params, and parsed locator name.
+// returns/effects: Returns a validated nth finder action.
+fn browser_find_nth_action(
+    method: &str,
+    params: &Map<String, Value>,
+    locator: String,
+) -> Result<BrowserAction, BridgeError> {
+    let index = optional_usize(params, &["index"])?
+        .ok_or_else(|| BridgeError::invalid_params("browser.find.nth requires index"))?;
+    browser_find_selector_action(method, params, locator, Some(index))
+}
+
+// purpose: Build a query-based CMUX browser finder action.
+// inputs: Browser find method, params, and parsed locator name.
+// returns/effects: Returns a validated text/label/attribute finder action.
+fn browser_find_query_action(
+    method: &str,
+    params: &Map<String, Value>,
+    locator: String,
+) -> Result<BrowserAction, BridgeError> {
+    let query = required_browser_field(method, params, &[locator.as_str(), "query"])?;
+    Ok(BrowserAction::Find {
+        locator,
+        selector: None,
+        query: Some(query),
+        role: None,
+        name: None,
+        index: None,
+    })
+}
+
+// purpose: Read a required non-empty browser locator field from alternate parameter names.
+// inputs: Method name, JSON parameter map, and accepted field keys.
+// returns/effects: Returns the field or an invalid_params error naming the missing field.
+fn required_browser_field(
+    method: &str,
+    params: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<String, BridgeError> {
+    optional_string(params, keys).ok_or_else(|| {
+        BridgeError::invalid_params(format!("{method} requires {}", keys.join(" or ")))
+    })
 }
 
 // purpose: Identify CMUX browser APIs documented as unsupported by WKWebView.
@@ -1340,6 +1464,16 @@ fn handle_method(
         | "browser.get.box"
         | "browser.get.html"
         | "browser.get.styles"
+        | "browser.find.role"
+        | "browser.find.text"
+        | "browser.find.label"
+        | "browser.find.placeholder"
+        | "browser.find.alt"
+        | "browser.find.title"
+        | "browser.find.testid"
+        | "browser.find.first"
+        | "browser.find.last"
+        | "browser.find.nth"
         | "browser.snapshot"
         | "browser.wait"
         | "browser.addscript"
@@ -1561,6 +1695,19 @@ fn handle_method(
                         property: optional_string(params, &["property", "name"]),
                     }
                 }
+                "browser.find.role"
+                | "browser.find.text"
+                | "browser.find.label"
+                | "browser.find.placeholder"
+                | "browser.find.alt"
+                | "browser.find.title"
+                | "browser.find.testid"
+                | "browser.find.first"
+                | "browser.find.last"
+                | "browser.find.nth" => match parse_browser_find_action(method, params) {
+                    Ok(action) => action,
+                    Err(error) => return error_response(id, error),
+                },
                 "browser.snapshot" => BrowserAction::Snapshot {
                     interactive: match optional_bool(params, "interactive") {
                         Ok(value) => value.unwrap_or(false),
@@ -3469,6 +3616,76 @@ mod tests {
         }
     }
 
+    #[test]
+    // purpose: Verify CMUX semantic browser locator methods reach the live bridge.
+    // inputs: JSON-RPC requests for role and text finders.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    fn browser_find_semantic_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.find.role","params":{"surface_id":"surface:9:browser","role":"button","name":"Submit"}}"#,
+                BrowserAction::Find {
+                    locator: "role".to_string(),
+                    selector: None,
+                    query: None,
+                    role: Some("button".to_string()),
+                    name: Some("Submit".to_string()),
+                    index: None,
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.find.text","params":{"surface_id":"surface:9:browser","text":"Done"}}"#,
+                BrowserAction::Find {
+                    locator: "text".to_string(),
+                    selector: None,
+                    query: Some("Done".to_string()),
+                    role: None,
+                    name: None,
+                    index: None,
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
+    #[test]
+    // purpose: Verify CMUX positional browser locator methods reach the live bridge.
+    // inputs: JSON-RPC requests for first and nth finders.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    fn browser_find_positional_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r##"{"id":1,"method":"browser.find.first","params":{"surface_id":"surface:9:browser","selector":".row"}}"##,
+                BrowserAction::Find {
+                    locator: "first".to_string(),
+                    selector: Some(".row".to_string()),
+                    query: None,
+                    role: None,
+                    name: None,
+                    index: None,
+                },
+            ),
+            (
+                r##"{"id":1,"method":"browser.find.nth","params":{"surface_id":"surface:9:browser","selector":".row","index":2}}"##,
+                BrowserAction::Find {
+                    locator: "nth".to_string(),
+                    selector: Some(".row".to_string()),
+                    query: None,
+                    role: None,
+                    name: None,
+                    index: Some(2),
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
     // purpose: Verify injection routes reject requests missing required script or CSS payloads.
     // inputs: Malformed addscript and addstyle JSON-RPC requests.
     // returns/effects: Panics when invalid requests dispatch instead of returning invalid_params.
@@ -3507,6 +3724,27 @@ mod tests {
         ] {
             let response = dispatch_request(request, &|command| {
                 panic!("invalid stateful browser action should not dispatch: {command:?}")
+            });
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
+    }
+
+    // purpose: Verify browser locator methods reject missing required locator fields.
+    // inputs: Malformed role, text, first, and nth finder requests.
+    // returns/effects: Panics when invalid requests dispatch instead of returning invalid_params.
+    #[test]
+    fn browser_find_routes_reject_invalid_params() {
+        for request in [
+            r#"{"id":1,"method":"browser.find.role","params":{"surface_id":"surface:9:browser"}}"#,
+            r#"{"id":1,"method":"browser.find.text","params":{"surface_id":"surface:9:browser"}}"#,
+            r#"{"id":1,"method":"browser.find.first","params":{"surface_id":"surface:9:browser"}}"#,
+            r##"{"id":1,"method":"browser.find.nth","params":{"surface_id":"surface:9:browser","selector":".row"}}"##,
+        ] {
+            let response = dispatch_request(request, &|command| {
+                panic!("invalid browser finder should not dispatch: {command:?}")
             });
             assert_eq!(
                 response.error.as_ref().map(|error| error.code),

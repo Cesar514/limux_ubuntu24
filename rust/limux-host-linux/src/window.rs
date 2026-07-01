@@ -211,6 +211,36 @@ fn send_browser_eval_response(
     });
 }
 
+// purpose: Evaluate JavaScript that returns an object and merge it into the bridge response.
+// inputs: Browser target, JavaScript source, base payload, and socket reply channel.
+// returns/effects: Sends merged object fields or a fatal JavaScript evaluation error.
+fn send_browser_object_response(
+    browser: pane::BrowserSurfaceTarget,
+    script: String,
+    mut payload: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    browser.evaluate_javascript(&script, move |result| match result {
+        Ok(value) => {
+            let Some(object) = value.as_object() else {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "browser JavaScript object response was not an object",
+                )));
+                return;
+            };
+            for (key, value) in object {
+                payload[key] = value.clone();
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(BridgeError::internal(format!(
+                "browser JavaScript evaluation failed: {error}"
+            ))));
+        }
+    });
+}
+
 // purpose: Build JavaScript that targets one required DOM element and fails loudly when it cannot be resolved.
 // inputs: CSS selector and JavaScript expression that receives `node`.
 // returns/effects: Returns an immediately-invoked JavaScript snippet for WebKit evaluation.
@@ -277,6 +307,117 @@ node.setAttribute('data-limux-highlighted', 'true');
 node.style.outline = '3px solid #ffcc00';
 return { action: 'highlight', selector, ok: true };
 "#,
+    )
+}
+
+const BROWSER_FIND_SCRIPT_BODY: &str = r#"
+function textOf(node) {
+  return (node.innerText || node.textContent || node.value || '').replace(/\s+/g, ' ').trim();
+}
+function attr(node, name) {
+  return node.getAttribute ? (node.getAttribute(name) || '') : '';
+}
+function inferredRole(node) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (tag === 'button') return 'button';
+  if (tag === 'a' && attr(node, 'href')) return 'link';
+  if (['input', 'textarea', 'select'].includes(tag)) return 'textbox';
+  return attr(node, 'role');
+}
+function selectorFor(node) {
+  if (node.id) return '#' + node.id;
+  const tag = (node.tagName || '').toLowerCase() || '*';
+  const testid = attr(node, 'data-testid');
+  if (testid) return '[data-testid="' + testid.replace(/"/g, '\\"') + '"]';
+  return tag;
+}
+let nodes = [];
+if (locator === 'first' || locator === 'last' || locator === 'nth') {
+  nodes = Array.from(document.querySelectorAll(selector));
+  if (locator === 'first') {
+    nodes = nodes.slice(0, 1);
+  } else if (locator === 'last') {
+    nodes = nodes.slice(-1);
+  } else {
+    nodes = nodes.slice(index, index + 1);
+  }
+} else if (locator === 'role') {
+  nodes = Array.from(document.querySelectorAll('*')).filter((node) => {
+    const roleMatches = inferredRole(node) === role;
+    const nameText = [attr(node, 'aria-label'), attr(node, 'name'), textOf(node)].join(' ');
+    return roleMatches && (name === null || nameText.toLowerCase().includes(name.toLowerCase()));
+  });
+} else if (locator === 'text') {
+  nodes = Array.from(document.querySelectorAll('body *')).filter((node) => {
+    return textOf(node).includes(query);
+  });
+} else if (locator === 'label') {
+  nodes = Array.from(document.querySelectorAll('label,[aria-label]')).filter((node) => {
+    return textOf(node).includes(query) || attr(node, 'aria-label').includes(query);
+  });
+} else if (locator === 'placeholder') {
+  nodes = Array.from(document.querySelectorAll('[placeholder]')).filter((node) => {
+    return attr(node, 'placeholder').includes(query);
+  });
+} else if (locator === 'alt') {
+  nodes = Array.from(document.querySelectorAll('[alt]')).filter((node) => {
+    return attr(node, 'alt').includes(query);
+  });
+} else if (locator === 'title') {
+  nodes = Array.from(document.querySelectorAll('[title]')).filter((node) => {
+    return attr(node, 'title').includes(query);
+  });
+} else if (locator === 'testid') {
+  nodes = Array.from(document.querySelectorAll('[data-testid]')).filter((node) => {
+    return attr(node, 'data-testid') === query;
+  });
+}
+const node = nodes[0];
+if (!node) throw new Error('locator not found: ' + locator);
+const resolvedSelector = selectorFor(node);
+return {
+  element_ref: '@e1',
+  selector: resolvedSelector,
+  matches: nodes.slice(0, 25).map((node) => ({
+    selector: selectorFor(node),
+    tag: (node.tagName || '').toLowerCase(),
+    text: textOf(node).slice(0, 120)
+  }))
+};
+"#;
+
+// purpose: Build JavaScript for CMUX browser.find.* locator methods.
+// inputs: Parsed BrowserAction::Find locator fields.
+// returns/effects: Returns element_ref and match metadata, or throws when no element matches.
+fn browser_find_script(action: &BrowserAction) -> String {
+    let BrowserAction::Find {
+        locator,
+        selector,
+        query,
+        role,
+        name,
+        index,
+    } = action
+    else {
+        unreachable!("browser find script requires BrowserAction::Find");
+    };
+    let locator = serde_json::to_string(locator).expect("json locator");
+    let selector = serde_json::to_string(selector).expect("json selector");
+    let query = serde_json::to_string(query).expect("json query");
+    let role = serde_json::to_string(role).expect("json role");
+    let name = serde_json::to_string(name).expect("json name");
+    let index = serde_json::to_string(index).expect("json index");
+    format!(
+        r#"(function() {{
+const locator = {locator};
+const selector = {selector};
+const query = {query};
+const role = {role};
+const name = {name};
+const index = {index};
+{body}
+}})()"#,
+        body = BROWSER_FIND_SCRIPT_BODY,
     )
 }
 
@@ -5309,6 +5450,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_eval_response(browser, script, payload, "value", reply);
                     return;
                 }
+                BrowserAction::Find { .. } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_find_script(&action);
+                    send_browser_object_response(browser, script, payload, reply);
+                    return;
+                }
                 BrowserAction::Snapshot {
                     interactive,
                     compact,
@@ -5565,6 +5713,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::GetBox { .. }
                 | BrowserAction::GetHtml { .. }
                 | BrowserAction::GetStyles { .. }
+                | BrowserAction::Find { .. }
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::Wait { .. }
                 | BrowserAction::AddScript { .. }
