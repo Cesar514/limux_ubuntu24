@@ -268,6 +268,8 @@ fn full_help_text() -> &'static str {
         "  list-panels [--workspace <id|ref>]\n",
         "  list-panes [--workspace <id|ref>]\n",
         "  list-workspaces\n",
+        "  list-workspace-groups\n",
+        "  workspace-group list\n",
         "  current-workspace\n",
         "  memory [--groups <count>]\n",
         "  surface-health [--workspace <id|ref>]\n",
@@ -1106,6 +1108,7 @@ async fn run_list(client: &mut Client, command: &str, args: &[String]) -> Result
         "list-panels" => "surface.list",
         "list-panes" => "pane.list",
         "list-workspaces" => "workspace.list",
+        "list-workspace-groups" => "workspace.group.list",
         "surface-health" => "surface.health",
         _ => bail!("unsupported list command"),
     };
@@ -1122,6 +1125,23 @@ async fn run_list(client: &mut Client, command: &str, args: &[String]) -> Result
         }
     }
     Ok(payload)
+}
+
+// purpose: Run CMUX-compatible workspace-group subcommands through the host socket.
+// inputs: Subcommand args, currently supporting the read-only `list` slice.
+// returns/effects: Sends one control request or fails explicitly on unsupported mutations.
+async fn run_workspace_group_command(client: &mut Client, args: &[String]) -> Result<Value> {
+    let subcommand = args.first().map(String::as_str).unwrap_or("list");
+    match subcommand {
+        "list" | "ls" => client.call("workspace.group.list", json!({})).await,
+        "create" | "delete" | "rename" | "collapse" | "expand" | "pin" | "unpin" | "add"
+        | "remove" | "set-anchor" | "set-color" | "set-icon" | "move" | "focus" => {
+            bail!(
+                "workspace-group {subcommand} is not implemented yet; parity matrix still marks workspace groups partial"
+            )
+        }
+        other => bail!("unsupported workspace-group command `{other}`"),
+    }
 }
 
 fn render_list_text(command: &str, payload: &Value) -> String {
@@ -1183,6 +1203,32 @@ fn render_list_text(command: &str, payload: &Value) -> String {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     if selected {
+                        format!("* {} {}", handle, title)
+                    } else {
+                        format!("  {} {}", handle, title)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "list-workspace-groups" => {
+            let rows = payload
+                .get("groups")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if rows.is_empty() {
+                return "No workspace groups".to_string();
+            }
+            rows.iter()
+                .map(|row| {
+                    let handle = handle_from_payload(row, "group_id", "group_ref");
+                    let title = get_string(row, &["title", "name"]).unwrap_or_default();
+                    let pinned = row
+                        .get("isPinned")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if pinned {
                         format!("* {} {}", handle, title)
                     } else {
                         format!("  {} {}", handle, title)
@@ -4512,12 +4558,24 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "identify" => CommandOutput::Json(run_identify(client, args).await?),
-        "list-panels" | "list-panes" | "list-workspaces" | "surface-health" => {
+        "list-panels"
+        | "list-panes"
+        | "list-workspaces"
+        | "list-workspace-groups"
+        | "surface-health" => {
             let payload = run_list(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
                 CommandOutput::Text(render_list_text(command, &payload))
+            }
+        }
+        "workspace-group" | "workspace-groups" => {
+            let payload = run_workspace_group_command(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_list_text("list-workspace-groups", &payload))
             }
         }
         "memory" => {
@@ -4920,6 +4978,29 @@ mod cli_arg_tests {
             }
             CommandOutput::Json(_) => panic!("docs should render text"),
         }
+    }
+
+    #[test]
+    fn renders_workspace_group_list_text() {
+        let payload = json!({
+            "groups": [
+                {
+                    "group_id": "group-1",
+                    "group_ref": "workspace-group:group-1",
+                    "name": "Agents",
+                    "isPinned": true
+                }
+            ]
+        });
+
+        assert_eq!(
+            render_list_text("list-workspace-groups", &payload),
+            "* workspace-group:group-1 Agents"
+        );
+        assert_eq!(
+            render_list_text("list-workspace-groups", &json!({ "groups": [] })),
+            "No workspace groups"
+        );
     }
 
     #[test]

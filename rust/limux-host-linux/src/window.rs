@@ -24,7 +24,7 @@ use crate::control_bridge::{
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
-    TabState, WorkspaceState,
+    TabState, WorkspaceGroupState, WorkspaceState,
 };
 use crate::pane::{self, PaneCallbacks};
 use crate::shortcut_config::{
@@ -61,6 +61,8 @@ struct Workspace {
     unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
+    /// CMUX-compatible workspace-group id when this workspace belongs to a group.
+    group_id: Option<String>,
     /// Last known working directory from the terminal (via OSC 7).
     cwd: Rc<RefCell<Option<String>>>,
     /// The folder path this workspace was opened with.
@@ -89,6 +91,7 @@ pub(crate) struct AppState {
     config: Rc<RefCell<app_config::AppConfig>>,
     system_prefers_dark: Rc<Cell<Option<bool>>>,
     workspaces: Vec<Workspace>,
+    workspace_groups: Vec<WorkspaceGroupState>,
     active_idx: usize,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
@@ -295,6 +298,26 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
         "selected": index == selected_idx,
         "focused": index == selected_idx,
         "cwd": cwd,
+        "group_id": workspace.group_id.as_deref(),
+    })
+}
+
+// purpose: Render one CMUX-compatible workspace-group row for control clients.
+// inputs: A persisted workspace group.
+// returns/effects: Returns JSON only; does not mutate GTK state.
+fn workspace_group_row(group: &WorkspaceGroupState) -> serde_json::Value {
+    serde_json::json!({
+        "id": group.id.as_str(),
+        "group_id": group.id.as_str(),
+        "ref": format!("workspace-group:{}", group.id),
+        "group_ref": format!("workspace-group:{}", group.id),
+        "name": group.name.as_str(),
+        "title": group.name.as_str(),
+        "isCollapsed": group.is_collapsed,
+        "isPinned": group.is_pinned,
+        "anchorWorkspaceId": group.anchor_workspace_id.as_deref(),
+        "customColor": group.custom_color.as_deref(),
+        "iconSymbol": group.icon_symbol.as_deref(),
     })
 }
 
@@ -940,6 +963,9 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
 
     let restored_any = !loaded.state.workspaces.is_empty();
+    {
+        state.borrow_mut().workspace_groups = loaded.state.workspace_groups.clone();
+    }
     if restored_any {
         let restorable_agents = layout_state::RestorableAgentIndex::load();
         for workspace in &mut loaded.state.workspaces {
@@ -1043,6 +1069,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
+                group_id: workspace.group_id.clone(),
                 layout,
             }
         })
@@ -1057,6 +1084,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             width: sidebar_width,
         },
         workspaces,
+        workspace_groups: s.workspace_groups.clone(),
     })
 }
 
@@ -1580,6 +1608,7 @@ pub fn build_window(app: &adw::Application) {
         config,
         system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
+        workspace_groups: Vec::new(),
         active_idx: 0,
         shortcuts,
         stack: stack.clone(),
@@ -3490,6 +3519,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_label,
             unread: false,
             favorite: false,
+            group_id: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             path_label,
@@ -3925,6 +3955,7 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
+        group_id: None,
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
     add_workspace_from_state(state, &workspace);
@@ -4042,6 +4073,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::ListWorkspaceGroups { reply } => {
+            let groups = {
+                let app_state = state.borrow();
+                app_state
+                    .workspace_groups
+                    .iter()
+                    .map(workspace_group_row)
+                    .collect::<Vec<_>>()
+            };
+            let _ = reply.send(Ok(serde_json::json!({ "groups": groups })));
         }
         ControlCommand::ListPanes { target, reply } => {
             let resolved = {
@@ -4686,6 +4728,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     favorite: false,
                     cwd: Some(folder_path.to_string()),
                     folder_path: Some(folder_path.to_string()),
+                    group_id: None,
                     layout: mixed_workspace_layout(
                         panes_per_workspace,
                         terminals_per_workspace,
@@ -5139,6 +5182,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         notify_label,
         unread: false,
         favorite: workspace.favorite,
+        group_id: workspace.group_id.clone(),
         cwd,
         folder_path: workspace.folder_path.clone(),
         path_label,

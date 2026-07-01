@@ -52,6 +52,8 @@ pub struct AppSessionState {
     pub sidebar: SidebarState,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceState>,
+    #[serde(default)]
+    pub workspace_groups: Vec<WorkspaceGroupState>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -65,7 +67,25 @@ pub struct WorkspaceState {
     pub cwd: Option<String>,
     #[serde(default)]
     pub folder_path: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
     pub layout: LayoutNodeState,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceGroupState {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "isCollapsed")]
+    pub is_collapsed: bool,
+    #[serde(default, rename = "isPinned")]
+    pub is_pinned: bool,
+    #[serde(default, rename = "anchorWorkspaceId")]
+    pub anchor_workspace_id: Option<String>,
+    #[serde(default, rename = "customColor")]
+    pub custom_color: Option<String>,
+    #[serde(default, rename = "iconSymbol")]
+    pub icon_symbol: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -232,6 +252,7 @@ impl Default for AppSessionState {
             top_bar_visible: default_top_bar_visible(),
             sidebar: SidebarState::default(),
             workspaces: Vec::new(),
+            workspace_groups: Vec::new(),
         }
     }
 }
@@ -443,6 +464,7 @@ pub fn split_position_from_ratio(ratio: f64, total_size: i32) -> i32 {
 pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
     state.version = SESSION_VERSION;
     state.sidebar.width = state.sidebar.width.max(DEFAULT_SIDEBAR_WIDTH);
+    normalize_workspace_groups(&mut state);
     if state.workspaces.is_empty() {
         state.active_workspace_index = 0;
     } else if state.active_workspace_index >= state.workspaces.len() {
@@ -458,6 +480,47 @@ pub fn normalize_session(mut state: AppSessionState) -> AppSessionState {
         );
     }
     state
+}
+
+// purpose: Keep persisted workspace-group references internally consistent.
+// inputs: Mutable session state loaded from disk or assembled from live GTK state.
+// returns/effects: Removes invalid group rows and clears workspace/group cross-references.
+fn normalize_workspace_groups(state: &mut AppSessionState) {
+    let mut seen = std::collections::BTreeSet::new();
+    state
+        .workspace_groups
+        .retain(|group| !group.id.trim().is_empty() && seen.insert(group.id.clone()));
+
+    let group_ids = state
+        .workspace_groups
+        .iter()
+        .map(|group| group.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for workspace in &mut state.workspaces {
+        if workspace
+            .group_id
+            .as_deref()
+            .is_some_and(|group_id| !group_ids.contains(group_id))
+        {
+            workspace.group_id = None;
+        }
+    }
+
+    let workspace_ids = state
+        .workspaces
+        .iter()
+        .filter_map(|workspace| workspace.id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    for group in &mut state.workspace_groups {
+        if group
+            .anchor_workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| !workspace_ids.contains(workspace_id))
+        {
+            group.anchor_workspace_id = None;
+        }
+    }
 }
 
 pub fn normalize_layout(layout: &mut LayoutNodeState, working_directory: Option<&str>) {
@@ -502,6 +565,7 @@ impl AppSessionState {
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
+                    group_id: None,
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -1045,6 +1109,7 @@ mod tests {
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1173,6 +1238,7 @@ mod tests {
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1692,6 +1758,7 @@ mod tests {
                 favorite: false,
                 cwd: None,
                 folder_path: None,
+                group_id: None,
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
@@ -1715,6 +1782,85 @@ mod tests {
         };
         assert_eq!(pane.active_tab_id.as_deref(), Some("keybinds-1"));
         assert!(matches!(pane.tabs[0].content, TabContentState::Keybinds {}));
+    }
+
+    #[test]
+    fn workspace_group_state_round_trips_through_session_json() {
+        let state = AppSessionState {
+            workspace_groups: vec![WorkspaceGroupState {
+                id: "group-1".to_string(),
+                name: "Agents".to_string(),
+                is_collapsed: true,
+                is_pinned: true,
+                anchor_workspace_id: Some("44444444-4444-4444-8444-444444444444".to_string()),
+                custom_color: Some("#3366ff".to_string()),
+                icon_symbol: Some("A".to_string()),
+            }],
+            workspaces: vec![WorkspaceState {
+                id: Some("44444444-4444-4444-8444-444444444444".to_string()),
+                name: "workspace".to_string(),
+                favorite: false,
+                cwd: None,
+                folder_path: None,
+                group_id: Some("group-1".to_string()),
+                layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let raw = serde_json::to_string(&state).expect("serialize group session");
+        assert!(raw.contains("isCollapsed"));
+        assert!(raw.contains("anchorWorkspaceId"));
+
+        let decoded: AppSessionState = serde_json::from_str(&raw).expect("decode group session");
+        assert_eq!(decoded.workspace_groups[0].id, "group-1");
+        assert_eq!(
+            decoded.workspace_groups[0].custom_color.as_deref(),
+            Some("#3366ff")
+        );
+        assert_eq!(decoded.workspaces[0].group_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn normalize_session_clears_invalid_workspace_group_refs() {
+        let state = AppSessionState {
+            workspace_groups: vec![
+                WorkspaceGroupState {
+                    id: "group-1".to_string(),
+                    name: "Agents".to_string(),
+                    is_collapsed: false,
+                    is_pinned: false,
+                    anchor_workspace_id: Some("missing-workspace".to_string()),
+                    custom_color: None,
+                    icon_symbol: None,
+                },
+                WorkspaceGroupState {
+                    id: "group-1".to_string(),
+                    name: "Duplicate".to_string(),
+                    is_collapsed: false,
+                    is_pinned: false,
+                    anchor_workspace_id: None,
+                    custom_color: None,
+                    icon_symbol: None,
+                },
+            ],
+            workspaces: vec![WorkspaceState {
+                id: Some("55555555-5555-4555-8555-555555555555".to_string()),
+                name: "workspace".to_string(),
+                favorite: false,
+                cwd: None,
+                folder_path: None,
+                group_id: Some("missing-group".to_string()),
+                layout: LayoutNodeState::Pane(PaneState::fallback(None)),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let normalized = normalize_session(state);
+
+        assert_eq!(normalized.workspace_groups.len(), 1);
+        assert_eq!(normalized.workspace_groups[0].anchor_workspace_id, None);
+        assert_eq!(normalized.workspaces[0].group_id, None);
     }
 
     #[test]

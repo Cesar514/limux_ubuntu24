@@ -31,6 +31,7 @@ const METHODS: &[&str] = &[
     "workspace.select",
     "workspace.rename",
     "workspace.close",
+    "workspace.group.list",
     "pane.list",
     "pane.surfaces",
     "pane.create",
@@ -166,6 +167,9 @@ pub enum ControlCommand {
         reply: mpsc::Sender<BridgeResult>,
     },
     ListWorkspaces {
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ListWorkspaceGroups {
         reply: mpsc::Sender<BridgeResult>,
     },
     ListPanes {
@@ -311,6 +315,7 @@ impl ControlCommand {
             | Self::Memory { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
+            | Self::ListWorkspaceGroups { reply }
             | Self::ListPanes { reply, .. }
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
@@ -737,6 +742,10 @@ fn handle_method(
         "workspace.list" | "list-workspaces" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWorkspaces { reply }, rx)
+        }
+        "workspace.group.list" | "list-workspace-groups" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ListWorkspaceGroups { reply }, rx)
         }
         "pane.list" | "list-panes" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -1567,6 +1576,30 @@ mod tests {
     #[test]
     fn capabilities_include_events_stream() {
         assert!(METHODS.contains(&"events.stream"));
+    }
+
+    #[test]
+    fn capabilities_include_workspace_group_list() {
+        assert!(METHODS.contains(&"workspace.group.list"));
+    }
+
+    #[test]
+    fn workspace_group_list_route_queues_group_command() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"workspace.group.list","params":{}}"#,
+            &|command| match command {
+                ControlCommand::ListWorkspaceGroups { reply } => {
+                    let _ = reply.send(Ok(json!({ "groups": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("workspace.group.list result")["groups"],
+            json!([])
+        );
     }
 
     #[test]
