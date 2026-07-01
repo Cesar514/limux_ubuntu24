@@ -2424,7 +2424,12 @@ async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value
 
 async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace");
-    call_in_workspace_scope(client, workspace, "surface.create", json!({})).await
+    let command = parse_opt(args, "--command");
+    let mut params = Map::new();
+    if let Some(command) = command {
+        params.insert("command".to_string(), Value::String(command));
+    }
+    call_in_workspace_scope(client, workspace, "surface.create", Value::Object(params)).await
 }
 
 fn env_opt(name: &str) -> Option<String> {

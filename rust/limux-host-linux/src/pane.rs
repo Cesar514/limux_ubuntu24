@@ -943,6 +943,8 @@ struct TerminalTabOptions<'a> {
     pinned: bool,
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
+    startup_command: Option<String>,
+    activate: bool,
 }
 
 struct BrowserTabOptions<'a> {
@@ -976,17 +978,21 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
-                internals,
-                cwd.as_deref().or(working_directory),
-                Some(TerminalTabOptions {
-                    id: Some(saved_tab.id.as_str()),
-                    custom_name: saved_tab.custom_name.as_deref(),
-                    pinned: saved_tab.pinned,
-                    cwd: cwd.as_deref().or(working_directory),
-                    agent: agent.clone(),
-                }),
-            ),
+            TabContentState::Terminal { cwd, agent } => {
+                add_terminal_tab_inner(
+                    internals,
+                    cwd.as_deref().or(working_directory),
+                    Some(TerminalTabOptions {
+                        id: Some(saved_tab.id.as_str()),
+                        custom_name: saved_tab.custom_name.as_deref(),
+                        pinned: saved_tab.pinned,
+                        cwd: cwd.as_deref().or(working_directory),
+                        agent: agent.clone(),
+                        startup_command: None,
+                        activate: true,
+                    }),
+                );
+            }
             TabContentState::Browser { uri } => add_browser_tab_inner(
                 internals,
                 Some(BrowserTabOptions {
@@ -1194,7 +1200,7 @@ fn add_terminal_tab_inner(
     internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
     options: Option<TerminalTabOptions<'_>>,
-) {
+) -> String {
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
@@ -1240,8 +1246,13 @@ fn add_terminal_tab_inner(
     }
     let startup_command = options
         .as_ref()
-        .and_then(|value| value.agent.as_ref())
-        .and_then(|agent| agent.resume_command());
+        .and_then(|value| value.startup_command.clone())
+        .or_else(|| {
+            options
+                .as_ref()
+                .and_then(|value| value.agent.as_ref())
+                .and_then(|agent| agent.resume_command())
+        });
     if let Some(command) = startup_command.as_deref() {
         eprintln!(
             "limux: restoring agent terminal surface={}:{} command={}",
@@ -1307,16 +1318,20 @@ fn add_terminal_tab_inner(
         }
     }
 
-    activate_tab(
-        &internals.tab_strip,
-        &internals.content_stack,
-        &internals.tab_state,
-        &tab_id,
-    );
-    term.handle.focus_surface();
+    let activate = options.as_ref().map(|value| value.activate).unwrap_or(true);
+    if activate {
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+        );
+        term.handle.focus_surface();
+    }
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
+    tab_id
 }
 
 fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
@@ -1475,6 +1490,47 @@ pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
         let dir = internals.working_directory.borrow().clone();
         add_terminal_tab_inner(&internals, dir.as_deref(), None);
     }
+}
+
+#[allow(dead_code)]
+pub fn add_terminal_tab_to_pane_with_command(
+    pane_widget: &gtk::Widget,
+    command: Option<String>,
+    activate: bool,
+) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    let dir = internals.working_directory.borrow().clone();
+    let options = if command.is_some() || !activate {
+        Some(TerminalTabOptions {
+            id: None,
+            custom_name: None,
+            pinned: false,
+            cwd: None,
+            agent: None,
+            startup_command: command,
+            activate,
+        })
+    } else {
+        None
+    };
+    let tab_id = add_terminal_tab_inner(&internals, dir.as_deref(), options);
+    let surface_id = composite_surface_id(internals.pane_id, &tab_id);
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let (kind, cwd, uri) = match &entry.kind {
+        TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
+        TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::Keybinds => ("keybinds".to_string(), None, None),
+    };
+    Some(SurfaceSummary {
+        pane_id: internals.pane_id,
+        surface_id,
+        title: entry.title_label.label().to_string(),
+        kind,
+        selected: tab_state.active_tab.as_deref() == Some(tab_id.as_str()),
+        cwd,
+        uri,
+    })
 }
 
 #[allow(dead_code)]

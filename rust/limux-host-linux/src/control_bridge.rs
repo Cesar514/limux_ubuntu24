@@ -1,4 +1,7 @@
-//! Bridge the limux control socket onto the GTK host state.
+// summary: Bridge the Limux control socket onto GTK host state.
+// purpose: Parse socket RPC requests, authorize clients, and dispatch live workspace/pane/surface commands.
+// inputs: Unix socket frames, v1/v2 protocol requests, peer credentials, and GTK command dispatch callbacks.
+// returns/effects: Sends JSON responses, mutates live host state through ControlCommand, and exits loudly on invalid requests.
 
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
@@ -28,6 +31,8 @@ const METHODS: &[&str] = &[
     "pane.list",
     "pane.surfaces",
     "pane.create",
+    "surface.create",
+    "surface.create_many",
     "surface.list",
     "surface.health",
     "surface.read_text",
@@ -122,6 +127,17 @@ pub enum ControlCommand {
         request: CreatePaneRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
+    CreateSurface {
+        target: WorkspaceTarget,
+        command: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    CreateSurfaces {
+        target: WorkspaceTarget,
+        count: usize,
+        command_template: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ListSurfaces {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
@@ -188,6 +204,8 @@ impl ControlCommand {
             | Self::ListPanes { reply, .. }
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
+            | Self::CreateSurface { reply, .. }
+            | Self::CreateSurfaces { reply, .. }
             | Self::ListSurfaces { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
@@ -499,6 +517,47 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
+        }
+        "surface.create" | "new-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreateSurface {
+                    target,
+                    command: optional_string(params, &["command"]),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.create_many" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let count = match optional_index(params, "count") {
+                Ok(Some(count)) if (1..=200).contains(&count) => count,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("surface.create_many count must be 1..=200"),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreateSurfaces {
+                    target,
+                    count,
+                    command_template: optional_string(params, &["command_template", "command"]),
+                    reply,
+                },
+                rx,
+            )
         }
         "surface.list" | "list-panels" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -976,6 +1035,70 @@ mod tests {
         assert_eq!(response.result, None);
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn surface_create_route_queues_command_backed_terminal_surface() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.create","params":{"workspace_id":"codex","command":"bash"}}"#,
+            &|command| match command {
+                ControlCommand::CreateSurface {
+                    target,
+                    command,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(command, Some("bash".to_string()));
+                    let _ = reply.send(Ok(json!({
+                        "pane_ref": "pane:1",
+                        "surface_ref": "surface:1:tab"
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.create result")["surface_ref"],
+            "surface:1:tab"
+        );
+    }
+
+    #[test]
+    fn surface_create_many_route_validates_count_and_template() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.create_many","params":{"workspace_id":"codex","count":40,"command_template":"echo {i}"}}"#,
+            &|command| match command {
+                ControlCommand::CreateSurfaces {
+                    target,
+                    count,
+                    command_template,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(count, 40);
+                    assert_eq!(command_template, Some("echo {i}".to_string()));
+                    let _ = reply.send(Ok(json!({ "count": count, "surfaces": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.create_many result")["count"],
+            40
+        );
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"surface.create_many","params":{"count":0}}"#,
+            &|command| panic!("invalid surface.create_many should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }

@@ -2,6 +2,15 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T12:19:05Z Run repository verification and move completed 40-terminal efficiency TODO entries to TODO_COMPLETED.md. \
+[x] 2026-07-01T12:19:05Z Migrate high-value cmux surface/tab functionality into Limux with live surface.create and surface.create_many. \
+[x] 2026-07-01T12:19:05Z Re-run the 40-terminal benchmark and prove the 85% target with measured batch creation results. \
+[x] 2026-07-01T12:19:05Z Patch verified 40-terminal inefficiencies while preserving existing Limux functionality. \
+[x] 2026-07-01T12:19:05Z Identify eager activation and repeated CLI/socket calls as dominant 40-terminal bottlenecks. \
+[x] 2026-07-01T12:19:05Z Capture baseline 40-terminal latency, host CPU, RSS, GPU, and disk-write behavior. \
+[x] 2026-07-01T12:19:05Z Build a repeatable 40-terminal Limux stress benchmark with isolated runtime state. \
+[x] 2026-07-01T12:19:05Z Audit current cmux functionality and map it against Limux features. \
+[x] 2026-07-01T12:19:05Z Create an 85%-efficiency 40-terminal stress ExecPlan with benchmark definition and acceptance criteria. \
 [x] 2026-07-01T11:18:21Z Move completed performance-goal items to TODO_COMPLETED.md and leave TODO.md clean. \
 [x] 2026-07-01T11:18:21Z Re-run profiling and tests to prove measurable improvements and document the Xvfb privilege blocker. \
 [x] 2026-07-01T11:18:21Z Patch the verified Ghostty mailbox polling inefficiency while preserving functionality and hard-cutout behavior. \

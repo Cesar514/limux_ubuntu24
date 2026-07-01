@@ -4073,6 +4073,128 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let _ = reply.send(Ok(response));
         }
+        ControlCommand::CreateSurface {
+            target,
+            command,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let pane_id = focused_ids_for_workspace(state, &workspace_id)
+                .0
+                .or_else(|| {
+                    pane::pane_summaries_for_root(&workspace_root)
+                        .first()
+                        .map(|summary| summary.pane_id)
+                });
+            let Some(pane_id) = pane_id else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+            let Some(pane_widget) = pane::pane_widget_for_root(&workspace_root, pane_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+            let Some(surface) =
+                pane::add_terminal_tab_to_pane_with_command(&pane_widget, command, false)
+            else {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "surface.create did not produce a terminal surface",
+                )));
+                return;
+            };
+
+            request_session_save(state);
+            let response = pane_create_response_payload(&workspace_id, &workspace_name, surface);
+            let _ = reply.send(Ok(response));
+        }
+        ControlCommand::CreateSurfaces {
+            target,
+            count,
+            command_template,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let pane_id = focused_ids_for_workspace(state, &workspace_id)
+                .0
+                .or_else(|| {
+                    pane::pane_summaries_for_root(&workspace_root)
+                        .first()
+                        .map(|summary| summary.pane_id)
+                });
+            let Some(pane_id) = pane_id else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+            let Some(pane_widget) = pane::pane_widget_for_root(&workspace_root, pane_id) else {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+                return;
+            };
+
+            let mut surfaces = Vec::with_capacity(count);
+            for index in 1..=count {
+                let command = command_template
+                    .as_ref()
+                    .map(|template| template.replace("{i}", &index.to_string()));
+                let Some(surface) =
+                    pane::add_terminal_tab_to_pane_with_command(&pane_widget, command, false)
+                else {
+                    let _ = reply.send(Err(BridgeError::internal(
+                        "surface.create_many did not produce a terminal surface",
+                    )));
+                    return;
+                };
+                surfaces.push(pane_create_response_payload(
+                    &workspace_id,
+                    &workspace_name,
+                    surface,
+                ));
+            }
+
+            request_session_save(state);
+            let _ = reply.send(Ok(serde_json::json!({
+                "ok": true,
+                "count": count,
+                "workspace_id": workspace_id,
+                "workspace_ref": workspace_ref(&workspace_id),
+                "surfaces": surfaces,
+            })));
+        }
         ControlCommand::ListSurfaces { target, reply } => {
             let resolved = {
                 let app_state = state.borrow();
