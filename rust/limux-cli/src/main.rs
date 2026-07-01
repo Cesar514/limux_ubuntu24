@@ -237,17 +237,373 @@ fn parse_global_args_from(mut args: Vec<String>) -> Result<GlobalOptions> {
 }
 
 fn print_help() {
-    println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  rpc <method> [json-params]\n  capabilities\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  current-workspace\n  memory [--groups <count>]\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  select-workspace --workspace <id|ref>\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n  new-split [--workspace <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>]\n  focus-panel --panel <id|ref> [--workspace <id|ref>]\n  close-surface --surface <id|ref>\n  refresh-surfaces [--surface <id|ref>]\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nCMUX compatibility aliases:\n  new-window | current-window | list-windows | focus-window | close-window\n  list-pane-surfaces | new-split | focus-panel | close-surface | refresh-surfaces\n  list-notifications | dismiss-notification | mark-notification-read\n  open-notification | jump-to-unread | clear-notifications\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
-    );
+    println!("{}", full_help_text());
 }
 
 fn help_text() -> &'static str {
-    "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\nUse `limux --help` for the full command list."
+    concat!(
+        "limux CLI\n\n",
+        "Usage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] ",
+        "<command> [args...]\n",
+        "Use `limux --help` for the full command list."
+    )
 }
 
 fn version_text() -> String {
     format!("limux {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn full_help_text() -> &'static str {
+    concat!(
+        "limux CLI\n\n",
+        "Usage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] ",
+        "<command> [args...]\n",
+        "       limux\n\n",
+        "Running `limux` with no arguments launches the GTK app.\n\n",
+        "Common commands:\n",
+        "  identify [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  rpc <method> [json-params]\n",
+        "  capabilities\n",
+        "  list-panels [--workspace <id|ref>]\n",
+        "  list-panes [--workspace <id|ref>]\n",
+        "  list-workspaces\n",
+        "  current-workspace\n",
+        "  memory [--groups <count>]\n",
+        "  surface-health [--workspace <id|ref>]\n",
+        "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
+        "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
+        "  new-workspace [--cwd <path>] [--command <text>]\n",
+        "  select-workspace --workspace <id|ref>\n",
+        "  close-workspace --workspace <id|ref>\n",
+        "  sidebar-state --workspace <id|ref>\n",
+        "  new-surface [--workspace <id|ref>]\n",
+        "  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>]\n",
+        "      [--direction <left|right|up|down>] [--type <terminal|browser>]\n",
+        "      [--command <text>] [--url <url>]\n",
+        "  new-split [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "      [--direction <left|right|up|down>]\n",
+        "  focus-panel --panel <id|ref> [--workspace <id|ref>]\n",
+        "  close-surface --surface <id|ref>\n",
+        "  refresh-surfaces [--surface <id|ref>]\n",
+        "  rename-workspace [--workspace <id|ref>] <title>\n",
+        "  rename-window [--workspace <id|ref>] <title>\n",
+        "  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n",
+        "  read-screen [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "      [--scrollback] [--lines <n>]\n",
+        "  capture-pane (alias of read-screen)\n",
+        "  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>]\n",
+        "      [--title <text>] [--url <url>]\n",
+        "  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\n",
+        "CMUX compatibility aliases:\n",
+        "  docs [settings|shortcuts|api|browser|agents]\n",
+        "  settings [path|docs|open]\n",
+        "  config <doctor|check|validate|path|paths|docs|documentation|reload>\n",
+        "  shortcuts\n",
+        "  themes [list|set|clear]\n",
+        "  new-window | current-window | list-windows | focus-window | close-window\n",
+        "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
+        "  refresh-surfaces\n",
+        "  list-notifications | dismiss-notification | mark-notification-read\n",
+        "  open-notification | jump-to-unread | clear-notifications\n\n",
+        "Agent integrations:\n",
+        "  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n",
+        "  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n",
+        "  claude-hook | opencode-hook | gemini-hook --event <name>\n",
+        "      [--subtitle <text>] [--body <text>] [--title <text>]\n",
+        "  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>]\n",
+        "      [--no-launch] [--dry-run]\n",
+        "      Splits the active workspace into one pane per agent and writes AGENTS.md.\n"
+    )
+}
+
+/// purpose: Resolve Limux's XDG config directory without creating it.
+/// inputs: The process environment observed by dirs::config_dir.
+/// returns/effects: Returns the config directory path or a fatal configuration error.
+fn limux_config_dir() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|base| base.join("limux"))
+        .ok_or_else(|| anyhow!("XDG config directory is unavailable"))
+}
+
+fn limux_settings_path() -> Result<PathBuf> {
+    Ok(limux_config_dir()?.join("settings.json"))
+}
+
+fn limux_shortcuts_path() -> Result<PathBuf> {
+    Ok(limux_config_dir()?.join("shortcuts.json"))
+}
+
+/// purpose: Produce CMUX-compatible docs pointers for local command families.
+/// inputs: Optional docs topic from the CLI.
+/// returns/effects: Returns text only; never contacts the Limux socket.
+fn docs_text(topic: Option<&str>) -> Result<String> {
+    let topics = "settings, shortcuts, api, browser, agents";
+    let Some(topic) = topic else {
+        return Ok(format!(
+            "Limux docs topics: {topics}\nUse `limux docs <topic>`."
+        ));
+    };
+    match topic {
+        "settings" => Ok(format!(
+            "Settings docs\nsettings path: {}\nvalidate: limux config validate\nreload: restart Limux or use host reload support when available",
+            limux_settings_path()?.display()
+        )),
+        "shortcuts" => Ok(format!(
+            "Shortcuts docs\nshortcuts path: {}\nvalidate: limux config validate",
+            limux_shortcuts_path()?.display()
+        )),
+        "api" => Ok("API docs\nUse `limux capabilities` and `limux rpc <method> [json-params]` against a running host.".to_string()),
+        "browser" => Ok(concat!(
+            "Browser docs\n",
+            "Use `limux browser open|navigate|url|back|forward|reload`; ",
+            "DOM automation remains tracked in the CMUX parity matrix."
+        )
+        .to_string()),
+        "agents" => Ok(concat!(
+            "Agent docs\n",
+            "Use `limux hooks setup`, `limux agent-team`, and agent hook commands ",
+            "for Codex, Claude, Gemini, and OpenCode."
+        )
+        .to_string()),
+        _ => bail!("unknown docs topic `{topic}`; expected one of {topics}"),
+    }
+}
+
+/// purpose: Parse a JSON config file if it exists and fail loudly if it is corrupt.
+/// inputs: A settings or shortcuts path.
+/// returns/effects: Returns true when the file existed and parsed; false when absent.
+fn validate_json_file(path: &Path) -> Result<bool> {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            serde_json::from_str::<Value>(&raw)
+                .with_context(|| format!("{} is not valid JSON", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// purpose: Validate Limux local config files for CMUX-compatible config commands.
+/// inputs: The current XDG config directory.
+/// returns/effects: Reads settings and shortcuts JSON; does not create or modify files.
+fn config_validation_text() -> Result<String> {
+    config_validation_text_for(&limux_settings_path()?, &limux_shortcuts_path()?)
+}
+
+/// purpose: Validate specific settings and shortcuts files for tests and CLI output.
+/// inputs: Concrete settings and shortcuts paths.
+/// returns/effects: Reads JSON files; does not create or modify them.
+fn config_validation_text_for(settings: &Path, shortcuts: &Path) -> Result<String> {
+    let settings_state = if validate_json_file(settings)? {
+        "valid"
+    } else {
+        "missing"
+    };
+    let shortcuts_state = if validate_json_file(shortcuts)? {
+        "valid"
+    } else {
+        "missing"
+    };
+    Ok(format!(
+        "settings: {settings_state} ({})\nshortcuts: {shortcuts_state} ({})",
+        settings.display(),
+        shortcuts.display()
+    ))
+}
+
+/// purpose: Read the settings JSON object while rejecting corrupt or non-object config.
+/// inputs: The Limux settings path.
+/// returns/effects: Returns an editable JSON object; creates no files by itself.
+fn read_settings_root(path: &Path) -> Result<Map<String, Value>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?
+        {
+            Value::Object(root) => Ok(root),
+            _ => bail!("{} root must be a JSON object", path.display()),
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Map::new()),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// purpose: Persist the settings JSON through a same-directory temporary file.
+/// inputs: Target path and the full JSON object to write.
+/// returns/effects: Creates the config directory and atomically replaces settings.json.
+fn write_settings_root(path: &Path, root: &Map<String, Value>) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("settings path has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let temp = path.with_extension("json.tmp");
+    let encoded = serde_json::to_vec_pretty(&Value::Object(root.clone()))
+        .context("failed to encode settings JSON")?;
+    fs::write(&temp, encoded).with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp.display()
+        )
+    })
+}
+
+/// purpose: Update Limux appearance theme settings from CMUX-compatible theme commands.
+/// inputs: Optional light and dark scheme names.
+/// returns/effects: Writes settings.json and rejects unknown schemes.
+fn set_theme_settings(light: Option<&str>, dark: Option<&str>) -> Result<String> {
+    let path = limux_settings_path()?;
+    set_theme_settings_at(&path, light, dark)
+}
+
+/// purpose: Update a specific settings file with CMUX-compatible theme values.
+/// inputs: Settings path plus optional light and dark scheme names.
+/// returns/effects: Writes settings JSON and rejects unknown schemes.
+fn set_theme_settings_at(path: &Path, light: Option<&str>, dark: Option<&str>) -> Result<String> {
+    let mut root = read_settings_root(path)?;
+    let appearance = root
+        .entry("appearance".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(map) = appearance else {
+        bail!("{} appearance must be a JSON object", path.display());
+    };
+    if let Some(value) = light {
+        map.insert(
+            "color_scheme".to_string(),
+            Value::String(parse_theme(value)?.to_string()),
+        );
+    }
+    if let Some(value) = dark {
+        map.insert(
+            "ghostty_color_scheme".to_string(),
+            Value::String(parse_theme(value)?.to_string()),
+        );
+    }
+    write_settings_root(path, &root)?;
+    Ok(format!("OK {}", path.display()))
+}
+
+fn parse_theme(raw: &str) -> Result<&'static str> {
+    match raw {
+        "system" | "default" => Ok("system"),
+        "dark" => Ok("dark"),
+        "light" => Ok("light"),
+        _ => bail!("unsupported Limux theme `{raw}`; expected system, dark, or light"),
+    }
+}
+
+/// purpose: Remove Limux appearance theme overrides from settings JSON.
+/// inputs: The current Limux settings file, if present.
+/// returns/effects: Writes settings.json only when an appearance object exists.
+fn clear_theme_settings() -> Result<String> {
+    let path = limux_settings_path()?;
+    clear_theme_settings_at(&path)
+}
+
+/// purpose: Remove appearance theme override keys from a concrete settings file.
+/// inputs: Settings path.
+/// returns/effects: Writes the settings JSON with theme override keys removed.
+fn clear_theme_settings_at(path: &Path) -> Result<String> {
+    let mut root = read_settings_root(path)?;
+    if let Some(Value::Object(map)) = root.get_mut("appearance") {
+        map.remove("color_scheme");
+        map.remove("ghostty_color_scheme");
+    }
+    write_settings_root(path, &root)?;
+    Ok(format!("OK {}", path.display()))
+}
+
+/// purpose: Handle CMUX-compatible local commands without requiring a socket.
+/// inputs: Parsed global CLI options.
+/// returns/effects: May read or write local config files, but never contacts the host socket.
+fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
+    let Some(command) = opts.command_args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    let args = &opts.command_args[1..];
+    let out = match command {
+        "docs" => Some(CommandOutput::Text(docs_text(
+            args.first().map(String::as_str),
+        )?)),
+        "settings" => Some(run_settings_command(args)?),
+        "config" => Some(run_config_command(args)?),
+        "shortcuts" => Some(CommandOutput::Text(
+            limux_shortcuts_path()?.display().to_string(),
+        )),
+        "themes" => Some(run_themes_command(args)?),
+        "reload-config" => Some(run_config_command(&["reload".to_string()])?),
+        _ => None,
+    };
+    Ok(out)
+}
+
+/// purpose: Implement CMUX settings command probes that can run without the app.
+/// inputs: Settings subcommand arguments.
+/// returns/effects: Prints paths/docs or fails explicitly for host-only actions.
+fn run_settings_command(args: &[String]) -> Result<CommandOutput> {
+    let sub = args.first().map(String::as_str).unwrap_or("path");
+    match sub {
+        "--help" | "-h" | "docs" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
+        "path" => Ok(CommandOutput::Text(
+            limux_settings_path()?.display().to_string(),
+        )),
+        "open" => bail!(
+            "settings open requires running host settings UI support; use `limux settings path`"
+        ),
+        target => bail!("unsupported settings target `{target}`; expected path, docs, or open"),
+    }
+}
+
+/// purpose: Implement CMUX config path, docs, validation, and reload probes.
+/// inputs: Config subcommand arguments.
+/// returns/effects: Reads local JSON config and fails on corrupt files.
+fn run_config_command(args: &[String]) -> Result<CommandOutput> {
+    let sub = args.first().map(String::as_str).unwrap_or("check");
+    match sub {
+        "--help" | "-h" | "docs" | "documentation" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
+        "path" => Ok(CommandOutput::Text(limux_settings_path()?.display().to_string())),
+        "paths" => Ok(CommandOutput::Text(format!(
+            "config_dir: {}\nsettings: {}\nshortcuts: {}",
+            limux_config_dir()?.display(),
+            limux_settings_path()?.display(),
+            limux_shortcuts_path()?.display()
+        ))),
+        "check" | "validate" | "doctor" => Ok(CommandOutput::Text(config_validation_text()?)),
+        "reload" => bail!("config reload requires running host reload support; restart Limux after editing settings"),
+        target => bail!("unsupported config command `{target}`"),
+    }
+}
+
+/// purpose: Implement CMUX-compatible theme list/set/clear commands for Limux schemes.
+/// inputs: Theme subcommand arguments.
+/// returns/effects: Reads or writes settings.json for set/clear.
+fn run_themes_command(args: &[String]) -> Result<CommandOutput> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "--help" | "-h" | "list" => Ok(CommandOutput::Text(
+            "system\ndark\nlight\ncurrent file: ".to_string()
+                + &limux_settings_path()?.display().to_string(),
+        )),
+        "set" => {
+            let light = parse_opt(args, "--light");
+            let dark = parse_opt(args, "--dark");
+            let positional = args.get(1).filter(|value| !value.starts_with('-'));
+            let text = match (light.as_deref(), dark.as_deref(), positional) {
+                (None, None, Some(value)) => set_theme_settings(Some(value), Some(value))?,
+                (Some(_), None, _) => set_theme_settings(light.as_deref(), None)?,
+                (None, Some(_), _) => set_theme_settings(None, dark.as_deref())?,
+                (Some(_), Some(_), _) => set_theme_settings(light.as_deref(), dark.as_deref())?,
+                (None, None, None) => {
+                    bail!("themes set requires <theme>, --light <theme>, or --dark <theme>")
+                }
+            };
+            Ok(CommandOutput::Text(text))
+        }
+        "clear" => Ok(CommandOutput::Text(clear_theme_settings()?)),
+        target => bail!("unsupported themes command `{target}`"),
+    }
 }
 
 fn should_launch_host(opts: &GlobalOptions) -> bool {
@@ -4228,6 +4584,10 @@ async fn main() -> Result<()> {
     if should_launch_host(&opts) {
         return launch_host();
     }
+    if let Some(output) = run_local_command(&opts)? {
+        print_command_output(output, opts.pretty)?;
+        return Ok(());
+    }
 
     let socket = resolve_socket_path_checked(opts.socket.clone(), opts.socket_mode)
         .map_err(anyhow::Error::msg)?;
@@ -4236,12 +4596,28 @@ async fn main() -> Result<()> {
     let output = execute_command(&mut client, &opts).await;
 
     match output {
-        Ok(CommandOutput::Text(text)) => {
+        Ok(output) => {
+            print_command_output(output, opts.pretty)?;
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// purpose: Print a command result consistently for local and socket-backed commands.
+/// inputs: The command output and pretty-print setting.
+/// returns/effects: Writes to stdout or returns JSON encoding errors.
+fn print_command_output(output: CommandOutput, pretty: bool) -> Result<()> {
+    match output {
+        CommandOutput::Text(text) => {
             println!("{}", text);
             Ok(())
         }
-        Ok(CommandOutput::Json(value)) => {
-            if opts.pretty {
+        CommandOutput::Json(value) => {
+            if pretty {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&value)
@@ -4254,10 +4630,6 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(())
-        }
-        Err(err) => {
-            eprintln!("{}", err);
-            std::process::exit(1);
         }
     }
 }
@@ -4325,6 +4697,79 @@ mod cli_arg_tests {
         assert_eq!(
             version_text(),
             format!("limux {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn local_docs_command_returns_without_socket_client() {
+        let opts = default_opts(args(&["docs", "agents"]));
+        let output = run_local_command(&opts)
+            .expect("local command runs")
+            .expect("docs is local");
+
+        match output {
+            CommandOutput::Text(text) => {
+                assert!(text.contains("Agent docs"));
+                assert!(text.contains("limux hooks setup"));
+            }
+            CommandOutput::Json(_) => panic!("docs should render text"),
+        }
+    }
+
+    #[test]
+    fn config_validation_reports_valid_missing_and_corrupt_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        let shortcuts = dir.path().join("shortcuts.json");
+        fs::write(&settings, br#"{"appearance":{"color_scheme":"dark"}}"#).expect("write settings");
+
+        let text = config_validation_text_for(&settings, &shortcuts).expect("validate config");
+        assert!(text.contains("settings: valid"));
+        assert!(text.contains("shortcuts: missing"));
+
+        fs::write(&shortcuts, b"{invalid").expect("write corrupt shortcuts");
+        let err = config_validation_text_for(&settings, &shortcuts)
+            .expect_err("corrupt shortcuts must fail");
+        assert!(
+            err.to_string().contains("is not valid JSON"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn theme_set_and_clear_update_settings_without_losing_other_sections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("limux/settings.json");
+        fs::create_dir_all(path.parent().expect("settings parent")).expect("create config dir");
+        fs::write(&path, br#"{"focus":{"hover_terminal_focus":true}}"#).expect("write settings");
+
+        set_theme_settings_at(&path, Some("light"), Some("dark")).expect("set themes");
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["focus"]["hover_terminal_focus"], true);
+        assert_eq!(parsed["appearance"]["color_scheme"], "light");
+        assert_eq!(parsed["appearance"]["ghostty_color_scheme"], "dark");
+
+        clear_theme_settings_at(&path).expect("clear themes");
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert!(parsed["appearance"].get("color_scheme").is_none());
+        assert!(parsed["appearance"].get("ghostty_color_scheme").is_none());
+        assert_eq!(parsed["focus"]["hover_terminal_focus"], true);
+    }
+
+    #[test]
+    fn theme_set_rejects_unknown_scheme_without_rewriting_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, br#"{"appearance":{"color_scheme":"dark"}}"#).expect("write settings");
+
+        let err = set_theme_settings_at(&path, Some("solarized"), None)
+            .expect_err("unknown theme should fail");
+        assert!(err.to_string().contains("unsupported Limux theme"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read settings"),
+            r#"{"appearance":{"color_scheme":"dark"}}"#
         );
     }
 
