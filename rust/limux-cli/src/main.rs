@@ -3809,7 +3809,7 @@ async fn run_browser(
         }
         match arg.as_str() {
             "--workspace" | "--surface" | "--id-format" | "--timeout-ms" | "--load-state"
-            | "--out" => {
+            | "--url-contains" | "--function" | "--max-depth" | "--out" => {
                 if idx + 1 < browser_args.len() {
                     skip = true;
                 }
@@ -3974,6 +3974,18 @@ async fn run_browser(
             if let Some(selector) = parse_opt(&browser_args, "--selector") {
                 p.insert("selector".to_string(), Value::String(selector));
             }
+            if let Some(text) = parse_opt(&browser_args, "--text") {
+                p.insert("text".to_string(), Value::String(text));
+            }
+            if let Some(url_contains) = parse_opt(&browser_args, "--url-contains") {
+                p.insert("url_contains".to_string(), Value::String(url_contains));
+            }
+            if let Some(load_state) = parse_opt(&browser_args, "--load-state") {
+                p.insert("load_state".to_string(), Value::String(load_state));
+            }
+            if let Some(function) = parse_opt(&browser_args, "--function") {
+                p.insert("function".to_string(), Value::String(function));
+            }
             if let Some(timeout_ms) = parse_opt(&browser_args, "--timeout-ms") {
                 if let Ok(ms) = timeout_ms.parse::<u64>() {
                     p.insert("timeout_ms".to_string(), Value::Number(ms.into()));
@@ -3990,7 +4002,19 @@ async fn run_browser(
             let sid = surface
                 .clone()
                 .ok_or_else(|| anyhow!("browser snapshot requires a surface"))?;
-            let payload = browser_call(client, Some(sid), "browser.snapshot", Map::new()).await?;
+            let mut p = Map::new();
+            if parse_flag(&browser_args, "--interactive") {
+                p.insert("interactive".to_string(), Value::Bool(true));
+            }
+            if parse_flag(&browser_args, "--compact") {
+                p.insert("compact".to_string(), Value::Bool(true));
+            }
+            if let Some(max_depth) = parse_opt(&browser_args, "--max-depth") {
+                if let Ok(depth) = max_depth.parse::<u64>() {
+                    p.insert("max_depth".to_string(), Value::Number(depth.into()));
+                }
+            }
+            let payload = browser_call(client, Some(sid), "browser.snapshot", p).await?;
             if local_json {
                 CommandOutput::Json(payload)
             } else {
@@ -4000,7 +4024,11 @@ async fn run_browser(
                 } else if parse_flag(&browser_args, "--interactive") {
                     let mut text = get_string(&payload, &["snapshot", "text"])
                         .unwrap_or_else(|| "OK".to_string());
-                    if let Some(refs) = payload.get("refs").and_then(Value::as_object) {
+                    if let Some(refs) = payload
+                        .get("snapshot")
+                        .and_then(|snapshot| snapshot.get("refs"))
+                        .and_then(Value::as_object)
+                    {
                         for key in refs.keys() {
                             text.push_str(&format!("\nref={}", key));
                         }

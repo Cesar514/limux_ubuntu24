@@ -65,6 +65,8 @@ const METHODS: &[&str] = &[
     "browser.get.title",
     "browser.get.text",
     "browser.get.html",
+    "browser.snapshot",
+    "browser.wait",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -117,17 +119,34 @@ pub enum PaneCreateType {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrowserAction {
-    Navigate { url: String },
+    Navigate {
+        url: String,
+    },
     GetUrl,
     Back,
     Forward,
     Reload,
     Focus,
     IsFocused,
-    Eval { script: String },
+    Eval {
+        script: String,
+    },
     GetTitle,
     GetText,
     GetHtml,
+    Snapshot {
+        interactive: bool,
+        compact: bool,
+        max_depth: Option<usize>,
+    },
+    Wait {
+        selector: Option<String>,
+        text: Option<String>,
+        url_contains: Option<String>,
+        load_state: Option<String>,
+        function: Option<String>,
+        timeout_ms: u64,
+    },
 }
 
 /// Parser-level contract for the live-GTK `pane.create` route.
@@ -593,6 +612,29 @@ fn optional_u64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64
     Ok(None)
 }
 
+fn optional_usize(
+    params: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<usize>, BridgeError> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        if let Some(number) = value.as_u64() {
+            return Ok(Some(number as usize));
+        }
+        if let Some(raw) = value.as_str() {
+            return raw.trim().parse::<usize>().map(Some).map_err(|_| {
+                BridgeError::invalid_params(format!("{key} must be a non-negative integer"))
+            });
+        }
+        return Err(BridgeError::invalid_params(format!(
+            "{key} must be a non-negative integer"
+        )));
+    }
+    Ok(None)
+}
+
 fn has_workspace_selector(params: &Map<String, Value>) -> bool {
     [
         "workspace_id",
@@ -1025,7 +1067,9 @@ fn handle_method(
         | "browser.eval"
         | "browser.get.title"
         | "browser.get.text"
-        | "browser.get.html" => {
+        | "browser.get.html"
+        | "browser.snapshot"
+        | "browser.wait" => {
             let surface_hint =
                 match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
                     Ok(Some(value)) => value,
@@ -1065,6 +1109,58 @@ fn handle_method(
                 "browser.get.title" => BrowserAction::GetTitle,
                 "browser.get.text" => BrowserAction::GetText,
                 "browser.get.html" => BrowserAction::GetHtml,
+                "browser.snapshot" => BrowserAction::Snapshot {
+                    interactive: match optional_bool(params, "interactive") {
+                        Ok(value) => value.unwrap_or(false),
+                        Err(error) => return error_response(id, error),
+                    },
+                    compact: match optional_bool(params, "compact") {
+                        Ok(value) => value.unwrap_or(false),
+                        Err(error) => return error_response(id, error),
+                    },
+                    max_depth: match optional_usize(params, &["max_depth", "maxDepth"]) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.wait" => {
+                    let timeout_ms = match optional_u64(params, &["timeout_ms", "timeoutMs"]) {
+                        Ok(value) => value.unwrap_or(5_000),
+                        Err(error) => return error_response(id, error),
+                    };
+                    let action = BrowserAction::Wait {
+                        selector: optional_string(params, &["selector"]),
+                        text: optional_string(params, &["text"]),
+                        url_contains: optional_string(params, &["url_contains", "urlContains"]),
+                        load_state: optional_string(params, &["load_state", "loadState"]),
+                        function: optional_string(params, &["function", "script"]),
+                        timeout_ms,
+                    };
+                    if let BrowserAction::Wait {
+                        selector,
+                        text,
+                        url_contains,
+                        load_state,
+                        function,
+                        ..
+                    } = &action
+                    {
+                        if selector.is_none()
+                            && text.is_none()
+                            && url_contains.is_none()
+                            && load_state.is_none()
+                            && function.is_none()
+                        {
+                            return error_response(
+                                id,
+                                BridgeError::invalid_params(
+                                    "browser.wait requires selector, text, url_contains, load_state, or function",
+                                ),
+                            );
+                        }
+                    }
+                    action
+                }
                 _ => unreachable!("browser method matched above"),
             };
             let target = match parse_optional_workspace_target(params, true) {
@@ -2174,6 +2270,68 @@ mod tests {
             },
         );
         assert_eq!(title.error, None);
+
+        let snapshot = dispatch_request(
+            r#"{"id":1,"method":"browser.snapshot","params":{"surface_id":"surface:9:browser","interactive":true,"compact":true,"max_depth":3}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(
+                        action,
+                        BrowserAction::Snapshot {
+                            interactive: true,
+                            compact: true,
+                            max_depth: Some(3)
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "snapshot": { "text": "body" } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(snapshot.error, None);
+
+        let wait = dispatch_request(
+            r##"{"id":1,"method":"browser.wait","params":{"surface_id":"surface:9:browser","selector":"#ready","text":"Ready","url_contains":"example","load_state":"complete","function":"() => true","timeout_ms":250}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(
+                        action,
+                        BrowserAction::Wait {
+                            selector: Some("#ready".to_string()),
+                            text: Some("Ready".to_string()),
+                            url_contains: Some("example".to_string()),
+                            load_state: Some("complete".to_string()),
+                            function: Some("() => true".to_string()),
+                            timeout_ms: 250,
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "matched": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(wait.error, None);
+
+        let invalid_wait = dispatch_request(
+            r#"{"id":1,"method":"browser.wait","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid browser.wait should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_wait.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
 
         let invalid = dispatch_request(
             r#"{"id":1,"method":"browser.navigate","params":{"surface_id":"surface:9:browser"}}"#,

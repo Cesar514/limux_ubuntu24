@@ -34,6 +34,7 @@ use crate::split_tree::{self, SplitTreeContainer};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
+const BROWSER_WAIT_POLL_INTERVAL_MS: u64 = 50;
 const MAX_HOST_NOTIFICATIONS: usize = 200;
 
 // ---------------------------------------------------------------------------
@@ -208,6 +209,212 @@ fn send_browser_eval_response(
             ))));
         }
     });
+}
+
+fn browser_snapshot_script(interactive: bool, compact: bool, max_depth: Option<usize>) -> String {
+    let max_depth = max_depth.unwrap_or(4).min(12);
+    format!(
+        r#"(function() {{
+const maxDepth = {max_depth};
+const interactiveOnly = {interactive};
+const compact = {compact};
+const refs = {{}};
+let nextRef = 1;
+function labelFor(node) {{
+  const tag = (node.tagName || '').toLowerCase();
+  const id = node.id ? '#' + node.id : '';
+  const cls = node.className && typeof node.className === 'string'
+    ? '.' + node.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.')
+    : '';
+  const role = node.getAttribute ? (node.getAttribute('role') || '') : '';
+  const name = node.getAttribute ? (node.getAttribute('aria-label') || node.getAttribute('name') || '') : '';
+  const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, compact ? 60 : 120);
+  return [tag + id + cls, role && 'role=' + role, name && 'name=' + name, text && JSON.stringify(text)]
+    .filter(Boolean)
+    .join(' ');
+}}
+function isInteractive(node) {{
+  const tag = (node.tagName || '').toLowerCase();
+  return ['a','button','input','select','textarea','summary'].includes(tag)
+    || (node.getAttribute && (node.getAttribute('role') || node.getAttribute('tabindex') !== null))
+    || !!node.onclick;
+}}
+function walk(node, depth, lines) {{
+  if (!node || depth > maxDepth || lines.length >= 250) return;
+  if (node.nodeType !== Node.ELEMENT_NODE) return;
+  const include = !interactiveOnly || isInteractive(node);
+  if (include) {{
+    const ref = isInteractive(node) ? '@e' + nextRef++ : null;
+    if (ref) refs[ref] = {{ selector: node.id ? '#' + node.id : null, tag: (node.tagName || '').toLowerCase() }};
+    lines.push('  '.repeat(depth) + (ref ? '[' + ref + '] ' : '') + labelFor(node));
+  }}
+  for (const child of Array.from(node.children || [])) {{
+    walk(child, depth + 1, lines);
+  }}
+}}
+const lines = [];
+walk(document.body || document.documentElement, 0, lines);
+return {{
+  url: location.href,
+  title: document.title || '',
+  text: lines.join('\n'),
+  refs,
+  interactive
+}};
+}})()"#,
+    )
+}
+
+fn browser_wait_script(action: &BrowserAction, current_uri: Option<&str>) -> String {
+    let BrowserAction::Wait {
+        selector,
+        text,
+        url_contains,
+        load_state,
+        function,
+        timeout_ms,
+    } = action
+    else {
+        return "({ matched: false, condition: 'invalid' })".to_string();
+    };
+    let uri = serde_json::to_string(&current_uri.unwrap_or_default()).expect("json string");
+    let selector = serde_json::to_string(&selector.as_deref()).expect("json selector");
+    let text = serde_json::to_string(&text.as_deref()).expect("json text");
+    let url_contains = serde_json::to_string(&url_contains.as_deref()).expect("json url");
+    let load_state = serde_json::to_string(&load_state.as_deref()).expect("json load state");
+    let function = serde_json::to_string(&function.as_deref()).expect("json function");
+    format!(
+        r#"(function() {{
+const selector = {selector};
+const text = {text};
+const urlContains = {url_contains};
+const loadState = {load_state};
+const fnSource = {function};
+const currentUri = {uri};
+let matched = false;
+let condition = 'unknown';
+try {{
+  if (selector !== null) {{
+    condition = 'selector';
+    matched = !!document.querySelector(selector);
+  }} else if (text !== null) {{
+    condition = 'text';
+    matched = ((document.body && document.body.innerText) || document.documentElement.innerText || '').includes(text);
+  }} else if (urlContains !== null) {{
+    condition = 'url_contains';
+    matched = currentUri.includes(urlContains) || location.href.includes(urlContains);
+  }} else if (loadState !== null) {{
+    condition = 'load_state';
+    matched = document.readyState === loadState;
+  }} else if (fnSource !== null) {{
+    condition = 'function';
+    matched = !!Function('return (' + fnSource + ')')();
+  }}
+  return {{ matched, condition, readyState: document.readyState, url: location.href, timeout_ms: {timeout_ms} }};
+}} catch (error) {{
+  return {{ matched: false, condition, error: String(error), readyState: document.readyState, url: location.href, timeout_ms: {timeout_ms} }};
+}}
+}})()"#,
+    )
+}
+
+struct BrowserWaitPollState {
+    started: std::time::Instant,
+    in_flight: bool,
+    completed: bool,
+    last_condition: String,
+}
+
+// purpose: Poll a browser wait predicate without blocking GTK while preserving loud failures.
+// inputs: Browser target, JavaScript predicate, base response payload, timeout, and socket reply.
+// returns/effects: Sends exactly one bridge reply on match, timeout, or JavaScript failure.
+fn send_browser_wait_response(
+    browser: pane::BrowserSurfaceTarget,
+    script: String,
+    payload: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+    timeout_ms: u64,
+) {
+    let poll_state = Rc::new(RefCell::new(BrowserWaitPollState {
+        started: std::time::Instant::now(),
+        in_flight: false,
+        completed: false,
+        last_condition: "unknown".to_string(),
+    }));
+    let reply = Rc::new(RefCell::new(Some(reply)));
+    let payload = Rc::new(RefCell::new(payload));
+    let deadline = std::time::Duration::from_millis(timeout_ms);
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(BROWSER_WAIT_POLL_INTERVAL_MS),
+        move || {
+            {
+                let mut state = poll_state.borrow_mut();
+                if state.completed {
+                    return glib::ControlFlow::Break;
+                }
+                if state.started.elapsed() >= deadline {
+                    state.completed = true;
+                    if let Some(reply) = reply.borrow_mut().take() {
+                        let _ = reply.send(Err(BridgeError::not_found(format!(
+                            "browser.wait timed out after {timeout_ms}ms waiting for {}",
+                            state.last_condition
+                        ))));
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                if state.in_flight {
+                    return glib::ControlFlow::Continue;
+                }
+                state.in_flight = true;
+            }
+
+            let browser = browser.clone();
+            let script = script.clone();
+            let poll_state = Rc::clone(&poll_state);
+            let reply = Rc::clone(&reply);
+            let payload = Rc::clone(&payload);
+            browser.evaluate_javascript(&script, move |result| {
+                let mut state = poll_state.borrow_mut();
+                if state.completed {
+                    return;
+                }
+                state.in_flight = false;
+                match result {
+                    Ok(value) => {
+                        state.last_condition = value
+                            .get("condition")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let matched = value
+                            .get("matched")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        if matched {
+                            state.completed = true;
+                            let mut response = payload.borrow().clone();
+                            response["wait"] = value;
+                            response["matched"] = serde_json::Value::Bool(true);
+                            if let Some(reply) = reply.borrow_mut().take() {
+                                let _ = reply.send(Ok(response));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        state.completed = true;
+                        if let Some(reply) = reply.borrow_mut().take() {
+                            let _ = reply.send(Err(BridgeError::internal(format!(
+                                "browser wait evaluation failed: {error}"
+                            ))));
+                        }
+                    }
+                }
+            });
+
+            glib::ControlFlow::Continue
+        },
+    );
 }
 
 fn send_pane_create_response_after_command(
@@ -4701,6 +4908,35 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     );
                     return;
                 }
+                BrowserAction::Snapshot {
+                    interactive,
+                    compact,
+                    max_depth,
+                } => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    if let Some(url) = browser.current_uri() {
+                        payload["url"] = serde_json::Value::String(url);
+                    }
+                    let script = browser_snapshot_script(*interactive, *compact, *max_depth);
+                    send_browser_eval_response(browser, script, payload, "snapshot", reply);
+                    return;
+                }
+                BrowserAction::Wait { .. } => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let current_uri = browser.current_uri();
+                    if let Some(url) = current_uri.clone() {
+                        payload["url"] = serde_json::Value::String(url);
+                    }
+                    let script = browser_wait_script(&action, current_uri.as_deref());
+                    let timeout_ms = match &action {
+                        BrowserAction::Wait { timeout_ms, .. } => *timeout_ms,
+                        _ => unreachable!("browser wait action matched above"),
+                    };
+                    send_browser_wait_response(browser, script, payload, reply, timeout_ms);
+                    return;
+                }
                 _ => {}
             }
             let ok = match &action {
@@ -4714,7 +4950,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::Eval { .. }
                 | BrowserAction::GetTitle
                 | BrowserAction::GetText
-                | BrowserAction::GetHtml => unreachable!("read-only browser action handled above"),
+                | BrowserAction::GetHtml
+                | BrowserAction::Snapshot { .. }
+                | BrowserAction::Wait { .. } => {
+                    unreachable!("read-only browser action handled above")
+                }
             };
             if !ok {
                 let _ = reply.send(Err(BridgeError::invalid_params(
