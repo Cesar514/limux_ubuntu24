@@ -1073,15 +1073,17 @@ fn restore_tabs_from_state(
                     }),
                 );
             }
-            TabContentState::Browser { uri } => add_browser_tab_inner(
-                internals,
-                Some(BrowserTabOptions {
-                    id: Some(saved_tab.id.as_str()),
-                    custom_name: saved_tab.custom_name.as_deref(),
-                    pinned: saved_tab.pinned,
-                    uri: uri.as_deref(),
-                }),
-            ),
+            TabContentState::Browser { uri } => {
+                add_browser_tab_inner(
+                    internals,
+                    Some(BrowserTabOptions {
+                        id: Some(saved_tab.id.as_str()),
+                        custom_name: saved_tab.custom_name.as_deref(),
+                        pinned: saved_tab.pinned,
+                        uri: uri.as_deref(),
+                    }),
+                );
+            }
             TabContentState::Keybinds {} => add_keybind_editor_tab_inner(
                 internals,
                 KeybindsTabInput {
@@ -1428,7 +1430,10 @@ fn add_terminal_tab_inner(
     tab_id
 }
 
-fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
+fn add_browser_tab_inner(
+    internals: &Rc<PaneInternals>,
+    options: Option<BrowserTabOptions<'_>>,
+) -> String {
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
@@ -1502,6 +1507,7 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
+    tab_id
 }
 
 fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTabInput<'_>) {
@@ -1633,16 +1639,23 @@ pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
 }
 
 #[allow(dead_code)]
-pub fn add_browser_tab_to_pane_with_uri(pane_widget: &gtk::Widget, uri: Option<&str>) {
-    if let Some(internals) = find_pane_internals(pane_widget) {
-        let options = uri.map(|uri| BrowserTabOptions {
-            id: None,
-            custom_name: None,
-            pinned: false,
-            uri: Some(uri),
-        });
-        add_browser_tab_inner(&internals, options);
+pub fn add_browser_tab_to_pane_with_uri(
+    pane_widget: &gtk::Widget,
+    uri: Option<&str>,
+) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    let options = uri.map(|uri| BrowserTabOptions {
+        id: None,
+        custom_name: None,
+        pinned: false,
+        uri: Some(uri),
+    });
+    let notify_after_insert = options.is_some();
+    let tab_id = add_browser_tab_inner(&internals, options);
+    if notify_after_insert {
+        (internals.callbacks.on_state_changed)();
     }
+    surface_summary_for_tab(&internals, &tab_id)
 }
 
 pub fn add_keybind_editor_tab_to_pane(
@@ -1805,6 +1818,35 @@ pub struct SurfaceSummary {
     pub selected: bool,
     pub cwd: Option<String>,
     pub uri: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserTabCloseError {
+    ContextNotFound,
+    TargetNotFound,
+    LastBrowserTab,
+}
+
+// purpose: Build a public surface summary for one tab entry.
+// inputs: Live pane internals and the tab id to summarize.
+// returns/effects: Returns metadata for the matching tab without mutating GTK state.
+fn surface_summary_for_tab(internals: &Rc<PaneInternals>, tab_id: &str) -> Option<SurfaceSummary> {
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+    let (kind, cwd, uri) = match &entry.kind {
+        TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
+        TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::Keybinds => ("keybinds".to_string(), None, None),
+    };
+    Some(SurfaceSummary {
+        pane_id: internals.pane_id,
+        surface_id: composite_surface_id(internals.pane_id, &entry.id),
+        title: entry.title_label.label().to_string(),
+        kind,
+        selected: tab_state.active_tab.as_deref() == Some(entry.id.as_str()),
+        cwd,
+        uri,
+    })
 }
 
 fn pane_internals_for_root(root: &gtk::Widget) -> Vec<Rc<PaneInternals>> {
@@ -1972,6 +2014,144 @@ pub fn focus_surface_for_root(root: &gtk::Widget, surface_hint: &str) -> Option<
         return active_surface_summary(&pane_widget);
     }
     None
+}
+
+// purpose: List browser tabs in the same pane as an addressed browser surface.
+// inputs: Workspace root and a raw or `surface:` browser surface hint.
+// returns/effects: Returns browser-only surface summaries without changing focus.
+pub fn browser_tab_summaries_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+) -> Option<Vec<SurfaceSummary>> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let tab_state = internals.tab_state.borrow();
+        let has_context = tab_state.tabs.iter().any(|entry| {
+            let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+            surface_hint_matches(&surface_id, &entry.id, requested)
+                && matches!(entry.kind, TabKind::Browser { .. })
+        });
+        if !has_context {
+            continue;
+        }
+        let tabs = tab_state
+            .tabs
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                TabKind::Browser { state } => Some(SurfaceSummary {
+                    pane_id: internals.pane_id,
+                    surface_id: composite_surface_id(internals.pane_id, &entry.id),
+                    title: entry.title_label.label().to_string(),
+                    kind: "browser".to_string(),
+                    selected: tab_state.active_tab.as_deref() == Some(entry.id.as_str()),
+                    cwd: None,
+                    uri: state.uri.borrow().clone(),
+                }),
+                TabKind::Terminal { .. } | TabKind::Keybinds => None,
+            })
+            .collect::<Vec<_>>();
+        return Some(tabs);
+    }
+    None
+}
+
+// purpose: Create a browser tab beside an addressed browser surface.
+// inputs: Workspace root, context browser surface hint, and optional initial URI.
+// returns/effects: Adds and activates the browser tab, returning its surface summary.
+pub fn add_browser_tab_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+    uri: Option<&str>,
+) -> Option<SurfaceSummary> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let has_context = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().any(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested)
+                    && matches!(entry.kind, TabKind::Browser { .. })
+            })
+        };
+        if !has_context {
+            continue;
+        }
+        let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+        return add_browser_tab_to_pane_with_uri(&pane_widget, uri);
+    }
+    None
+}
+
+// purpose: Close a browser tab in the same pane as an addressed browser surface.
+// inputs: Workspace root, context browser hint, and optional explicit target hint.
+// returns/effects: Removes the browser tab or reports context, target, or last-tab errors.
+pub fn close_browser_tab_for_root(
+    root: &gtk::Widget,
+    context_surface_hint: &str,
+    target_surface_hint: Option<&str>,
+) -> Result<SurfaceSummary, BrowserTabCloseError> {
+    let requested_context = normalize_surface_hint(context_surface_hint);
+    let requested_target = target_surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(requested_context);
+    if requested_context.is_empty() || requested_target.is_empty() {
+        return Err(BrowserTabCloseError::ContextNotFound);
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let (has_context, target_id, browser_count) = {
+            let tab_state = internals.tab_state.borrow();
+            let has_context = tab_state.tabs.iter().any(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested_context)
+                    && matches!(entry.kind, TabKind::Browser { .. })
+            });
+            let target_id = tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                let matches_target = surface_hint_matches(&surface_id, &entry.id, requested_target);
+                (matches_target && matches!(entry.kind, TabKind::Browser { .. }))
+                    .then(|| entry.id.clone())
+            });
+            let browser_count = tab_state
+                .tabs
+                .iter()
+                .filter(|entry| matches!(entry.kind, TabKind::Browser { .. }))
+                .count();
+            (has_context, target_id, browser_count)
+        };
+        if !has_context {
+            continue;
+        }
+        let Some(tab_id) = target_id else {
+            return Err(BrowserTabCloseError::TargetNotFound);
+        };
+        if browser_count <= 1 {
+            return Err(BrowserTabCloseError::LastBrowserTab);
+        }
+        let Some(summary) = surface_summary_for_tab(&internals, &tab_id) else {
+            return Err(BrowserTabCloseError::TargetNotFound);
+        };
+        remove_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+            &internals.callbacks,
+            &internals.pane_outer,
+            PaneEmptyReason::ClosedLastTab,
+        );
+        return Ok(summary);
+    }
+    Err(BrowserTabCloseError::ContextNotFound)
 }
 
 /// purpose: Resolve a browser surface target inside one workspace root.

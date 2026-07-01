@@ -19,8 +19,9 @@ use libadwaita as adw;
 
 use crate::app_config;
 use crate::control_bridge::{
-    BridgeError, BrowserAction, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection,
-    PaneCreateType, WorkspaceGroupAction, WorkspaceTarget,
+    BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
+    PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, WorkspaceGroupAction,
+    WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -1271,6 +1272,14 @@ fn normalize_surface_handle(raw: &str) -> &str {
         .unwrap_or_else(|| raw.trim())
 }
 
+fn surface_hint_matches(surface_id: &str, hint: &str) -> bool {
+    let normalized = normalize_surface_handle(hint);
+    surface_id == normalized
+        || surface_id
+            .rsplit_once(':')
+            .is_some_and(|(_, tab_id)| tab_id == normalized)
+}
+
 fn resolve_pane_create_source_id(
     surface_id: Option<&str>,
     pane_id: Option<u32>,
@@ -1471,6 +1480,50 @@ fn surface_list_payload(
         })
         .collect::<Vec<_>>();
     serde_json::json!({ "surfaces": surfaces })
+}
+
+// purpose: Render CMUX-style browser tab rows from live Limux browser surfaces.
+// inputs: Focused surface id and browser-only surface summaries from one pane.
+// returns/effects: Returns JSON rows without mutating GTK state.
+fn browser_tab_list_payload(
+    focused_surface_id: Option<String>,
+    tabs: Vec<pane::SurfaceSummary>,
+) -> serde_json::Value {
+    let current_surface_id = tabs
+        .iter()
+        .find(|tab| tab.selected)
+        .or_else(|| tabs.first())
+        .map(|tab| tab.surface_id.clone());
+    let rows = tabs
+        .into_iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let focused = focused_surface_id.as_deref() == Some(tab.surface_id.as_str());
+            let surface_id = tab.surface_id;
+            let uri = tab.uri.unwrap_or_default();
+            serde_json::json!({
+                "id": surface_id.clone(),
+                "ref": surface_ref(&surface_id),
+                "surface_id": surface_id.clone(),
+                "surface_ref": surface_ref(&surface_id),
+                "pane_id": tab.pane_id.to_string(),
+                "pane_ref": pane_ref(tab.pane_id),
+                "index": index,
+                "title": tab.title,
+                "url": uri.clone(),
+                "uri": uri,
+                "selected": tab.selected,
+                "focused": focused,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut payload = serde_json::json!({ "tabs": rows });
+    if let Some(surface_id) = current_surface_id {
+        payload["current_surface_id"] = serde_json::Value::String(surface_id.clone());
+        payload["current_surface_ref"] = serde_json::Value::String(surface_ref(&surface_id));
+    }
+    payload
 }
 
 fn surface_health_row(
@@ -5369,6 +5422,103 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             let _ = reply.send(Ok(result));
+        }
+        ControlCommand::BrowserTabAction {
+            target,
+            surface_hint,
+            action,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+
+            let result = match action {
+                BrowserTabAction::List => {
+                    let tabs = pane::browser_tab_summaries_for_root(&workspace_root, &surface_hint);
+                    let Some(tabs) = tabs else {
+                        let _ =
+                            reply.send(Err(BridgeError::not_found("browser surface not found")));
+                        return;
+                    };
+                    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace_id);
+                    Ok(browser_tab_list_payload(focused_surface_id, tabs))
+                }
+                BrowserTabAction::New { url } => {
+                    let surface = pane::add_browser_tab_for_root(
+                        &workspace_root,
+                        &surface_hint,
+                        url.as_deref(),
+                    );
+                    surface
+                        .map(|surface| {
+                            pane_create_response_payload(&workspace_id, &workspace_name, surface)
+                        })
+                        .ok_or_else(|| BridgeError::not_found("browser surface not found"))
+                }
+                BrowserTabAction::Switch {
+                    target_surface_hint,
+                } => {
+                    let tabs = pane::browser_tab_summaries_for_root(&workspace_root, &surface_hint);
+                    let Some(tabs) = tabs else {
+                        let _ =
+                            reply.send(Err(BridgeError::not_found("browser surface not found")));
+                        return;
+                    };
+                    let target_in_context = tabs
+                        .iter()
+                        .any(|tab| surface_hint_matches(&tab.surface_id, &target_surface_hint));
+                    if !target_in_context {
+                        let _ = reply.send(Err(BridgeError::not_found("browser tab not found")));
+                        return;
+                    }
+                    pane::focus_surface_for_root(&workspace_root, &target_surface_hint)
+                        .filter(|surface| surface.kind == "browser")
+                        .map(|surface| {
+                            pane_create_response_payload(&workspace_id, &workspace_name, surface)
+                        })
+                        .ok_or_else(|| BridgeError::not_found("browser tab not found"))
+                }
+                BrowserTabAction::Close {
+                    target_surface_hint,
+                } => match pane::close_browser_tab_for_root(
+                    &workspace_root,
+                    &surface_hint,
+                    target_surface_hint.as_deref(),
+                ) {
+                    Ok(surface) => {
+                        let mut payload =
+                            pane_create_response_payload(&workspace_id, &workspace_name, surface);
+                        payload["closed"] = serde_json::Value::Bool(true);
+                        Ok(payload)
+                    }
+                    Err(pane::BrowserTabCloseError::LastBrowserTab) => {
+                        Err(BridgeError::conflict("cannot close last browser tab"))
+                    }
+                    Err(pane::BrowserTabCloseError::ContextNotFound) => {
+                        Err(BridgeError::not_found("browser surface not found"))
+                    }
+                    Err(pane::BrowserTabCloseError::TargetNotFound) => {
+                        Err(BridgeError::not_found("browser tab not found"))
+                    }
+                },
+            };
+
+            let _ = reply.send(result);
         }
         ControlCommand::BrowserAction {
             target,

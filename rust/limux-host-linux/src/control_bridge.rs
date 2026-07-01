@@ -116,6 +116,10 @@ const METHODS: &[&str] = &[
     "browser.storage.get",
     "browser.storage.set",
     "browser.storage.clear",
+    "browser.tab.list",
+    "browser.tab.new",
+    "browser.tab.switch",
+    "browser.tab.close",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -318,6 +322,14 @@ pub enum BrowserAction {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserTabAction {
+    List,
+    New { url: Option<String> },
+    Switch { target_surface_hint: String },
+    Close { target_surface_hint: Option<String> },
+}
+
 /// Parser-level contract for the live-GTK `pane.create` route.
 ///
 /// Request fields accepted by the bridge:
@@ -469,6 +481,12 @@ pub enum ControlCommand {
         action: BrowserAction,
         reply: mpsc::Sender<BridgeResult>,
     },
+    BrowserTabAction {
+        target: WorkspaceTarget,
+        surface_hint: String,
+        action: BrowserTabAction,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CreateSurface {
         target: WorkspaceTarget,
         command: Option<String>,
@@ -592,6 +610,7 @@ impl ControlCommand {
             | Self::CreatePanes { reply, .. }
             | Self::FocusPane { reply, .. }
             | Self::BrowserAction { reply, .. }
+            | Self::BrowserTabAction { reply, .. }
             | Self::CreateSurface { reply, .. }
             | Self::CreateSurfaces { reply, .. }
             | Self::ListSurfaces { reply, .. }
@@ -1888,6 +1907,71 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::BrowserAction {
+                    target,
+                    surface_hint,
+                    action,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "browser.tab.list" | "browser.tab.new" | "browser.tab.switch" | "browser.tab.close" => {
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(format!("{method} requires surface_id")),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let action = match method {
+                "browser.tab.list" => BrowserTabAction::List,
+                "browser.tab.new" => BrowserTabAction::New {
+                    url: optional_string(params, &["url"]),
+                },
+                "browser.tab.switch" => {
+                    let target_surface_hint = match optional_ref_handle(
+                        params,
+                        &["target_surface_id", "tab_id", "target_id"],
+                        "surface:",
+                    ) {
+                        Ok(Some(value)) if !value.trim().is_empty() => value,
+                        Ok(_) => {
+                            return error_response(
+                                id,
+                                BridgeError::invalid_params(
+                                    "browser.tab.switch requires target_surface_id",
+                                ),
+                            );
+                        }
+                        Err(error) => return error_response(id, error),
+                    };
+                    BrowserTabAction::Switch {
+                        target_surface_hint,
+                    }
+                }
+                "browser.tab.close" => BrowserTabAction::Close {
+                    target_surface_hint: match optional_ref_handle(
+                        params,
+                        &["target_surface_id", "tab_id", "target_id"],
+                        "surface:",
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                _ => unreachable!("browser tab method matched above"),
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BrowserTabAction {
                     target,
                     surface_hint,
                     action,
@@ -3655,6 +3739,71 @@ mod tests {
         for (request, expected_action) in cases {
             assert_browser_action_route(request, expected_action);
         }
+    }
+
+    // purpose: Verify CMUX browser tab methods reach the live bridge with validated targets.
+    // inputs: JSON-RPC requests for tab list, new, switch, and close.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong command.
+    #[test]
+    fn browser_tab_routes_queue_browser_tab_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.tab.list","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserTabAction::List,
+            ),
+            (
+                r#"{"id":1,"method":"browser.tab.new","params":{"surface_id":"surface:9:browser","url":"https://example.com"}}"#,
+                BrowserTabAction::New {
+                    url: Some("https://example.com".to_string()),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.tab.switch","params":{"surface_id":"surface:9:browser","target_surface_id":"surface:9:other"}}"#,
+                BrowserTabAction::Switch {
+                    target_surface_hint: "9:other".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.tab.close","params":{"surface_id":"surface:9:browser","tab_id":"other"}}"#,
+                BrowserTabAction::Close {
+                    target_surface_hint: Some("other".to_string()),
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            let response = dispatch_request(request, &|command| match command {
+                ControlCommand::BrowserTabAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(action, expected_action);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            });
+
+            assert_eq!(response.error, None);
+        }
+    }
+
+    // purpose: Verify tab switching fails before dispatch when no target tab is supplied.
+    // inputs: Malformed browser.tab.switch request missing target_surface_id/tab_id.
+    // returns/effects: Panics when invalid params are not reported.
+    #[test]
+    fn browser_tab_switch_rejects_missing_target() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"browser.tab.switch","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid browser.tab.switch should not dispatch: {command:?}"),
+        );
+
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]
