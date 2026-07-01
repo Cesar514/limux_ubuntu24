@@ -2,6 +2,12 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T12:59:37Z Move completed mixed-workload TODO entries to TODO_COMPLETED.md, commit the verified changes, and push only to the fork remote. \
+[x] 2026-07-01T12:59:37Z Re-run repository checks and the mixed-workload profiler to verify stability and resource behavior. \
+[x] 2026-07-01T12:59:37Z Patch the verified mixed-workload bottleneck without removing existing Limux functionality. \
+[x] 2026-07-01T12:59:37Z Measure the existing sequential multi-workspace split-pane path and identify the dominant bottleneck. \
+[x] 2026-07-01T12:59:37Z Add a repeatable mixed-workload profiler that measures creation latency, host CPU, RSS, disk writes, GPU state, pane count, surface count, and workspace count. \
+[x] 2026-07-01T12:59:37Z Define and document a mixed Limux workload with multiple workspaces, multiple split panes per workspace, and multiple terminal surfaces per workspace. \
 [x] 2026-07-01T12:19:05Z Run repository verification and move completed 40-terminal efficiency TODO entries to TODO_COMPLETED.md. \
 [x] 2026-07-01T12:19:05Z Migrate high-value cmux surface/tab functionality into Limux with live surface.create and surface.create_many. \
 [x] 2026-07-01T12:19:05Z Re-run the 40-terminal benchmark and prove the 85% target with measured batch creation results. \

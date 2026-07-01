@@ -31,6 +31,7 @@ const METHODS: &[&str] = &[
     "pane.list",
     "pane.surfaces",
     "pane.create",
+    "pane.create_many",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -102,6 +103,15 @@ pub struct CreatePaneRequest {
     pub command: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatePanesRequest {
+    pub target: WorkspaceTarget,
+    pub source_pane_id: Option<String>,
+    pub source_surface_id: Option<String>,
+    pub count: usize,
+    pub directions: Vec<PaneCreateDirection>,
+}
+
 #[derive(Debug)]
 pub enum ControlCommand {
     Identify {
@@ -127,6 +137,10 @@ pub enum ControlCommand {
         request: CreatePaneRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
+    CreatePanes {
+        request: CreatePanesRequest,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CreateSurface {
         target: WorkspaceTarget,
         command: Option<String>,
@@ -134,6 +148,7 @@ pub enum ControlCommand {
     },
     CreateSurfaces {
         target: WorkspaceTarget,
+        pane_id: Option<String>,
         count: usize,
         command_template: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
@@ -204,6 +219,7 @@ impl ControlCommand {
             | Self::ListPanes { reply, .. }
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
+            | Self::CreatePanes { reply, .. }
             | Self::CreateSurface { reply, .. }
             | Self::CreateSurfaces { reply, .. }
             | Self::ListSurfaces { reply, .. }
@@ -386,23 +402,26 @@ fn parse_optional_workspace_target(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn parse_pane_create_direction(raw: &str) -> Result<PaneCreateDirection, BridgeError> {
+    match raw {
+        "left" => Ok(PaneCreateDirection::Left),
+        "right" => Ok(PaneCreateDirection::Right),
+        "up" => Ok(PaneCreateDirection::Up),
+        "down" => Ok(PaneCreateDirection::Down),
+        _ => Err(BridgeError::invalid_params(
+            "pane.create direction must be one of left|right|up|down",
+        )),
+    }
+}
+
 fn parse_create_pane_request(
     params: &Map<String, Value>,
 ) -> Result<CreatePaneRequest, BridgeError> {
-    let direction = match optional_string(params, &["direction"])
-        .unwrap_or_else(|| "right".to_string())
-        .as_str()
-    {
-        "left" => PaneCreateDirection::Left,
-        "right" => PaneCreateDirection::Right,
-        "up" => PaneCreateDirection::Up,
-        "down" => PaneCreateDirection::Down,
-        _ => {
-            return Err(BridgeError::invalid_params(
-                "pane.create direction must be one of left|right|up|down",
-            ));
-        }
-    };
+    let direction = parse_pane_create_direction(
+        optional_string(params, &["direction"])
+            .unwrap_or_else(|| "right".to_string())
+            .as_str(),
+    )?;
 
     let pane_type = match optional_string(params, &["type"])
         .unwrap_or_else(|| "terminal".to_string())
@@ -435,6 +454,63 @@ fn parse_create_pane_request(
         direction,
         pane_type,
         command: optional_string(params, &["command"]),
+    })
+}
+
+fn parse_pane_create_many_directions(
+    params: &Map<String, Value>,
+) -> Result<Vec<PaneCreateDirection>, BridgeError> {
+    let Some(value) = params.get("directions") else {
+        return Ok(vec![PaneCreateDirection::Right, PaneCreateDirection::Down]);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(BridgeError::invalid_params(
+            "pane.create_many directions must be an array",
+        ));
+    };
+    if values.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "pane.create_many directions must not be empty",
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    BridgeError::invalid_params(
+                        "pane.create_many directions must contain only strings",
+                    )
+                })
+                .and_then(parse_pane_create_direction)
+        })
+        .collect()
+}
+
+fn parse_create_panes_request(
+    params: &Map<String, Value>,
+) -> Result<CreatePanesRequest, BridgeError> {
+    let count = match optional_index(params, "count")? {
+        Some(1) => 1,
+        _ => {
+            return Err(BridgeError::invalid_params(
+                "pane.create_many currently supports count=1 only",
+            ));
+        }
+    };
+    if optional_string(params, &["command_template", "command"]).is_some() {
+        return Err(BridgeError::invalid_params(
+            "pane.create_many does not support command templates",
+        ));
+    }
+
+    Ok(CreatePanesRequest {
+        target: parse_optional_workspace_target(params, true)?,
+        source_pane_id: optional_ref_handle(params, &["pane_id"], "pane:")?,
+        source_surface_id: optional_ref_handle(params, &["surface_id"], "surface:")?,
+        count,
+        directions: parse_pane_create_many_directions(params)?,
     })
 }
 
@@ -518,6 +594,14 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
         }
+        "pane.create_many" => {
+            let request = match parse_create_panes_request(params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CreatePanes { request, reply }, rx)
+        }
         "surface.create" | "new-surface" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -538,6 +622,10 @@ fn handle_method(
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
             };
+            let pane_id = match optional_ref_handle(params, &["pane_id"], "pane:") {
+                Ok(pane_id) => pane_id,
+                Err(error) => return error_response(id, error),
+            };
             let count = match optional_index(params, "count") {
                 Ok(Some(count)) if (1..=200).contains(&count) => count,
                 Ok(_) => {
@@ -552,6 +640,7 @@ fn handle_method(
             (
                 ControlCommand::CreateSurfaces {
                     target,
+                    pane_id,
                     count,
                     command_template: optional_string(params, &["command_template", "command"]),
                     reply,
@@ -1068,17 +1157,71 @@ mod tests {
     }
 
     #[test]
+    fn pane_create_many_route_validates_count_directions_and_rejects_template() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"pane.create_many","params":{"workspace_id":"codex","count":1,"directions":["right","down"]}}"#,
+            &|command| match command {
+                ControlCommand::CreatePanes { request, reply } => {
+                    assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(request.count, 1);
+                    assert_eq!(
+                        request.directions,
+                        vec![PaneCreateDirection::Right, PaneCreateDirection::Down]
+                    );
+                    let _ = reply.send(Ok(json!({ "count": request.count, "panes": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.create_many result")["count"],
+            1
+        );
+
+        let invalid_count = dispatch_request(
+            r#"{"id":1,"method":"pane.create_many","params":{"count":0}}"#,
+            &|command| panic!("invalid pane.create_many should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_count.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_direction = dispatch_request(
+            r#"{"id":1,"method":"pane.create_many","params":{"count":1,"directions":["diagonal"]}}"#,
+            &|command| panic!("invalid pane.create_many should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_direction.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_template = dispatch_request(
+            r#"{"id":1,"method":"pane.create_many","params":{"count":1,"command_template":"echo {i}"}}"#,
+            &|command| panic!("invalid pane.create_many should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_template.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
     fn surface_create_many_route_validates_count_and_template() {
         let response = dispatch_request(
             r#"{"id":1,"method":"surface.create_many","params":{"workspace_id":"codex","count":40,"command_template":"echo {i}"}}"#,
             &|command| match command {
                 ControlCommand::CreateSurfaces {
                     target,
+                    pane_id,
                     count,
                     command_template,
                     reply,
                 } => {
                     assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(pane_id, None);
                     assert_eq!(count, 40);
                     assert_eq!(command_template, Some("echo {i}".to_string()));
                     let _ = reply.send(Ok(json!({ "count": count, "surfaces": [] })));

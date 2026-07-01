@@ -4073,6 +4073,59 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let _ = reply.send(Ok(response));
         }
+        ControlCommand::CreatePanes { request, reply } => {
+            let source_pane_id = request
+                .source_pane_id
+                .as_deref()
+                .and_then(parse_pane_handle);
+            if request.source_pane_id.is_some() && source_pane_id.is_none() {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.create_many requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let first_direction = PaneCreateDirection::from(request.directions[0].clone());
+            let resolved = match resolve_pane_create_target(
+                state,
+                &request.target,
+                request.source_surface_id.as_deref(),
+                source_pane_id,
+                first_direction,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = reply.send(Err(pane_create_target_error(error)));
+                    return;
+                }
+            };
+
+            let workspace_name = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == resolved.workspace_id)
+                    .map(|workspace| workspace.name.clone())
+            };
+            let Some(workspace_name) = workspace_name else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let batch = PendingPaneBatch {
+                state: state.clone(),
+                workspace_id: resolved.workspace_id,
+                workspace_name,
+                source_pane_id: resolved.pane_id,
+                directions: request.directions,
+                count: request.count,
+                created: 0,
+                panes: Vec::with_capacity(request.count),
+                reply: Some(reply),
+            };
+            schedule_pane_batch_step(Rc::new(RefCell::new(batch)));
+        }
         ControlCommand::CreateSurface {
             target,
             command,
@@ -4127,6 +4180,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::CreateSurfaces {
             target,
+            pane_id,
             count,
             command_template,
             reply,
@@ -4150,18 +4204,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     workspace.root.clone(),
                 )
             };
-            let pane_id = focused_ids_for_workspace(state, &workspace_id)
-                .0
+            let requested_pane_id = pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| pane_id.as_deref().and_then(|raw| raw.parse::<u32>().ok()));
+            if pane_id.is_some() && requested_pane_id.is_none() {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "surface.create_many requires a valid pane_id",
+                )));
+                return;
+            }
+            let target_pane_id = requested_pane_id
+                .or_else(|| focused_ids_for_workspace(state, &workspace_id).0)
                 .or_else(|| {
                     pane::pane_summaries_for_root(&workspace_root)
                         .first()
                         .map(|summary| summary.pane_id)
                 });
-            let Some(pane_id) = pane_id else {
+            let Some(target_pane_id) = target_pane_id else {
                 let _ = reply.send(Err(BridgeError::not_found("pane not found")));
                 return;
             };
-            let Some(pane_widget) = pane::pane_widget_for_root(&workspace_root, pane_id) else {
+            let Some(pane_widget) = pane::pane_widget_for_root(&workspace_root, target_pane_id)
+            else {
                 let _ = reply.send(Err(BridgeError::not_found("pane not found")));
                 return;
             };
@@ -5154,6 +5219,107 @@ struct SplitPaneOptions {
     skip_default_tab: bool,
     new_pane_first: bool,
     persist: bool,
+}
+
+struct PendingPaneBatch {
+    state: State,
+    workspace_id: String,
+    workspace_name: String,
+    source_pane_id: u32,
+    directions: Vec<BridgePaneCreateDirection>,
+    count: usize,
+    created: usize,
+    panes: Vec<serde_json::Value>,
+    reply: Option<std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>>,
+}
+
+fn schedule_pane_batch_step(batch: Rc<RefCell<PendingPaneBatch>>) {
+    glib::timeout_add_local_once(std::time::Duration::from_millis(25), move || {
+        let mut pending = batch.borrow_mut();
+        let next_index = pending.created + 1;
+        let direction_index = pending.created % pending.directions.len();
+        let direction = PaneCreateDirection::from(pending.directions[direction_index].clone());
+        let placement = pane_create_split_placement(direction);
+        let workspace_root = {
+            let app_state = pending.state.borrow();
+            app_state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == pending.workspace_id)
+                .map(|workspace| workspace.root.clone())
+        };
+        let Some(workspace_root) = workspace_root else {
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+            }
+            return;
+        };
+        let source_widget = pane::pane_widget_for_root(&workspace_root, pending.source_pane_id);
+        let Some(source_widget) = source_widget else {
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Err(BridgeError::not_found("pane not found")));
+            }
+            return;
+        };
+        let new_pane = split_pane(
+            &pending.state,
+            &pending.workspace_id,
+            &source_widget,
+            placement.orientation,
+            SplitPaneOptions {
+                initial_state: None,
+                skip_default_tab: false,
+                new_pane_first: placement.new_pane_first,
+                persist: false,
+            },
+        );
+        let Some(new_pane) = new_pane else {
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "not enough room to split pane",
+                )));
+            }
+            return;
+        };
+
+        let surface = pane::active_surface_summary(&new_pane);
+        let Some(surface) = surface else {
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "pane.create_many did not produce a terminal surface",
+                )));
+            }
+            return;
+        };
+
+        let workspace_id = pending.workspace_id.clone();
+        let workspace_name = pending.workspace_name.clone();
+        pending.panes.push(pane_create_response_payload(
+            &workspace_id,
+            &workspace_name,
+            surface,
+        ));
+        pending.created = next_index;
+
+        if pending.created == pending.count {
+            request_session_save(&pending.state);
+            let panes = std::mem::take(&mut pending.panes);
+            let payload = serde_json::json!({
+                "ok": true,
+                "count": pending.count,
+                "workspace_id": pending.workspace_id,
+                "workspace_ref": workspace_ref(&pending.workspace_id),
+                "panes": panes,
+            });
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Ok(payload));
+            }
+            return;
+        }
+
+        drop(pending);
+        schedule_pane_batch_step(batch);
+    });
 }
 
 fn split_pane(
