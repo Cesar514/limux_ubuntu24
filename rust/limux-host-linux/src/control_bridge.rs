@@ -59,12 +59,31 @@ const METHODS: &[&str] = &[
     "browser.back",
     "browser.forward",
     "browser.reload",
+    "browser.click",
+    "browser.dblclick",
+    "browser.fill",
+    "browser.type",
+    "browser.select",
+    "browser.hover",
+    "browser.focus",
+    "browser.check",
+    "browser.uncheck",
+    "browser.press",
+    "browser.keydown",
+    "browser.keyup",
+    "browser.scroll",
+    "browser.scroll_into_view",
     "browser.focus_webview",
     "browser.is_webview_focused",
     "browser.eval",
     "browser.get.title",
     "browser.get.text",
+    "browser.get.value",
+    "browser.get.attr",
+    "browser.get.count",
+    "browser.get.box",
     "browser.get.html",
+    "browser.get.styles",
     "browser.snapshot",
     "browser.wait",
     "surface.create",
@@ -126,14 +145,82 @@ pub enum BrowserAction {
     Back,
     Forward,
     Reload,
+    Click {
+        selector: String,
+    },
+    DblClick {
+        selector: String,
+    },
+    Fill {
+        selector: String,
+        text: String,
+    },
+    Type {
+        selector: String,
+        text: String,
+    },
+    Select {
+        selector: String,
+        value: String,
+    },
+    Hover {
+        selector: String,
+    },
+    FocusElement {
+        selector: String,
+    },
+    Check {
+        selector: String,
+    },
+    Uncheck {
+        selector: String,
+    },
+    Press {
+        key: String,
+    },
+    KeyDown {
+        key: String,
+    },
+    KeyUp {
+        key: String,
+    },
+    Scroll {
+        selector: Option<String>,
+        dx: i64,
+        dy: i64,
+    },
+    ScrollIntoView {
+        selector: String,
+    },
     Focus,
     IsFocused,
     Eval {
         script: String,
     },
     GetTitle,
-    GetText,
-    GetHtml,
+    GetText {
+        selector: Option<String>,
+    },
+    GetValue {
+        selector: String,
+    },
+    GetAttr {
+        selector: String,
+        name: String,
+    },
+    GetCount {
+        selector: String,
+    },
+    GetBox {
+        selector: String,
+    },
+    GetHtml {
+        selector: Option<String>,
+    },
+    GetStyles {
+        selector: String,
+        property: Option<String>,
+    },
     Snapshot {
         interactive: bool,
         compact: bool,
@@ -519,6 +606,19 @@ fn optional_string(params: &Map<String, Value>, keys: &[&str]) -> Option<String>
     })
 }
 
+fn required_browser_selector(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<String, BridgeError> {
+    optional_string(params, &["selector"])
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires selector")))
+}
+
+fn required_browser_key(method: &str, params: &Map<String, Value>) -> Result<String, BridgeError> {
+    optional_string(params, &["key"])
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires key")))
+}
+
 fn optional_handle(
     params: &Map<String, Value>,
     keys: &[&str],
@@ -607,6 +707,28 @@ fn optional_u64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64
         }
         return Err(BridgeError::invalid_params(format!(
             "{key} must be a non-negative integer"
+        )));
+    }
+    Ok(None)
+}
+
+fn optional_i64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<i64>, BridgeError> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        if let Some(number) = value.as_i64() {
+            return Ok(Some(number));
+        }
+        if let Some(raw) = value.as_str() {
+            return raw
+                .trim()
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| BridgeError::invalid_params(format!("{key} must be an integer")));
+        }
+        return Err(BridgeError::invalid_params(format!(
+            "{key} must be an integer"
         )));
     }
     Ok(None)
@@ -1062,12 +1184,31 @@ fn handle_method(
         | "browser.back"
         | "browser.forward"
         | "browser.reload"
+        | "browser.click"
+        | "browser.dblclick"
+        | "browser.fill"
+        | "browser.type"
+        | "browser.select"
+        | "browser.hover"
+        | "browser.focus"
+        | "browser.check"
+        | "browser.uncheck"
+        | "browser.press"
+        | "browser.keydown"
+        | "browser.keyup"
+        | "browser.scroll"
+        | "browser.scroll_into_view"
         | "browser.focus_webview"
         | "browser.is_webview_focused"
         | "browser.eval"
         | "browser.get.title"
         | "browser.get.text"
+        | "browser.get.value"
+        | "browser.get.attr"
+        | "browser.get.count"
+        | "browser.get.box"
         | "browser.get.html"
+        | "browser.get.styles"
         | "browser.snapshot"
         | "browser.wait" => {
             let surface_hint =
@@ -1095,6 +1236,114 @@ fn handle_method(
                 "browser.back" => BrowserAction::Back,
                 "browser.forward" => BrowserAction::Forward,
                 "browser.reload" => BrowserAction::Reload,
+                "browser.click" => BrowserAction::Click {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.dblclick" => BrowserAction::DblClick {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.fill" => BrowserAction::Fill {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                    text: optional_string(params, &["text"]).unwrap_or_default(),
+                },
+                "browser.type" => {
+                    let Some(text) = optional_string(params, &["text"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.type requires text"),
+                        );
+                    };
+                    BrowserAction::Type {
+                        selector: match required_browser_selector(method, params) {
+                            Ok(value) => value,
+                            Err(error) => return error_response(id, error),
+                        },
+                        text,
+                    }
+                }
+                "browser.select" => {
+                    let Some(value) = optional_string(params, &["value"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.select requires value"),
+                        );
+                    };
+                    BrowserAction::Select {
+                        selector: match required_browser_selector(method, params) {
+                            Ok(value) => value,
+                            Err(error) => return error_response(id, error),
+                        },
+                        value,
+                    }
+                }
+                "browser.hover" => BrowserAction::Hover {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.focus" => BrowserAction::FocusElement {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.check" => BrowserAction::Check {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.uncheck" => BrowserAction::Uncheck {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.press" => BrowserAction::Press {
+                    key: match required_browser_key(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.keydown" => BrowserAction::KeyDown {
+                    key: match required_browser_key(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.keyup" => BrowserAction::KeyUp {
+                    key: match required_browser_key(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.scroll" => BrowserAction::Scroll {
+                    selector: optional_string(params, &["selector"]),
+                    dx: match optional_i64(params, &["dx"]) {
+                        Ok(value) => value.unwrap_or(0),
+                        Err(error) => return error_response(id, error),
+                    },
+                    dy: match optional_i64(params, &["dy"]) {
+                        Ok(value) => value.unwrap_or(0),
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.scroll_into_view" => BrowserAction::ScrollIntoView {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
                 "browser.focus_webview" => BrowserAction::Focus,
                 "browser.is_webview_focused" => BrowserAction::IsFocused,
                 "browser.eval" => {
@@ -1107,8 +1356,66 @@ fn handle_method(
                     BrowserAction::Eval { script }
                 }
                 "browser.get.title" => BrowserAction::GetTitle,
-                "browser.get.text" => BrowserAction::GetText,
-                "browser.get.html" => BrowserAction::GetHtml,
+                "browser.get.text" => BrowserAction::GetText {
+                    selector: optional_string(params, &["selector"]),
+                },
+                "browser.get.value" => {
+                    let Some(selector) = optional_string(params, &["selector"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.value requires selector"),
+                        );
+                    };
+                    BrowserAction::GetValue { selector }
+                }
+                "browser.get.attr" => {
+                    let Some(selector) = optional_string(params, &["selector"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.attr requires selector"),
+                        );
+                    };
+                    let Some(name) = optional_string(params, &["name", "attr"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.attr requires name or attr"),
+                        );
+                    };
+                    BrowserAction::GetAttr { selector, name }
+                }
+                "browser.get.count" => {
+                    let Some(selector) = optional_string(params, &["selector"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.count requires selector"),
+                        );
+                    };
+                    BrowserAction::GetCount { selector }
+                }
+                "browser.get.box" => {
+                    let Some(selector) = optional_string(params, &["selector"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.box requires selector"),
+                        );
+                    };
+                    BrowserAction::GetBox { selector }
+                }
+                "browser.get.html" => BrowserAction::GetHtml {
+                    selector: optional_string(params, &["selector"]),
+                },
+                "browser.get.styles" => {
+                    let Some(selector) = optional_string(params, &["selector"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.get.styles requires selector"),
+                        );
+                    };
+                    BrowserAction::GetStyles {
+                        selector,
+                        property: optional_string(params, &["property", "name"]),
+                    }
+                }
                 "browser.snapshot" => BrowserAction::Snapshot {
                     interactive: match optional_bool(params, "interactive") {
                         Ok(value) => value.unwrap_or(false),
@@ -2271,6 +2578,216 @@ mod tests {
         );
         assert_eq!(title.error, None);
 
+        let text = dispatch_request(
+            r##"{"id":1,"method":"browser.get.text","params":{"surface_id":"surface:9:browser","selector":"#copy"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetText {
+                            selector: Some("#copy".to_string())
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "text": "Copy" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(text.error, None);
+
+        let value = dispatch_request(
+            r##"{"id":1,"method":"browser.get.value","params":{"surface_id":"surface:9:browser","selector":"#email"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetValue {
+                            selector: "#email".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "value": "a@example.com" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(value.error, None);
+
+        let attr = dispatch_request(
+            r##"{"id":1,"method":"browser.get.attr","params":{"surface_id":"surface:9:browser","selector":"#email","attr":"aria-label"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetAttr {
+                            selector: "#email".to_string(),
+                            name: "aria-label".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "value": "Email" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(attr.error, None);
+
+        let count = dispatch_request(
+            r##"{"id":1,"method":"browser.get.count","params":{"surface_id":"surface:9:browser","selector":".item"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetCount {
+                            selector: ".item".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "count": 3 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(count.error, None);
+
+        let box_result = dispatch_request(
+            r##"{"id":1,"method":"browser.get.box","params":{"surface_id":"surface:9:browser","selector":"main"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetBox {
+                            selector: "main".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "value": { "x": 1, "y": 2 } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(box_result.error, None);
+
+        let html = dispatch_request(
+            r##"{"id":1,"method":"browser.get.html","params":{"surface_id":"surface:9:browser","selector":"main"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetHtml {
+                            selector: Some("main".to_string())
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "html": "<main></main>" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(html.error, None);
+
+        let styles = dispatch_request(
+            r##"{"id":1,"method":"browser.get.styles","params":{"surface_id":"surface:9:browser","selector":"main","property":"display"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::GetStyles {
+                            selector: "main".to_string(),
+                            property: Some("display".to_string())
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "value": "block" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(styles.error, None);
+
+        let click = dispatch_request(
+            r##"{"id":1,"method":"browser.click","params":{"surface_id":"surface:9:browser","selector":"#submit"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::Click {
+                            selector: "#submit".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "action": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(click.error, None);
+
+        let fill = dispatch_request(
+            r##"{"id":1,"method":"browser.fill","params":{"surface_id":"surface:9:browser","selector":"#email","text":"a@example.com"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::Fill {
+                            selector: "#email".to_string(),
+                            text: "a@example.com".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "action": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(fill.error, None);
+
+        let select = dispatch_request(
+            r##"{"id":1,"method":"browser.select","params":{"surface_id":"surface:9:browser","selector":"select","value":"pro"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::Select {
+                            selector: "select".to_string(),
+                            value: "pro".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "action": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(select.error, None);
+
+        let keydown = dispatch_request(
+            r#"{"id":1,"method":"browser.keydown","params":{"surface_id":"surface:9:browser","key":"Enter"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::KeyDown {
+                            key: "Enter".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "action": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(keydown.error, None);
+
+        let scroll = dispatch_request(
+            r#"{"id":1,"method":"browser.scroll","params":{"surface_id":"surface:9:browser","dx":10,"dy":-20}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::Scroll {
+                            selector: None,
+                            dx: 10,
+                            dy: -20
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "action": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(scroll.error, None);
+
         let snapshot = dispatch_request(
             r#"{"id":1,"method":"browser.snapshot","params":{"surface_id":"surface:9:browser","interactive":true,"compact":true,"max_depth":3}}"#,
             &|command| match command {
@@ -2297,7 +2814,19 @@ mod tests {
         assert_eq!(snapshot.error, None);
 
         let wait = dispatch_request(
-            r##"{"id":1,"method":"browser.wait","params":{"surface_id":"surface:9:browser","selector":"#ready","text":"Ready","url_contains":"example","load_state":"complete","function":"() => true","timeout_ms":250}}"##,
+            r##"{
+                "id":1,
+                "method":"browser.wait",
+                "params":{
+                    "surface_id":"surface:9:browser",
+                    "selector":"#ready",
+                    "text":"Ready",
+                    "url_contains":"example",
+                    "load_state":"complete",
+                    "function":"() => true",
+                    "timeout_ms":250
+                }
+            }"##,
             &|command| match command {
                 ControlCommand::BrowserAction {
                     surface_hint,
@@ -2330,6 +2859,24 @@ mod tests {
         );
         assert_eq!(
             invalid_wait.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_getter = dispatch_request(
+            r#"{"id":1,"method":"browser.get.value","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid browser.get.value should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_getter.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_attr = dispatch_request(
+            r##"{"id":1,"method":"browser.get.attr","params":{"surface_id":"surface:9:browser","selector":"#email"}}"##,
+            &|command| panic!("invalid browser.get.attr should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_attr.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
 
@@ -2575,7 +3122,17 @@ mod tests {
     #[test]
     fn workspace_create_many_route_validates_shape() {
         let response = dispatch_request(
-            r#"{"id":1,"method":"workspace.create_many","params":{"count":12,"name_prefix":"triple","cwd":"/tmp","panes_per_workspace":4,"terminals_per_workspace":10}}"#,
+            r#"{
+                "id":1,
+                "method":"workspace.create_many",
+                "params":{
+                    "count":12,
+                    "name_prefix":"triple",
+                    "cwd":"/tmp",
+                    "panes_per_workspace":4,
+                    "terminals_per_workspace":10
+                }
+            }"#,
             &|command| match command {
                 ControlCommand::CreateWorkspaces {
                     count,

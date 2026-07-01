@@ -4130,14 +4130,14 @@ async fn run_browser(
             };
             CommandOutput::Json(payload)
         }
-        "click" => {
+        "click" | "dblclick" | "hover" | "focus" | "check" | "uncheck" | "scroll_into_view" => {
             let sid = surface
                 .clone()
-                .ok_or_else(|| anyhow!("browser click requires a surface"))?;
+                .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
-                .ok_or_else(|| anyhow!("browser click requires a selector"))?;
-            let payload = browser_call(client, Some(sid), "browser.click", {
+                .ok_or_else(|| anyhow!("browser {} requires a selector", sub))?;
+            let payload = browser_call(client, Some(sid), &format!("browser.{}", sub), {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
                 p
@@ -4145,20 +4145,22 @@ async fn run_browser(
             .await?;
             CommandOutput::Json(payload)
         }
-        "fill" => {
+        "fill" | "type" | "select" => {
             let sid = surface
                 .clone()
-                .ok_or_else(|| anyhow!("browser fill requires a surface"))?;
+                .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
             let selector = parse_opt(&browser_args, "--selector")
                 .or_else(|| rest.first().cloned())
-                .unwrap_or_default();
-            let text = parse_opt(&browser_args, "--text")
+                .ok_or_else(|| anyhow!("browser {} requires a selector", sub))?;
+            let value_key = if sub == "select" { "value" } else { "text" };
+            let value = parse_opt(&browser_args, "--text")
+                .or_else(|| parse_opt(&browser_args, "--value"))
                 .or_else(|| rest.get(1).cloned())
                 .unwrap_or_default();
-            let payload = browser_call(client, Some(sid), "browser.fill", {
+            let payload = browser_call(client, Some(sid), &format!("browser.{}", sub), {
                 let mut p = Map::new();
                 p.insert("selector".to_string(), Value::String(selector));
-                p.insert("text".to_string(), Value::String(text));
+                p.insert(value_key.to_string(), Value::String(value));
                 p
             })
             .await?;
@@ -4180,6 +4182,40 @@ async fn run_browser(
             } else {
                 CommandOutput::Json(payload)
             }
+        }
+        "press" | "keydown" | "keyup" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser {} requires a surface", sub))?;
+            let key = parse_opt(&browser_args, "--key")
+                .or_else(|| rest.first().cloned())
+                .ok_or_else(|| anyhow!("browser {} requires a key", sub))?;
+            let payload = browser_call(client, Some(sid), &format!("browser.{}", sub), {
+                let mut p = Map::new();
+                p.insert("key".to_string(), Value::String(key));
+                p
+            })
+            .await?;
+            CommandOutput::Json(payload)
+        }
+        "scroll" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser scroll requires a surface"))?;
+            let mut p = Map::new();
+            if let Some(selector) = parse_opt(&browser_args, "--selector") {
+                p.insert("selector".to_string(), Value::String(selector));
+            }
+            for (flag, key) in [("--dx", "dx"), ("--dy", "dy")] {
+                if let Some(raw) = parse_opt(&browser_args, flag) {
+                    let value = raw
+                        .parse::<i64>()
+                        .with_context(|| format!("browser scroll {flag} must be an integer"))?;
+                    p.insert(key.to_string(), Value::Number(value.into()));
+                }
+            }
+            let payload = browser_call(client, Some(sid), "browser.scroll", p).await?;
+            CommandOutput::Json(payload)
         }
         "get" => {
             let sid = surface

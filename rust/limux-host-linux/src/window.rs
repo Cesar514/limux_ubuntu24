@@ -211,6 +211,211 @@ fn send_browser_eval_response(
     });
 }
 
+// purpose: Build JavaScript that targets one required DOM element and fails loudly when it cannot be resolved.
+// inputs: CSS selector and JavaScript expression that receives `node`.
+// returns/effects: Returns an immediately-invoked JavaScript snippet for WebKit evaluation.
+fn browser_required_element_script(selector: &str, expression: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("json selector");
+    format!(
+        r#"(function() {{
+const selector = {selector};
+const node = document.querySelector(selector);
+if (!node) {{
+  throw new Error('selector not found: ' + selector);
+}}
+return {expression};
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript for text/html getters that can address either the whole page or one selected element.
+// inputs: Optional CSS selector and JavaScript expressions for page-wide and element-specific reads.
+// returns/effects: Returns an immediately-invoked JavaScript snippet for WebKit evaluation.
+fn browser_optional_element_script(
+    selector: Option<&str>,
+    page_expression: &str,
+    element_expression: &str,
+) -> String {
+    match selector {
+        Some(selector) => browser_required_element_script(selector, element_expression),
+        None => format!("(function() {{ return {page_expression}; }})()"),
+    }
+}
+
+// purpose: Build JavaScript that counts all DOM elements matching a required CSS selector.
+// inputs: CSS selector.
+// returns/effects: Returns a JavaScript snippet that fails on invalid selectors and returns a number.
+fn browser_count_script(selector: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("json selector");
+    format!("(function() {{ const selector = {selector}; return document.querySelectorAll(selector).length; }})()")
+}
+
+// purpose: Build JavaScript that reads a selected element's computed styles.
+// inputs: CSS selector and optional style property name.
+// returns/effects: Returns a JavaScript snippet that fails on missing elements and returns a string or style map.
+fn browser_styles_script(selector: &str, property: Option<&str>) -> String {
+    let selector = serde_json::to_string(selector).expect("json selector");
+    let property = serde_json::to_string(&property).expect("json property");
+    format!(
+        r#"(function() {{
+const selector = {selector};
+const property = {property};
+const node = document.querySelector(selector);
+if (!node) {{
+  throw new Error('selector not found: ' + selector);
+}}
+const styles = window.getComputedStyle(node);
+if (property !== null) {{
+  return styles.getPropertyValue(property);
+}}
+const result = {{}};
+for (const name of styles) {{
+  result[name] = styles.getPropertyValue(name);
+}}
+return result;
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript for a DOM action against one required CSS selector.
+// inputs: CSS selector and JavaScript body that operates on `node`.
+// returns/effects: Returns a script that throws when the element cannot be resolved.
+fn browser_element_action_script(selector: &str, body: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("json selector");
+    format!(
+        r#"(function() {{
+const selector = {selector};
+const node = document.querySelector(selector);
+if (!node) {{
+  throw new Error('selector not found: ' + selector);
+}}
+{body}
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript for keyboard event browser actions.
+// inputs: Key value and event name.
+// returns/effects: Dispatches a bubbling keyboard event on the focused element or document body.
+fn browser_key_action_script(key: &str, event_name: &str) -> String {
+    let key = serde_json::to_string(key).expect("json key");
+    let event_name = serde_json::to_string(event_name).expect("json event");
+    format!(
+        r#"(function() {{
+const target = document.activeElement || document.body || document.documentElement;
+if (!target) throw new Error('no keyboard target available');
+target.dispatchEvent(new KeyboardEvent({event_name}, {{ key: {key}, bubbles: true, cancelable: true }}));
+return {{ action: {event_name}, key: {key}, ok: true }};
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript for browser scroll actions.
+// inputs: Optional CSS selector and x/y deltas.
+// returns/effects: Scrolls the selected element or window and returns action metadata.
+fn browser_scroll_script(selector: Option<&str>, dx: i64, dy: i64) -> String {
+    let selector = serde_json::to_string(&selector).expect("json selector");
+    format!(
+        r#"(function() {{
+const selector = {selector};
+if (selector !== null) {{
+  const node = document.querySelector(selector);
+  if (!node) throw new Error('selector not found: ' + selector);
+  node.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
+  return {{ action: 'scroll', selector, dx: {dx}, dy: {dy}, ok: true }};
+}}
+window.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
+return {{ action: 'scroll', selector: null, dx: {dx}, dy: {dy}, ok: true }};
+}})()"#,
+    )
+}
+
+fn browser_dblclick_body() -> &'static str {
+    r#"node.dispatchEvent(new MouseEvent('dblclick', {
+  bubbles: true,
+  cancelable: true,
+  view: window
+}));
+return { action: 'dblclick', selector, ok: true };"#
+}
+
+fn browser_fill_body(text: &str) -> String {
+    let text = serde_json::to_string(text).expect("json text");
+    format!(
+        r#"const value = {text};
+if (!('value' in node)) throw new Error('element is not fillable: ' + selector);
+node.focus();
+node.value = value;
+node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return {{ action: 'fill', selector, ok: true }};"#
+    )
+}
+
+fn browser_type_body(text: &str) -> String {
+    let text = serde_json::to_string(text).expect("json text");
+    format!(
+        r#"const value = {text};
+if (!('value' in node)) throw new Error('element is not typeable: ' + selector);
+node.focus();
+node.value = String(node.value || '') + value;
+node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return {{ action: 'type', selector, ok: true }};"#
+    )
+}
+
+fn browser_select_body(value: &str) -> String {
+    let value = serde_json::to_string(value).expect("json value");
+    format!(
+        r#"const value = {value};
+if (node.tagName !== 'SELECT') throw new Error('element is not a select: ' + selector);
+const option = Array.from(node.options).find((item) => {{
+  return item.value === value || item.text === value;
+}});
+if (!option) throw new Error('select option not found: ' + value);
+node.value = option.value;
+node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return {{ action: 'select', selector, value: option.value, ok: true }};"#
+    )
+}
+
+fn browser_hover_body() -> &'static str {
+    r#"node.dispatchEvent(new MouseEvent('mouseover', {
+  bubbles: true,
+  cancelable: true,
+  view: window
+}));
+node.dispatchEvent(new MouseEvent('mouseenter', {
+  bubbles: true,
+  cancelable: true,
+  view: window
+}));
+return { action: 'hover', selector, ok: true };"#
+}
+
+fn browser_focus_body() -> &'static str {
+    r#"if (typeof node.focus !== 'function') {
+  throw new Error('element is not focusable: ' + selector);
+}
+node.focus();
+return { action: 'focus', selector, ok: true };"#
+}
+
+fn browser_check_body(checked: bool) -> String {
+    let action = if checked { "check" } else { "uncheck" };
+    format!(
+        r#"if (node.type !== 'checkbox' && node.type !== 'radio') {{
+  throw new Error('element is not checkable: ' + selector);
+}}
+node.checked = {checked};
+node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return {{ action: '{action}', selector, checked: {checked}, ok: true }};"#
+    )
+}
+
 fn browser_snapshot_script(interactive: bool, compact: bool, max_depth: Option<usize>) -> String {
     let max_depth = max_depth.unwrap_or(4).min(12);
     format!(
@@ -4883,29 +5088,83 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     );
                     return;
                 }
-                BrowserAction::GetText => {
+                BrowserAction::GetText { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
-                    send_browser_eval_response(
-                        browser,
-                        "document.body ? document.body.innerText : ''".to_string(),
-                        payload,
-                        "text",
-                        reply,
+                    let script = browser_optional_element_script(
+                        selector.as_deref(),
+                        "document.body ? document.body.innerText : ''",
+                        "node.innerText || node.textContent || ''",
                     );
+                    send_browser_eval_response(browser, script, payload, "text", reply);
                     return;
                 }
-                BrowserAction::GetHtml => {
+                BrowserAction::GetValue { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
-                    send_browser_eval_response(
-                        browser,
-                        "document.documentElement ? document.documentElement.outerHTML : ''"
-                            .to_string(),
-                        payload,
-                        "html",
-                        reply,
+                    let script = browser_required_element_script(
+                        selector,
+                        "node.value !== undefined ? node.value : node.textContent || ''",
                     );
+                    send_browser_eval_response(browser, script, payload, "box", reply);
+                    return;
+                }
+                BrowserAction::GetAttr { selector, name } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let name = serde_json::to_string(name).expect("json attr name");
+                    let script = browser_required_element_script(
+                        selector,
+                        &format!("node.getAttribute({name})"),
+                    );
+                    send_browser_eval_response(browser, script, payload, "styles", reply);
+                    return;
+                }
+                BrowserAction::GetCount { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_count_script(selector);
+                    send_browser_eval_response(browser, script, payload, "count", reply);
+                    return;
+                }
+                BrowserAction::GetBox { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_required_element_script(
+                        selector,
+                        r#"(() => {
+  const rect = node.getBoundingClientRect();
+  return {
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    left: rect.left
+  };
+})()"#,
+                    );
+                    send_browser_eval_response(browser, script, payload, "value", reply);
+                    return;
+                }
+                BrowserAction::GetHtml { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_optional_element_script(
+                        selector.as_deref(),
+                        "document.documentElement ? document.documentElement.outerHTML : ''",
+                        "node.outerHTML",
+                    );
+                    send_browser_eval_response(browser, script, payload, "html", reply);
+                    return;
+                }
+                BrowserAction::GetStyles { selector, property } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_styles_script(selector, property.as_deref());
+                    send_browser_eval_response(browser, script, payload, "value", reply);
                     return;
                 }
                 BrowserAction::Snapshot {
@@ -4937,6 +5196,106 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_wait_response(browser, script, payload, reply, timeout_ms);
                     return;
                 }
+                BrowserAction::Click { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(
+                        selector,
+                        "node.click(); return { action: 'click', selector, ok: true };",
+                    );
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::DblClick { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(selector, browser_dblclick_body());
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Fill { selector, text } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(selector, &browser_fill_body(text));
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Type { selector, text } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(selector, &browser_type_body(text));
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Select { selector, value } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script =
+                        browser_element_action_script(selector, &browser_select_body(value));
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Hover { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(selector, browser_hover_body());
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::FocusElement { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(selector, browser_focus_body());
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Check { selector } | BrowserAction::Uncheck { selector } => {
+                    let checked = matches!(action, BrowserAction::Check { .. });
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script =
+                        browser_element_action_script(selector, &browser_check_body(checked));
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Press { key } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_key_action_script(key, "keydown");
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::KeyDown { key } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_key_action_script(key, "keydown");
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::KeyUp { key } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_key_action_script(key, "keyup");
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::Scroll { selector, dx, dy } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_scroll_script(selector.as_deref(), *dx, *dy);
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::ScrollIntoView { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_element_action_script(
+                        selector,
+                        "node.scrollIntoView({ block: 'center', inline: 'center' }); return { action: 'scroll_into_view', selector, ok: true };",
+                    );
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
                 _ => {}
             }
             let ok = match &action {
@@ -4946,13 +5305,33 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 BrowserAction::Forward => browser.go_forward(),
                 BrowserAction::Reload => browser.reload(),
                 BrowserAction::Focus => browser.focus_content(),
-                BrowserAction::IsFocused
-                | BrowserAction::Eval { .. }
+                BrowserAction::Click { .. }
+                | BrowserAction::DblClick { .. }
+                | BrowserAction::Fill { .. }
+                | BrowserAction::Type { .. }
+                | BrowserAction::Select { .. }
+                | BrowserAction::Hover { .. }
+                | BrowserAction::FocusElement { .. }
+                | BrowserAction::Check { .. }
+                | BrowserAction::Uncheck { .. }
+                | BrowserAction::Press { .. }
+                | BrowserAction::KeyDown { .. }
+                | BrowserAction::KeyUp { .. }
+                | BrowserAction::Scroll { .. }
+                | BrowserAction::ScrollIntoView { .. }
                 | BrowserAction::GetTitle
-                | BrowserAction::GetText
-                | BrowserAction::GetHtml
+                | BrowserAction::GetText { .. }
+                | BrowserAction::GetValue { .. }
+                | BrowserAction::GetAttr { .. }
+                | BrowserAction::GetCount { .. }
+                | BrowserAction::GetBox { .. }
+                | BrowserAction::GetHtml { .. }
+                | BrowserAction::GetStyles { .. }
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::Wait { .. } => {
+                    unreachable!("read-only browser action handled above")
+                }
+                BrowserAction::IsFocused | BrowserAction::Eval { .. } => {
                     unreachable!("read-only browser action handled above")
                 }
             };
