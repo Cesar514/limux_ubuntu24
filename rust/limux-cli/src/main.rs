@@ -1699,6 +1699,738 @@ fn parse_hook_event(args: &[String], payload: &Value) -> String {
         .unwrap_or_else(|| "event".to_string())
 }
 
+fn parse_feed_hook_event(args: &[String], payload: &Value) -> String {
+    parse_opt(args, "--event")
+        .or_else(|| feed_hook_positional_event(args))
+        .or_else(|| hook_str(payload, &["hook_event_name", "event"]).map(str::to_owned))
+        .unwrap_or_else(|| "event".to_string())
+}
+
+fn feed_hook_positional_event(args: &[String]) -> Option<String> {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--source" | "--workspace" | "--surface" | "--event"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedEventSemantic {
+    ApprovalRequest,
+    ToolStart,
+    ToolStartMaybeApproval,
+    ToolEnd,
+    PreCompact,
+    PostCompact,
+    PromptSubmit,
+    SubagentStart,
+    Response,
+    SubagentResponse,
+    SessionStart,
+    SessionEnd,
+    StatusNotification,
+    Unknown,
+}
+
+// purpose: Classify raw agent hook events into CMUX Feed wire events.
+// inputs: Source agent name, raw hook event name, and optional tool name.
+// returns/effects: Returns hook_event_name plus whether feed.push should wait for a user decision.
+fn classify_feed_event(source: &str, event: &str, tool_name: &str) -> (String, bool) {
+    let semantic = feed_event_semantic(source, event);
+    let (name, actionable) = match semantic {
+        FeedEventSemantic::ApprovalRequest => {
+            dedicated_feed_approval(tool_name).unwrap_or(("PermissionRequest", true))
+        }
+        FeedEventSemantic::ToolStartMaybeApproval => map_maybe_approval_tool(source, tool_name),
+        FeedEventSemantic::ToolStart => ("PreToolUse", false),
+        FeedEventSemantic::ToolEnd => ("PostToolUse", false),
+        FeedEventSemantic::PreCompact => ("PreCompact", false),
+        FeedEventSemantic::PostCompact => ("PostCompact", false),
+        FeedEventSemantic::PromptSubmit => ("UserPromptSubmit", false),
+        FeedEventSemantic::SubagentStart => ("SubagentStart", false),
+        FeedEventSemantic::Response => ("Stop", false),
+        FeedEventSemantic::SubagentResponse => ("SubagentStop", false),
+        FeedEventSemantic::SessionStart => ("SessionStart", false),
+        FeedEventSemantic::SessionEnd => ("SessionEnd", false),
+        FeedEventSemantic::StatusNotification => ("Notification", false),
+        FeedEventSemantic::Unknown => ("PreToolUse", false),
+    };
+    (name.to_string(), actionable)
+}
+
+fn map_maybe_approval_tool(source: &str, tool_name: &str) -> (&'static str, bool) {
+    if let Some(dedicated) = dedicated_feed_approval(tool_name) {
+        return dedicated;
+    }
+    if is_side_effecting_feed_tool(source, tool_name) {
+        ("PermissionRequest", true)
+    } else {
+        ("PreToolUse", false)
+    }
+}
+
+// purpose: Resolve a source-specific hook event into its user-attention semantic.
+// inputs: Agent source and raw event string from hook stdin or --event.
+// returns/effects: Returns explicit telemetry/approval semantics with unknown events non-actionable.
+fn feed_event_semantic(source: &str, event: &str) -> FeedEventSemantic {
+    match source {
+        "claude" => claude_feed_event_semantic(event),
+        "codex" => codex_feed_event_semantic(event),
+        "hermes-agent" => hermes_feed_event_semantic(event),
+        "kiro" => kiro_feed_event_semantic(event),
+        _ => generic_feed_event_semantic(event),
+    }
+}
+
+fn claude_feed_event_semantic(event: &str) -> FeedEventSemantic {
+    match event {
+        "PermissionRequest" => FeedEventSemantic::ApprovalRequest,
+        "PreToolUse" => FeedEventSemantic::ToolStart,
+        other => generic_feed_event_semantic(other),
+    }
+}
+
+fn codex_feed_event_semantic(event: &str) -> FeedEventSemantic {
+    match event {
+        "PermissionRequest"
+        | "permission_request"
+        | "PreToolUse"
+        | "pre_tool_use"
+        | "beforeShellExecution" => FeedEventSemantic::ToolStart,
+        "PostToolUse" | "post_tool_use" => FeedEventSemantic::ToolEnd,
+        "PreCompact" | "pre_compact" => FeedEventSemantic::PreCompact,
+        "PostCompact" | "post_compact" => FeedEventSemantic::PostCompact,
+        "UserPromptSubmit" | "user_prompt_submit" => FeedEventSemantic::PromptSubmit,
+        "SessionStart" | "session_start" => FeedEventSemantic::SessionStart,
+        "SessionEnd" | "session_end" => FeedEventSemantic::SessionEnd,
+        "Stop" | "stop" => FeedEventSemantic::Response,
+        "SubagentStart" | "subagent_start" => FeedEventSemantic::SubagentStart,
+        "SubagentStop" | "subagent_stop" => FeedEventSemantic::SubagentResponse,
+        "Notification" | "notification" => FeedEventSemantic::StatusNotification,
+        _ => FeedEventSemantic::Unknown,
+    }
+}
+
+fn hermes_feed_event_semantic(event: &str) -> FeedEventSemantic {
+    match event {
+        "pre_tool_call" => FeedEventSemantic::ToolStart,
+        "post_tool_call" => FeedEventSemantic::ToolEnd,
+        "pre_approval_request" | "post_approval_response" => FeedEventSemantic::StatusNotification,
+        "pre_llm_call" => FeedEventSemantic::PromptSubmit,
+        "post_llm_call" => FeedEventSemantic::Response,
+        "on_session_start" | "on_session_reset" => FeedEventSemantic::SessionStart,
+        "on_session_end" | "on_session_finalize" => FeedEventSemantic::SessionEnd,
+        _ => FeedEventSemantic::Unknown,
+    }
+}
+
+fn kiro_feed_event_semantic(event: &str) -> FeedEventSemantic {
+    match event {
+        "preToolUse" => FeedEventSemantic::ToolStartMaybeApproval,
+        "postToolUse" => FeedEventSemantic::ToolEnd,
+        "userPromptSubmit" => FeedEventSemantic::PromptSubmit,
+        "agentSpawn" => FeedEventSemantic::SessionStart,
+        "stop" => FeedEventSemantic::Response,
+        _ => FeedEventSemantic::Unknown,
+    }
+}
+
+// purpose: Classify hooks for agents without source-specific Feed tables.
+// inputs: Raw event string from generic agent hook integrations.
+// returns/effects: Returns the CMUX generic semantic, escalating side-effecting pre-tool hooks later.
+fn generic_feed_event_semantic(event: &str) -> FeedEventSemantic {
+    match event {
+        "PreToolUse" | "beforeShellExecution" => FeedEventSemantic::ToolStartMaybeApproval,
+        "PermissionRequest" => FeedEventSemantic::ApprovalRequest,
+        "PostToolUse" => FeedEventSemantic::ToolEnd,
+        "PreCompact" => FeedEventSemantic::PreCompact,
+        "PostCompact" => FeedEventSemantic::PostCompact,
+        "UserPromptSubmit" => FeedEventSemantic::PromptSubmit,
+        "SessionStart" => FeedEventSemantic::SessionStart,
+        "SessionEnd" => FeedEventSemantic::SessionEnd,
+        "Stop" => FeedEventSemantic::Response,
+        "SubagentStart" => FeedEventSemantic::SubagentStart,
+        "SubagentStop" => FeedEventSemantic::SubagentResponse,
+        "Notification" => FeedEventSemantic::StatusNotification,
+        _ => FeedEventSemantic::Unknown,
+    }
+}
+
+fn dedicated_feed_approval(tool_name: &str) -> Option<(&'static str, bool)> {
+    match tool_name {
+        "ExitPlanMode" => Some(("ExitPlanMode", true)),
+        "AskUserQuestion" => Some(("AskUserQuestion", true)),
+        _ => None,
+    }
+}
+
+// purpose: Decide whether a pre-tool event should become a Feed permission card.
+// inputs: Agent source and raw tool name.
+// returns/effects: Returns true only for tools CMUX treats as state-mutating.
+fn is_side_effecting_feed_tool(source: &str, tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase();
+    let canonical = [
+        "bash",
+        "write",
+        "edit",
+        "multiedit",
+        "notebookedit",
+        "apply_patch",
+        "shell",
+        "terminal",
+        "run_command",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "manage_task",
+        "schedule",
+        "ask_permission",
+        "invoke_subagent",
+        "define_subagent",
+        "manage_subagents",
+        "generate_image",
+    ];
+    canonical.contains(&normalized.as_str())
+        || source == "kiro" && is_kiro_side_effecting_tool(&normalized)
+}
+
+fn is_kiro_side_effecting_tool(normalized_tool_name: &str) -> bool {
+    matches!(
+        normalized_tool_name,
+        "execute_bash"
+            | "fs_write"
+            | "use_aws"
+            | "bash"
+            | "write"
+            | "edit"
+            | "multiedit"
+            | "apply_patch"
+            | "shell"
+    )
+}
+
+fn feed_tool_name(payload: &Value) -> Option<String> {
+    hook_str(payload, &["tool_name", "toolName"])
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("toolCall")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn feed_tool_input(payload: &Value, hook_event_name: &str) -> Option<Value> {
+    if hook_event_name == "PostToolUse" {
+        if let Some(value) = first_payload_value(
+            payload,
+            &["tool_response", "toolResponse", "tool_result", "toolResult"],
+        ) {
+            return Some(value);
+        }
+    }
+    first_payload_value(payload, &["tool_input", "toolInput"]).or_else(|| {
+        payload
+            .get("toolCall")
+            .and_then(|value| value.get("args"))
+            .cloned()
+    })
+}
+
+fn first_payload_value(payload: &Value, keys: &[&str]) -> Option<Value> {
+    keys.iter().find_map(|key| payload.get(*key).cloned())
+}
+
+fn feed_session_id(source: &str, payload: &Value) -> String {
+    let session = hook_session_id(payload)
+        .or_else(|| hook_str(payload, &["conversation_id", "conversationId"]).map(str::to_string))
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()));
+    if session.starts_with(&format!("{source}-")) {
+        session
+    } else {
+        format!("{source}-{session}")
+    }
+}
+
+// purpose: Build the CMUX-shaped feed.push request body from hook stdin.
+// inputs: Hook CLI args and decoded agent hook JSON.
+// returns/effects: Returns params, actionable flag, event name, tool name, and tool input.
+fn build_feed_hook_push(
+    args: &[String],
+    payload: &Value,
+) -> Result<(Value, bool, String, String, Option<Value>)> {
+    let source = parse_opt(args, "--source")
+        .ok_or_else(|| anyhow!("limux hooks feed requires --source <agent-name>"))?;
+    let raw_event = parse_feed_hook_event(args, payload);
+    let tool_name = feed_tool_name(payload).unwrap_or_default();
+    let (hook_event_name, actionable) = classify_feed_event(&source, &raw_event, &tool_name);
+    let tool_input = feed_tool_input(payload, &hook_event_name);
+    let mut event = payload.as_object().cloned().unwrap_or_default();
+
+    event.insert(
+        "session_id".to_string(),
+        Value::String(feed_session_id(&source, payload)),
+    );
+    event.insert(
+        "hook_event_name".to_string(),
+        Value::String(hook_event_name.clone()),
+    );
+    event.insert("_source".to_string(), Value::String(source.clone()));
+    if !tool_name.is_empty() {
+        event.insert("tool_name".to_string(), Value::String(tool_name.clone()));
+    }
+    if let Some(input) = tool_input.clone() {
+        event.insert("tool_input".to_string(), input);
+    }
+    enrich_feed_hook_context(args, payload, &source, &mut event);
+    ensure_feed_request_id(&source, &raw_event, &tool_name, payload, &mut event);
+
+    Ok((
+        json!({
+            "event": Value::Object(event),
+            "wait_timeout_seconds": if actionable { 120.0 } else { 0.0 },
+        }),
+        actionable,
+        hook_event_name,
+        tool_name,
+        tool_input,
+    ))
+}
+
+// purpose: Add workspace, surface, cwd, and process context to Feed hook events.
+// inputs: Hook args, raw payload, agent source, and mutable event object.
+// returns/effects: Mutates event with available non-empty context fields.
+fn enrich_feed_hook_context(
+    args: &[String],
+    payload: &Value,
+    source: &str,
+    event: &mut Map<String, Value>,
+) {
+    if let Some(workspace) =
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        event.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(surface) =
+        parse_opt(args, "--surface").or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+    {
+        event.insert("surface_id".to_string(), Value::String(surface));
+    }
+    if let Some(cwd) = hook_str(payload, &["cwd", "working_directory", "workingDirectory"]) {
+        event.insert("cwd".to_string(), Value::String(cwd.to_string()));
+    }
+    if let Some(agent) = agent_hooks::AgentKind::from_hook_name(source) {
+        if let Some(pid) = agent_ancestor_pid(agent) {
+            event.insert("_ppid".to_string(), json!(pid));
+        }
+    }
+}
+
+// purpose: Ensure feed.push can correlate later feed.*.reply calls.
+// inputs: Source, raw event name, tool name, payload, and mutable event object.
+// returns/effects: Preserves supplied request ids or inserts a generated non-empty id.
+fn ensure_feed_request_id(
+    source: &str,
+    raw_event: &str,
+    tool_name: &str,
+    payload: &Value,
+    event: &mut Map<String, Value>,
+) {
+    let request_id = hook_str(
+        payload,
+        &[
+            "_opencode_request_id",
+            "request_id",
+            "tool_use_id",
+            "toolUseID",
+        ],
+    )
+    .map(str::to_string)
+    .unwrap_or_else(|| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        format!("{source}-{raw_event}-{tool_name}-{now}")
+    });
+    event.insert(
+        "_opencode_request_id".to_string(),
+        Value::String(request_id),
+    );
+}
+
+// purpose: Run CMUX-compatible `limux hooks feed --source <agent>`.
+// inputs: Hook CLI args, stdin hook JSON, socket client, and JSON-output flag.
+// returns/effects: Pushes to feed.push and emits agent-native decision JSON when resolved.
+async fn run_feed_hook(
+    client: &mut Client,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    use std::io::Read;
+
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .context("failed to read hook JSON from stdin")?;
+    let payload: Value = if raw.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(raw.trim()).context("hook stdin was not valid JSON")?
+    };
+    let (params, _actionable, hook_event_name, tool_name, tool_input) =
+        build_feed_hook_push(args, &payload)?;
+    let result = client.call("feed.push", params).await?;
+    if json_output {
+        return Ok(CommandOutput::Json(result));
+    }
+    let decision = result.get("decision").cloned();
+    let output = decision
+        .as_ref()
+        .map(|value| render_feed_decision(args, tool_input.as_ref(), &payload, value))
+        .transpose()?
+        .unwrap_or_else(|| "{}".to_string());
+    let _ = hook_event_name;
+    let _ = tool_name;
+    Ok(CommandOutput::Text(output))
+}
+
+// purpose: Convert resolved Feed decisions into the source agent's hook stdout JSON.
+// inputs: Hook args, optional tool input, raw hook payload, and feed decision object.
+// returns/effects: Returns compact JSON text for stdout; unknown decisions emit an empty object.
+fn render_feed_decision(
+    args: &[String],
+    tool_input: Option<&Value>,
+    raw_payload: &Value,
+    decision: &Value,
+) -> Result<String> {
+    let source = parse_opt(args, "--source")
+        .ok_or_else(|| anyhow!("limux hooks feed requires --source <agent-name>"))?;
+    let kind = hook_str(decision, &["kind"]).unwrap_or("");
+    let rendered = match kind {
+        "permission" => render_feed_permission_decision(&source, raw_payload, decision),
+        "exit_plan" => render_feed_exit_plan_decision(&source, tool_input, decision),
+        "question" => render_feed_question_decision(&source, tool_input, decision),
+        _ => json!({}),
+    };
+    serde_json::to_string(&rendered).context("failed to encode feed decision")
+}
+
+// purpose: Render permission allow/deny decisions for Claude, Codex, and generic hooks.
+// inputs: Agent source, raw hook payload, and Feed permission decision.
+// returns/effects: Produces agent-native hookSpecificOutput JSON.
+fn render_feed_permission_decision(source: &str, raw_payload: &Value, decision: &Value) -> Value {
+    let mode = hook_str(decision, &["mode"]).unwrap_or("deny");
+    if matches!(source, "claude" | "codex") {
+        return render_claude_like_permission_decision(mode, raw_payload);
+    }
+    if source == "hermes-agent" {
+        return render_hermes_permission_decision(mode);
+    }
+    if source == "antigravity" {
+        return render_antigravity_permission_decision(mode);
+    }
+    render_generic_permission_decision(mode)
+}
+
+fn render_claude_like_permission_decision(mode: &str, raw_payload: &Value) -> Value {
+    if mode == "deny" {
+        return permission_request_hook_decision(
+            "deny",
+            Some("User denied permission via Limux Feed."),
+            None,
+            None,
+        );
+    }
+    let permissions = if mode == "always" || mode == "all" {
+        raw_payload
+            .get("permission_suggestions")
+            .and_then(Value::as_array)
+            .cloned()
+    } else {
+        None
+    };
+    permission_request_hook_decision("allow", None, None, permissions)
+}
+
+fn render_hermes_permission_decision(mode: &str) -> Value {
+    if mode == "deny" {
+        json!({ "action": "block", "message": "User denied permission via Limux Feed." })
+    } else {
+        json!({})
+    }
+}
+
+fn render_antigravity_permission_decision(mode: &str) -> Value {
+    let reason = if mode == "deny" {
+        "User denied permission via Limux Feed."
+    } else {
+        "User approved via Limux Feed."
+    };
+    json!({ "decision": if mode == "deny" { "deny" } else { "allow" }, "reason": reason })
+}
+
+fn render_generic_permission_decision(mode: &str) -> Value {
+    if mode == "deny" {
+        return non_claude_pre_tool_decision(
+            "deny",
+            "User denied permission via Limux Feed.",
+            None,
+            None,
+        );
+    }
+    let reason = generic_permission_allow_reason(mode);
+    non_claude_pre_tool_decision("allow", &reason, None, None)
+}
+
+fn generic_permission_allow_reason(mode: &str) -> String {
+    if matches!(mode, "always" | "all" | "bypass") {
+        return format!(
+            "User granted {mode} permission via Limux Feed. Reduce subsequent approval prompts for similar calls."
+        );
+    }
+    "User approved via Limux Feed.".to_string()
+}
+
+// purpose: Render ExitPlanMode decisions in agent-native hook stdout shape.
+// inputs: Agent source, original tool input, and Feed exit-plan decision.
+// returns/effects: Produces allow/deny or context JSON matching CMUX semantics.
+fn render_feed_exit_plan_decision(
+    source: &str,
+    tool_input: Option<&Value>,
+    decision: &Value,
+) -> Value {
+    let mode = hook_str(decision, &["mode"]).unwrap_or("manual");
+    let feedback = hook_str(decision, &["feedback"]);
+    if source == "claude" {
+        return render_claude_exit_plan_decision(mode, feedback, tool_input);
+    }
+    if source == "hermes-agent" {
+        if let Some(feedback) = feedback {
+            return json!({ "action": "block", "message": format!("User rejected the plan via Limux Feed and wants this change: {feedback}") });
+        }
+        return if mode == "deny" {
+            json!({ "action": "block", "message": "User rejected the plan via Limux Feed." })
+        } else {
+            json!({})
+        };
+    }
+    let context = generic_exit_plan_context(mode, feedback);
+    non_claude_pre_tool_decision("deny", &context, Some(&context), None)
+}
+
+// purpose: Render Claude-specific ExitPlanMode updates.
+// inputs: Feed mode, optional feedback, and original tool input.
+// returns/effects: Produces PermissionRequest hookSpecificOutput for Claude.
+fn render_claude_exit_plan_decision(
+    mode: &str,
+    feedback: Option<&str>,
+    tool_input: Option<&Value>,
+) -> Value {
+    if let Some(feedback) = feedback {
+        return claude_exit_plan_deny(&format!(
+            "User rejected the plan via Limux Feed and wants this change: {feedback}"
+        ));
+    }
+    if mode == "deny" {
+        return claude_exit_plan_deny("User rejected the plan via Limux Feed.");
+    }
+    if mode == "ultraplan" {
+        return claude_exit_plan_deny(
+            "User chose Ultraplan via Limux Feed. Refine this plan with Ultraplan on Claude Code on the web.",
+        );
+    }
+    permission_request_hook_decision(
+        "allow",
+        None,
+        tool_input.and_then(json_dictionary),
+        claude_exit_plan_permissions(mode),
+    )
+}
+
+fn claude_exit_plan_deny(message: &str) -> Value {
+    permission_request_hook_decision("deny", Some(message), None, None)
+}
+
+fn claude_exit_plan_permissions(mode: &str) -> Option<Vec<Value>> {
+    if mode == "autoAccept" {
+        Some(vec![
+            json!({ "type": "setMode", "mode": "auto", "destination": "session" }),
+        ])
+    } else {
+        None
+    }
+}
+
+fn generic_exit_plan_context(mode: &str, feedback: Option<&str>) -> String {
+    if let Some(feedback) = feedback {
+        return format!("User rejected the plan via Limux Feed and wants this change: {feedback}");
+    }
+    match mode {
+        "deny" => "User rejected the plan via Limux Feed.".to_string(),
+        "ultraplan" => "User chose Ultraplan via Limux Feed. Refine this plan with Ultraplan if available.".to_string(),
+        "bypassPermissions" => {
+            "User accepted this plan via Limux Feed with bypass-permissions mode. Exit plan mode now and proceed.".to_string()
+        }
+        "autoAccept" => "User accepted this plan via Limux Feed with auto mode. Exit plan mode now and proceed.".to_string(),
+        _ => "User accepted this plan via Limux Feed with manual-approval mode. Exit plan mode now and proceed.".to_string(),
+    }
+}
+
+// purpose: Render AskUserQuestion decisions in agent-native hook stdout shape.
+// inputs: Agent source, original tool input, and Feed question decision.
+// returns/effects: Produces updated Claude input or generic context response.
+fn render_feed_question_decision(
+    source: &str,
+    tool_input: Option<&Value>,
+    decision: &Value,
+) -> Value {
+    let selections = decision
+        .get("selections")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if source == "hermes-agent" {
+        return json!({ "context": question_answer_body(&selections) });
+    }
+    if source == "claude" {
+        return permission_request_hook_decision(
+            "allow",
+            None,
+            Some(claude_question_input(tool_input, &selections)),
+            None,
+        );
+    }
+    let body = question_answer_body(&selections);
+    let context = format!(
+        "[Limux Feed] {body}. Treat this as the user's response; do not ask again for the same question."
+    );
+    non_claude_pre_tool_decision("deny", &context, Some(&context), None)
+}
+
+fn question_answer_body(selections: &[String]) -> String {
+    match selections {
+        [] => "The user submitted an empty answer.".to_string(),
+        [one] => format!("The user answered: {one}"),
+        many => format!("The user answered: {}", many.join(", ")),
+    }
+}
+
+fn permission_request_hook_decision(
+    behavior: &str,
+    message: Option<&str>,
+    updated_input: Option<Map<String, Value>>,
+    updated_permissions: Option<Vec<Value>>,
+) -> Value {
+    let mut inner = Map::new();
+    inner.insert("behavior".to_string(), Value::String(behavior.to_string()));
+    if behavior == "deny" {
+        inner.insert(
+            "message".to_string(),
+            Value::String(
+                message
+                    .unwrap_or("User denied permission via Limux Feed.")
+                    .to_string(),
+            ),
+        );
+    }
+    if let Some(updated_input) = updated_input.filter(|value| !value.is_empty()) {
+        inner.insert("updatedInput".to_string(), Value::Object(updated_input));
+    }
+    if let Some(updated_permissions) = updated_permissions.filter(|value| !value.is_empty()) {
+        inner.insert(
+            "updatedPermissions".to_string(),
+            Value::Array(updated_permissions),
+        );
+    }
+    json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": Value::Object(inner) } })
+}
+
+fn non_claude_pre_tool_decision(
+    permission: &str,
+    reason: &str,
+    additional_context: Option<&str>,
+    updated_input: Option<Value>,
+) -> Value {
+    let mut specific = json!({ "hookEventName": "PreToolUse", "permissionDecision": permission });
+    specific["permissionDecisionReason"] = Value::String(reason.to_string());
+    if let Some(context) = additional_context {
+        specific["additionalContext"] = Value::String(context.to_string());
+    }
+    if let Some(input) = updated_input {
+        specific["updatedInput"] = input;
+    }
+    let mut out = json!({ "hookSpecificOutput": specific });
+    out["decision"] = Value::String(
+        if permission == "deny" {
+            "block"
+        } else {
+            "approve"
+        }
+        .to_string(),
+    );
+    if permission == "deny" {
+        out["reason"] = Value::String(reason.to_string());
+    } else {
+        out["systemMessage"] = Value::String(additional_context.unwrap_or(reason).to_string());
+    }
+    out
+}
+
+fn json_dictionary(value: &Value) -> Option<Map<String, Value>> {
+    if let Some(object) = value.as_object() {
+        return Some(object.clone());
+    }
+    value
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|parsed| parsed.as_object().cloned())
+}
+
+fn claude_question_input(tool_input: Option<&Value>, selections: &[String]) -> Map<String, Value> {
+    let mut input = tool_input.and_then(json_dictionary).unwrap_or_default();
+    let questions = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let answers = selections
+        .iter()
+        .enumerate()
+        .map(|(index, selection)| {
+            let key = questions
+                .get(index)
+                .and_then(|question| hook_str(question, &["question"]))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Answer {}", index + 1));
+            (key, Value::String(selection.clone()))
+        })
+        .collect::<Map<_, _>>();
+    input.insert("answers".to_string(), Value::Object(answers));
+    input
+}
+
 /// Run an agent hook: read JSON from stdin, synthesize a notification.
 ///
 /// Args:
@@ -2177,6 +2909,7 @@ async fn run_hooks_command(
     };
 
     match first {
+        "feed" => return run_feed_hook(client, &args[1..], json_output).await,
         "setup" | "install" => {
             let target = parse_opt(args, "--agent").or_else(|| positional_arg(args, 1));
             let installed = install_hook_targets(target.as_deref())?;
@@ -5497,6 +6230,104 @@ mod cli_arg_tests {
         let payload = json!({ "hook_event_name": "Notification" });
 
         assert_eq!(parse_hook_event(&args, &payload), "Stop");
+    }
+
+    #[test]
+    fn feed_hook_builds_blocking_claude_permission_request() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": { "command": "echo ok" },
+            "request_id": "req-1"
+        });
+
+        let (params, actionable, event_name, tool_name, _) =
+            build_feed_hook_push(&args(&["--source", "claude"]), &payload).expect("feed push");
+        let event = &params["event"];
+
+        assert!(actionable);
+        assert_eq!(event_name, "PermissionRequest");
+        assert_eq!(tool_name, "Bash");
+        assert_eq!(params["wait_timeout_seconds"], json!(120.0));
+        assert_eq!(event["session_id"], json!("claude-s1"));
+        assert_eq!(event["_source"], json!("claude"));
+        assert_eq!(event["_opencode_request_id"], json!("req-1"));
+    }
+
+    #[test]
+    fn feed_hook_keeps_codex_permission_request_nonblocking() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "shell",
+            "request_id": "req-1"
+        });
+
+        let (params, actionable, event_name, _, _) =
+            build_feed_hook_push(&args(&["--source", "codex"]), &payload).expect("feed push");
+
+        assert!(!actionable);
+        assert_eq!(event_name, "PreToolUse");
+        assert_eq!(params["wait_timeout_seconds"], json!(0.0));
+    }
+
+    #[test]
+    fn feed_hook_escalates_generic_side_effecting_tool() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write"
+        });
+
+        let (params, actionable, event_name, _, _) =
+            build_feed_hook_push(&args(&["--source", "gemini"]), &payload).expect("feed push");
+
+        assert!(actionable);
+        assert_eq!(event_name, "PermissionRequest");
+        assert_eq!(params["wait_timeout_seconds"], json!(120.0));
+    }
+
+    #[test]
+    fn feed_permission_decision_renders_claude_deny_output() {
+        let output = render_feed_decision(
+            &args(&["--source", "claude"]),
+            None,
+            &json!({}),
+            &json!({ "kind": "permission", "mode": "deny" }),
+        )
+        .expect("render");
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+
+        assert_eq!(
+            parsed,
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {
+                        "behavior": "deny",
+                        "message": "User denied permission via Limux Feed."
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn feed_question_decision_renders_claude_answers() {
+        let output = render_feed_decision(
+            &args(&["--source", "claude"]),
+            Some(&json!({ "questions": [{ "question": "Deploy?" }] })),
+            &json!({}),
+            &json!({ "kind": "question", "selections": ["Yes"] }),
+        )
+        .expect("render");
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+
+        assert_eq!(
+            parsed["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["Deploy?"],
+            json!("Yes")
+        );
     }
 
     #[test]

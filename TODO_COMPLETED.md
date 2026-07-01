@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T19:43:29Z Implement and verify the CMUX `hooks feed --source` CLI forwarding and decision-rendering parity slice for Feed permission, plan, and question events. \
 [x] 2026-07-01T19:32:46Z Implement and verify the first CMUX Feed backend parity slice: `feed.push`, `feed.list`, `feed.permission.reply`, `feed.question.reply`, and `feed.exit_plan.reply`. \
 [x] 2026-07-01T19:25:22Z Implement and verify the CMUX browser DOM action and selector-aware getter parity slice for live WebKit browser surfaces. \
 [x] 2026-07-01T19:15:55Z Implement and verify the CMUX browser `snapshot` and bounded-polling `wait` parity slice for live WebKit browser surfaces. \
