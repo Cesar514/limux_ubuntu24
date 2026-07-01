@@ -43,6 +43,11 @@ const METHODS: &[&str] = &[
     "browser.forward",
     "browser.reload",
     "browser.focus_webview",
+    "browser.is_webview_focused",
+    "browser.eval",
+    "browser.get.title",
+    "browser.get.text",
+    "browser.get.html",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -101,6 +106,11 @@ pub enum BrowserAction {
     Forward,
     Reload,
     Focus,
+    IsFocused,
+    Eval { script: String },
+    GetTitle,
+    GetText,
+    GetHtml,
 }
 
 /// Parser-level contract for the live-GTK `pane.create` route.
@@ -777,7 +787,12 @@ fn handle_method(
         | "browser.back"
         | "browser.forward"
         | "browser.reload"
-        | "browser.focus_webview" => {
+        | "browser.focus_webview"
+        | "browser.is_webview_focused"
+        | "browser.eval"
+        | "browser.get.title"
+        | "browser.get.text"
+        | "browser.get.html" => {
             let surface_hint =
                 match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
                     Ok(Some(value)) => value,
@@ -804,6 +819,19 @@ fn handle_method(
                 "browser.forward" => BrowserAction::Forward,
                 "browser.reload" => BrowserAction::Reload,
                 "browser.focus_webview" => BrowserAction::Focus,
+                "browser.is_webview_focused" => BrowserAction::IsFocused,
+                "browser.eval" => {
+                    let Some(script) = optional_string(params, &["script"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.eval requires script"),
+                        );
+                    };
+                    BrowserAction::Eval { script }
+                }
+                "browser.get.title" => BrowserAction::GetTitle,
+                "browser.get.text" => BrowserAction::GetText,
+                "browser.get.html" => BrowserAction::GetHtml,
                 _ => unreachable!("browser method matched above"),
             };
             let target = match parse_optional_workspace_target(params, true) {
@@ -1775,6 +1803,53 @@ mod tests {
             },
         );
         assert_eq!(url.error, None);
+
+        let eval = dispatch_request(
+            r#"{"id":1,"method":"browser.eval","params":{"surface_id":"surface:9:browser","script":"document.title"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(
+                        action,
+                        BrowserAction::Eval {
+                            script: "document.title".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "value": "Example" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(eval.error, None);
+
+        let focused = dispatch_request(
+            r#"{"id":1,"method":"browser.is_webview_focused","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(action, BrowserAction::IsFocused);
+                    let _ = reply.send(Ok(json!({ "focused": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(focused.error, None);
+
+        let title = dispatch_request(
+            r#"{"id":1,"method":"browser.get.title","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(action, BrowserAction::GetTitle);
+                    let _ = reply.send(Ok(json!({ "title": "Example" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(title.error, None);
 
         let invalid = dispatch_request(
             r#"{"id":1,"method":"browser.navigate","params":{"surface_id":"surface:9:browser"}}"#,

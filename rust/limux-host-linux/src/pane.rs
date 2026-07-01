@@ -12,6 +12,7 @@ use gtk::glib;
 #[allow(unused_imports)]
 use gtk::prelude::*;
 use gtk4 as gtk;
+use serde_json::Value;
 #[cfg(feature = "webkit")]
 use webkit6::prelude::*;
 
@@ -305,6 +306,17 @@ impl BrowserSurfaceTarget {
 
     pub fn reload(&self) -> bool {
         self.target.reload()
+    }
+
+    pub fn is_content_focused(&self) -> bool {
+        self.target.is_content_focused()
+    }
+
+    pub fn evaluate_javascript<F>(&self, script: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<Value, String>) + 'static,
+    {
+        self.target.evaluate_javascript(script, callback)
     }
 }
 
@@ -3054,6 +3066,17 @@ impl BrowserShortcutTarget {
     pub fn is_page_editable(&self) -> bool {
         self.handles.is_page_editable()
     }
+
+    pub fn is_content_focused(&self) -> bool {
+        self.handles.is_content_focused()
+    }
+
+    pub fn evaluate_javascript<F>(&self, script: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<Value, String>) + 'static,
+    {
+        self.handles.evaluate_javascript(script, callback)
+    }
 }
 
 #[cfg(feature = "webkit")]
@@ -3082,6 +3105,10 @@ impl BrowserHandles {
 
     fn is_page_editable(&self) -> bool {
         self.dom_editable.get()
+    }
+
+    fn is_content_focused(&self) -> bool {
+        self.webview.is_focus()
     }
 
     fn focus_location(&self) -> bool {
@@ -3187,6 +3214,23 @@ impl BrowserHandles {
         true
     }
 
+    fn evaluate_javascript<F>(&self, script: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<Value, String>) + 'static,
+    {
+        self.webview.evaluate_javascript(
+            script,
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            move |result| match result {
+                Ok(value) => callback(Ok(javascript_value_to_json(&value))),
+                Err(error) => callback(Err(error.to_string())),
+            },
+        );
+        true
+    }
+
     fn search_for_entry_text(&self) {
         let query = self.search_entry.text();
         if query.is_empty() {
@@ -3199,6 +3243,26 @@ impl BrowserHandles {
                 | webkit6::FindOptions::WRAP_AROUND.bits(),
             u32::MAX,
         );
+    }
+}
+
+#[cfg(feature = "webkit")]
+fn javascript_value_to_json(value: &webkit6::javascriptcore::Value) -> Value {
+    if value.is_null() || value.is_undefined() {
+        Value::Null
+    } else if value.is_boolean() {
+        Value::Bool(value.to_boolean())
+    } else if value.is_number() {
+        serde_json::Number::from_f64(value.to_double())
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    } else if value.is_string() {
+        Value::String(value.to_str().to_string())
+    } else if let Some(json) = value.to_json(0) {
+        serde_json::from_str(json.as_str())
+            .unwrap_or_else(|_| Value::String(value.to_str().to_string()))
+    } else {
+        Value::String(value.to_str().to_string())
     }
 }
 
@@ -3217,6 +3281,20 @@ impl BrowserHandles {
     }
 
     fn is_page_editable(&self) -> bool {
+        false
+    }
+
+    fn is_content_focused(&self) -> bool {
+        false
+    }
+
+    fn evaluate_javascript<F>(&self, _script: &str, _callback: F) -> bool
+    where
+        F: FnOnce(Result<Value, String>) + 'static,
+    {
+        _callback(Err(
+            "browser JavaScript evaluation requires webkit support".to_string()
+        ));
         false
     }
 

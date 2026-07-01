@@ -166,6 +166,47 @@ fn pane_create_response_payload(
     })
 }
 
+fn browser_action_response_payload(
+    workspace_id: &str,
+    workspace_name: &str,
+    browser: &pane::BrowserSurfaceTarget,
+) -> serde_json::Value {
+    let surface_id = browser.surface.surface_id.clone();
+    serde_json::json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "workspace_name": workspace_name,
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(&browser.surface.surface_id),
+        "pane_id": browser.surface.pane_id.to_string(),
+        "pane_ref": pane_ref(browser.surface.pane_id),
+    })
+}
+
+fn send_browser_eval_response(
+    browser: pane::BrowserSurfaceTarget,
+    script: String,
+    mut payload: serde_json::Value,
+    output_key: &'static str,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    browser.evaluate_javascript(&script, move |result| match result {
+        Ok(value) => {
+            payload[output_key] = value.clone();
+            if output_key != "value" {
+                payload["value"] = value;
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(BridgeError::internal(format!(
+                "browser JavaScript evaluation failed: {error}"
+            ))));
+        }
+    });
+}
+
 fn send_pane_create_response_after_command(
     pane_widget: gtk::Widget,
     surface_id: String,
@@ -4137,6 +4178,59 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let _ = reply.send(Err(BridgeError::not_found("browser surface not found")));
                 return;
             };
+            match &action {
+                BrowserAction::IsFocused => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    payload["focused"] = serde_json::Value::Bool(browser.is_content_focused());
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
+                BrowserAction::Eval { script } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_eval_response(browser, script.clone(), payload, "value", reply);
+                    return;
+                }
+                BrowserAction::GetTitle => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_eval_response(
+                        browser,
+                        "document.title".to_string(),
+                        payload,
+                        "title",
+                        reply,
+                    );
+                    return;
+                }
+                BrowserAction::GetText => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_eval_response(
+                        browser,
+                        "document.body ? document.body.innerText : ''".to_string(),
+                        payload,
+                        "text",
+                        reply,
+                    );
+                    return;
+                }
+                BrowserAction::GetHtml => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_eval_response(
+                        browser,
+                        "document.documentElement ? document.documentElement.outerHTML : ''"
+                            .to_string(),
+                        payload,
+                        "html",
+                        reply,
+                    );
+                    return;
+                }
+                _ => {}
+            }
             let ok = match &action {
                 BrowserAction::Navigate { url } => browser.navigate(url),
                 BrowserAction::GetUrl => true,
@@ -4144,6 +4238,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 BrowserAction::Forward => browser.go_forward(),
                 BrowserAction::Reload => browser.reload(),
                 BrowserAction::Focus => browser.focus_content(),
+                BrowserAction::IsFocused
+                | BrowserAction::Eval { .. }
+                | BrowserAction::GetTitle
+                | BrowserAction::GetText
+                | BrowserAction::GetHtml => unreachable!("read-only browser action handled above"),
             };
             if !ok {
                 let _ = reply.send(Err(BridgeError::invalid_params(
@@ -4155,18 +4254,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 BrowserAction::Navigate { url } => Some(url.clone()),
                 _ => browser.current_uri(),
             };
-            let surface_id = browser.surface.surface_id.clone();
-            let pane_id = browser.surface.pane_id;
-            let mut payload = serde_json::json!({
-                "ok": true,
-                "workspace_id": workspace_id,
-                "workspace_ref": workspace_ref(&workspace_id),
-                "workspace_name": workspace_name,
-                "surface_id": surface_id,
-                "surface_ref": surface_ref(&surface_id),
-                "pane_id": pane_id.to_string(),
-                "pane_ref": pane_ref(pane_id),
-            });
+            let mut payload =
+                browser_action_response_payload(&workspace_id, &workspace_name, &browser);
             if let Some(url) = url {
                 payload["url"] = serde_json::Value::String(url);
             }

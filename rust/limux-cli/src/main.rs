@@ -3700,6 +3700,62 @@ async fn run_browser(
                 CommandOutput::Text(get_string(&payload, &["url"]).unwrap_or_default())
             }
         }
+        "focus-webview" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser focus-webview requires a surface"))?;
+            let payload =
+                browser_call(client, Some(sid), "browser.focus_webview", Map::new()).await?;
+            CommandOutput::Json(payload)
+        }
+        "is-webview-focused" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser is-webview-focused requires a surface"))?;
+            let payload =
+                browser_call(client, Some(sid), "browser.is_webview_focused", Map::new()).await?;
+            if local_json {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(
+                    payload
+                        .get("focused")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        .to_string(),
+                )
+            }
+        }
+        "eval" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser eval requires a surface"))?;
+            let script = rest
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("browser eval requires a script"))?;
+            let payload = browser_call(client, Some(sid), "browser.eval", {
+                let mut p = Map::new();
+                p.insert("script".to_string(), Value::String(script));
+                p
+            })
+            .await?;
+            if local_json {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(
+                    payload
+                        .get("value")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .unwrap_or_default(),
+                )
+            }
+        }
         "goto" | "navigate" => {
             let sid = surface
                 .clone()
@@ -4686,6 +4742,21 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "browser-reload" => {
             let mut bridged = vec!["reload".to_string()];
+            bridged.extend(args.iter().cloned());
+            return run_browser(client, &bridged, opts.json_output).await;
+        }
+        "get-url" => {
+            let mut bridged = vec!["get-url".to_string()];
+            bridged.extend(args.iter().cloned());
+            return run_browser(client, &bridged, opts.json_output).await;
+        }
+        "focus-webview" => {
+            let mut bridged = vec!["focus-webview".to_string()];
+            bridged.extend(args.iter().cloned());
+            return run_browser(client, &bridged, opts.json_output).await;
+        }
+        "is-webview-focused" => {
+            let mut bridged = vec!["is-webview-focused".to_string()];
             bridged.extend(args.iter().cloned());
             return run_browser(client, &bridged, opts.json_output).await;
         }
