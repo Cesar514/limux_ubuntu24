@@ -120,3 +120,56 @@ Run the triple baseline:
 Run the optimized triple profile:
 
     LIMUX_MIXED_MODE=batch LIMUX_MIXED_WORKSPACES=12 LIMUX_MIXED_PANES_PER_WORKSPACE=4 LIMUX_MIXED_TERMINALS_PER_WORKSPACE=10 ./scripts/profile-mixed-workload.sh
+
+## Sustained Active-Output Result
+
+The active-output benchmark keeps the optimized triple layout open and sends a synchronized shell loop to every terminal surface:
+
+- 12 workspaces
+- 48 panes
+- 120 terminal surfaces
+- 1000 printed lines per terminal
+- 0.02 seconds between printed lines per terminal
+- 15-second active sample window
+- verified `read-screen` sample containing `limux-active-` output
+
+The profiler samples host-only CPU/RSS/write bytes and process-tree CPU/RSS/write bytes. The process-tree numbers include the Limux host plus terminal child processes, so the active result reflects terminals running commands rather than just opening surfaces.
+
+Old continuous GLArea auto-render mode:
+
+- active surfaces reached: 120
+- activity readback sample: ok
+- active host CPU: 0.267%
+- active process-tree CPU: 0.267%
+- active host write bytes: 0
+- active process-tree write bytes: 0
+- idle host CPU after activity: 0.333%
+- idle process-tree CPU after activity: 0.333%
+- idle host/process-tree write bytes: 0
+- NVIDIA framebuffer: 36 MB
+
+Optimized explicit-render mode:
+
+- active surfaces reached: 120
+- activity readback sample: ok
+- active host CPU: 0.333%
+- active process-tree CPU: 0.333%
+- active host write bytes: 0
+- active process-tree write bytes: 0
+- idle host CPU after activity: 0.200%
+- idle process-tree CPU after activity: 0.200%
+- idle host/process-tree write bytes: 0
+- NVIDIA framebuffer: 35 MB
+
+Measured sustained-usage change:
+
+- terminal targeting correctness: fixed for inactive tab surfaces, enabling commands and readback on hidden terminal tabs
+- idle CPU after active output: 40.0% lower in this sample
+- NVIDIA framebuffer: 2.8% lower in this sample
+- disk writes: unchanged at 0 during active output and post-activity idle
+
+This result does not prove an 80% sustained-runtime efficiency gain. The strongest proven runtime result is that all 120 terminals can be targeted, run output, be read back, and hold zero disk writes while explicit render queueing reduces idle repaint work. The earlier 88.7% improvement applies to triple-workload creation latency, not sustained command execution.
+
+Run the active-output triple profile:
+
+    LIMUX_MIXED_MODE=batch LIMUX_MIXED_ACTIVITY=echo LIMUX_MIXED_ACTIVITY_SECONDS=15 LIMUX_MIXED_WORKSPACES=12 LIMUX_MIXED_PANES_PER_WORKSPACE=4 LIMUX_MIXED_TERMINALS_PER_WORKSPACE=10 ./scripts/profile-mixed-workload.sh

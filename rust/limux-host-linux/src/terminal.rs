@@ -1133,10 +1133,9 @@ pub fn create_terminal(
     let gl_area = gtk::GLArea::new();
     gl_area.set_hexpand(true);
     gl_area.set_vexpand(true);
-    // auto_render=true ensures GTK continuously redraws the GLArea,
-    // which forces its internal FBO to match the current allocation.
-    // With auto_render=false, the FBO may stay at the initial size.
-    gl_area.set_auto_render(true);
+    // Explicit render queueing keeps idle and hidden terminals from repainting
+    // continuously while still drawing on Ghostty wakeups and resize events.
+    gl_area.set_auto_render(false);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
     let wd = working_directory.map(|s| s.to_string());

@@ -2,6 +2,12 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T13:58:15Z Move completed active-output TODO entries to TODO_COMPLETED.md, commit verified changes, and push only to the fork remote. \
+[x] 2026-07-01T13:58:15Z Re-run active-output profiling and repository checks to verify runtime efficiency, stability, and no continuous disk writes. \
+[x] 2026-07-01T13:58:15Z Patch the verified active-runtime bottleneck while preserving terminal functionality. \
+[x] 2026-07-01T13:58:15Z Capture active-output baseline metrics for the triple workload. \
+[x] 2026-07-01T13:58:15Z Extend the mixed workload profiler to measure active-output CPU, RSS, disk writes, GPU state, and stability separately from creation and idle metrics. \
+[x] 2026-07-01T13:58:15Z Define an active-output workload with many open terminals repeatedly printing text while Limux stays running. \
 [x] 2026-07-01T13:34:55Z Move completed triple-workload TODO entries to TODO_COMPLETED.md, commit the verified changes, and push only to the fork remote. \
 [x] 2026-07-01T13:34:55Z Run repository verification after any code/script/docs changes. \
 [x] 2026-07-01T13:34:55Z Re-run the optimized triple workload and verify whether the 80% creation-latency target is achieved or blocked by a measured constraint. \

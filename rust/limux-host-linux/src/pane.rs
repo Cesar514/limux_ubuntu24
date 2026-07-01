@@ -760,6 +760,10 @@ pub fn terminal_handle_for_surface(
             return Some((full_surface_id, state.handle.clone()));
         }
 
+        if requested.is_some() {
+            continue;
+        }
+
         if active_tab == Some(entry.id.as_str()) {
             return Some((full_surface_id, state.handle.clone()));
         }
@@ -1854,11 +1858,7 @@ pub fn terminal_handle_for_root(
             if let Some((surface_id, handle)) =
                 terminal_handle_for_surface(&pane_widget, Some(requested))
             {
-                if surface_id == requested
-                    || surface_id
-                        .strip_prefix("surface:")
-                        .is_some_and(|value| value == requested)
-                {
+                if normalize_surface_hint(&surface_id) == requested {
                     return Some((surface_id, handle));
                 }
             }
