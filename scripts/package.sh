@@ -18,12 +18,16 @@ GHOSTTY_SO="${ROOT_DIR}/ghostty/zig-out/lib/libghostty.so"
 MAX_GLIBC_VERSION="${LIMUX_MAX_GLIBC:-2.39}"
 GHOSTTY_SHARE_DIR=""
 GHOSTTY_TERMINFO_DIR=""
+WEBKITGTK_RUNTIME_DIR=""
+WEBKITGTK_PROCESS_DIR=""
 ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons"
 APP_ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons/app"
 DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.desktop"
 METADATA_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.metainfo.xml"
 OUT_DIR="${ROOT_DIR}/dist"
 GHOSTTY_ZIG_ARGS=(-Doptimize=ReleaseFast -Dcpu=baseline)
+CLI_ENTRYPOINT_NAME="limux"
+HOST_ENTRYPOINT_NAME="limux-host"
 
 remove_tree() {
     local path="$1"
@@ -62,7 +66,7 @@ assert_glibc_compatibility() {
     local label="$2"
     local required_glibc
 
-    required_glibc="$(glibc_requirement_for "$path")"
+    required_glibc="$(glibc_requirement_for "$path" || true)"
     if [ -z "$required_glibc" ]; then
         echo "WARNING: unable to determine GLIBC requirement for ${label}"
         return 0
@@ -70,12 +74,45 @@ assert_glibc_compatibility() {
 
     if version_gt "$required_glibc" "$MAX_GLIBC_VERSION"; then
         echo "ERROR: ${label} requires GLIBC_${required_glibc}, which exceeds the supported release baseline GLIBC_${MAX_GLIBC_VERSION}."
-        echo "Build release artifacts inside Ubuntu 24.04 or another environment pinned to GLIBC_${MAX_GLIBC_VERSION} or older."
+        echo "Build release artifacts inside an environment pinned to GLIBC_${MAX_GLIBC_VERSION}."
         echo "Override the baseline intentionally with LIMUX_MAX_GLIBC=<version> if you are targeting a newer distro on purpose."
         exit 1
     fi
 
     echo "Verified ${label} GLIBC requirement: GLIBC_${required_glibc} (target max GLIBC_${MAX_GLIBC_VERSION})"
+}
+
+assert_cli_entrypoint() {
+    local path="$1"
+    local label="$2"
+
+    if ! "$path" --help 2>&1 | grep -q "limux CLI"; then
+        echo "ERROR: ${label} is not the limux CLI entrypoint: ${path}"
+        exit 1
+    fi
+}
+
+assert_no_legacy_host_entrypoint() {
+    local path="$1"
+    local label="$2"
+
+    if [ -e "$path" ]; then
+        echo "ERROR: ${label} contains legacy host entrypoint at ${path}"
+        echo "Only the CLI may be named 'limux'; the GTK host must be 'limux-host'."
+        exit 1
+    fi
+}
+
+install_desktop_file() {
+    local src="$1"
+    local dest="$2"
+    local exec_path="$3"
+
+    sed \
+        -e "s|^Exec=.*|Exec=${exec_path}|" \
+        -e "s|^TryExec=.*|TryExec=${exec_path}|" \
+        "$src" > "$dest"
+    chmod 644 "$dest"
 }
 
 resolve_ghostty_share_dir() {
@@ -132,6 +169,8 @@ copy_ghostty_terminfo_entries() {
     fi
 }
 
+. "${ROOT_DIR}/scripts/appimage-webkit.sh"
+
 configure_ghostty_build_args() {
     if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gtk4-layer-shell-0; then
         echo "gtk4-layer-shell not available via pkg-config; building Ghostty with bundled gtk4-layer-shell."
@@ -162,6 +201,12 @@ echo "GLIBC:   <= ${MAX_GLIBC_VERSION}"
 if ! command -v zig >/dev/null 2>&1; then
     echo "ERROR: zig not found in PATH."
     echo "Install Zig, then rerun ./scripts/package.sh"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found in PATH."
+    echo "Install Python 3, then rerun ./scripts/package.sh"
     exit 1
 fi
 
@@ -202,18 +247,39 @@ if ! GHOSTTY_TERMINFO_DIR="$(resolve_ghostty_terminfo_dir)"; then
     exit 1
 fi
 
+if ! WEBKITGTK_RUNTIME_DIR="$(resolve_webkitgtk_runtime_dir)"; then
+    echo "ERROR: WebKitGTK 6 runtime directory not found."
+    echo "Install the runtime/development package before building release artifacts:"
+    echo "  Ubuntu/Debian: sudo apt install libwebkitgtk-6.0-dev"
+    echo "  Fedora:        sudo dnf install webkitgtk6.0-devel"
+    exit 1
+fi
+
+if ! WEBKITGTK_PROCESS_DIR="$(resolve_webkitgtk_process_dir)"; then
+    echo "ERROR: WebKitGTK 6 helper processes not found."
+    echo "Expected WebKitWebProcess from the WebKitGTK runtime package."
+    exit 1
+fi
+
 # Build release binary
 echo "Building release binary..."
 cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml"
 
-BINARY="${ROOT_DIR}/target/release/limux"
-if [ ! -f "$BINARY" ]; then
-    echo "ERROR: Binary not found at ${BINARY}"
+CLI_BINARY="${ROOT_DIR}/target/release/limux-cli"
+HOST_BINARY="${ROOT_DIR}/target/release/limux"
+if [ ! -f "$CLI_BINARY" ]; then
+    echo "ERROR: CLI binary not found at ${CLI_BINARY}"
+    exit 1
+fi
+if [ ! -f "$HOST_BINARY" ]; then
+    echo "ERROR: Host binary not found at ${HOST_BINARY}"
     exit 1
 fi
 
 assert_glibc_compatibility "$GHOSTTY_SO" "libghostty.so"
-assert_glibc_compatibility "$BINARY" "limux"
+assert_glibc_compatibility "$CLI_BINARY" "limux CLI"
+assert_glibc_compatibility "$HOST_BINARY" "limux host"
+assert_cli_entrypoint "$CLI_BINARY" "target/release/limux-cli"
 
 # Clean staging and output
 remove_tree "$STAGE"
@@ -228,6 +294,7 @@ populate_tree() {
     local prefix="${2:-/usr/local}"
     local strip_files="${3:-true}"
     local bindir="$dest${prefix}/bin"
+    local libexecdir="$dest${prefix}/libexec/limux"
     local libdir="$dest${prefix}/lib/limux"
     local ghostty_datadir="$dest${prefix}/share/limux"
     local ghostty_resdir="$ghostty_datadir/ghostty"
@@ -235,14 +302,19 @@ populate_tree() {
     local metadatadir="$dest${prefix}/share/metainfo"
     local icondir="$dest${prefix}/share/icons/hicolor"
 
-    mkdir -p "$bindir" "$libdir" "$ghostty_resdir" "$appdir" "$metadatadir" "$icondir/scalable/actions"
+    mkdir -p "$bindir" "$libexecdir" "$libdir" "$ghostty_resdir" "$appdir" "$metadatadir" "$icondir/scalable/actions"
 
-    # Binary
-    cp "$BINARY" "$bindir/limux"
+    # Public CLI and private GTK host binary.
+    cp "$CLI_BINARY" "$bindir/$CLI_ENTRYPOINT_NAME"
+    cp "$HOST_BINARY" "$libexecdir/$HOST_ENTRYPOINT_NAME"
+    rm -f "$libexecdir/limux"
     if [ "$strip_files" = "true" ]; then
-        strip "$bindir/limux"
+        strip "$bindir/$CLI_ENTRYPOINT_NAME"
+        strip "$libexecdir/$HOST_ENTRYPOINT_NAME"
     fi
-    chmod 755 "$bindir/limux"
+    chmod 755 "$bindir/$CLI_ENTRYPOINT_NAME" "$libexecdir/$HOST_ENTRYPOINT_NAME"
+    assert_cli_entrypoint "$bindir/$CLI_ENTRYPOINT_NAME" "packaged $prefix/bin/$CLI_ENTRYPOINT_NAME"
+    assert_no_legacy_host_entrypoint "$libexecdir/limux" "packaged $prefix libexec tree"
 
     # Shared library
     cp "$GHOSTTY_SO" "$libdir/libghostty.so"
@@ -254,8 +326,9 @@ populate_tree() {
     cp -r "$GHOSTTY_SHARE_DIR"/. "$ghostty_resdir"
     copy_ghostty_terminfo_entries "$GHOSTTY_TERMINFO_DIR" "$ghostty_datadir/terminfo"
 
-    # Desktop file
-    cp "$DESKTOP_FILE" "$appdir/dev.limux.linux.desktop"
+    # Desktop file. Use the absolute CLI path so desktop launchers do not
+    # accidentally resolve an older GTK host binary named `limux` from PATH.
+    install_desktop_file "$DESKTOP_FILE" "$appdir/dev.limux.linux.desktop" "$prefix/bin/$CLI_ENTRYPOINT_NAME"
     cp "$METADATA_FILE" "$metadatadir/dev.limux.linux.metainfo.xml"
 
     # Action icons
@@ -332,12 +405,15 @@ echo ""
 echo "--- Building tarball ---"
 TARBALL_STAGE="/tmp/${PKG_BASE}"
 remove_tree "$TARBALL_STAGE"
-mkdir -p "$TARBALL_STAGE"/{lib,share/limux/ghostty,share/limux/terminfo,share/applications,share/icons/hicolor/scalable/actions}
+mkdir -p "$TARBALL_STAGE"/{lib,libexec/limux,share/limux/ghostty,share/limux/terminfo,share/applications,share/icons/hicolor/scalable/actions}
 mkdir -p "$TARBALL_STAGE/share/metainfo"
 
-cp "$BINARY" "$TARBALL_STAGE/limux"
+cp "$CLI_BINARY" "$TARBALL_STAGE/limux"
+cp "$HOST_BINARY" "$TARBALL_STAGE/libexec/limux/limux-host"
 strip "$TARBALL_STAGE/limux"
-chmod 755 "$TARBALL_STAGE/limux"
+strip "$TARBALL_STAGE/libexec/limux/limux-host"
+chmod 755 "$TARBALL_STAGE/limux" "$TARBALL_STAGE/libexec/limux/limux-host"
+assert_cli_entrypoint "$TARBALL_STAGE/limux" "tarball limux"
 cp "$GHOSTTY_SO" "$TARBALL_STAGE/lib/libghostty.so"
 strip --strip-debug "$TARBALL_STAGE/lib/libghostty.so"
 cp -r "$GHOSTTY_SHARE_DIR"/. "$TARBALL_STAGE/share/limux/ghostty"
@@ -389,6 +465,87 @@ need_root() {
     fi
 }
 
+install_desktop_file() {
+    local src="$1"
+    local dest="$2"
+    local exec_path="$3"
+
+    sed \
+        -e "s|^Exec=.*|Exec=${exec_path}|" \
+        -e "s|^TryExec=.*|TryExec=${exec_path}|" \
+        "$src" > "$dest"
+    chmod 644 "$dest"
+}
+
+legacy_limux_paths() {
+    local sudo_home=""
+
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+
+    printf '%s\n' \
+        "$PREFIX/libexec/limux/limux" \
+        /usr/local/libexec/limux/limux \
+        /usr/libexec/limux/limux \
+        /usr/local/bin/limux \
+        /usr/bin/limux
+
+    if [ -n "$sudo_home" ]; then
+        printf '%s\n' \
+            "$sudo_home/.local/libexec/limux/limux" \
+            "$sudo_home/.local/bin/limux"
+    fi
+}
+
+is_legacy_limux_host() {
+    local path="$1"
+    local help
+
+    [ -x "$path" ] || return 1
+    help="$("$path" --help 2>&1 || true)"
+    printf '%s\n' "$help" | grep -q "limux CLI" && return 1
+    printf '%s\n' "$help" | grep -q "GApplication" && return 0
+    "$path" --json identify >/tmp/limux-installer-probe.log 2>&1 && return 1
+    grep -q "Unknown option --json" /tmp/limux-installer-probe.log
+}
+
+clean_legacy_limux_entrypoints() {
+    local path
+
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        [ "$path" = "$PREFIX/bin/limux" ] && continue
+        if [ "${path%/bin/limux}" != "$path" ]; then
+            if is_legacy_limux_host "$path"; then
+                rm -f "$path"
+                echo "Removed legacy Limux host entrypoint: $path"
+            fi
+        elif [ -e "$path" ]; then
+            rm -f "$path"
+            echo "Removed legacy Limux host entrypoint: $path"
+        fi
+    done <<EOF_PATHS
+$(legacy_limux_paths)
+EOF_PATHS
+}
+
+warn_if_limux_is_shadowed() {
+    local expected="$PREFIX/bin/limux"
+    local first
+
+    first="$(PATH="$PREFIX/bin:$PATH" command -v limux 2>/dev/null || true)"
+    if [ "$first" != "$expected" ]; then
+        echo "WARNING: the first limux on PATH is '$first', expected '$expected'."
+        echo "         Agent/CLI commands require the Limux CLI entrypoint."
+    fi
+
+    if ! "$expected" --help 2>&1 | grep -q "limux CLI"; then
+        echo "ERROR: installed limux entrypoint is not the CLI: $expected" >&2
+        exit 1
+    fi
+}
+
 remove_tree() {
     local path="$1"
 
@@ -405,6 +562,7 @@ if $UNINSTALL; then
     need_root "$@"
     echo "Uninstalling Limux..."
     rm -f "$PREFIX/bin/limux"
+    remove_tree "$PREFIX/libexec/limux"
     remove_tree "$PREFIX/lib/limux"
     remove_tree "$PREFIX/share/limux"
     rm -f /etc/ld.so.conf.d/limux.conf
@@ -429,6 +587,8 @@ need_root "$@"
 echo "Installing Limux to ${PREFIX}..."
 
 install -Dm755 "$SCRIPT_DIR/limux" "$PREFIX/bin/limux"
+clean_legacy_limux_entrypoints
+install -Dm755 "$SCRIPT_DIR/libexec/limux/limux-host" "$PREFIX/libexec/limux/limux-host"
 install -Dm644 "$SCRIPT_DIR/lib/libghostty.so" "$PREFIX/lib/limux/libghostty.so"
 if [ -d "$SCRIPT_DIR/share/limux" ]; then
     cp -r "$SCRIPT_DIR/share/limux" "$PREFIX/share/"
@@ -436,7 +596,8 @@ fi
 echo "$PREFIX/lib/limux" > /etc/ld.so.conf.d/limux.conf
 ldconfig 2>/dev/null || true
 rm -f "$PREFIX/share/applications/limux.desktop"
-install -Dm644 "$SCRIPT_DIR/share/applications/dev.limux.linux.desktop" "$PREFIX/share/applications/dev.limux.linux.desktop"
+mkdir -p "$PREFIX/share/applications"
+install_desktop_file "$SCRIPT_DIR/share/applications/dev.limux.linux.desktop" "$PREFIX/share/applications/dev.limux.linux.desktop" "$PREFIX/bin/limux"
 install -Dm644 "$SCRIPT_DIR/share/metainfo/dev.limux.linux.metainfo.xml" "$PREFIX/share/metainfo/dev.limux.linux.metainfo.xml"
 if [ -d "$SCRIPT_DIR/share/icons" ]; then
     cp -r "$SCRIPT_DIR/share/icons/hicolor" "$PREFIX/share/icons/"
@@ -444,12 +605,14 @@ fi
 gtk-update-icon-cache -f -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
 appstreamcli refresh-cache --force 2>/dev/null || true
+warn_if_limux_is_shadowed
 
 echo ""
 echo "Limux installed successfully!"
-echo "  Binary:  $PREFIX/bin/limux"
+echo "  CLI:     $PREFIX/bin/limux"
+echo "  Host:    $PREFIX/libexec/limux/limux-host"
 echo "  Library: $PREFIX/lib/limux/libghostty.so"
-echo "  Run:     limux"
+echo "  App:     limux"
 echo ""
 echo "System dependencies (install if missing):"
 echo "  sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4"
@@ -495,7 +658,24 @@ EOF
 # Post-install: run ldconfig and update caches
 cat > "$DEB_ROOT/DEBIAN/postinst" << 'EOF'
 #!/bin/bash
+set -e
+
+is_legacy_limux_host() {
+    path="$1"
+    [ -x "$path" ] || return 1
+    help="$("$path" --help 2>&1 || true)"
+    echo "$help" | grep -q "limux CLI" && return 1
+    echo "$help" | grep -q "GApplication" && return 0
+    "$path" --json identify >/tmp/limux-postinst-probe.log 2>&1 && return 1
+    grep -q "Unknown option --json" /tmp/limux-postinst-probe.log
+}
+
 ldconfig 2>/dev/null || true
+rm -f /usr/libexec/limux/limux
+rm -f /usr/local/libexec/limux/limux
+if is_legacy_limux_host /usr/local/bin/limux; then
+    rm -f /usr/local/bin/limux
+fi
 rm -f /usr/share/applications/limux.desktop
 rm -f /usr/local/share/applications/limux.desktop
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
@@ -532,19 +712,26 @@ echo ""
 echo "--- Building AppImage ---"
 APPDIR="$STAGE/Limux.AppDir"
 remove_tree "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/libexec/limux" \
+         "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/icons/hicolor/scalable/actions" \
          "$APPDIR/usr/share/limux"
 
-# Binary
-cp "$BINARY" "$APPDIR/usr/bin/limux"
+# Public CLI and private GTK host binary.
+cp "$CLI_BINARY" "$APPDIR/usr/bin/limux"
+cp "$HOST_BINARY" "$APPDIR/usr/libexec/limux/limux-host"
 strip "$APPDIR/usr/bin/limux"
-chmod 755 "$APPDIR/usr/bin/limux"
+strip "$APPDIR/usr/libexec/limux/limux-host"
+chmod 755 "$APPDIR/usr/bin/limux" "$APPDIR/usr/libexec/limux/limux-host"
+assert_cli_entrypoint "$APPDIR/usr/bin/limux" "AppImage usr/bin/limux"
 
 # Shared library
 cp "$GHOSTTY_SO" "$APPDIR/usr/lib/libghostty.so"
 strip --strip-debug "$APPDIR/usr/lib/libghostty.so"
+
+# WebKitGTK runtime, helper processes, and non-glibc library dependencies.
+copy_appimage_webkit_runtime "$APPDIR"
 
 # Ghostty resources required for named themes and shell integration
 cp -r "$GHOSTTY_SHARE_DIR" "$APPDIR/usr/share/limux/ghostty"
@@ -581,8 +768,11 @@ fi
 cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
 #!/bin/bash
 HERE="$(dirname "$(readlink -f "$0")")"
+cd "$HERE"
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/share}"
+export WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkitgtk-6.0"
+export WEBKIT_INJECTED_BUNDLE_PATH="${HERE}/usr/lib/webkitgtk-6.0/injected-bundle"
 exec "${HERE}/usr/bin/limux" "$@"
 APPRUN_EOF
 chmod 755 "$APPDIR/AppRun"

@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use limux_ghostty_sys::*;
 
+use crate::shortcut_config::NormalizedShortcut;
+
 // ---------------------------------------------------------------------------
 // Global Ghostty app singleton
 // ---------------------------------------------------------------------------
@@ -31,23 +33,39 @@ unsafe impl Sync for GhosttyState {}
 
 static GHOSTTY: OnceLock<GhosttyState> = OnceLock::new();
 static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIGHT);
+static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
+static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
-type DesktopNotificationCallback = dyn Fn(&str, &str);
+type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
+type BellCallback = dyn Fn(bool);
+type OpenUrlCallback = dyn Fn(&str, bool);
 type VoidCallback = dyn Fn();
 type WidgetCallback = dyn Fn(&gtk::Widget);
+type IdentityCallback = dyn Fn() -> TerminalIdentity;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalIdentity {
+    pub workspace_id: Option<String>,
+    pub surface_id: String,
+}
 
 /// Per-surface state, stored in a global registry keyed by surface pointer.
 struct SurfaceEntry {
     gl_area: gtk::GLArea,
     toast_overlay: gtk::Overlay,
+    scrollbar: gtk::Scrollbar,
+    scrollbar_adjustment: gtk::Adjustment,
+    scrollbar_syncing: Rc<Cell<bool>>,
     on_title_changed: Option<Box<TitleChangedCallback>>,
     on_pwd_changed: Option<Box<PwdChangedCallback>>,
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
-    on_bell: Option<Box<VoidCallback>>,
+    on_bell: Option<Box<BellCallback>>,
+    on_open_url: Option<Box<OpenUrlCallback>>,
     on_close: Option<Box<VoidCallback>>,
+    open_url_external: Rc<Cell<bool>>,
     clipboard_context: *mut ClipboardContext,
 }
 
@@ -154,14 +172,34 @@ pub struct TerminalHandle {
     callbacks: Rc<RefCell<TerminalCallbacks>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalHealth {
+    pub realized: bool,
+    pub process_exited: bool,
+    pub columns: u16,
+    pub rows: u16,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
 impl TerminalHandle {
     pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
         *self.callbacks.borrow_mut() = callbacks;
     }
 
     pub fn focus_surface(&self) -> bool {
+        self.refresh_display();
         self.gl_area.grab_focus();
         true
+    }
+
+    pub fn refresh_display(&self) {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            self.gl_area.queue_render();
+            return;
+        };
+
+        refresh_realized_surface_display(surface, &self.gl_area);
     }
 
     pub fn perform_binding_action(&self, action: &str) -> bool {
@@ -173,12 +211,107 @@ impl TerminalHandle {
     /// Inject text into the terminal surface for control-socket requests and
     /// drag/drop payloads. Ghostty treats this as pasted text, which matches
     /// the current control protocol semantics.
-    pub fn send_text(&self, text: &str) {
-        if let Some(surface) = *self.surface_cell.borrow() {
-            unsafe {
-                ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
-            }
+    pub fn send_text(&self, text: &str) -> bool {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return false;
+        };
+
+        unsafe {
+            ghostty_surface_text(surface, text.as_ptr() as *const c_char, text.len());
         }
+        true
+    }
+
+    pub fn send_key(&self, key: &str) -> bool {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return false;
+        };
+
+        let Ok(binding) = NormalizedShortcut::parse(key) else {
+            return false;
+        };
+        let Some((keyval, modifier)) = gtk::accelerator_parse(binding.to_config_accel()) else {
+            return false;
+        };
+
+        let press = translate_key_event(
+            GHOSTTY_ACTION_PRESS,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+        let release = translate_key_event(
+            GHOSTTY_ACTION_RELEASE,
+            Some(self.gl_area.upcast_ref()),
+            None,
+            keyval,
+            0,
+            modifier,
+        );
+
+        unsafe {
+            ghostty_surface_key(surface, press);
+            ghostty_surface_key(surface, release);
+        }
+        true
+    }
+
+    pub fn health(&self) -> TerminalHealth {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return TerminalHealth {
+                realized: false,
+                process_exited: false,
+                columns: 0,
+                rows: 0,
+                width_px: 0,
+                height_px: 0,
+            };
+        };
+
+        let size = unsafe { ghostty_surface_size(surface) };
+        TerminalHealth {
+            realized: true,
+            process_exited: unsafe { ghostty_surface_process_exited(surface) },
+            columns: size.columns,
+            rows: size.rows,
+            width_px: size.width_px,
+            height_px: size.height_px,
+        }
+    }
+
+    pub fn read_viewport_text(&self) -> Option<String> {
+        let Some(surface) = *self.surface_cell.borrow() else {
+            return Some(String::new());
+        };
+
+        let selection = ghostty_selection_s {
+            top_left: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                x: 0,
+                y: 0,
+            },
+            bottom_right: ghostty_point_s {
+                tag: GHOSTTY_POINT_VIEWPORT,
+                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                x: 0,
+                y: 0,
+            },
+            rectangle: false,
+        };
+        let mut text = empty_ghostty_text();
+
+        let has_text = unsafe { ghostty_surface_read_text(surface, selection, &mut text) };
+        if !has_text || text.text.is_null() {
+            return Some(String::new());
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(text.text as *const u8, text.text_len) };
+        let output = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { ghostty_surface_free_text(surface, &mut text) };
+        Some(output)
     }
 
     pub fn show_find(&self) -> bool {
@@ -240,17 +373,10 @@ impl TerminalHandle {
             return String::new();
         };
 
-        let mut text = ghostty_text_s {
-            tl_px_x: 0.0,
-            tl_px_y: 0.0,
-            offset_start: 0,
-            offset_len: 0,
-            text: ptr::null(),
-            text_len: 0,
-        };
+        let mut text = empty_ghostty_text();
 
         let has_selection = unsafe { ghostty_surface_read_selection(surface, &mut text) };
-        if !has_selection || text.text.is_null() || text.text_len == 0 {
+        if !has_selection || text.text.is_null() {
             return String::new();
         }
 
@@ -261,8 +387,19 @@ impl TerminalHandle {
     }
 }
 
+fn empty_ghostty_text() -> ghostty_text_s {
+    ghostty_text_s {
+        tl_px_x: 0.0,
+        tl_px_y: 0.0,
+        offset_start: 0,
+        offset_len: 0,
+        text: ptr::null(),
+        text_len: 0,
+    }
+}
+
 pub struct TerminalWidget {
-    pub overlay: gtk::Overlay,
+    pub root: gtk::Widget,
     pub handle: TerminalHandle,
 }
 
@@ -273,6 +410,31 @@ fn terminal_search_action(query: &str) -> String {
 fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     had_focus.set(true);
     gl_area.grab_focus();
+}
+
+fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+    let alloc = gl_area.allocation();
+    let w = alloc.width() as u32;
+    let h = alloc.height() as u32;
+    if w > 0 && h > 0 {
+        let scale = gl_area.scale_factor() as f64;
+        unsafe {
+            ghostty_surface_set_content_scale(surface, scale, scale);
+            ghostty_surface_set_size(surface, w, h);
+        }
+    }
+    unsafe { ghostty_surface_refresh(surface) };
+    gl_area.queue_render();
+}
+
+fn refresh_realized_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
+    if gl_area.is_realized() {
+        gl_area.make_current();
+        if gl_area.error().is_none() {
+            unsafe { ghostty_surface_display_realized(surface) };
+        }
+    }
+    refresh_surface_display(surface, gl_area);
 }
 
 fn clear_ghostty_preedit(surface: ghostty_surface_t) {
@@ -355,6 +517,7 @@ pub fn init_ghostty() {
 
         let config = load_ghostty_config();
         let background_opacity = load_background_opacity(config);
+        CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
 
         let runtime_config = ghostty_runtime_config_s {
             userdata: ptr::null_mut(),
@@ -416,6 +579,21 @@ fn load_background_opacity(config: ghostty_config_t) -> f64 {
     } else {
         1.0
     }
+}
+
+fn load_scrollbar_enabled(config: ghostty_config_t) -> bool {
+    let mut value: *const c_char = ptr::null();
+    let key = b"scrollbar";
+    let loaded = unsafe {
+        ghostty_config_get(
+            config,
+            (&mut value as *mut *const c_char).cast::<c_void>(),
+            key.as_ptr().cast::<c_char>(),
+            key.len(),
+        )
+    };
+
+    !loaded || value.is_null() || unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes() != b"never"
 }
 
 fn ghostty_color_scheme_for_dark_mode(dark: bool) -> c_int {
@@ -482,6 +660,31 @@ unsafe extern "C" fn ghostty_action_cb(
     let tag = action.tag;
 
     match tag {
+        GHOSTTY_ACTION_SCROLLBAR => {
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let scrollbar = unsafe { action.action.scrollbar };
+                SURFACE_MAP.with(|map| {
+                    if let Some(entry) = map.borrow().get(&surface_key) {
+                        entry.scrollbar_syncing.set(true);
+                        entry.scrollbar_adjustment.configure(
+                            scrollbar.offset as f64,
+                            0.0,
+                            scrollbar.total as f64,
+                            1.0,
+                            scrollbar.len as f64,
+                            scrollbar.len as f64,
+                        );
+                        entry.scrollbar_syncing.set(false);
+                        entry.scrollbar.set_visible(
+                            CURRENT_SCROLLBAR_ENABLED.load(Ordering::Relaxed)
+                                && scrollbar.total > scrollbar.len,
+                        );
+                    }
+                });
+            }
+            true
+        }
         GHOSTTY_ACTION_RENDER => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
@@ -537,7 +740,7 @@ unsafe extern "C" fn ghostty_action_cb(
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
                         if let Some(cb) = &entry.on_desktop_notification {
-                            cb(&title, &body);
+                            cb(&title, &body, entry.gl_area.is_focus());
                         }
                     }
                 });
@@ -564,13 +767,37 @@ unsafe extern "C" fn ghostty_action_cb(
             }
             true
         }
+        GHOSTTY_ACTION_OPEN_URL => {
+            if target.tag == GHOSTTY_TARGET_SURFACE {
+                let surface_key = unsafe { target.target.surface } as usize;
+                let open_url = unsafe { action.action.open_url };
+                if let Some(url) = ghostty_open_url_to_string(open_url) {
+                    let external = SURFACE_MAP.with(|map| {
+                        map.borrow()
+                            .get(&surface_key)
+                            .map(|entry| entry.open_url_external.get())
+                            .unwrap_or(false)
+                    });
+                    glib::idle_add_local_once(move || {
+                        SURFACE_MAP.with(|map| {
+                            if let Some(entry) = map.borrow().get(&surface_key) {
+                                if let Some(cb) = &entry.on_open_url {
+                                    cb(&url, external);
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            true
+        }
         GHOSTTY_ACTION_RING_BELL => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
                 SURFACE_MAP.with(|map| {
                     if let Some(entry) = map.borrow().get(&surface_key) {
                         if let Some(cb) = &entry.on_bell {
-                            cb();
+                            cb(entry.gl_area.is_focus());
                         }
                     }
                 });
@@ -594,6 +821,7 @@ unsafe extern "C" fn ghostty_action_cb(
         }
         GHOSTTY_ACTION_RELOAD_CONFIG => {
             let config = load_ghostty_config();
+            CURRENT_SCROLLBAR_ENABLED.store(load_scrollbar_enabled(config), Ordering::Relaxed);
             match target.tag {
                 GHOSTTY_TARGET_APP => unsafe {
                     ghostty_app_update_config(app, config);
@@ -615,6 +843,15 @@ unsafe extern "C" fn ghostty_action_cb(
     }
 }
 
+fn ghostty_open_url_to_string(open_url: ghostty_action_open_url_s) -> Option<String> {
+    if open_url.url.is_null() || open_url.len == 0 {
+        return None;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(open_url.url.cast::<u8>(), open_url.len) };
+    Some(String::from_utf8_lossy(bytes).to_string())
+}
+
 unsafe fn clipboard_surface_from_userdata(userdata: *mut c_void) -> Option<ghostty_surface_t> {
     if userdata.is_null() {
         return None;
@@ -625,6 +862,43 @@ unsafe fn clipboard_surface_from_userdata(userdata: *mut c_void) -> Option<ghost
         None
     } else {
         Some(surface)
+    }
+}
+
+fn clipboard_read_text_cstring(text: Option<&str>) -> CString {
+    CString::new(text.unwrap_or_default().replace('\0', ""))
+        .expect("clipboard text should not contain NUL bytes")
+}
+
+fn clipboard_completion_text_ptr(text: *const c_char) -> *const c_char {
+    if text.is_null() {
+        EMPTY_CLIPBOARD_TEXT.as_ptr().cast()
+    } else {
+        text
+    }
+}
+
+fn surface_is_registered(surface: ghostty_surface_t) -> bool {
+    SURFACE_MAP.with(|map| map.borrow().contains_key(&(surface as usize)))
+}
+
+unsafe fn complete_clipboard_request(
+    surface: ghostty_surface_t,
+    text: *const c_char,
+    state: *mut c_void,
+    confirmed: bool,
+) {
+    if !surface_is_registered(surface) {
+        return;
+    }
+
+    unsafe {
+        ghostty_surface_complete_clipboard_request(
+            surface,
+            clipboard_completion_text_ptr(text),
+            state,
+            confirmed,
+        );
     }
 }
 
@@ -640,23 +914,20 @@ unsafe extern "C" fn ghostty_read_clipboard_cb(
 
     let display = match gtk::gdk::Display::default() {
         Some(d) => d,
-        None => return,
+        None => {
+            unsafe {
+                complete_clipboard_request(surface_ptr, ptr::null(), state, true);
+            }
+            return;
+        }
     };
     let clipboard = clipboard_from_type(&display, clipboard_type);
 
     clipboard.read_text_async(gtk::gio::Cancellable::NONE, move |result| {
-        // Get clipboard text, defaulting to empty string on failure
-        let text = result
-            .ok()
-            .flatten()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        // Replace interior null bytes so CString doesn't fail
-        let clean = text.replace('\0', "");
-        if let Ok(cstr) = CString::new(clean) {
-            unsafe {
-                ghostty_surface_complete_clipboard_request(surface_ptr, cstr.as_ptr(), state, true);
-            }
+        let text = result.ok().flatten().map(|s| s.to_string());
+        let cstr = clipboard_read_text_cstring(text.as_deref());
+        unsafe {
+            complete_clipboard_request(surface_ptr, cstr.as_ptr(), state, true);
         }
     });
 }
@@ -724,7 +995,7 @@ unsafe extern "C" fn ghostty_confirm_read_clipboard_cb(
         None => return,
     };
     unsafe {
-        ghostty_surface_complete_clipboard_request(surface_ptr, text, state, true);
+        complete_clipboard_request(surface_ptr, text, state, true);
     }
 }
 
@@ -805,17 +1076,39 @@ pub struct TerminalCallbacks {
     pub on_title_changed: Box<TitleChangedCallback>,
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
-    pub on_bell: Box<VoidCallback>,
+    pub on_bell: Box<BellCallback>,
     pub on_close: Box<VoidCallback>,
+    pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
+    pub identity: Box<IdentityCallback>,
 }
 
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
+    pub startup_command: Option<String>,
+    /// Extra environment variables to expose to the spawned shell
+    /// (e.g. `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, `LIMUX_PANE_ID`, `LIMUX_SOCKET`).
+    ///
+    /// These are resolved at pane-creation time so scripts running inside the
+    /// terminal can discover their own workspace/surface/pane without having
+    /// to call `limux identify` first. This is the foundation for the cmux
+    /// agent-to-agent communication workflow.
+    pub extra_env: Vec<(String, String)>,
+}
+
+impl Default for TerminalOptions {
+    fn default() -> Self {
+        Self {
+            hover_focus: Rc::new(|| false),
+            saved_font_size: None,
+            startup_command: None,
+            extra_env: Vec::new(),
+        }
+    }
 }
 
 /// Default font-size from ghostty config (cached on first access).
@@ -841,16 +1134,16 @@ pub fn create_terminal(
     gl_area.set_auto_render(true);
     gl_area.set_focusable(true);
     gl_area.set_can_focus(true);
-    gl_area.connect_map(|gl_area| {
-        gl_area.queue_render();
-    });
-
     let wd = working_directory.map(|s| s.to_string());
     let saved_font_size = options.saved_font_size;
+    let startup_command = options.startup_command;
     let hover_focus = options.hover_focus;
+    let extra_env = options.extra_env;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
     let had_focus = Rc::new(Cell::new(false));
+    let scrollbar_syncing = Rc::new(Cell::new(false));
+    let open_url_external = Rc::new(Cell::new(false));
     let clipboard_context_cell: Rc<Cell<*mut ClipboardContext>> =
         Rc::new(Cell::new(ptr::null_mut()));
 
@@ -859,6 +1152,17 @@ pub fn create_terminal(
     overlay.set_child(Some(&gl_area));
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+
+    let scrollbar_adjustment = gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&scrollbar_adjustment));
+    scrollbar.set_visible(false);
+    scrollbar.set_vexpand(true);
+
+    let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.append(&overlay);
+    root.append(&scrollbar);
 
     let search_entry = gtk::SearchEntry::builder()
         .hexpand(true)
@@ -887,6 +1191,17 @@ pub fn create_terminal(
         search_entry: search_entry.clone(),
         callbacks: callbacks.clone(),
     };
+
+    {
+        let surface_cell = surface_cell.clone();
+        gl_area.connect_map(move |gl_area| {
+            if let Some(surface) = *surface_cell.borrow() {
+                refresh_realized_surface_display(surface, gl_area);
+            } else {
+                gl_area.queue_render();
+            }
+        });
+    }
 
     {
         let handle = handle.clone();
@@ -938,15 +1253,32 @@ pub fn create_terminal(
             }
         });
     }
+    {
+        let surface_cell = surface_cell.clone();
+        let scrollbar_syncing = scrollbar_syncing.clone();
+        scrollbar_adjustment.connect_value_changed(move |adj| {
+            if scrollbar_syncing.get() {
+                return;
+            }
+
+            let row = adj.value().round() as usize;
+            surface_action(*surface_cell.borrow(), &format!("scroll_to_row:{row}"));
+        });
+    }
 
     // On realize: create the Ghostty surface
     {
         let gl = gl_area.clone();
         let overlay_for_map = overlay.clone();
+        let scrollbar_for_map = scrollbar.clone();
+        let scrollbar_adjustment_for_map = scrollbar_adjustment.clone();
         let surface_cell = surface_cell.clone();
         let callbacks = callbacks.clone();
         let had_focus = had_focus.clone();
         let clipboard_context_cell = clipboard_context_cell.clone();
+        let scrollbar_syncing = scrollbar_syncing.clone();
+        let open_url_external_for_map = open_url_external.clone();
+        let extra_env = extra_env.clone();
         gl_area.connect_realize(move |gl_area| {
             gl_area.make_current();
             if let Some(err) = gl_area.error() {
@@ -958,8 +1290,11 @@ pub fn create_terminal(
             // reinitialize the GL renderer with the new GL context while
             // preserving the terminal/pty state.
             if let Some(surface) = *surface_cell.borrow() {
-                unsafe { ghostty_surface_display_realized(surface) };
-                gl_area.queue_render();
+                refresh_realized_surface_display(surface, gl_area);
+                let gl_area = gl_area.clone();
+                glib::idle_add_local_once(move || {
+                    gl_area.queue_render();
+                });
                 return;
             }
 
@@ -983,6 +1318,40 @@ pub fn create_terminal(
             let c_wd = wd.as_ref().and_then(|s| CString::new(s.as_str()).ok());
             if let Some(ref cwd) = c_wd {
                 config.working_directory = cwd.as_ptr();
+            }
+
+            // Build env_vars array for the spawned shell. Keep the CStrings
+            // and the ghostty_env_var_s array alive until after
+            // ghostty_surface_new returns — Ghostty dupes the strings into
+            // its own arena (see ghostty/src/apprt/embedded.zig:573), so we
+            // only need the pointers valid across that single call.
+            let mut env_cstrings: Vec<(CString, CString)> = Vec::with_capacity(extra_env.len());
+            for (k, v) in extra_env.iter() {
+                if let (Ok(k_c), Ok(v_c)) = (CString::new(k.as_str()), CString::new(v.as_str())) {
+                    env_cstrings.push((k_c, v_c));
+                }
+            }
+            let mut env_vars_raw: Vec<ghostty_env_var_s> = env_cstrings
+                .iter()
+                .map(|(k, v)| ghostty_env_var_s {
+                    key: k.as_ptr(),
+                    value: v.as_ptr(),
+                })
+                .collect();
+            if !env_vars_raw.is_empty() {
+                config.env_vars = env_vars_raw.as_mut_ptr();
+                config.env_var_count = env_vars_raw.len();
+            }
+
+            let c_startup_command = startup_command
+                .as_ref()
+                .and_then(|command| CString::new(command.as_str()).ok());
+            if let Some(ref command) = c_startup_command {
+                config.command = command.as_ptr();
+                eprintln!(
+                    "limux: starting restored terminal command={}",
+                    command.to_string_lossy()
+                );
             }
 
             let surface = unsafe { ghostty_surface_new(app, &config) };
@@ -1017,10 +1386,7 @@ pub fn create_terminal(
             let w = alloc.width() as u32;
             let h = alloc.height() as u32;
             if w > 0 && h > 0 {
-                unsafe {
-                    ghostty_surface_set_content_scale(surface, scale, scale);
-                    ghostty_surface_set_size(surface, w, h);
-                }
+                refresh_surface_display(surface, gl_area);
             }
 
             let surface_key = surface as usize;
@@ -1030,6 +1396,9 @@ pub fn create_terminal(
                     SurfaceEntry {
                         gl_area: gl.clone(),
                         toast_overlay: overlay_for_map.clone(),
+                        scrollbar: scrollbar_for_map.clone(),
+                        scrollbar_adjustment: scrollbar_adjustment_for_map.clone(),
+                        scrollbar_syncing: scrollbar_syncing.clone(),
                         on_title_changed: Some(Box::new({
                             let cb = callbacks.clone();
                             move |title| {
@@ -1046,16 +1415,23 @@ pub fn create_terminal(
                         })),
                         on_desktop_notification: Some(Box::new({
                             let cb = callbacks.clone();
-                            move |title, body| {
+                            move |title, body, source_focused| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_desktop_notification)(title, body);
+                                (callbacks.on_desktop_notification)(title, body, source_focused);
                             }
                         })),
                         on_bell: Some(Box::new({
                             let cb = callbacks.clone();
-                            move || {
+                            move |source_focused| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_bell)();
+                                (callbacks.on_bell)(source_focused);
+                            }
+                        })),
+                        on_open_url: Some(Box::new({
+                            let cb = callbacks.clone();
+                            move |url, external| {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_open_url)(url, external);
                             }
                         })),
                         on_close: Some(Box::new({
@@ -1065,6 +1441,7 @@ pub fn create_terminal(
                                 (callbacks.on_close)();
                             }
                         })),
+                        open_url_external: open_url_external_for_map.clone(),
                         clipboard_context,
                     },
                 );
@@ -1106,12 +1483,7 @@ pub fn create_terminal(
                 let w = width as u32;
                 let h = height as u32;
                 if w > 0 && h > 0 {
-                    let scale = gl_area.scale_factor() as f64;
-                    unsafe {
-                        ghostty_surface_set_content_scale(surface, scale, scale);
-                        ghostty_surface_set_size(surface, w, h);
-                    }
-                    gl_area.queue_render();
+                    refresh_surface_display(surface, gl_area);
                 }
             }
 
@@ -1234,6 +1606,8 @@ pub fn create_terminal(
     // Mouse buttons (also handles click-to-focus) — skip right-click (handled below)
     {
         let surface_cell = surface_cell.clone();
+        let open_url_external_for_press = open_url_external.clone();
+        let open_url_external_for_release = open_url_external.clone();
         let click = gtk::GestureClick::new();
         click.set_button(0); // all buttons
         let sc = surface_cell.clone();
@@ -1256,7 +1630,9 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
+                    open_url_external_for_press.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, button, mods);
+                    open_url_external_for_press.set(false);
                 }
             }
         });
@@ -1275,7 +1651,9 @@ pub fn create_terminal(
                 let mods = translate_mouse_mods(gesture.current_event_state());
                 unsafe {
                     ghostty_surface_mouse_pos(surface, x, y, mods);
+                    open_url_external_for_release.set(mods & GHOSTTY_MODS_CTRL != 0);
                     ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, button, mods);
+                    open_url_external_for_release.set(false);
                 }
             }
         });
@@ -1287,11 +1665,12 @@ pub fn create_terminal(
         let sc = surface_cell.clone();
         let callbacks = callbacks.clone();
         let gl = gl_area.clone();
+        let overlay = overlay.clone();
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
             let surface = *sc.borrow();
-            show_terminal_context_menu(&gl, surface, &callbacks, x, y);
+            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
         gl_area.add_controller(right_click);
@@ -1439,7 +1818,10 @@ pub fn create_terminal(
         });
     }
 
-    TerminalWidget { overlay, handle }
+    TerminalWidget {
+        root: root.upcast(),
+        handle,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,8 +1852,16 @@ fn surface_action(surface: Option<ghostty_surface_t>, action: &str) {
     }
 }
 
+fn copy_text_to_clipboards(text: &str) {
+    if let Some(display) = gtk::gdk::Display::default() {
+        display.clipboard().set_text(text);
+        display.primary_clipboard().set_text(text);
+    }
+}
+
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
+    overlay: &gtk::Overlay,
     surface: Option<ghostty_surface_t>,
     callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
@@ -1491,6 +1881,8 @@ fn show_terminal_context_menu(
         ("Copy", has_selection),
         ("Paste", true),
         ("---", false),
+        ("IDs", true),
+        ("---", false),
         ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
@@ -1498,6 +1890,29 @@ fn show_terminal_context_menu(
         ("---", false),
         ("Clear", true),
     ];
+
+    let identity = (callbacks.borrow().identity)();
+    let ids_popover = gtk::Popover::new();
+    ids_popover.set_has_arrow(false);
+    ids_popover.set_position(gtk::PositionType::Right);
+    let ids_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    ids_box.set_margin_top(4);
+    ids_box.set_margin_bottom(4);
+    ids_box.set_margin_start(4);
+    ids_box.set_margin_end(4);
+    let copy_workspace_btn = gtk::Button::with_label("Copy Workspace ID");
+    copy_workspace_btn.add_css_class("flat");
+    copy_workspace_btn.set_sensitive(identity.workspace_id.is_some());
+    let copy_surface_btn = gtk::Button::with_label("Copy Surface ID");
+    copy_surface_btn.add_css_class("flat");
+    for btn in [&copy_workspace_btn, &copy_surface_btn] {
+        btn.set_halign(gtk::Align::Fill);
+        if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            lbl.set_xalign(0.0);
+        }
+        ids_box.append(btn);
+    }
+    ids_popover.set_child(Some(&ids_box));
 
     for (label, enabled) in &items {
         if *label == "---" {
@@ -1508,12 +1923,25 @@ fn show_terminal_context_menu(
             continue;
         }
 
-        let btn = gtk::Button::with_label(label);
+        let btn = gtk::Button::with_label(if *label == "IDs" { "IDs >" } else { label });
         btn.add_css_class("flat");
         btn.set_sensitive(*enabled);
         btn.set_halign(gtk::Align::Fill);
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
             lbl.set_xalign(0.0);
+        }
+        if *label == "IDs" {
+            ids_popover.set_parent(&btn);
+            let ids_popover_for_motion = ids_popover.clone();
+            let motion = gtk::EventControllerMotion::new();
+            motion.connect_enter(move |_, _, _| {
+                ids_popover_for_motion.popup();
+            });
+            btn.add_controller(motion);
+            let ids_popover_for_click = ids_popover.clone();
+            btn.connect_clicked(move |_| {
+                ids_popover_for_click.popup();
+            });
         }
         menu_box.append(&btn);
     }
@@ -1534,6 +1962,9 @@ fn show_terminal_context_menu(
             let gl_area = gl_area.clone();
 
             btn.connect_clicked(move |_| {
+                if label == "IDs >" {
+                    return;
+                }
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
@@ -1567,7 +1998,37 @@ fn show_terminal_context_menu(
     }
 
     {
+        let pop = popover.clone();
+        let ids_pop = ids_popover.clone();
+        let overlay = overlay.clone();
+        let workspace_id = identity.workspace_id.clone();
+        copy_workspace_btn.connect_clicked(move |_| {
+            if let Some(workspace_id) = workspace_id.as_deref() {
+                copy_text_to_clipboards(workspace_id);
+                show_clipboard_toast(&overlay);
+            }
+            ids_pop.popdown();
+            pop.popdown();
+        });
+    }
+
+    {
+        let pop = popover.clone();
+        let ids_pop = ids_popover.clone();
+        let overlay = overlay.clone();
+        let surface_id = identity.surface_id.clone();
+        copy_surface_btn.connect_clicked(move |_| {
+            copy_text_to_clipboards(&surface_id);
+            show_clipboard_toast(&overlay);
+            ids_pop.popdown();
+            pop.popdown();
+        });
+    }
+
+    {
+        let ids_popover = ids_popover.clone();
         popover.connect_closed(move |p| {
+            ids_popover.popdown();
             p.unparent();
         });
     }
@@ -1855,6 +2316,32 @@ mod tests {
     }
 
     #[test]
+    fn open_url_action_uses_explicit_byte_len() {
+        let url = b"https://example.com/path?x=1";
+        let action = ghostty_action_open_url_s {
+            kind: 0,
+            url: url.as_ptr().cast(),
+            len: url.len(),
+        };
+
+        assert_eq!(
+            ghostty_open_url_to_string(action).as_deref(),
+            Some("https://example.com/path?x=1")
+        );
+    }
+
+    #[test]
+    fn open_url_action_rejects_empty_payload() {
+        let action = ghostty_action_open_url_s {
+            kind: 0,
+            url: ptr::null(),
+            len: 0,
+        };
+
+        assert_eq!(ghostty_open_url_to_string(action), None);
+    }
+
+    #[test]
     fn key_event_text_preserves_printable_chords() {
         let ctrl_shift_h = key_event_text(gtk::gdk::Key::H).and_then(|s| s.into_string().ok());
         let alt_shift_gt =
@@ -1964,6 +2451,35 @@ mod tests {
             ["text/plain", "text/plain;charset=utf-8"]
         ));
         assert!(clipboard_formats_include_image(["image/png", "text/plain"]));
+    }
+
+    #[test]
+    fn clipboard_read_text_defaults_to_empty_when_missing() {
+        let text = clipboard_read_text_cstring(None);
+
+        assert_eq!(text.to_bytes_with_nul(), b"\0");
+    }
+
+    #[test]
+    fn clipboard_read_text_strips_nul_bytes() {
+        let text = clipboard_read_text_cstring(Some("a\0b\0c"));
+
+        assert_eq!(text.to_bytes(), b"abc");
+    }
+
+    #[test]
+    fn clipboard_completion_text_replaces_null_with_empty_cstr() {
+        let text = clipboard_completion_text_ptr(ptr::null());
+        let text = unsafe { std::ffi::CStr::from_ptr(text) };
+
+        assert_eq!(text.to_bytes(), b"");
+    }
+
+    #[test]
+    fn clipboard_completion_text_keeps_non_null_ptr() {
+        let text = CString::new("clipboard").unwrap();
+
+        assert_eq!(clipboard_completion_text_ptr(text.as_ptr()), text.as_ptr());
     }
 
     #[test]

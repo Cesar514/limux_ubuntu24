@@ -4,6 +4,8 @@
 // returns/effects: Presents the main window and persists workspace/session changes.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -15,7 +17,10 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::app_config;
-use crate::control_bridge::{ControlCommand, WorkspaceTarget};
+use crate::control_bridge::{
+    BridgeError, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType,
+    WorkspaceTarget,
+};
 use crate::keybind_editor;
 use crate::layout_state::{
     self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
@@ -25,6 +30,9 @@ use crate::shortcut_config::{
     self, EditableCapturePolicy, ResolvedShortcutConfig, ShortcutCommand, ShortcutId,
 };
 use crate::split_tree::{self, SplitTreeContainer};
+
+const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
+const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
 
 // ---------------------------------------------------------------------------
 // State
@@ -72,7 +80,8 @@ pub(crate) struct AppState {
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
-    paned: gtk::Paned,
+    sidebar_shell: gtk::Box,
+    sidebar_handle: gtk::Box,
     new_ws_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
@@ -80,9 +89,13 @@ pub(crate) struct AppState {
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
+    desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
     _theme_gnome_signal: Option<glib::SignalHandlerId>,
+    _desktop_notification_token_signal: Option<gio::SignalSubscription>,
+    _desktop_notification_action_signal: Option<gio::SignalSubscription>,
+    _desktop_notification_closed_signal: Option<gio::SignalSubscription>,
 }
 
 impl AppState {
@@ -101,14 +114,98 @@ fn workspace_ref(id: &str) -> String {
     format!("workspace:{id}")
 }
 
+fn pane_ref(id: u32) -> String {
+    format!("pane:{id}")
+}
+
 fn surface_ref(id: &str) -> String {
     format!("surface:{id}")
+}
+
+fn pane_create_response_payload(
+    workspace_id: &str,
+    workspace_name: &str,
+    surface: pane::SurfaceSummary,
+) -> serde_json::Value {
+    let surface_id = surface.surface_id;
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "workspace": {
+            "id": workspace_id,
+            "ref": workspace_ref(workspace_id),
+            "workspace_id": workspace_id,
+            "workspace_ref": workspace_ref(workspace_id),
+            "title": workspace_name,
+            "name": workspace_name,
+        },
+        "title": workspace_name,
+        "name": workspace_name,
+        "pane_id": surface.pane_id.to_string(),
+        "pane_ref": pane_ref(surface.pane_id),
+        "surface_id": surface_id.clone(),
+        "surface_ref": surface_ref(&surface_id),
+        "surface_title": surface.title,
+        "surface_type": surface.kind,
+        "ok": true,
+    })
+}
+
+fn send_pane_create_response_after_command(
+    pane_widget: gtk::Widget,
+    surface_id: String,
+    command: String,
+    response: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    let mut attempts = 0;
+    let mut reply = Some(reply);
+    let command = format!("{command}\n");
+
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(PANE_CREATE_COMMAND_READY_INTERVAL_MS),
+        move || {
+            attempts += 1;
+
+            if let Some((matched_surface_id, handle)) =
+                pane::exact_terminal_handle_for_surface(&pane_widget, &surface_id)
+            {
+                if matched_surface_id == surface_id && handle.send_text(&command) {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Ok(response.clone()));
+                    }
+                    return glib::ControlFlow::Break;
+                }
+            }
+
+            if attempts >= PANE_CREATE_COMMAND_READY_ATTEMPTS {
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Err(BridgeError::internal(format!(
+                        "pane.create command target surface {surface_id} never became writable"
+                    ))));
+                }
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        },
+    );
 }
 
 fn normalize_workspace_handle(raw: &str) -> &str {
     raw.trim()
         .strip_prefix("workspace:")
         .unwrap_or_else(|| raw.trim())
+}
+
+fn normalize_pane_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("pane:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn parse_pane_handle(raw: &str) -> Option<u32> {
+    normalize_pane_handle(raw).parse::<u32>().ok()
 }
 
 fn workspace_index_for_target(state: &AppState, target: &WorkspaceTarget) -> Option<usize> {
@@ -156,6 +253,473 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
     }))
 }
 
+fn focused_surface_payload(state: &State) -> Option<serde_json::Value> {
+    let (workspace_id, workspace_name, pane_widget) = {
+        let app_state = state.borrow();
+        let workspace = app_state.active_workspace()?;
+        let pane_widget = find_focused_pane(state).map(|(_, pane_widget)| pane_widget)?;
+        (workspace.id.clone(), workspace.name.clone(), pane_widget)
+    };
+    let surface = pane::active_surface_summary(&pane_widget)?;
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "workspace_id".to_string(),
+        serde_json::Value::String(workspace_id.clone()),
+    );
+    payload.insert(
+        "workspace_ref".to_string(),
+        serde_json::Value::String(workspace_ref(&workspace_id)),
+    );
+    payload.insert(
+        "title".to_string(),
+        serde_json::Value::String(workspace_name.clone()),
+    );
+    payload.insert(
+        "name".to_string(),
+        serde_json::Value::String(workspace_name),
+    );
+    payload.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(surface.pane_id.to_string()),
+    );
+    payload.insert(
+        "pane_ref".to_string(),
+        serde_json::Value::String(pane_ref(surface.pane_id)),
+    );
+    payload.insert(
+        "surface_id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    payload.insert(
+        "surface_ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    if !surface.title.is_empty() {
+        payload.insert(
+            "surface_title".to_string(),
+            serde_json::Value::String(surface.title),
+        );
+    }
+    payload.insert(
+        "surface_type".to_string(),
+        serde_json::Value::String(surface.kind),
+    );
+    if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+        payload.insert("cwd".to_string(), serde_json::Value::String(cwd));
+    }
+    if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+        payload.insert("uri".to_string(), serde_json::Value::String(uri));
+    }
+    Some(serde_json::Value::Object(payload))
+}
+
+fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>, Option<String>) {
+    let is_active = {
+        let app_state = state.borrow();
+        app_state
+            .active_workspace()
+            .map(|workspace| workspace.id == workspace_id)
+            .unwrap_or(false)
+    };
+    if !is_active {
+        return (None, None);
+    }
+
+    let Some((_focused_workspace_id, pane_widget)) = find_focused_pane(state) else {
+        return (None, None);
+    };
+    let Some(surface) = pane::active_surface_summary(&pane_widget) else {
+        return (None, None);
+    };
+    (Some(surface.pane_id), Some(surface.surface_id))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PaneCreateDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl PaneCreateDirection {
+    #[allow(dead_code)]
+    pub(crate) fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+impl From<BridgePaneCreateDirection> for PaneCreateDirection {
+    fn from(direction: BridgePaneCreateDirection) -> Self {
+        match direction {
+            BridgePaneCreateDirection::Left => Self::Left,
+            BridgePaneCreateDirection::Right => Self::Right,
+            BridgePaneCreateDirection::Up => Self::Up,
+            BridgePaneCreateDirection::Down => Self::Down,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PaneCreateSplitPlacement {
+    pub(crate) orientation: gtk::Orientation,
+    pub(crate) new_pane_first: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PaneCreateTargetError {
+    WorkspaceNotFound,
+    InvalidSurfaceId(String),
+    InvalidPaneId(u32),
+    NoPanes,
+}
+
+#[allow(dead_code)]
+pub(crate) struct ResolvedPaneCreateTarget {
+    pub(crate) workspace_id: String,
+    pub(crate) pane_id: u32,
+    pub(crate) pane_widget: gtk::Widget,
+    pub(crate) placement: PaneCreateSplitPlacement,
+}
+
+fn pane_create_split_placement(direction: PaneCreateDirection) -> PaneCreateSplitPlacement {
+    match direction {
+        PaneCreateDirection::Left => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Horizontal,
+            new_pane_first: true,
+        },
+        PaneCreateDirection::Right => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Horizontal,
+            new_pane_first: false,
+        },
+        PaneCreateDirection::Up => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Vertical,
+            new_pane_first: true,
+        },
+        PaneCreateDirection::Down => PaneCreateSplitPlacement {
+            orientation: gtk::Orientation::Vertical,
+            new_pane_first: false,
+        },
+    }
+}
+
+fn normalize_surface_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("surface:")
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn resolve_pane_create_source_id(
+    surface_id: Option<&str>,
+    pane_id: Option<u32>,
+    focused_pane_id: Option<u32>,
+    target_workspace_is_active: bool,
+    pane_ids: &[u32],
+    surface_to_pane: &[(&str, u32)],
+) -> Result<u32, PaneCreateTargetError> {
+    if pane_ids.is_empty() {
+        return Err(PaneCreateTargetError::NoPanes);
+    }
+
+    if let Some(surface_id) = surface_id {
+        let requested = normalize_surface_handle(surface_id);
+        return surface_to_pane
+            .iter()
+            .find(|(known_surface_id, _)| *known_surface_id == requested)
+            .map(|(_, pane_id)| *pane_id)
+            .ok_or_else(|| PaneCreateTargetError::InvalidSurfaceId(surface_id.to_string()));
+    }
+
+    if let Some(pane_id) = pane_id {
+        if pane_ids.contains(&pane_id) {
+            return Ok(pane_id);
+        }
+        return Err(PaneCreateTargetError::InvalidPaneId(pane_id));
+    }
+
+    if target_workspace_is_active {
+        if let Some(focused_pane_id) = focused_pane_id {
+            if pane_ids.contains(&focused_pane_id) {
+                return Ok(focused_pane_id);
+            }
+        }
+    }
+
+    pane_ids
+        .first()
+        .copied()
+        .ok_or(PaneCreateTargetError::NoPanes)
+}
+
+fn pane_create_target_error(error: PaneCreateTargetError) -> BridgeError {
+    match error {
+        PaneCreateTargetError::WorkspaceNotFound => BridgeError::not_found("workspace not found"),
+        PaneCreateTargetError::InvalidSurfaceId(_) => BridgeError::not_found("surface not found"),
+        PaneCreateTargetError::InvalidPaneId(_) => BridgeError::not_found("pane not found"),
+        PaneCreateTargetError::NoPanes => BridgeError::not_found("pane not found"),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn resolve_pane_create_target(
+    state: &State,
+    target: &WorkspaceTarget,
+    surface_id: Option<&str>,
+    pane_id: Option<u32>,
+    direction: PaneCreateDirection,
+) -> Result<ResolvedPaneCreateTarget, PaneCreateTargetError> {
+    let (workspace_id, workspace_root, target_workspace_is_active) = {
+        let app_state = state.borrow();
+        let workspace_index = workspace_index_for_target(&app_state, target)
+            .ok_or(PaneCreateTargetError::WorkspaceNotFound)?;
+        let workspace = &app_state.workspaces[workspace_index];
+        (
+            workspace.id.clone(),
+            workspace.root.clone(),
+            workspace_index == app_state.active_idx,
+        )
+    };
+
+    let pane_summaries = pane::pane_summaries_for_root(&workspace_root);
+    let pane_ids = pane_summaries
+        .iter()
+        .map(|summary| summary.pane_id)
+        .collect::<Vec<_>>();
+    let surface_summaries = pane::surface_summaries_for_root(&workspace_root);
+    let surface_to_pane = surface_summaries
+        .iter()
+        .map(|surface| (surface.surface_id.as_str(), surface.pane_id))
+        .collect::<Vec<_>>();
+    let focused_pane_id = target_workspace_is_active
+        .then(|| focused_ids_for_workspace(state, &workspace_id).0)
+        .flatten();
+
+    let pane_id = resolve_pane_create_source_id(
+        surface_id,
+        pane_id,
+        focused_pane_id,
+        target_workspace_is_active,
+        &pane_ids,
+        &surface_to_pane,
+    )?;
+    let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
+        .ok_or(PaneCreateTargetError::InvalidPaneId(pane_id))?;
+
+    Ok(ResolvedPaneCreateTarget {
+        workspace_id,
+        pane_id,
+        pane_widget,
+        placement: pane_create_split_placement(direction),
+    })
+}
+
+fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value {
+    let (focused_pane_id, _) = focused_ids_for_workspace(state, &workspace.id);
+    let panes = pane::pane_summaries_for_root(&workspace.root)
+        .into_iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(pane.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(pane.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "surface_count".to_string(),
+                serde_json::json!(pane.surface_count),
+            );
+            let focused = focused_pane_id == Some(pane.pane_id);
+            row.insert("focused".to_string(), serde_json::Value::Bool(focused));
+            row.insert("selected".to_string(), serde_json::Value::Bool(focused));
+            if let Some(surface_id) = pane.active_surface_id {
+                row.insert(
+                    "surface_id".to_string(),
+                    serde_json::Value::String(surface_id.clone()),
+                );
+                row.insert(
+                    "surface_ref".to_string(),
+                    serde_json::Value::String(surface_ref(&surface_id)),
+                );
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "panes": panes })
+}
+
+fn surface_list_payload(
+    state: &State,
+    workspace: &Workspace,
+    pane_filter: Option<u32>,
+) -> serde_json::Value {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .filter(|surface| pane_filter.is_none_or(|pane_id| surface.pane_id == pane_id))
+        .enumerate()
+        .map(|(index, surface)| {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "surface_id".to_string(),
+                serde_json::Value::String(surface.surface_id.clone()),
+            );
+            row.insert(
+                "surface_ref".to_string(),
+                serde_json::Value::String(surface_ref(&surface.surface_id)),
+            );
+            row.insert(
+                "pane_id".to_string(),
+                serde_json::Value::String(surface.pane_id.to_string()),
+            );
+            row.insert(
+                "pane_ref".to_string(),
+                serde_json::Value::String(pane_ref(surface.pane_id)),
+            );
+            row.insert("index".to_string(), serde_json::json!(index));
+            row.insert(
+                "title".to_string(),
+                serde_json::Value::String(surface.title.clone()),
+            );
+            row.insert(
+                "type".to_string(),
+                serde_json::Value::String(surface.kind.clone()),
+            );
+            row.insert(
+                "selected".to_string(),
+                serde_json::Value::Bool(surface.selected),
+            );
+            row.insert(
+                "focused".to_string(),
+                serde_json::Value::Bool(
+                    focused_surface_id.as_deref() == Some(surface.surface_id.as_str()),
+                ),
+            );
+            if let Some(cwd) = surface.cwd.filter(|cwd| !cwd.is_empty()) {
+                row.insert("cwd".to_string(), serde_json::Value::String(cwd));
+            }
+            if let Some(uri) = surface.uri.filter(|uri| !uri.is_empty()) {
+                row.insert("uri".to_string(), serde_json::Value::String(uri));
+            }
+            serde_json::Value::Object(row)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "surfaces": surfaces })
+}
+
+fn surface_health_row(
+    state: &State,
+    workspace: &Workspace,
+    index: usize,
+    surface: pane::SurfaceSummary,
+) -> serde_json::Value {
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    let mut row = serde_json::Map::new();
+    row.insert("index".to_string(), serde_json::json!(index));
+    row.insert(
+        "id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    row.insert(
+        "ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    row.insert(
+        "surface_id".to_string(),
+        serde_json::Value::String(surface.surface_id.clone()),
+    );
+    row.insert(
+        "surface_ref".to_string(),
+        serde_json::Value::String(surface_ref(&surface.surface_id)),
+    );
+    row.insert(
+        "pane_id".to_string(),
+        serde_json::Value::String(surface.pane_id.to_string()),
+    );
+    row.insert(
+        "pane_ref".to_string(),
+        serde_json::Value::String(pane_ref(surface.pane_id)),
+    );
+    row.insert(
+        "type".to_string(),
+        serde_json::Value::String(surface.kind.clone()),
+    );
+    let focused = focused_surface_id.as_deref() == Some(surface.surface_id.as_str());
+    row.insert("focused".to_string(), serde_json::Value::Bool(focused));
+    row.insert(
+        "selected".to_string(),
+        serde_json::Value::Bool(surface.selected),
+    );
+    row.insert("in_window".to_string(), serde_json::Value::Bool(true));
+    row.insert("hidden".to_string(), serde_json::Value::Bool(false));
+
+    if surface.kind == "terminal" {
+        if let Some((_surface_id, handle)) =
+            pane::terminal_handle_for_root(&workspace.root, Some(&surface.surface_id))
+        {
+            let health = handle.health();
+            row.insert(
+                "healthy".to_string(),
+                serde_json::Value::Bool(health.realized && !health.process_exited),
+            );
+            row.insert(
+                "realized".to_string(),
+                serde_json::Value::Bool(health.realized),
+            );
+            row.insert(
+                "process_exited".to_string(),
+                serde_json::Value::Bool(health.process_exited),
+            );
+            row.insert("columns".to_string(), serde_json::json!(health.columns));
+            row.insert("rows".to_string(), serde_json::json!(health.rows));
+            row.insert("width_px".to_string(), serde_json::json!(health.width_px));
+            row.insert("height_px".to_string(), serde_json::json!(health.height_px));
+        } else {
+            row.insert("healthy".to_string(), serde_json::Value::Bool(false));
+            row.insert("realized".to_string(), serde_json::Value::Bool(false));
+            row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+        }
+    } else {
+        row.insert("healthy".to_string(), serde_json::Value::Bool(true));
+        row.insert("realized".to_string(), serde_json::Value::Bool(true));
+        row.insert("process_exited".to_string(), serde_json::Value::Bool(false));
+    }
+
+    serde_json::Value::Object(row)
+}
+
+fn surface_health_payload(
+    state: &State,
+    workspace: &Workspace,
+    surface_hint: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let requested = surface_hint.map(normalize_surface_handle);
+    let surfaces = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .filter(|surface| requested.is_none_or(|requested| surface.surface_id == requested))
+        .enumerate()
+        .map(|(index, surface)| surface_health_row(state, workspace, index, surface))
+        .collect::<Vec<_>>();
+
+    if surface_hint.is_some() && surfaces.is_empty() {
+        return Err(BridgeError::not_found("surface not found"));
+    }
+
+    Ok(serde_json::json!({ "surfaces": surfaces }))
+}
+
 #[derive(Clone)]
 struct WorkspaceSeedSource {
     workspace_cwd: Option<String>,
@@ -179,8 +743,13 @@ const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
 const PORTAL_APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
 const PORTAL_COLOR_SCHEME_KEY: &str = "color-scheme";
+const FREEDESKTOP_NOTIFICATIONS_SERVICE: &str = "org.freedesktop.Notifications";
+const FREEDESKTOP_NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+const FREEDESKTOP_NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
 const GNOME_INTERFACE_SCHEMA: &str = "org.gnome.desktop.interface";
 const GNOME_COLOR_SCHEME_KEY: &str = "color-scheme";
+const DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS: i32 = 1_000;
+const DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS: i32 = 10_000;
 const PORTAL_THEME_READ_TIMEOUT_MS: i32 = 500;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -190,6 +759,27 @@ enum PortalColorSchemePreference {
     Default,
     Dark,
     Light,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationTarget {
+    workspace_id: String,
+    pane_id: Option<u32>,
+    tab_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationRoute {
+    target: DesktopNotificationTarget,
+    activation_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopNotificationRequest {
+    summary: String,
+    body: String,
+    sound: app_config::NotificationSound,
+    target: DesktopNotificationTarget,
 }
 
 impl PortalColorSchemePreference {
@@ -288,13 +878,21 @@ fn suspend_persistence(state: &State, suspended: bool) {
     state.borrow_mut().persistence_suspended = suspended;
 }
 
-fn apply_loaded_session(state: &State, loaded: LoadedSession) {
+fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     suspend_persistence(state, true);
 
     apply_top_bar_state_immediately(state, loaded.state.top_bar_visible);
 
     let restored_any = !loaded.state.workspaces.is_empty();
     if restored_any {
+        let restorable_agents = layout_state::RestorableAgentIndex::load();
+        for workspace in &mut loaded.state.workspaces {
+            layout_state::attach_restorable_agents_to_layout(
+                &mut workspace.layout,
+                workspace.id.as_deref().unwrap_or(""),
+                &restorable_agents,
+            );
+        }
         for workspace in &loaded.state.workspaces {
             add_workspace_from_state(state, workspace);
         }
@@ -331,25 +929,24 @@ fn restore_active_workspace(state: &State, index: usize) {
 }
 
 fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
-    let (paned, sidebar, width) = {
+    let (sidebar_shell, sidebar_handle, width) = {
         let mut s = state.borrow_mut();
         s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
-        let sidebar = match s.paned.start_child() {
-            Some(sidebar) => sidebar,
-            None => return,
-        };
-        (s.paned.clone(), sidebar, s.sidebar_expanded_width)
+        (
+            s.sidebar_shell.clone(),
+            s.sidebar_handle.clone(),
+            s.sidebar_expanded_width,
+        )
     };
 
-    if sidebar_state.visible {
-        sidebar.set_visible(true);
-        paned.set_position(width);
-    } else {
-        // Apply restored sidebar visibility directly; using the animated toggle path during
-        // startup would create flicker and extra persistence churn while restore is suspended.
-        sidebar.set_visible(false);
-        paned.set_position(0);
-    }
+    // Apply restored sidebar visibility directly; using the animated toggle path during
+    // startup would create flicker and extra persistence churn while restore is suspended.
+    set_sidebar_state_widgets(
+        &sidebar_shell,
+        &sidebar_handle,
+        if sidebar_state.visible { width } else { 0 },
+        sidebar_state.visible,
+    );
 }
 
 fn apply_top_bar_state_immediately(state: &State, visible: bool) {
@@ -359,9 +956,10 @@ fn apply_top_bar_state_immediately(state: &State, visible: bool) {
 
 fn snapshot_session_state(state: &State) -> AppSessionState {
     let s = state.borrow();
+    let restorable_agents = layout_state::RestorableAgentIndex::load();
     let sidebar_visible = sidebar_is_visible(&s);
     let sidebar_width = if sidebar_visible {
-        s.paned.position()
+        sidebar_width(&s.sidebar_shell)
     } else {
         s.sidebar_expanded_width
     }
@@ -374,15 +972,22 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             let cwd = workspace.cwd.borrow().clone();
             let folder_path = workspace.folder_path.clone();
             let working_directory = folder_path.clone().or(cwd.clone());
+            let mut layout = workspace
+                .split_container
+                .tree()
+                .snapshot(working_directory.as_deref());
+            layout_state::attach_restorable_agents_to_layout(
+                &mut layout,
+                &workspace.id,
+                &restorable_agents,
+            );
             WorkspaceState {
+                id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
-                layout: workspace
-                    .split_container
-                    .tree()
-                    .snapshot(working_directory.as_deref()),
+                layout,
             }
         })
         .collect();
@@ -400,11 +1005,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
 }
 
 fn sidebar_is_visible(state: &AppState) -> bool {
-    state
-        .paned
-        .start_child()
-        .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
-        .unwrap_or(false)
+    state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
 }
 
 fn begin_window_move_from_widget(
@@ -547,6 +1148,9 @@ const HOST_ENTRY_CSS_CLASS: &str = "limux-host-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASS: &str = "limux-ws-rename-entry";
 const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
     [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS];
+const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
+const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
+const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
 
 const BASE_CSS: &str = r#"
 .limux-host-entry {
@@ -701,6 +1305,13 @@ row:selected .limux-ws-path {
 }
 .limux-content {
     background-color: @window_bg_color;
+}
+.limux-sidebar-handle {
+    min-width: 3px;
+    background-color: alpha(@window_fg_color, 0.08);
+}
+.limux-sidebar-handle:hover {
+    background-color: alpha(@accent_bg_color, 0.45);
 }
 "#;
 
@@ -890,29 +1501,19 @@ pub fn build_window(app: &adw::Application) {
     let sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .width_request(220)
         .build();
     sidebar.add_css_class("limux-sidebar");
     sidebar.append(&sidebar_title);
     sidebar.append(&sidebar_scroll);
     sidebar.append(&new_ws_btn);
 
-    let main_paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .position(220)
-        .resize_start_child(false)
-        .resize_end_child(true)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .start_child(&sidebar)
-        .end_child(&stack)
-        .build();
+    let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
         vbox.append(header);
     }
-    vbox.append(&main_paned);
+    vbox.append(&main_split);
     window.set_content(Some(&vbox));
 
     let state: State = Rc::new(RefCell::new(AppState {
@@ -927,7 +1528,8 @@ pub fn build_window(app: &adw::Application) {
         shortcuts,
         stack: stack.clone(),
         sidebar_list: sidebar_list.clone(),
-        paned: main_paned.clone(),
+        sidebar_shell: sidebar_shell.clone(),
+        sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
@@ -935,13 +1537,19 @@ pub fn build_window(app: &adw::Application) {
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
+        desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
         _theme_gnome_signal: None,
+        _desktop_notification_token_signal: None,
+        _desktop_notification_action_signal: None,
+        _desktop_notification_closed_signal: None,
     }));
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    install_sidebar_resize(&state, &main_split, &sidebar, &sidebar_shell);
 
     {
         let state = state.clone();
@@ -976,6 +1584,7 @@ pub fn build_window(app: &adw::Application) {
         system_prefers_dark.clone(),
         portal_color_scheme_preference.clone(),
     );
+    connect_desktop_notification_watch_async(state.clone());
 
     apply_shortcuts_to_application(app, &state.borrow().shortcuts);
 
@@ -983,24 +1592,6 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         window.connect_fullscreened_notify(move |_| {
             sync_top_bar_visibility(&state);
-        });
-    }
-
-    {
-        let state = state.clone();
-        main_paned.connect_position_notify(move |paned| {
-            let position = paned.position();
-            let should_save = if position > 10 {
-                let mut s = state.borrow_mut();
-                let changed = s.sidebar_expanded_width != position;
-                s.sidebar_expanded_width = position;
-                changed
-            } else {
-                false
-            };
-            if should_save {
-                request_session_save(&state);
-            }
         });
     }
 
@@ -1107,6 +1698,121 @@ fn build_window_css(background_opacity: f64) -> String {
     format!(
         "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
     )
+}
+
+fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk::Box, gtk::Box) {
+    let sidebar_shell = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    sidebar_shell.append(sidebar);
+    set_sidebar_width(&sidebar_shell, SIDEBAR_WIDTH);
+
+    let sidebar_handle = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(SIDEBAR_RESIZE_HANDLE_WIDTH_PX)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    sidebar_handle.add_css_class(SIDEBAR_HANDLE_CSS_CLASS);
+    sidebar_handle.set_cursor_from_name(Some(SIDEBAR_HANDLE_CURSOR_NAME));
+
+    let main_split = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    main_split.append(&sidebar_shell);
+    main_split.append(&sidebar_handle);
+    main_split.append(stack);
+
+    (main_split, sidebar_shell, sidebar_handle)
+}
+
+fn install_sidebar_resize(
+    state: &State,
+    main_split: &gtk::Box,
+    sidebar: &gtk::Box,
+    sidebar_shell: &gtk::Box,
+) {
+    let resizing_sidebar = Rc::new(Cell::new(false));
+    let drag_origin = Rc::new(Cell::new(SIDEBAR_WIDTH));
+    let drag = gtk::GestureDrag::new();
+
+    {
+        let drag_origin = drag_origin.clone();
+        let sidebar = sidebar.clone();
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        drag.connect_drag_begin(move |gesture, x, _| {
+            let current_width = sidebar_width(&sidebar_shell);
+            let handle_start = current_width as f64;
+            let handle_end = handle_start + SIDEBAR_RESIZE_HANDLE_WIDTH_PX as f64;
+            if x < handle_start || x > handle_end {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            resizing_sidebar.set(true);
+            drag_origin.set(current_width.max(sidebar_min_width(&sidebar)));
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+    }
+
+    {
+        let drag_origin = drag_origin.clone();
+        let sidebar = sidebar.clone();
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        let state = state.clone();
+        drag.connect_drag_update(move |_, offset_x, _| {
+            if !resizing_sidebar.get() {
+                return;
+            }
+            let min_width = sidebar_min_width(&sidebar);
+            let width = (drag_origin.get() as f64 + offset_x).round() as i32;
+            let width = width.max(min_width);
+            set_sidebar_width(&sidebar_shell, width);
+            state.borrow_mut().sidebar_expanded_width = width;
+        });
+    }
+
+    {
+        let sidebar_shell = sidebar_shell.clone();
+        let resizing_sidebar = resizing_sidebar.clone();
+        let state = state.clone();
+        drag.connect_drag_end(move |_, _, _| {
+            resizing_sidebar.set(false);
+            state.borrow_mut().sidebar_expanded_width = sidebar_width(&sidebar_shell);
+            request_session_save(&state);
+        });
+    }
+
+    main_split.add_controller(drag);
+}
+
+fn set_sidebar_width(sidebar_shell: &gtk::Box, width: i32) {
+    sidebar_shell.set_width_request(width.max(0));
+}
+
+fn set_sidebar_state_widgets(
+    sidebar_shell: &gtk::Box,
+    sidebar_handle: &gtk::Box,
+    width: i32,
+    visible: bool,
+) {
+    set_sidebar_width(sidebar_shell, width);
+    sidebar_shell.set_visible(visible);
+    sidebar_handle.set_visible(visible);
+}
+
+fn sidebar_width(sidebar_shell: &gtk::Box) -> i32 {
+    sidebar_shell.width_request().max(0)
+}
+
+fn sidebar_min_width(sidebar: &gtk::Box) -> i32 {
+    let (minimum, _, _, _) = sidebar.measure(gtk::Orientation::Horizontal, -1);
+    minimum.max(1)
 }
 
 fn sanitize_background_opacity(background_opacity: f64) -> f64 {
@@ -1395,6 +2101,10 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
         }
         ShortcutCommand::CloseFocusedPane => {
             close_focused_tab(state);
+            true
+        }
+        ShortcutCommand::ToggleFocusedPaneZoom => {
+            toggle_focused_pane_zoom(state);
             true
         }
         ShortcutCommand::FocusLeft => {
@@ -1779,6 +2489,228 @@ fn connect_portal_appearance_watch(
             );
         },
     ))
+}
+
+fn connect_desktop_notification_watch_async(state: State) {
+    gio::DBusProxy::for_bus(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None::<&gio::DBusInterfaceInfo>,
+        FREEDESKTOP_NOTIFICATIONS_SERVICE,
+        FREEDESKTOP_NOTIFICATIONS_PATH,
+        FREEDESKTOP_NOTIFICATIONS_INTERFACE,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(proxy) = result else {
+                return;
+            };
+
+            let token_subscription =
+                connect_desktop_notification_token_watch(&proxy, state.clone());
+            let action_subscription =
+                connect_desktop_notification_action_watch(&proxy, state.clone());
+            let closed_subscription =
+                connect_desktop_notification_closed_watch(&proxy, state.clone());
+            let mut s = state.borrow_mut();
+            s._desktop_notification_token_signal = token_subscription;
+            s._desktop_notification_action_signal = action_subscription;
+            s._desktop_notification_closed_signal = closed_subscription;
+        },
+    );
+}
+
+fn desktop_notification_id_from_response(response: &glib::Variant) -> Option<u32> {
+    response
+        .try_child_get::<u32>(0)
+        .ok()
+        .flatten()
+        .or_else(|| response.try_get::<u32>().ok())
+}
+
+fn desktop_notification_action_from_signal(parameters: &glib::Variant) -> Option<(u32, String)> {
+    parameters.try_get::<(u32, String)>().ok()
+}
+
+fn desktop_notification_activation_token_from_signal(
+    parameters: &glib::Variant,
+) -> Option<(u32, String)> {
+    parameters.try_get::<(u32, String)>().ok()
+}
+
+fn desktop_notification_closed_id_from_signal(parameters: &glib::Variant) -> Option<u32> {
+    parameters.try_get::<(u32, u32)>().ok().map(|(id, _)| id)
+}
+
+fn connect_desktop_notification_token_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("ActivationToken"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some((notification_id, activation_token)) =
+                desktop_notification_activation_token_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            let mut s = state.borrow_mut();
+            if let Some(route) = s.desktop_notification_routes.get_mut(&notification_id) {
+                route.activation_token = Some(activation_token);
+            }
+        },
+    ))
+}
+
+fn connect_desktop_notification_action_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("ActionInvoked"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some((notification_id, action_key)) =
+                desktop_notification_action_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            if action_key != "default" {
+                return;
+            }
+
+            let route = {
+                let mut s = state.borrow_mut();
+                s.desktop_notification_routes.remove(&notification_id)
+            };
+            let Some(route) = route else {
+                return;
+            };
+
+            activate_desktop_notification_target(
+                &state,
+                &route.target,
+                route.activation_token.as_deref(),
+            );
+        },
+    ))
+}
+
+fn connect_desktop_notification_closed_watch(
+    proxy: &gio::DBusProxy,
+    state: State,
+) -> Option<gio::SignalSubscription> {
+    let connection = proxy.connection();
+    Some(connection.subscribe_to_signal(
+        Some(FREEDESKTOP_NOTIFICATIONS_SERVICE),
+        Some(FREEDESKTOP_NOTIFICATIONS_INTERFACE),
+        Some("NotificationClosed"),
+        Some(FREEDESKTOP_NOTIFICATIONS_PATH),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |signal| {
+            let Some(notification_id) =
+                desktop_notification_closed_id_from_signal(signal.parameters)
+            else {
+                return;
+            };
+
+            state
+                .borrow_mut()
+                .desktop_notification_routes
+                .remove(&notification_id);
+        },
+    ))
+}
+
+fn activate_desktop_notification_target(
+    state: &State,
+    target: &DesktopNotificationTarget,
+    activation_token: Option<&str>,
+) {
+    let (workspace_idx, row, sidebar_list, window, workspace_changed) = {
+        let s = state.borrow();
+        let Some((idx, workspace)) = s
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, workspace)| workspace.id == target.workspace_id)
+        else {
+            return;
+        };
+
+        (
+            idx,
+            workspace.sidebar_row.clone(),
+            s.sidebar_list.clone(),
+            s.window.clone(),
+            idx != s.active_idx,
+        )
+    };
+
+    if let Some(token) = activation_token.filter(|token| !token.is_empty()) {
+        window.set_startup_id(token);
+    }
+    window.present();
+    switch_workspace(state, workspace_idx);
+    sidebar_list.select_row(Some(&row));
+
+    let state_for_focus = state.clone();
+    let target_for_focus = target.clone();
+    if workspace_changed {
+        glib::idle_add_local_once(move || {
+            glib::idle_add_local_once(move || {
+                focus_desktop_notification_target(&state_for_focus, &target_for_focus);
+            });
+        });
+    } else {
+        glib::idle_add_local_once(move || {
+            focus_desktop_notification_target(&state_for_focus, &target_for_focus);
+        });
+    }
+}
+
+fn focus_desktop_notification_target(state: &State, target: &DesktopNotificationTarget) -> bool {
+    if let Some(pane_id) = target.pane_id {
+        if let Some(pane_widget) = pane::find_pane_widget_by_id(pane_id) {
+            if let Some(tab_id) = target.tab_id.as_deref() {
+                if pane::activate_tab_in_pane(&pane_widget, tab_id) {
+                    return true;
+                }
+            }
+
+            if pane::focus_active_tab_in_pane(&pane_widget) {
+                return true;
+            }
+        }
+    }
+
+    let root = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == target.workspace_id)
+            .map(|workspace| workspace.root.clone())
+    };
+
+    if let Some(root) = root {
+        focus_workspace_entrypoint(&root);
+        return true;
+    }
+
+    false
 }
 
 fn connect_gnome_appearance_watch(
@@ -2708,55 +3640,229 @@ fn install_workspace_row_interactions(
     }
 }
 
-#[allow(deprecated)]
 fn add_workspace(state: &State, _working_directory: Option<&str>) {
-    // Open a folder chooser dialog (using FileChooserDialog to avoid portal crashes)
-    let window: Option<gtk::Window> = {
-        let s = state.borrow();
-        s.stack
-            .root()
-            .and_then(|r| r.downcast::<gtk::Window>().ok())
-    };
+    show_workspace_path_dialog(state);
+}
 
-    let dialog = gtk::FileChooserDialog::new(
-        Some("Open Folder as Workspace"),
-        window.as_ref(),
-        gtk::FileChooserAction::SelectFolder,
-        &[
-            ("Cancel", gtk::ResponseType::Cancel),
-            ("Open", gtk::ResponseType::Accept),
-        ],
-    );
-    dialog.set_modal(true);
+fn active_window(state: &State) -> Option<gtk::Window> {
+    let s = state.borrow();
+    s.stack
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok())
+}
 
-    // Start in the home directory
-    if let Some(home) = dirs::home_dir() {
-        let home_file = gtk::gio::File::for_path(&home);
-        let _ = dialog.set_current_folder(Some(&home_file));
+fn show_workspace_path_dialog(state: &State) {
+    let dialog = gtk::Window::builder()
+        .title("Open Folder as Workspace")
+        .modal(true)
+        .default_width(520)
+        .build();
+    if let Some(window) = active_window(state) {
+        dialog.set_transient_for(Some(&window));
     }
 
-    let state = state.clone();
-    dialog.connect_response(move |dlg, response| {
-        if response == gtk::ResponseType::Accept {
-            if let Some(file) = dlg.file() {
-                if let Some(path) = file.path() {
-                    let path_str = path.to_string_lossy().to_string();
-                    let folder_name = path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path_str.clone());
-                    create_workspace_with_folder(&state, &folder_name, &path_str);
-                }
+    let default_folder = dirs::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let entry = gtk::Entry::builder()
+        .text(default_folder.to_string_lossy())
+        .hexpand(true)
+        .activates_default(true)
+        .build();
+    let browse_button = gtk::Button::with_label("Browse...");
+    let error_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .wrap(true)
+        .build();
+    error_label.add_css_class("error");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let path_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    path_row.append(&entry);
+    path_row.append(&browse_button);
+    content.append(&path_row);
+    content.append(&error_label);
+
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .spacing(8)
+        .build();
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let open_button = gtk::Button::with_label("Open");
+    open_button.add_css_class("suggested-action");
+    buttons.append(&cancel_button);
+    buttons.append(&open_button);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+
+    entry.grab_focus();
+    entry.select_region(0, -1);
+    let state_for_open = state.clone();
+    let entry_for_open = entry.clone();
+    let error_label_for_open = error_label.clone();
+    let dialog_for_open = dialog.clone();
+    open_button.connect_clicked(move |_| {
+        match validate_workspace_folder_input(entry_for_open.text().as_str()) {
+            Ok(selection) => {
+                create_workspace_with_folder(
+                    &state_for_open,
+                    &selection.name,
+                    selection.path_text.as_str(),
+                );
+                dialog_for_open.close();
+            }
+            Err(message) => {
+                error_label_for_open.set_label(&message);
+                error_label_for_open.set_visible(true);
+                entry_for_open.grab_focus();
             }
         }
-        dlg.close();
     });
 
-    dialog.show();
+    let open_button_for_entry = open_button.clone();
+    entry.connect_activate(move |_| {
+        open_button_for_entry.emit_clicked();
+    });
+
+    let entry_for_browse = entry.clone();
+    let error_label_for_browse = error_label.clone();
+    let browse_button_for_browse = browse_button.clone();
+    let transient_for_browse = active_window(state);
+    browse_button.connect_clicked(move |_| {
+        error_label_for_browse.set_visible(false);
+        browse_button_for_browse.set_sensitive(false);
+
+        let picker = gtk::FileDialog::builder()
+            .title("Choose Workspace Folder")
+            .accept_label("Choose")
+            .modal(true)
+            .build();
+
+        if let Ok(selection) = validate_workspace_folder_input(entry_for_browse.text().as_str()) {
+            picker.set_initial_folder(Some(&gio::File::for_path(selection.path_text)));
+        }
+
+        let entry_for_result = entry_for_browse.clone();
+        let error_label_for_result = error_label_for_browse.clone();
+        let browse_button_for_result = browse_button_for_browse.clone();
+        picker.select_folder(
+            transient_for_browse.as_ref(),
+            None::<&gio::Cancellable>,
+            move |result| {
+                browse_button_for_result.set_sensitive(true);
+                match result {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            entry_for_result.set_text(&path.to_string_lossy());
+                            entry_for_result.grab_focus();
+                            entry_for_result.set_position(-1);
+                        }
+                    }
+                    Err(err) if is_workspace_picker_cancel(&err) => {}
+                    Err(err) => {
+                        error_label_for_result.set_label(&format!("Folder picker failed: {err}"));
+                        error_label_for_result.set_visible(true);
+                    }
+                }
+            },
+        );
+    });
+
+    let dialog_for_cancel = dialog.clone();
+    cancel_button.connect_clicked(move |_| {
+        dialog_for_cancel.close();
+    });
+
+    dialog.present();
+}
+
+fn is_workspace_picker_cancel(err: &glib::Error) -> bool {
+    matches!(
+        err.kind::<gtk::DialogError>(),
+        Some(gtk::DialogError::Cancelled | gtk::DialogError::Dismissed)
+    )
+}
+
+#[derive(Debug)]
+struct WorkspaceFolderSelection {
+    name: String,
+    path_text: String,
+}
+
+fn validate_workspace_folder_input(input: &str) -> Result<WorkspaceFolderSelection, String> {
+    let home_dir = dirs::home_dir();
+    let current_dir = std::env::current_dir().ok();
+    validate_workspace_folder_input_with_dirs(input, home_dir.as_deref(), current_dir.as_deref())
+}
+
+fn validate_workspace_folder_input_with_dirs(
+    input: &str,
+    home_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Result<WorkspaceFolderSelection, String> {
+    let path = workspace_folder_path_from_input(input, home_dir, current_dir)?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|err| format!("Cannot open {}: {err}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a folder", path.display()));
+    }
+
+    let path_text = path.to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .map(|segment| segment.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path_text.clone());
+    Ok(WorkspaceFolderSelection { name, path_text })
+}
+
+fn workspace_folder_path_from_input(
+    input: &str,
+    home_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a folder path".to_string());
+    }
+
+    let expanded = if trimmed == "~" {
+        home_dir
+            .ok_or_else(|| "Home directory is unavailable".to_string())?
+            .to_path_buf()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        home_dir
+            .ok_or_else(|| "Home directory is unavailable".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else if let Some(current_dir) = current_dir {
+        Ok(current_dir.join(expanded))
+    } else {
+        Err("Current directory is unavailable".to_string())
+    }
 }
 
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     let workspace = WorkspaceState {
+        id: None,
         name: name.to_string(),
         favorite: false,
         cwd: Some(folder_path.to_string()),
@@ -2784,17 +3890,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
     match command {
         ControlCommand::Identify { caller, reply } => {
             let result = {
-                let app_state = state.borrow();
-                let focused = workspace_payload(&app_state, app_state.active_idx)
-                    .map(|payload| {
-                        serde_json::json!({
-                            "workspace_id": payload["workspace_id"],
-                            "workspace_ref": payload["workspace_ref"],
-                            "title": payload["title"],
-                            "name": payload["name"],
-                        })
-                    })
-                    .unwrap_or(serde_json::Value::Null);
+                let focused = focused_surface_payload(state).unwrap_or(serde_json::Value::Null);
                 serde_json::json!({
                     "name": "limux-control",
                     "protocol": "v1+v2",
@@ -2825,6 +3921,199 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::ListPanes { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                pane_list_payload(state, &app_state.workspaces[index])
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::ListPaneSurfaces {
+            target,
+            pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let pane_filter = pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| pane_id.as_deref().and_then(|raw| raw.parse::<u32>().ok()));
+            if pane_id.is_some() && pane_filter.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.surfaces requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], pane_filter)
+            };
+
+            if pane_id.is_some()
+                && result["surfaces"]
+                    .as_array()
+                    .is_some_and(|surfaces| surfaces.is_empty())
+            {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found",
+                )));
+                return;
+            }
+
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::CreatePane { request, reply } => {
+            if !matches!(request.pane_type, PaneCreateType::Terminal) {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.create live GTK bridge supports type=terminal only",
+                )));
+                return;
+            }
+
+            let source_pane_id = request
+                .source_pane_id
+                .as_deref()
+                .and_then(parse_pane_handle);
+            if request.source_pane_id.is_some() && source_pane_id.is_none() {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "pane.create requires a valid pane_id",
+                )));
+                return;
+            }
+
+            let direction = PaneCreateDirection::from(request.direction);
+            let resolved = match resolve_pane_create_target(
+                state,
+                &request.target,
+                request.source_surface_id.as_deref(),
+                source_pane_id,
+                direction,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let _ = reply.send(Err(pane_create_target_error(error)));
+                    return;
+                }
+            };
+
+            let workspace_name = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == resolved.workspace_id)
+                    .map(|workspace| workspace.name.clone())
+            };
+            let Some(workspace_name) = workspace_name else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let new_pane = split_pane(
+                state,
+                &resolved.workspace_id,
+                &resolved.pane_widget,
+                resolved.placement.orientation,
+                SplitPaneOptions {
+                    initial_state: None,
+                    skip_default_tab: false,
+                    new_pane_first: resolved.placement.new_pane_first,
+                    persist: true,
+                },
+            );
+            let Some(new_pane) = new_pane else {
+                let _ = reply.send(Err(BridgeError::invalid_params(
+                    "not enough room to split pane",
+                )));
+                return;
+            };
+
+            let Some(surface) = pane::active_surface_summary(&new_pane) else {
+                let _ = reply.send(Err(BridgeError::internal(
+                    "pane.create did not produce a terminal surface",
+                )));
+                return;
+            };
+
+            let surface_id = surface.surface_id.clone();
+            let response =
+                pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
+
+            if let Some(command) = request.command {
+                send_pane_create_response_after_command(
+                    new_pane, surface_id, command, response, reply,
+                );
+                return;
+            }
+
+            let _ = reply.send(Ok(response));
+        }
+        ControlCommand::ListSurfaces { target, reply } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                surface_list_payload(state, &app_state.workspaces[index], None)
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::SurfaceHealth {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                surface_health_payload(state, &app_state.workspaces[index], surface_hint.as_deref())
+            };
+            let _ = reply.send(result);
         }
         ControlCommand::CreateWorkspace {
             name,
@@ -2998,7 +4287,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let target = {
                 let app_state = state.borrow();
                 let workspace = &app_state.workspaces[index];
-                pane::terminal_handle_for_surface(&workspace.root, surface_hint.as_deref()).map(
+                let (_focused_pane_id, focused_surface_id) =
+                    focused_ids_for_workspace(state, &workspace.id);
+                let resolved_surface_hint =
+                    surface_hint.as_deref().or(focused_surface_id.as_deref());
+                pane::terminal_handle_for_root(&workspace.root, resolved_surface_hint).map(
                     |(surface_id, handle)| {
                         (
                             serde_json::json!({
@@ -3026,6 +4319,166 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::ReadSurfaceText {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            let Some(text) = handle.read_viewport_text() else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
+                    "surface.read_text failed",
+                )));
+                return;
+            };
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("text".to_string(), serde_json::Value::String(text));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::SendKey {
+            target,
+            surface_hint,
+            key,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
+                    |(surface_id, handle)| {
+                        (
+                            serde_json::json!({
+                                "workspace_id": workspace.id.as_str(),
+                                "workspace_ref": workspace_ref(&workspace.id),
+                                "surface_id": surface_id.as_str(),
+                                "surface_ref": surface_ref(&surface_id),
+                            }),
+                            handle,
+                        )
+                    },
+                )
+            };
+
+            let Some((mut payload, handle)) = target else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+
+            if !handle.send_key(&key) {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "unsupported key",
+                )));
+                return;
+            }
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::CreateNotification {
+            target,
+            title,
+            subtitle,
+            body,
+            reply,
+        } => {
+            // Resolve the workspace target. `WorkspaceTarget::Active` maps to
+            // the currently-focused workspace via workspace_index_for_target.
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let ws_id = state.borrow().workspaces[index].id.clone();
+
+            // Build the sidebar message: title becomes the bold prefix,
+            // subtitle + body are joined with " — " for the body text.
+            let combined_body = match (subtitle.is_empty(), body.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => body.clone(),
+                (false, true) => subtitle.clone(),
+                (false, false) => format!("{subtitle} — {body}"),
+            };
+            let message = workspace_notification_message(&title, &combined_body);
+            let target = DesktopNotificationTarget {
+                workspace_id: ws_id.clone(),
+                pane_id: None,
+                tab_id: None,
+            };
+            if let Some(request) =
+                mark_workspace_unread_with_message(state, &ws_id, &message, false, target)
+            {
+                show_desktop_notification(state, request);
+            }
+
+            let payload = serde_json::json!({
+                "ok": true,
+                "workspace_id": ws_id,
+                "workspace_ref": workspace_ref(&ws_id),
+                "title": title,
+                "subtitle": subtitle,
+                "body": body,
+            });
+            let _ = reply.send(Ok(payload));
+        }
     }
 }
 
@@ -3038,7 +4491,12 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         let s = state.borrow();
         (s.stack.clone(), s.sidebar_list.clone())
     };
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = workspace
+        .id
+        .as_deref()
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let stack_name = format!("ws-{id}");
     let working_dir = workspace
         .folder_path
@@ -3111,6 +4569,7 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_config = state.clone();
     let state_for_config_changed = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
+    let ws_id_for_env = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -3130,22 +4589,47 @@ pub(crate) fn create_pane_for_workspace(
         on_close_pane: Box::new(move |pane_widget| {
             remove_pane_internal(&state_for_close, &ws_id_close, pane_widget, true);
         }),
-        on_bell: Box::new(move || {
+        on_bell: Box::new(move |source_focused: bool, pane_id: u32, tab_id: &str| {
             // Defer to avoid RefCell borrow conflicts — bell can fire during state mutation
             let state = state_for_bell.clone();
             let ws_id = ws_id_bell.clone();
+            let tab_id = tab_id.to_string();
+            let target = DesktopNotificationTarget {
+                workspace_id: ws_id.clone(),
+                pane_id: Some(pane_id),
+                tab_id: Some(tab_id),
+            };
             glib::idle_add_local_once(move || {
-                mark_workspace_unread(&state, &ws_id);
+                if let Some(request) = mark_workspace_unread(&state, &ws_id, source_focused, target)
+                {
+                    show_desktop_notification(&state, request);
+                }
             });
         }),
-        on_desktop_notification: Box::new(move |title: &str, body: &str| {
-            let state = state_for_desktop_notification.clone();
-            let ws_id = ws_id_desktop_notification.clone();
-            let message = workspace_notification_message(title, body);
-            glib::idle_add_local_once(move || {
-                mark_workspace_unread_with_message(&state, &ws_id, &message);
-            });
-        }),
+        on_desktop_notification: Box::new(
+            move |title: &str, body: &str, source_focused: bool, pane_id: u32, tab_id: &str| {
+                let state = state_for_desktop_notification.clone();
+                let ws_id = ws_id_desktop_notification.clone();
+                let tab_id = tab_id.to_string();
+                let target = DesktopNotificationTarget {
+                    workspace_id: ws_id.clone(),
+                    pane_id: Some(pane_id),
+                    tab_id: Some(tab_id),
+                };
+                let message = workspace_notification_message(title, body);
+                glib::idle_add_local_once(move || {
+                    if let Some(request) = mark_workspace_unread_with_message(
+                        &state,
+                        &ws_id,
+                        &message,
+                        source_focused,
+                        target,
+                    ) {
+                        show_desktop_notification(&state, request);
+                    }
+                });
+            },
+        ),
         on_open_browser_here: Box::new(move |pane_widget| {
             pane::add_browser_tab_to_pane(pane_widget);
         }),
@@ -3223,6 +4707,7 @@ pub(crate) fn create_pane_for_workspace(
                 }
             },
         ),
+        workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
     });
 
     pane::create_pane(
@@ -3442,12 +4927,9 @@ fn toggle_fullscreen(state: &State) {
 }
 
 fn toggle_sidebar(state: &State) {
-    let (paned, sidebar, current, is_visible, target_width, prior_animation, epoch) = {
+    let (sidebar_shell, sidebar_handle, current, is_visible, target_width, prior_animation, epoch) = {
         let mut s = state.borrow_mut();
-        let Some(sidebar) = s.paned.start_child() else {
-            return;
-        };
-        let current = s.paned.position();
+        let current = sidebar_width(&s.sidebar_shell);
         let is_visible = current > 10; // treat < 10px as collapsed
         if is_visible {
             s.sidebar_expanded_width = current;
@@ -3456,8 +4938,8 @@ fn toggle_sidebar(state: &State) {
         let prior_animation = s.sidebar_animation.take();
         s.sidebar_animation_epoch = s.sidebar_animation_epoch.wrapping_add(1);
         (
-            s.paned.clone(),
-            sidebar,
+            s.sidebar_shell.clone(),
+            s.sidebar_handle.clone(),
             current,
             is_visible,
             target_width,
@@ -3473,13 +4955,13 @@ fn toggle_sidebar(state: &State) {
     if is_visible {
         // Collapse: animate position to 0, then hide sidebar.
         let target = adw::CallbackAnimationTarget::new({
-            let p = paned.clone();
+            let sidebar_shell = sidebar_shell.clone();
             move |value| {
-                p.set_position(value as i32);
+                set_sidebar_width(&sidebar_shell, value as i32);
             }
         });
         let animation = adw::TimedAnimation::builder()
-            .widget(&paned)
+            .widget(&sidebar_shell)
             .value_from(current as f64)
             .value_to(0.0)
             .duration(200)
@@ -3498,7 +4980,7 @@ fn toggle_sidebar(state: &State) {
                 }
             };
             if is_current {
-                sidebar.set_visible(false);
+                set_sidebar_state_widgets(&sidebar_shell, &sidebar_handle, 0, false);
                 request_session_save(&state_for_done);
             }
         });
@@ -3506,16 +4988,15 @@ fn toggle_sidebar(state: &State) {
         animation.play();
     } else {
         // Expand: make sidebar visible, then animate position from 0 to remembered width.
-        sidebar.set_visible(true);
-        paned.set_position(0);
+        set_sidebar_state_widgets(&sidebar_shell, &sidebar_handle, 0, true);
         let target = adw::CallbackAnimationTarget::new({
-            let p = paned.clone();
+            let sidebar_shell = sidebar_shell.clone();
             move |value| {
-                p.set_position(value as i32);
+                set_sidebar_width(&sidebar_shell, value as i32);
             }
         });
         let animation = adw::TimedAnimation::builder()
-            .widget(&paned)
+            .widget(&sidebar_shell)
             .value_from(0.0)
             .value_to(target_width as f64)
             .duration(200)
@@ -3559,7 +5040,7 @@ fn split_pane(
     pane_widget: &gtk::Widget,
     orientation: gtk::Orientation,
     options: SplitPaneOptions,
-) -> gtk::Widget {
+) -> Option<gtk::Widget> {
     let (shortcuts, wd, container) = {
         let s = state.borrow();
         (
@@ -3574,9 +5055,10 @@ fn split_pane(
                 .map(|ws| ws.split_container.clone()),
         )
     };
-    let Some(container) = container else {
-        return pane_widget.clone();
-    };
+    let container = container?;
+    if !container.can_split(pane_widget, orientation) {
+        return None;
+    }
 
     let new_pane = create_pane_for_workspace(
         state,
@@ -3590,17 +5072,19 @@ fn split_pane(
     // Mutate the data model and trigger async widget tree rebuild.
     // The existing pane's GLArea will be unrealized then re-realized
     // on separate ticks, avoiding the GTK4 GLArea breakage.
-    container.split(
+    if !container.split(
         pane_widget,
         new_pane.clone().upcast(),
         orientation,
         options.new_pane_first,
         layout_state::DEFAULT_SPLIT_RATIO,
-    );
+    ) {
+        return None;
+    }
     if options.persist {
         request_session_save(state);
     }
-    new_pane.upcast()
+    Some(new_pane.upcast())
 }
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
@@ -3656,6 +5140,7 @@ fn handle_split_with_tab(
             persist: false,
         },
     );
+    let Some(new_pane) = new_pane else { return };
     if pane::move_tab_to_pane(source_pane, tab_id, &new_pane) {
         request_session_save(state);
     }
@@ -3848,7 +5333,7 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
             let Some((ws_id, pane_widget)) = find_leaf_focused_pane(state) else {
                 return false;
             };
-            let _ = split_pane(
+            split_pane(
                 state,
                 &ws_id,
                 &pane_widget,
@@ -3859,8 +5344,8 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
                     new_pane_first: false,
                     persist: true,
                 },
-            );
-            true
+            )
+            .is_some()
         }
         _ => false,
     }
@@ -3899,6 +5384,22 @@ fn close_focused_tab(state: &State) {
             }
         }
         remove_pane(state, &ws_id, &pane_widget);
+    }
+}
+
+fn toggle_focused_pane_zoom(state: &State) {
+    let Some((ws_id, pane_widget)) = find_focused_pane(state) else {
+        return;
+    };
+    let container = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .find(|workspace| workspace.id == ws_id)
+            .map(|workspace| workspace.split_container.clone())
+    };
+    if let Some(container) = container {
+        container.toggle_zoom(&pane_widget);
     }
 }
 
@@ -4182,8 +5683,28 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
     }
 }
 
-fn mark_workspace_unread(state: &State, ws_id: &str) {
-    mark_workspace_unread_with_message(state, ws_id, "Process needs attention");
+fn should_emit_desktop_notification(
+    desktop_notifications_enabled: bool,
+    window_active: bool,
+    workspace_is_active: bool,
+    source_focused: bool,
+) -> bool {
+    desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
+}
+
+fn mark_workspace_unread(
+    state: &State,
+    ws_id: &str,
+    source_focused: bool,
+    target: DesktopNotificationTarget,
+) -> Option<DesktopNotificationRequest> {
+    mark_workspace_unread_with_message(
+        state,
+        ws_id,
+        "Process needs attention",
+        source_focused,
+        target,
+    )
 }
 
 fn workspace_notification_message(title: &str, body: &str) -> String {
@@ -4197,15 +5718,37 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
     }
 }
 
-fn mark_workspace_unread_with_message(state: &State, ws_id: &str, message: &str) {
+fn mark_workspace_unread_with_message(
+    state: &State,
+    ws_id: &str,
+    message: &str,
+    source_focused: bool,
+    target: DesktopNotificationTarget,
+) -> Option<DesktopNotificationRequest> {
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
+    let window_active = s.window.is_active();
+    let notifications = s.config.borrow().notifications;
     if let Some((idx, ws)) = s
         .workspaces
         .iter_mut()
         .enumerate()
         .find(|(_, w)| w.id == ws_id)
     {
+        let workspace_is_active = idx == active_idx;
+        let desktop_request = should_emit_desktop_notification(
+            notifications.enabled,
+            window_active,
+            workspace_is_active,
+            source_focused,
+        )
+        .then(|| DesktopNotificationRequest {
+            summary: ws.name.clone(),
+            body: message.to_string(),
+            sound: notifications.sound,
+            target: target.clone(),
+        });
+
         if idx != active_idx {
             ws.unread = true;
             ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
@@ -4219,7 +5762,93 @@ fn mark_workspace_unread_with_message(state: &State, ws_id: &str, message: &str)
                 row_box.add_css_class("limux-sidebar-row-unread");
             }
         }
+
+        return desktop_request;
     }
+
+    None
+}
+
+fn desktop_notification_hints(
+    sound: app_config::NotificationSound,
+) -> HashMap<String, glib::Variant> {
+    let mut hints = HashMap::from([("desktop-entry".to_string(), crate::APP_ID.to_variant())]);
+
+    match sound {
+        app_config::NotificationSound::Default => {}
+        app_config::NotificationSound::None => {
+            hints.insert("suppress-sound".to_string(), true.to_variant());
+        }
+        _ => {
+            if let Some(sound_name) = sound.freedesktop_sound_name() {
+                let sound_variant = sound_name.to_variant();
+                hints.insert("sound-name".to_string(), sound_variant.clone());
+                hints.insert("x-canonical-sound-name".to_string(), sound_variant);
+            }
+        }
+    }
+
+    hints
+}
+
+fn desktop_notification_actions() -> Vec<String> {
+    vec!["default".to_string(), "Open".to_string()]
+}
+
+fn show_desktop_notification(state: &State, request: DesktopNotificationRequest) {
+    let state = state.clone();
+    gio::DBusProxy::for_bus(
+        gio::BusType::Session,
+        gio::DBusProxyFlags::NONE,
+        None::<&gio::DBusInterfaceInfo>,
+        FREEDESKTOP_NOTIFICATIONS_SERVICE,
+        FREEDESKTOP_NOTIFICATIONS_PATH,
+        FREEDESKTOP_NOTIFICATIONS_INTERFACE,
+        None::<&gio::Cancellable>,
+        move |result| {
+            let Ok(proxy) = result else {
+                return;
+            };
+            let route = DesktopNotificationRoute {
+                target: request.target.clone(),
+                activation_token: None,
+            };
+
+            let params = (
+                "Limux",
+                0u32,
+                crate::APP_ID,
+                request.summary.as_str(),
+                request.body.as_str(),
+                desktop_notification_actions(),
+                desktop_notification_hints(request.sound),
+                DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
+            )
+                .to_variant();
+
+            proxy.call(
+                "Notify",
+                Some(&params),
+                gio::DBusCallFlags::NONE,
+                DESKTOP_NOTIFICATION_DBUS_TIMEOUT_MS,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(response) = result else {
+                        return;
+                    };
+                    let Some(notification_id) = desktop_notification_id_from_response(&response)
+                    else {
+                        return;
+                    };
+
+                    state
+                        .borrow_mut()
+                        .desktop_notification_routes
+                        .insert(notification_id, route.clone());
+                },
+            );
+        },
+    );
 }
 
 #[cfg(test)]
@@ -4230,17 +5859,25 @@ mod tests {
     use super::glib;
     use super::gtk::ffi;
     use super::gtk::gdk;
+    use super::ToVariant;
     use super::{
-        build_window_css, clamp_workspace_insert_index_for_pinning, directional_neighbor_score,
-        favorites_prefix_len, font_size_after_delta, ghostty_prefers_dark,
-        gtk_system_prefers_dark_from_raw, next_active_workspace_index, queue_session_save_request,
+        build_window_css, clamp_workspace_insert_index_for_pinning,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
+        desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
+        directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
+        pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
         resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation, tab_drag_workspace_seed,
-        use_opaque_window_background, workspace_drop_layout_path, workspace_notification_message,
-        Direction, EditableCaptureContext, NeighborScore, PaneBounds, PortalColorSchemePreference,
-        SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation,
+        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_notification_message, Direction,
+        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
+        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -4366,6 +6003,96 @@ mod tests {
     }
 
     #[test]
+    fn pane_create_split_placement_maps_direction_to_orientation_and_order() {
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Left),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Horizontal,
+                new_pane_first: true,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Right),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Horizontal,
+                new_pane_first: false,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Up),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Vertical,
+                new_pane_first: true,
+            }
+        );
+        assert_eq!(
+            pane_create_split_placement(PaneCreateDirection::Down),
+            super::PaneCreateSplitPlacement {
+                orientation: super::gtk::Orientation::Vertical,
+                new_pane_first: false,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_create_source_prefers_surface_then_pane_then_active_focus_then_first_leaf() {
+        let panes = [10, 20, 30];
+        let surfaces = [("10:aaa", 10), ("20:bbb", 20)];
+
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("surface:20:bbb"),
+                Some(10),
+                Some(30),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Ok(20)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, Some(10), Some(30), true, &panes, &surfaces),
+            Ok(10)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, Some(30), true, &panes, &surfaces),
+            Ok(30)
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, Some(30), false, &panes, &surfaces),
+            Ok(10)
+        );
+    }
+
+    #[test]
+    fn pane_create_source_reports_invalid_surface_pane_and_empty_workspace() {
+        let panes = [10, 20];
+        let surfaces = [("10:aaa", 10)];
+
+        assert_eq!(
+            resolve_pane_create_source_id(
+                Some("missing"),
+                Some(10),
+                Some(20),
+                true,
+                &panes,
+                &surfaces,
+            ),
+            Err(PaneCreateTargetError::InvalidSurfaceId(
+                "missing".to_string()
+            ))
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, Some(99), Some(20), true, &panes, &surfaces),
+            Err(PaneCreateTargetError::InvalidPaneId(99))
+        );
+        assert_eq!(
+            resolve_pane_create_source_id(None, None, None, true, &[], &[]),
+            Err(PaneCreateTargetError::NoPanes)
+        );
+    }
+
+    #[test]
     fn build_window_css_uses_resolved_background_opacity() {
         let css = build_window_css(0.42);
         assert!(css.contains(".limux-host-entry"));
@@ -4402,6 +6129,36 @@ mod tests {
             [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS]
         );
         assert!(BASE_CSS.contains(".limux-ws-rename-entry"));
+    }
+
+    #[test]
+    fn desktop_notification_actions_include_default_open_action() {
+        assert_eq!(
+            desktop_notification_actions(),
+            vec!["default".to_string(), "Open".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_notification_response_and_signal_parsers_match_dbus_shapes() {
+        assert_eq!(
+            desktop_notification_id_from_response(&(42u32,).to_variant()),
+            Some(42)
+        );
+        assert_eq!(
+            desktop_notification_action_from_signal(&(42u32, "default".to_string()).to_variant()),
+            Some((42, "default".to_string()))
+        );
+        assert_eq!(
+            desktop_notification_activation_token_from_signal(
+                &(42u32, "token-123".to_string()).to_variant()
+            ),
+            Some((42, "token-123".to_string()))
+        );
+        assert_eq!(
+            desktop_notification_closed_id_from_signal(&(42u32, 2u32).to_variant()),
+            Some(42)
+        );
     }
 
     #[test]
@@ -4552,6 +6309,17 @@ mod tests {
             workspace_notification_message("  ", "  "),
             "Process needs attention"
         );
+    }
+
+    #[test]
+    fn desktop_notifications_only_fire_for_background_workspaces() {
+        assert!(should_emit_desktop_notification(true, false, false, false));
+        assert!(should_emit_desktop_notification(true, true, false, false));
+        assert!(should_emit_desktop_notification(true, true, true, false));
+        assert!(!should_emit_desktop_notification(
+            false, false, false, false
+        ));
+        assert!(!should_emit_desktop_notification(true, true, true, true));
     }
 
     #[test]
@@ -4865,5 +6633,54 @@ mod tests {
         assert_eq!(seed.name, "Browser");
         assert_eq!(seed.cwd.as_deref(), Some("/workspace-folder"));
         assert_eq!(seed.folder_path.as_deref(), Some("/workspace-folder"));
+    }
+
+    #[test]
+    fn workspace_folder_path_input_expands_home_and_relative_paths() {
+        let home = std::path::Path::new("/home/tester");
+        let current = std::path::Path::new("/tmp/current");
+
+        assert_eq!(
+            workspace_folder_path_from_input("~/project", Some(home), Some(current)).unwrap(),
+            std::path::PathBuf::from("/home/tester/project")
+        );
+        assert_eq!(
+            workspace_folder_path_from_input("relative", Some(home), Some(current)).unwrap(),
+            std::path::PathBuf::from("/tmp/current/relative")
+        );
+    }
+
+    #[test]
+    fn workspace_folder_path_input_rejects_empty_value() {
+        assert_eq!(
+            workspace_folder_path_from_input("  ", None, None).unwrap_err(),
+            "Enter a folder path"
+        );
+    }
+
+    #[test]
+    fn workspace_folder_validation_accepts_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let selection =
+            validate_workspace_folder_input_with_dirs(dir.path().to_str().unwrap(), None, None)
+                .unwrap();
+
+        assert_eq!(selection.path_text, dir.path().to_string_lossy());
+        assert_eq!(
+            selection.name,
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn workspace_folder_validation_rejects_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-folder");
+        std::fs::write(&file, "content").unwrap();
+
+        let error = validate_workspace_folder_input_with_dirs(file.to_str().unwrap(), None, None)
+            .unwrap_err();
+
+        assert!(error.ends_with(" is not a folder"));
     }
 }

@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::app_config::{AppConfig, ColorScheme};
+use crate::app_config::{AppConfig, ColorScheme, NotificationSound};
 use crate::keybind_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
 
@@ -71,6 +71,11 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     let general_page = build_general_page(&input);
     let general_stack_page = stack.add_titled(&general_page, Some("general"), "General");
     general_stack_page.set_icon_name(Some("preferences-system-symbolic"));
+
+    let notifications_page = build_notifications_page(&input);
+    let notifications_stack_page =
+        stack.add_titled(&notifications_page, Some("notifications"), "Notifications");
+    notifications_stack_page.set_icon_name(Some("preferences-system-notifications-symbolic"));
 
     let keybinds_page = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     let keybinds_stack_page = stack.add_titled(&keybinds_page, Some("keybindings"), "Keybindings");
@@ -204,6 +209,80 @@ fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {
             let hover_terminal_focus = switch.is_active();
             apply_config_change(&config, &*on_changed, move |c| {
                 c.focus.hover_terminal_focus = hover_terminal_focus;
+            });
+        });
+    }
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&page)
+        .build();
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+
+    scroller.upcast()
+}
+
+fn build_notifications_page(input: &SettingsEditorInput) -> gtk::Widget {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Notifications");
+    page.set_name(Some("notifications"));
+    page.set_icon_name(Some("preferences-system-notifications-symbolic"));
+    page.set_hexpand(true);
+    page.set_vexpand(true);
+
+    let group = adw::PreferencesGroup::new();
+
+    let enabled_row = adw::ActionRow::builder()
+        .title("Desktop notifications")
+        .subtitle("Show desktop alerts when background workspaces need attention")
+        .build();
+    enabled_row.set_title_lines(1);
+    enabled_row.set_subtitle_lines(2);
+    let notifications = input.config.borrow().notifications;
+    let enabled_switch = gtk::Switch::new();
+    enabled_switch.set_active(notifications.enabled);
+    enabled_switch.set_valign(gtk::Align::Center);
+    enabled_row.add_suffix(&enabled_switch);
+    enabled_row.set_activatable_widget(Some(&enabled_switch));
+    group.add(&enabled_row);
+
+    let sound_row = adw::ActionRow::builder()
+        .title("Notification sound")
+        .subtitle("Choose sound hint sent with desktop alerts. Support depends on your desktop notification service")
+        .build();
+    sound_row.set_title_lines(1);
+    sound_row.set_subtitle_lines(3);
+    sound_row.set_sensitive(notifications.enabled);
+    let sound_dropdown = gtk::DropDown::from_strings(NotificationSound::labels());
+    sound_dropdown.set_selected(notifications.sound.dropdown_index());
+    sound_dropdown.set_valign(gtk::Align::Center);
+    sound_row.add_suffix(&sound_dropdown);
+    sound_row.set_activatable_widget(Some(&sound_dropdown));
+    group.add(&sound_row);
+
+    page.add(&group);
+
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        let sound_row = sound_row.clone();
+        enabled_switch.connect_active_notify(move |switch| {
+            let enabled = switch.is_active();
+            sound_row.set_sensitive(enabled);
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.notifications.enabled = enabled;
+            });
+        });
+    }
+    {
+        let config = input.config.clone();
+        let on_changed = input.on_config_changed.clone();
+        sound_dropdown.connect_selected_notify(move |dropdown| {
+            let sound = NotificationSound::from_dropdown_index(dropdown.selected());
+            apply_config_change(&config, &*on_changed, move |c| {
+                c.notifications.sound = sound;
             });
         });
     }

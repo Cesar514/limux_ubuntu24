@@ -53,6 +53,15 @@ pub const GHOSTTY_SURFACE_CONTEXT_WINDOW: c_int = 0;
 pub const GHOSTTY_SURFACE_CONTEXT_TAB: c_int = 1;
 pub const GHOSTTY_SURFACE_CONTEXT_SPLIT: c_int = 2;
 
+pub const GHOSTTY_POINT_ACTIVE: c_int = 0;
+pub const GHOSTTY_POINT_VIEWPORT: c_int = 1;
+pub const GHOSTTY_POINT_SCREEN: c_int = 2;
+pub const GHOSTTY_POINT_SURFACE: c_int = 3;
+
+pub const GHOSTTY_POINT_COORD_EXACT: c_int = 0;
+pub const GHOSTTY_POINT_COORD_TOP_LEFT: c_int = 1;
+pub const GHOSTTY_POINT_COORD_BOTTOM_RIGHT: c_int = 2;
+
 pub const GHOSTTY_COLOR_SCHEME_LIGHT: c_int = 0;
 pub const GHOSTTY_COLOR_SCHEME_DARK: c_int = 1;
 
@@ -62,6 +71,7 @@ pub const GHOSTTY_ACTION_NEW_WINDOW: c_int = 1;
 pub const GHOSTTY_ACTION_NEW_TAB: c_int = 2;
 pub const GHOSTTY_ACTION_CLOSE_TAB: c_int = 3;
 pub const GHOSTTY_ACTION_NEW_SPLIT: c_int = 4;
+pub const GHOSTTY_ACTION_SCROLLBAR: c_int = 26;
 pub const GHOSTTY_ACTION_RENDER: c_int = 27;
 pub const GHOSTTY_ACTION_DESKTOP_NOTIFICATION: c_int = 31;
 pub const GHOSTTY_ACTION_SET_TITLE: c_int = 32;
@@ -72,6 +82,7 @@ pub const GHOSTTY_ACTION_RELOAD_CONFIG: c_int = 46;
 pub const GHOSTTY_ACTION_CONFIG_CHANGE: c_int = 47;
 pub const GHOSTTY_ACTION_CLOSE_WINDOW: c_int = 48;
 pub const GHOSTTY_ACTION_RING_BELL: c_int = 49;
+pub const GHOSTTY_ACTION_OPEN_URL: c_int = 53;
 pub const GHOSTTY_ACTION_SHOW_CHILD_EXITED: c_int = 54;
 
 // Key codes (W3C UIEvents, subset)
@@ -251,6 +262,23 @@ pub struct ghostty_surface_size_s {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_point_s {
+    pub tag: c_int,   // ghostty_point_tag_e
+    pub coord: c_int, // ghostty_point_coord_e
+    pub x: u32,
+    pub y: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_selection_s {
+    pub top_left: ghostty_point_s,
+    pub bottom_right: ghostty_point_s,
+    pub rectangle: bool,
+}
+
+#[repr(C)]
 pub struct ghostty_clipboard_content_s {
     pub mime: *const c_char,
     pub data: *const c_char,
@@ -293,11 +321,21 @@ pub struct ghostty_action_s {
 // Must be exactly 24 bytes to match the C union.
 #[repr(C)]
 pub union ghostty_action_u {
+    pub scrollbar: ghostty_action_scrollbar_s,
     pub desktop_notification: ghostty_action_desktop_notification_s,
     pub set_title: ghostty_action_set_title_s,
     pub pwd: ghostty_action_pwd_s,
+    pub open_url: ghostty_action_open_url_s,
     pub child_exited: ghostty_surface_message_childexited_s,
     _padding: [u8; 24],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_action_scrollbar_s {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
 }
 
 #[repr(C)]
@@ -317,6 +355,14 @@ pub struct ghostty_action_set_title_s {
 #[derive(Clone, Copy)]
 pub struct ghostty_action_pwd_s {
     pub pwd: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ghostty_action_open_url_s {
+    pub kind: c_int,
+    pub url: *const c_char,
+    pub len: usize,
 }
 
 #[repr(C)]
@@ -368,15 +414,15 @@ extern "C" {
     // Config
     pub fn ghostty_config_new() -> ghostty_config_t;
     pub fn ghostty_config_free(config: ghostty_config_t);
-    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
-    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
-    pub fn ghostty_config_finalize(config: ghostty_config_t);
     pub fn ghostty_config_get(
         config: ghostty_config_t,
         out: *mut c_void,
         key: *const c_char,
         key_len: usize,
     ) -> bool;
+    pub fn ghostty_config_load_default_files(config: ghostty_config_t);
+    pub fn ghostty_config_load_recursive_files(config: ghostty_config_t);
+    pub fn ghostty_config_finalize(config: ghostty_config_t);
 
     // App
     pub fn ghostty_app_new(
@@ -406,6 +452,7 @@ extern "C" {
     pub fn ghostty_surface_set_focus(surface: ghostty_surface_t, focused: bool);
     pub fn ghostty_surface_set_size(surface: ghostty_surface_t, width: u32, height: u32);
     pub fn ghostty_surface_size(surface: ghostty_surface_t) -> ghostty_surface_size_s;
+    pub fn ghostty_surface_process_exited(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_key(surface: ghostty_surface_t, event: ghostty_input_key_s) -> bool;
     pub fn ghostty_surface_text(surface: ghostty_surface_t, text: *const c_char, len: usize);
     pub fn ghostty_surface_preedit(surface: ghostty_surface_t, text: *const c_char, len: usize);
@@ -437,6 +484,11 @@ extern "C" {
     pub fn ghostty_surface_has_selection(surface: ghostty_surface_t) -> bool;
     pub fn ghostty_surface_read_selection(
         surface: ghostty_surface_t,
+        text: *mut ghostty_text_s,
+    ) -> bool;
+    pub fn ghostty_surface_read_text(
+        surface: ghostty_surface_t,
+        selection: ghostty_selection_s,
         text: *mut ghostty_text_s,
     ) -> bool;
     pub fn ghostty_surface_free_text(surface: ghostty_surface_t, text: *mut ghostty_text_s);

@@ -43,6 +43,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub appearance: AppearanceConfig,
     #[serde(skip)]
+    pub notifications: NotificationConfig,
+    #[serde(skip)]
     pub font_size: Option<f32>,
 }
 
@@ -56,6 +58,93 @@ pub struct AppearanceConfig {
 pub struct FocusConfig {
     #[serde(default)]
     pub hover_terminal_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationSound {
+    #[default]
+    Default,
+    Message,
+    Bell,
+    Complete,
+    Alert,
+    None,
+}
+
+impl NotificationSound {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Message => "message",
+            Self::Bell => "bell",
+            Self::Complete => "complete",
+            Self::Alert => "alert",
+            Self::None => "none",
+        }
+    }
+
+    pub fn labels() -> &'static [&'static str] {
+        &["Default", "Message", "Bell", "Complete", "Alert", "None"]
+    }
+
+    pub fn dropdown_index(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::Message => 1,
+            Self::Bell => 2,
+            Self::Complete => 3,
+            Self::Alert => 4,
+            Self::None => 5,
+        }
+    }
+
+    pub fn from_dropdown_index(index: u32) -> Self {
+        match index {
+            1 => Self::Message,
+            2 => Self::Bell,
+            3 => Self::Complete,
+            4 => Self::Alert,
+            5 => Self::None,
+            _ => Self::Default,
+        }
+    }
+
+    pub fn freedesktop_sound_name(self) -> Option<&'static str> {
+        match self {
+            Self::Default | Self::None => None,
+            Self::Message => Some("message-new-instant"),
+            Self::Bell => Some("bell-terminal"),
+            Self::Complete => Some("complete"),
+            Self::Alert => Some("dialog-warning"),
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "message" => Some(Self::Message),
+            "bell" => Some(Self::Bell),
+            "complete" => Some(Self::Complete),
+            "alert" => Some(Self::Alert),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub sound: NotificationSound,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sound: NotificationSound::Default,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -149,6 +238,18 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(ColorScheme::from_str)
         .unwrap_or(color_scheme);
 
+    let notifications = root.get("notifications").and_then(Value::as_object);
+    let notification_defaults = NotificationConfig::default();
+    let notifications_enabled = notifications
+        .and_then(|notifications| notifications.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(notification_defaults.enabled);
+    let notification_sound = notifications
+        .and_then(|notifications| notifications.get("sound"))
+        .and_then(Value::as_str)
+        .and_then(NotificationSound::from_str)
+        .unwrap_or(notification_defaults.sound);
+
     let font_size = root
         .get("font_size")
         .and_then(Value::as_f64)
@@ -162,6 +263,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
+        },
+        notifications: NotificationConfig {
+            enabled: notifications_enabled,
+            sound: notification_sound,
         },
         font_size,
     }
@@ -189,6 +294,13 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "focus".to_string(),
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+    root.insert(
+        "notifications".to_string(),
+        json!({
+            "enabled": config.notifications.enabled,
+            "sound": config.notifications.sound.as_str(),
+        }),
     );
 
     if let Some(size) = config.font_size {
@@ -303,6 +415,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
         },
         "focus": {
             "hover_terminal_focus": false
+        },
+        "notifications": {
+            "enabled": true,
+            "sound": "default"
         }
     });
     let serialized = serde_json::to_string_pretty(&default_root)
@@ -359,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_config_file_writes_dark_appearance_and_opt_in_false_setting() {
+    fn ensure_default_config_file_writes_dark_appearance_and_notification_defaults() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
 
@@ -375,6 +491,11 @@ mod tests {
         assert_eq!(
             parsed["appearance"]["ghostty_color_scheme"],
             Value::String("dark".to_string())
+        );
+        assert_eq!(parsed["notifications"]["enabled"], Value::Bool(true));
+        assert_eq!(
+            parsed["notifications"]["sound"],
+            Value::String("default".to_string())
         );
     }
 
@@ -444,6 +565,30 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.font_size, Some(18.5));
+    }
+
+    #[test]
+    fn load_from_path_reads_notification_preferences() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "notifications": {
+    "enabled": false,
+    "sound": "bell"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warnings.is_empty());
+        assert!(!loaded.config.notifications.enabled);
+        assert_eq!(loaded.config.notifications.sound, NotificationSound::Bell);
     }
 
     #[test]
@@ -524,6 +669,48 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read cleared config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse cleared config");
         assert!(parsed.get("font_size").is_none());
+    }
+
+    #[test]
+    fn save_to_path_writes_notification_preferences() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig::default();
+        config.notifications.enabled = false;
+        config.notifications.sound = NotificationSound::Alert;
+        save_to_path(&path, &config).expect("save notifications");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(parsed["notifications"]["enabled"], Value::Bool(false));
+        assert_eq!(
+            parsed["notifications"]["sound"],
+            Value::String("alert".to_string())
+        );
+    }
+
+    #[test]
+    fn notification_sound_maps_supported_freedesktop_events() {
+        assert_eq!(
+            NotificationSound::Message.freedesktop_sound_name(),
+            Some("message-new-instant")
+        );
+        assert_eq!(
+            NotificationSound::Bell.freedesktop_sound_name(),
+            Some("bell-terminal")
+        );
+        assert_eq!(
+            NotificationSound::Complete.freedesktop_sound_name(),
+            Some("complete")
+        );
+        assert_eq!(
+            NotificationSound::Alert.freedesktop_sound_name(),
+            Some("dialog-warning")
+        );
+        assert_eq!(NotificationSound::Default.freedesktop_sound_name(), None);
+        assert_eq!(NotificationSound::None.freedesktop_sound_name(), None);
     }
 
     #[test]

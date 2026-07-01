@@ -1,0 +1,7 @@
+interface:
+  display_name: "Limux A2A"
+  short_description: "Coordinate Limux panes and workspaces"
+  default_prompt: "Use $limux-a2a to create Limux panes or workspaces, identify their live IDs, and send structured messages between them."
+
+policy:
+  allow_implicit_invocation: true

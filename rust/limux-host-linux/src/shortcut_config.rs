@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 pub const CONFIG_DIR_NAME: &str = "limux";
 pub const SHORTCUTS_FILE_NAME: &str = "shortcuts.json";
+const LEGACY_CONFIG_FILE_NAME: &str = "config.json";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
@@ -28,6 +29,7 @@ pub enum ShortcutId {
     NewTerminalInFocusedPane,
     SplitRight,
     CloseFocusedPane,
+    ToggleFocusedPaneZoom,
     NewTerminal,
     FocusLeft,
     FocusRight,
@@ -79,6 +81,7 @@ pub enum ShortcutCommand {
     NewTerminal,
     SplitRight,
     CloseFocusedPane,
+    ToggleFocusedPaneZoom,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -308,7 +311,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 47] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 48] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -471,6 +474,17 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 47] = [
         label: "Close Focused Pane",
         registers_gtk_accel: false,
         command: ShortcutCommand::CloseFocusedPane,
+        scope: ShortcutScope::Window,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::ToggleFocusedPaneZoom,
+        config_key: "toggle_focused_pane_zoom",
+        action_name: "win.toggle-focused-pane-zoom",
+        default_accel: "<Ctrl><Shift>z",
+        label: "Toggle Focused Pane Zoom",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::ToggleFocusedPaneZoom,
         scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
@@ -1172,6 +1186,12 @@ pub fn shortcuts_path_in(base: &Path) -> PathBuf {
     config_dir_path_in(base).join(SHORTCUTS_FILE_NAME)
 }
 
+fn legacy_config_path_for(shortcuts_path: &Path) -> Option<PathBuf> {
+    shortcuts_path
+        .parent()
+        .map(|parent| parent.join(LEGACY_CONFIG_FILE_NAME))
+}
+
 pub fn default_shortcuts() -> ResolvedShortcutConfig {
     ResolvedShortcutConfig {
         shortcuts: definitions()
@@ -1211,7 +1231,7 @@ pub fn load_shortcuts_or_default_with_display(
     display: Option<&gdk::Display>,
 ) -> ResolvedShortcutConfig {
     if !path.exists() {
-        return default_shortcuts();
+        return load_legacy_shortcuts_or_default(path, display);
     }
 
     let raw = match fs::read_to_string(path) {
@@ -1237,6 +1257,94 @@ pub fn load_shortcuts_or_default_with_display(
             defaults
         }
     }
+}
+
+fn load_legacy_shortcuts_or_default(
+    canonical_path: &Path,
+    display: Option<&gdk::Display>,
+) -> ResolvedShortcutConfig {
+    let Some(legacy_path) = legacy_config_path_for(canonical_path) else {
+        return default_shortcuts();
+    };
+    if !legacy_path.exists() {
+        return default_shortcuts();
+    }
+
+    let raw = match fs::read_to_string(&legacy_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            let mut defaults = default_shortcuts();
+            defaults.warnings.push(format!(
+                "failed to read legacy shortcut config `{}`: {err}",
+                legacy_path.display()
+            ));
+            return defaults;
+        }
+    };
+
+    let Some(parsed) = (match parse_legacy_shortcut_config(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let mut defaults = default_shortcuts();
+            defaults.warnings.push(format!(
+                "failed to load legacy shortcut config `{}`: {err:?}",
+                legacy_path.display()
+            ));
+            return defaults;
+        }
+    }) else {
+        return default_shortcuts();
+    };
+
+    match resolve_shortcuts_from_file(parsed, display) {
+        Ok(mut config) => {
+            if let Err(err) = write_shortcuts(canonical_path, &config) {
+                config.warnings.push(format!(
+                    "loaded legacy shortcut config `{}` but failed to migrate to `{}`: {err}",
+                    legacy_path.display(),
+                    canonical_path.display()
+                ));
+            }
+            config
+        }
+        Err(err) => {
+            let mut defaults = default_shortcuts();
+            defaults.warnings.push(format!(
+                "failed to load legacy shortcut config `{}`: {err:?}",
+                legacy_path.display()
+            ));
+            defaults
+        }
+    }
+}
+
+fn parse_legacy_shortcut_config(
+    raw: &str,
+) -> Result<Option<ShortcutConfigFile>, ShortcutConfigError> {
+    let root: Value = serde_json::from_str(raw)
+        .map_err(|err| ShortcutConfigError::InvalidJson(err.to_string()))?;
+    let Value::Object(root) = root else {
+        return Err(ShortcutConfigError::InvalidJson(
+            "legacy shortcut config root must be a JSON object".to_string(),
+        ));
+    };
+
+    let Some(shortcuts) = root.get("shortcuts") else {
+        return Ok(None);
+    };
+
+    if !shortcuts.is_object() {
+        return Err(ShortcutConfigError::InvalidJson(
+            "legacy `shortcuts` must be a JSON object".to_string(),
+        ));
+    }
+
+    let mut legacy_root = Map::new();
+    legacy_root.insert("shortcuts".to_string(), shortcuts.clone());
+
+    serde_json::from_value(Value::Object(legacy_root))
+        .map(Some)
+        .map_err(|err| ShortcutConfigError::InvalidJson(err.to_string()))
 }
 
 pub fn load_shortcuts_for_display(display: &gdk::Display) -> ResolvedShortcutConfig {
@@ -1594,7 +1702,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 47);
+        assert_eq!(definitions().len(), 48);
     }
 
     #[test]
@@ -1732,6 +1840,26 @@ mod tests {
     }
 
     #[test]
+    fn focused_pane_zoom_shortcut_is_remappable_window_command() {
+        let defaults = default_shortcuts();
+        let shortcut = defaults
+            .find_by_id(ShortcutId::ToggleFocusedPaneZoom)
+            .expect("focused pane zoom shortcut should be registered");
+
+        assert_eq!(shortcut.definition.config_key, "toggle_focused_pane_zoom");
+        assert_eq!(
+            shortcut.definition.command,
+            ShortcutCommand::ToggleFocusedPaneZoom
+        );
+        assert_eq!(shortcut.definition.scope, ShortcutScope::Window);
+        assert_eq!(shortcut.runtime_combo().as_deref(), Some("ctrl+shift+z"));
+        assert_eq!(
+            defaults.command_for_runtime_combo("ctrl+shift+z"),
+            Some(ShortcutCommand::ToggleFocusedPaneZoom)
+        );
+    }
+
+    #[test]
     fn resolve_shortcuts_from_str_warns_on_unknown_ids() {
         let resolved = resolve_shortcuts_from_str(
             r#"{
@@ -1783,6 +1911,219 @@ mod tests {
         let resolved = load_shortcuts_or_default(&path);
         assert!(resolved.warnings.is_empty());
         assert_eq!(resolved.shortcuts.len(), definitions().len());
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_migrates_legacy_config_shortcuts() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "theme": "legacy",
+                "shortcuts": {
+                    "split_right": "<Ctrl>h",
+                    "close_focused_pane": null,
+                    "toggle_sidebar": "<Ctrl>m"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(
+            resolved
+                .find_by_id(ShortcutId::SplitRight)
+                .and_then(ResolvedShortcut::gtk_accel)
+                .as_deref(),
+            Some("<Ctrl>h")
+        );
+        assert_eq!(
+            resolved
+                .find_by_id(ShortcutId::CloseFocusedPane)
+                .and_then(ResolvedShortcut::gtk_accel),
+            None
+        );
+
+        let legacy: Value = serde_json::from_str(&fs::read_to_string(&legacy_path).unwrap())
+            .expect("legacy config should remain valid");
+        assert_eq!(legacy["theme"], "legacy");
+
+        let migrated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
+            .expect("migrated shortcuts config should be valid");
+        assert_eq!(migrated["shortcuts"]["split_right"], "<Ctrl>h");
+        assert_eq!(
+            migrated["shortcuts"]["close_focused_pane"],
+            serde_json::Value::Null
+        );
+        assert!(migrated["shortcuts"].get("toggle_sidebar").is_none());
+        assert!(migrated.get("theme").is_none());
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_prefers_existing_canonical_shortcuts() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>h"
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl><Alt>h"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(
+            resolved
+                .find_by_id(ShortcutId::SplitRight)
+                .and_then(ResolvedShortcut::gtk_accel)
+                .as_deref(),
+            Some("<Ctrl>h")
+        );
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_ignores_legacy_config_without_shortcuts_key() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "theme": "legacy"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(resolved, default_shortcuts());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_migrates_explicit_empty_legacy_shortcuts() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "shortcuts": {}
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(resolved, default_shortcuts());
+        let migrated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
+            .expect("migrated empty shortcuts config should be valid");
+        assert_eq!(migrated, serde_json::json!({}));
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_rejects_invalid_legacy_shortcuts_without_migrating() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Shift>h"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert_eq!(resolved.shortcuts, default_shortcuts().shortcuts);
+        assert_eq!(resolved.warnings.len(), 1);
+        assert!(resolved.warnings[0].contains("failed to load legacy shortcut config"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_shortcuts_or_default_preserves_unknown_legacy_warnings_and_omits_unknown_ids() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>h",
+                    "unknown_action": "<Ctrl><Alt>u"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_shortcuts_or_default(&path);
+
+        assert_eq!(resolved.warnings.len(), 1);
+        assert!(resolved.warnings[0].contains("unknown shortcut id `unknown_action`"));
+        let migrated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
+            .expect("migrated shortcuts config should be valid");
+        assert_eq!(migrated["shortcuts"]["split_right"], "<Ctrl>h");
+        assert!(migrated["shortcuts"].get("unknown_action").is_none());
+    }
+
+    #[test]
+    fn load_legacy_shortcuts_uses_resolved_config_when_migration_write_fails() {
+        let dir = tempdir().unwrap();
+        let path = shortcuts_path_in(dir.path());
+        let legacy_path = legacy_config_path_for(&path).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{
+                "shortcuts": {
+                    "split_right": "<Ctrl>h"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = load_legacy_shortcuts_or_default(&path, None);
+
+        assert_eq!(
+            resolved
+                .find_by_id(ShortcutId::SplitRight)
+                .and_then(ResolvedShortcut::gtk_accel)
+                .as_deref(),
+            Some("<Ctrl>h")
+        );
+        assert_eq!(resolved.warnings.len(), 1);
+        assert!(resolved.warnings[0].contains("failed to migrate"));
     }
 
     #[test]
