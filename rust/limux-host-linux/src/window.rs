@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::gdk::prelude::ToplevelExt;
@@ -239,6 +240,58 @@ fn send_browser_object_response(
             ))));
         }
     });
+}
+
+// purpose: Resolve the destination used by live browser screenshot capture.
+// inputs: Optional user-supplied output path from browser.screenshot params.
+// returns/effects: Returns the explicit path or a unique temp-file destination.
+fn browser_screenshot_path(path: &Option<String>) -> PathBuf {
+    if let Some(path) = path {
+        return PathBuf::from(path);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after UNIX_EPOCH")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "limux-browser-shot-{}-{nanos}.png",
+        std::process::id()
+    ))
+}
+
+// purpose: Capture a WebKit browser surface to PNG and reply with CMUX-compatible metadata.
+// inputs: Browser target, output path option, full-page flag, base payload, and reply channel.
+// returns/effects: Writes the screenshot file or sends a fatal bridge error.
+fn send_browser_screenshot_response(
+    browser: pane::BrowserSurfaceTarget,
+    path: Option<String>,
+    full_page: bool,
+    mut payload: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    let path = browser_screenshot_path(&path);
+    let unavailable_reply = reply.clone();
+    if !browser.save_screenshot(path, full_page, move |result| match result {
+        Ok(screenshot) => {
+            payload["ok"] = serde_json::Value::Bool(true);
+            payload["format"] = serde_json::Value::String("png".to_string());
+            payload["path"] = serde_json::Value::String(screenshot.path.clone());
+            payload["url"] = serde_json::Value::String(format!("file://{}", screenshot.path));
+            payload["width"] = serde_json::json!(screenshot.width);
+            payload["height"] = serde_json::json!(screenshot.height);
+            payload["bytes"] = serde_json::json!(screenshot.bytes);
+            let _ = reply.send(Ok(payload));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(BridgeError::internal(format!(
+                "browser screenshot capture failed: {error}"
+            ))));
+        }
+    }) {
+        let _ = unavailable_reply.send(Err(BridgeError::internal(
+            "browser screenshot capture is unavailable",
+        )));
+    }
 }
 
 // purpose: Build JavaScript that targets one required DOM element and fails loudly when it cannot be resolved.
@@ -5457,6 +5510,18 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_object_response(browser, script, payload, reply);
                     return;
                 }
+                BrowserAction::Screenshot { path, full_page } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_screenshot_response(
+                        browser,
+                        path.clone(),
+                        *full_page,
+                        payload,
+                        reply,
+                    );
+                    return;
+                }
                 BrowserAction::Snapshot {
                     interactive,
                     compact,
@@ -5713,6 +5778,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::GetBox { .. }
                 | BrowserAction::GetHtml { .. }
                 | BrowserAction::GetStyles { .. }
+                | BrowserAction::Screenshot { .. }
                 | BrowserAction::Find { .. }
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::Wait { .. }

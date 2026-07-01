@@ -89,6 +89,7 @@ const METHODS: &[&str] = &[
     "browser.get.box",
     "browser.get.html",
     "browser.get.styles",
+    "browser.screenshot",
     "browser.find.role",
     "browser.find.text",
     "browser.find.label",
@@ -250,6 +251,10 @@ pub enum BrowserAction {
     GetStyles {
         selector: String,
         property: Option<String>,
+    },
+    Screenshot {
+        path: Option<String>,
+        full_page: bool,
     },
     Find {
         locator: String,
@@ -1464,6 +1469,7 @@ fn handle_method(
         | "browser.get.box"
         | "browser.get.html"
         | "browser.get.styles"
+        | "browser.screenshot"
         | "browser.find.role"
         | "browser.find.text"
         | "browser.find.label"
@@ -1695,6 +1701,17 @@ fn handle_method(
                         property: optional_string(params, &["property", "name"]),
                     }
                 }
+                "browser.screenshot" => BrowserAction::Screenshot {
+                    path: optional_string(params, &["path", "out"]),
+                    full_page: match optional_bool(params, "full_page") {
+                        Ok(Some(value)) => value,
+                        Ok(None) => match optional_bool(params, "fullPage") {
+                            Ok(value) => value.unwrap_or(false),
+                            Err(error) => return error_response(id, error),
+                        },
+                        Err(error) => return error_response(id, error),
+                    },
+                },
                 "browser.find.role"
                 | "browser.find.text"
                 | "browser.find.label"
@@ -3352,6 +3369,30 @@ mod tests {
             },
         );
         assert_eq!(snapshot.error, None);
+
+        let screenshot = dispatch_request(
+            r#"{"id":1,"method":"browser.screenshot","params":{"surface_id":"surface:9:browser","path":"/tmp/shot.png","fullPage":true}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(
+                        action,
+                        BrowserAction::Screenshot {
+                            path: Some("/tmp/shot.png".to_string()),
+                            full_page: true
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "path": "/tmp/shot.png" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(screenshot.error, None);
 
         let wait = dispatch_request(
             r##"{

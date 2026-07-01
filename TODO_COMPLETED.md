@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T23:14:21Z Implement and verify live bridge CMUX browser screenshot capture for WebKit browser surfaces. \
 [x] 2026-07-01T22:59:57Z Implement and verify live bridge CMUX browser locator routing for WebKit browser surfaces. \
 [x] 2026-07-01T22:54:12Z Implement and verify live bridge CMUX browser highlight, cookies, and Web Storage routing for WebKit browser surfaces. \
 [x] 2026-07-01T22:47:41Z Implement and verify live bridge CMUX browser injection and console/error diagnostic routing for WebKit browser surfaces. \

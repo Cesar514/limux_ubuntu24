@@ -6033,14 +6033,37 @@ fn handle_command(
         "browser.is_webview_focused" => Ok(
             json!({ "focused": state.browser.focused, "is_webview_focused": state.browser.focused }),
         ),
-        "browser.screenshot" => Ok(json!({
-            "ok": true,
-            "format": "png",
-            "bytes": 256,
-            "path": "/tmp/limux-browser-shot.png",
-            "url": "file:///tmp/limux-browser-shot.png",
-            "png_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        })),
+        "browser.screenshot" => {
+            let params = params_object(params)?;
+            let path = if let Some(path) = optional_string_param(params, "path")? {
+                let path = std::path::PathBuf::from(path);
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent).map_err(|_| {
+                        CommandError::timeout("failed to create screenshot directory")
+                    })?;
+                }
+                std::fs::write(&path, MOCK_PNG_BYTES)
+                    .map_err(|_| CommandError::timeout("failed to write screenshot"))?;
+                path
+            } else {
+                write_mock_png("limux-browser", "browser", state.next_snapshot_id)
+                    .ok_or_else(|| CommandError::timeout("failed to write screenshot"))?
+            };
+            let bytes = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .map_err(|_| CommandError::timeout("failed to stat screenshot"))?;
+            let path_string = path.to_string_lossy().to_string();
+            Ok(json!({
+                "ok": true,
+                "format": "png",
+                "bytes": bytes,
+                "path": path_string,
+                "url": format!("file://{path_string}"),
+            }))
+        }
         "browser.back" => {
             if state.browser.history_index > 0 {
                 state.browser.history_index -= 1;
@@ -6609,6 +6632,30 @@ mod tests {
             focused.result.expect("browser focus")["is_webview_focused"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_browser_screenshot_writes_requested_png_path() {
+        let dispatcher = Dispatcher::new();
+        let path = std::env::temp_dir().join(format!(
+            "limux-browser-shot-test-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+
+        let screenshot = dispatcher
+            .dispatch(request(
+                "browser.screenshot",
+                json!({ "path": path.to_string_lossy() }),
+            ))
+            .await;
+        let result = screenshot.result.expect("browser screenshot");
+        assert_eq!(result["path"], path.to_string_lossy().as_ref());
+        assert!(path.exists());
+        assert!(std::fs::metadata(&path).expect("screenshot metadata").len() > 0);
     }
 
     #[tokio::test]

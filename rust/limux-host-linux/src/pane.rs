@@ -5,6 +5,7 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -283,6 +284,17 @@ pub struct BrowserSurfaceTarget {
     target: BrowserShortcutTarget,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+// purpose: Report the file and dimensions produced by browser screenshot capture.
+// inputs: Created by WebKit/GDK snapshot capture after writing a PNG file.
+// returns/effects: Passed to the live control bridge response without retaining image bytes.
+pub struct BrowserScreenshotResult {
+    pub path: String,
+    pub width: i32,
+    pub height: i32,
+    pub bytes: u64,
+}
+
 impl BrowserSurfaceTarget {
     pub fn current_uri(&self) -> Option<String> {
         self.target.current_uri()
@@ -317,6 +329,16 @@ impl BrowserSurfaceTarget {
         F: FnOnce(Result<Value, String>) + 'static,
     {
         self.target.evaluate_javascript(script, callback)
+    }
+
+    // purpose: Save the browser surface as a PNG screenshot.
+    // inputs: Destination path, full-page capture flag, and completion callback.
+    // returns/effects: Starts async WebKit capture when available and reports success through callback.
+    pub fn save_screenshot<F>(&self, path: PathBuf, full_page: bool, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
+    {
+        self.target.save_screenshot(path, full_page, callback)
     }
 }
 
@@ -3077,6 +3099,16 @@ impl BrowserShortcutTarget {
     {
         self.handles.evaluate_javascript(script, callback)
     }
+
+    // purpose: Save the browser shortcut target as a PNG screenshot.
+    // inputs: Destination path, full-page capture flag, and completion callback.
+    // returns/effects: Forwards async capture to the active browser handle.
+    pub fn save_screenshot<F>(&self, path: PathBuf, full_page: bool, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
+    {
+        self.handles.save_screenshot(path, full_page, callback)
+    }
 }
 
 #[cfg(feature = "webkit")]
@@ -3231,6 +3263,29 @@ impl BrowserHandles {
         true
     }
 
+    fn save_screenshot<F>(&self, path: PathBuf, full_page: bool, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
+    {
+        let region = if full_page {
+            webkit6::SnapshotRegion::FullDocument
+        } else {
+            webkit6::SnapshotRegion::Visible
+        };
+        self.webview.snapshot(
+            region,
+            webkit6::SnapshotOptions::NONE,
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                let outcome = result
+                    .map_err(|error| error.to_string())
+                    .and_then(|texture| save_browser_texture(path, texture));
+                callback(outcome);
+            },
+        );
+        true
+    }
+
     fn search_for_entry_text(&self) {
         let query = self.search_entry.text();
         if query.is_empty() {
@@ -3266,6 +3321,47 @@ fn javascript_value_to_json(value: &webkit6::javascriptcore::Value) -> Value {
     }
 }
 
+#[cfg(feature = "webkit")]
+// purpose: Save a WebKit snapshot texture to PNG and return metadata for the control bridge.
+// inputs: Destination path and captured GDK texture.
+// returns/effects: Writes a PNG file or returns the concrete filesystem/PNG failure.
+fn save_browser_texture(
+    path: PathBuf,
+    texture: gtk::gdk::Texture,
+) -> Result<BrowserScreenshotResult, String> {
+    use gtk::gdk::prelude::TextureExt;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create screenshot directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    texture.save_to_png(&path).map_err(|error| {
+        format!(
+            "failed to save browser screenshot {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "failed to stat browser screenshot {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(BrowserScreenshotResult {
+        path: path.to_string_lossy().into_owned(),
+        width: texture.width(),
+        height: texture.height(),
+        bytes: metadata.len(),
+    })
+}
+
 #[cfg(not(feature = "webkit"))]
 impl BrowserHandles {
     fn is_find_active(&self) -> bool {
@@ -3294,6 +3390,16 @@ impl BrowserHandles {
     {
         _callback(Err(
             "browser JavaScript evaluation requires webkit support".to_string()
+        ));
+        false
+    }
+
+    fn save_screenshot<F>(&self, _path: PathBuf, _full_page: bool, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
+    {
+        callback(Err(
+            "browser screenshot capture requires webkit support".to_string()
         ));
         false
     }
