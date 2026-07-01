@@ -1132,16 +1132,148 @@ async fn run_list(client: &mut Client, command: &str, args: &[String]) -> Result
 // returns/effects: Sends one control request or fails explicitly on unsupported mutations.
 async fn run_workspace_group_command(client: &mut Client, args: &[String]) -> Result<Value> {
     let subcommand = args.first().map(String::as_str).unwrap_or("list");
+    let rest = args.get(1..).unwrap_or(&[]);
     match subcommand {
         "list" | "ls" => client.call("workspace.group.list", json!({})).await,
-        "create" | "delete" | "rename" | "collapse" | "expand" | "pin" | "unpin" | "add"
-        | "remove" | "set-anchor" | "set-color" | "set-icon" | "move" | "focus" => {
-            bail!(
-                "workspace-group {subcommand} is not implemented yet; parity matrix still marks workspace groups partial"
-            )
+        "create" => {
+            let mut params = Map::new();
+            if let Some(name) = parse_opt(rest, "--name").or_else(|| first_positional(rest)) {
+                params.insert("name".to_string(), Value::String(name));
+            }
+            if let Some(cwd) = parse_opt(rest, "--cwd") {
+                params.insert("cwd".to_string(), Value::String(cwd));
+            }
+            if let Some(from) = parse_opt(rest, "--from") {
+                params.insert("from".to_string(), Value::String(from));
+            }
+            client
+                .call("workspace.group.create", Value::Object(params))
+                .await
+        }
+        "ungroup" | "delete" | "collapse" | "expand" | "pin" | "unpin" | "focus" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let method = format!("workspace.group.{}", subcommand.replace('-', "_"));
+            client.call(&method, json!({ "group_id": group })).await
+        }
+        "rename" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let name = parse_opt(rest, "--name")
+                .or_else(|| positional_arg(rest, 1))
+                .ok_or_else(|| anyhow!("workspace-group rename requires --name or a new name"))?;
+            client
+                .call(
+                    "workspace.group.rename",
+                    json!({ "group_id": group, "name": name }),
+                )
+                .await
+        }
+        "add" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let workspace = parse_opt(rest, "--workspace")
+                .or_else(|| positional_arg(rest, 1))
+                .ok_or_else(|| anyhow!("workspace-group add requires --workspace"))?;
+            client
+                .call(
+                    "workspace.group.add",
+                    json!({ "group_id": group, "workspace_id": workspace }),
+                )
+                .await
+        }
+        "remove" => {
+            let workspace = parse_opt(rest, "--workspace")
+                .or_else(|| first_positional(rest))
+                .ok_or_else(|| anyhow!("workspace-group remove requires --workspace"))?;
+            client
+                .call(
+                    "workspace.group.remove",
+                    json!({ "workspace_id": workspace }),
+                )
+                .await
+        }
+        "set-anchor" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let workspace = parse_opt(rest, "--workspace")
+                .or_else(|| positional_arg(rest, 1))
+                .ok_or_else(|| anyhow!("workspace-group set-anchor requires --workspace"))?;
+            client
+                .call(
+                    "workspace.group.set_anchor",
+                    json!({ "group_id": group, "workspace_id": workspace }),
+                )
+                .await
+        }
+        "new-workspace" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let mut params = Map::new();
+            params.insert("group_id".to_string(), Value::String(group));
+            if let Some(placement) = parse_opt(rest, "--placement") {
+                params.insert("placement".to_string(), Value::String(placement));
+            }
+            client
+                .call("workspace.group.new_workspace", Value::Object(params))
+                .await
+        }
+        "set-color" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let color = parse_opt(rest, "--hex")
+                .or_else(|| parse_opt(rest, "--color"))
+                .or_else(|| positional_arg(rest, 1));
+            client
+                .call(
+                    "workspace.group.set_color",
+                    json!({ "group_id": group, "hex": color }),
+                )
+                .await
+        }
+        "set-icon" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let symbol = parse_opt(rest, "--symbol")
+                .or_else(|| parse_opt(rest, "--icon"))
+                .or_else(|| positional_arg(rest, 1));
+            client
+                .call(
+                    "workspace.group.set_icon",
+                    json!({ "group_id": group, "symbol": symbol }),
+                )
+                .await
+        }
+        "move" => {
+            let group = workspace_group_arg(subcommand, rest)?;
+            let raw_index = parse_opt(rest, "--index")
+                .or_else(|| positional_arg(rest, 1))
+                .ok_or_else(|| anyhow!("workspace-group move requires --index"))?;
+            let index = raw_index
+                .parse::<usize>()
+                .with_context(|| format!("invalid workspace-group move index `{raw_index}`"))?;
+            client
+                .call(
+                    "workspace.group.move",
+                    json!({ "group_id": group, "index": index }),
+                )
+                .await
         }
         other => bail!("unsupported workspace-group command `{other}`"),
     }
+}
+
+// purpose: Extract the group id accepted by CMUX workspace-group commands.
+// inputs: Subcommand name plus raw subcommand args after the subcommand.
+// returns/effects: Returns a group id/ref or fails loudly with command context.
+fn workspace_group_arg(subcommand: &str, args: &[String]) -> Result<String> {
+    parse_opt(args, "--group")
+        .or_else(|| first_positional(args))
+        .ok_or_else(|| anyhow!("workspace-group {subcommand} requires a group id or --group"))
+}
+
+// purpose: Render list subcommands as rows and mutations as explicit payload text.
+// inputs: Original workspace-group args plus the returned payload.
+// returns/effects: Returns user-facing CLI text without contacting the host.
+fn render_workspace_group_text(args: &[String], payload: &Value) -> String {
+    let subcommand = args.first().map(String::as_str).unwrap_or("list");
+    if matches!(subcommand, "list" | "ls") {
+        return render_list_text("list-workspace-groups", payload);
+    }
+    default_text_output(payload)
 }
 
 fn render_list_text(command: &str, payload: &Value) -> String {
@@ -4575,7 +4707,16 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
-                CommandOutput::Text(render_list_text("list-workspace-groups", &payload))
+                CommandOutput::Text(render_workspace_group_text(args, &payload))
+            }
+        }
+        "workspace" if args.first().map(String::as_str) == Some("group") => {
+            let group_args = &args[1..];
+            let payload = run_workspace_group_command(client, group_args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_workspace_group_text(group_args, &payload))
             }
         }
         "memory" => {
@@ -4986,7 +5127,7 @@ mod cli_arg_tests {
             "groups": [
                 {
                     "group_id": "group-1",
-                    "group_ref": "workspace-group:group-1",
+                    "group_ref": "workspace_group:group-1",
                     "name": "Agents",
                     "isPinned": true
                 }
@@ -4995,11 +5136,31 @@ mod cli_arg_tests {
 
         assert_eq!(
             render_list_text("list-workspace-groups", &payload),
-            "* workspace-group:group-1 Agents"
+            "* workspace_group:group-1 Agents"
         );
         assert_eq!(
             render_list_text("list-workspace-groups", &json!({ "groups": [] })),
             "No workspace groups"
+        );
+    }
+
+    #[test]
+    fn workspace_group_cli_helpers_extract_group_and_render_mutations() {
+        assert_eq!(
+            workspace_group_arg("rename", &args(&["workspace_group:2", "--name", "New"]))
+                .expect("group id"),
+            "workspace_group:2"
+        );
+        assert_eq!(
+            workspace_group_arg("pin", &args(&["--group", "group-1"])).expect("group flag"),
+            "group-1"
+        );
+        assert!(workspace_group_arg("pin", &[]).is_err());
+
+        let mutation = json!({ "group_id": "group-1", "ok": true });
+        assert_eq!(
+            render_workspace_group_text(&args(&["rename", "group-1"]), &mutation),
+            "{\n  \"group_id\": \"group-1\",\n  \"ok\": true\n}"
         );
     }
 

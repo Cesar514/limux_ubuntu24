@@ -32,6 +32,22 @@ const METHODS: &[&str] = &[
     "workspace.rename",
     "workspace.close",
     "workspace.group.list",
+    "workspace.group.create",
+    "workspace.group.ungroup",
+    "workspace.group.delete",
+    "workspace.group.rename",
+    "workspace.group.collapse",
+    "workspace.group.expand",
+    "workspace.group.pin",
+    "workspace.group.unpin",
+    "workspace.group.add",
+    "workspace.group.remove",
+    "workspace.group.set_anchor",
+    "workspace.group.new_workspace",
+    "workspace.group.set_color",
+    "workspace.group.set_icon",
+    "workspace.group.move",
+    "workspace.group.focus",
     "pane.list",
     "pane.surfaces",
     "pane.create",
@@ -153,6 +169,67 @@ pub struct CreatePanesRequest {
     pub directions: Vec<PaneCreateDirection>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceGroupAction {
+    Create {
+        name: Option<String>,
+        cwd: Option<String>,
+        from_workspace_ids: Vec<String>,
+    },
+    Ungroup {
+        group_id: String,
+    },
+    Delete {
+        group_id: String,
+    },
+    Rename {
+        group_id: String,
+        name: String,
+    },
+    Collapse {
+        group_id: String,
+    },
+    Expand {
+        group_id: String,
+    },
+    Pin {
+        group_id: String,
+    },
+    Unpin {
+        group_id: String,
+    },
+    Add {
+        group_id: String,
+        workspace_id: String,
+    },
+    Remove {
+        workspace_id: String,
+    },
+    SetAnchor {
+        group_id: String,
+        workspace_id: String,
+    },
+    NewWorkspace {
+        group_id: String,
+        placement: Option<String>,
+    },
+    SetColor {
+        group_id: String,
+        color: Option<String>,
+    },
+    SetIcon {
+        group_id: String,
+        symbol: Option<String>,
+    },
+    Move {
+        group_id: String,
+        index: usize,
+    },
+    Focus {
+        group_id: String,
+    },
+}
+
 #[derive(Debug)]
 pub enum ControlCommand {
     Identify {
@@ -170,6 +247,10 @@ pub enum ControlCommand {
         reply: mpsc::Sender<BridgeResult>,
     },
     ListWorkspaceGroups {
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    WorkspaceGroupAction {
+        action: WorkspaceGroupAction,
         reply: mpsc::Sender<BridgeResult>,
     },
     ListPanes {
@@ -316,6 +397,7 @@ impl ControlCommand {
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListWorkspaceGroups { reply }
+            | Self::WorkspaceGroupAction { reply, .. }
             | Self::ListPanes { reply, .. }
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
@@ -686,6 +768,125 @@ fn parse_required_workspace_target(
     }
 }
 
+fn required_group_id(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
+    optional_handle(params, &["group_id", "group", "id"])?.ok_or_else(|| {
+        BridgeError::invalid_params(format!("{method} requires group_id/id or --group"))
+    })
+}
+
+fn required_workspace_id(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
+    optional_handle(params, &["workspace_id", "workspace"])?.ok_or_else(|| {
+        BridgeError::invalid_params(format!("{method} requires workspace_id or --workspace"))
+    })
+}
+
+fn optional_workspace_id_list(
+    params: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Vec<String>, BridgeError> {
+    let Some(value) = keys.iter().find_map(|key| params.get(*key)) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        BridgeError::invalid_params("workspace id lists must contain strings")
+                    })
+            })
+            .collect(),
+        Value::String(raw) => Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()),
+        _ => Err(BridgeError::invalid_params(
+            "workspace id lists must be a string or string array",
+        )),
+    }
+}
+
+fn parse_workspace_group_action(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<WorkspaceGroupAction, BridgeError> {
+    let action = match method {
+        "workspace.group.create" => WorkspaceGroupAction::Create {
+            name: optional_string(params, &["name"]),
+            cwd: optional_string(params, &["cwd"]),
+            from_workspace_ids: optional_workspace_id_list(params, &["from", "workspace_ids"])?,
+        },
+        "workspace.group.ungroup" => WorkspaceGroupAction::Ungroup {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.delete" => WorkspaceGroupAction::Delete {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.rename" => WorkspaceGroupAction::Rename {
+            group_id: required_group_id(params, method)?,
+            name: optional_string(params, &["name", "title"]).ok_or_else(|| {
+                BridgeError::invalid_params("workspace.group.rename requires name")
+            })?,
+        },
+        "workspace.group.collapse" => WorkspaceGroupAction::Collapse {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.expand" => WorkspaceGroupAction::Expand {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.pin" => WorkspaceGroupAction::Pin {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.unpin" => WorkspaceGroupAction::Unpin {
+            group_id: required_group_id(params, method)?,
+        },
+        "workspace.group.add" => WorkspaceGroupAction::Add {
+            group_id: required_group_id(params, method)?,
+            workspace_id: required_workspace_id(params, method)?,
+        },
+        "workspace.group.remove" => WorkspaceGroupAction::Remove {
+            workspace_id: required_workspace_id(params, method)?,
+        },
+        "workspace.group.set_anchor" => WorkspaceGroupAction::SetAnchor {
+            group_id: required_group_id(params, method)?,
+            workspace_id: required_workspace_id(params, method)?,
+        },
+        "workspace.group.new_workspace" => WorkspaceGroupAction::NewWorkspace {
+            group_id: required_group_id(params, method)?,
+            placement: optional_string(params, &["placement"]),
+        },
+        "workspace.group.set_color" => WorkspaceGroupAction::SetColor {
+            group_id: required_group_id(params, method)?,
+            color: optional_string(params, &["hex", "color", "customColor"]),
+        },
+        "workspace.group.set_icon" => WorkspaceGroupAction::SetIcon {
+            group_id: required_group_id(params, method)?,
+            symbol: optional_string(params, &["symbol", "icon", "iconSymbol"]),
+        },
+        "workspace.group.move" => WorkspaceGroupAction::Move {
+            group_id: required_group_id(params, method)?,
+            index: optional_index(params, "index")?.ok_or_else(|| {
+                BridgeError::invalid_params("workspace.group.move requires index")
+            })?,
+        },
+        "workspace.group.focus" => WorkspaceGroupAction::Focus {
+            group_id: required_group_id(params, method)?,
+        },
+        _ => {
+            return Err(BridgeError::invalid_params(
+                "unsupported workspace group action",
+            ))
+        }
+    };
+    Ok(action)
+}
+
 fn handle_method(
     id: Option<Value>,
     method: &str,
@@ -746,6 +947,29 @@ fn handle_method(
         "workspace.group.list" | "list-workspace-groups" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWorkspaceGroups { reply }, rx)
+        }
+        "workspace.group.create"
+        | "workspace.group.ungroup"
+        | "workspace.group.delete"
+        | "workspace.group.rename"
+        | "workspace.group.collapse"
+        | "workspace.group.expand"
+        | "workspace.group.pin"
+        | "workspace.group.unpin"
+        | "workspace.group.add"
+        | "workspace.group.remove"
+        | "workspace.group.set_anchor"
+        | "workspace.group.new_workspace"
+        | "workspace.group.set_color"
+        | "workspace.group.set_icon"
+        | "workspace.group.move"
+        | "workspace.group.focus" => {
+            let action = match parse_workspace_group_action(method, params) {
+                Ok(action) => action,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::WorkspaceGroupAction { action, reply }, rx)
         }
         "pane.list" | "list-panes" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -1600,6 +1824,73 @@ mod tests {
             response.result.expect("workspace.group.list result")["groups"],
             json!([])
         );
+    }
+
+    #[test]
+    fn workspace_group_mutation_routes_parse_cmux_params() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"workspace.group.rename","params":{"group_id":"workspace_group:1","name":"Agents"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceGroupAction { action, reply } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceGroupAction::Rename {
+                            group_id: "workspace_group:1".to_string(),
+                            name: "Agents".to_string(),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+
+        let response = dispatch_request(
+            r#"{"id":2,"method":"workspace.group.add","params":{"group":"group-1","workspace":"workspace:abc"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceGroupAction { action, reply } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceGroupAction::Add {
+                            group_id: "group-1".to_string(),
+                            workspace_id: "workspace:abc".to_string(),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+    }
+
+    #[test]
+    fn workspace_group_create_parses_from_workspace_list() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"workspace.group.create","params":{"name":"Agents","from":["workspace:1","workspace:2"],"cwd":"/tmp"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceGroupAction { action, reply } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceGroupAction::Create {
+                            name: Some("Agents".to_string()),
+                            cwd: Some("/tmp".to_string()),
+                            from_workspace_ids: vec![
+                                "workspace:1".to_string(),
+                                "workspace:2".to_string(),
+                            ],
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
     }
 
     #[test]

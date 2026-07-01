@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T19:06:02Z Implement and verify CMUX workspace-group mutation CLI/API parity for create, ungroup, delete, rename, collapse, expand, pin, unpin, add, remove, set-anchor, new-workspace, set-color, set-icon, move, and focus. \
 [x] 2026-07-01T18:57:54Z Implement and verify the CMUX workspace-group read/persistence parity slice: persisted group metadata, workspace `group_id`, live `workspace.group.list`, `list-workspace-groups`, and `workspace-group list`. \
 [x] 2026-07-01T18:13:19Z Convert the current CMUX and Limux inventories into a durable CMUX parity matrix with verification evidence and exact Limux files/tests for implemented or partial features. \
 [x] 2026-07-01T18:13:19Z Build a Limux feature inventory from the current fork and map every CMUX feature to implemented, partial, missing, intentionally incompatible, or blocked. \

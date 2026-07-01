@@ -19,7 +19,7 @@ use libadwaita as adw;
 use crate::app_config;
 use crate::control_bridge::{
     BridgeError, BrowserAction, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection,
-    PaneCreateType, WorkspaceTarget,
+    PaneCreateType, WorkspaceGroupAction, WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -309,8 +309,8 @@ fn workspace_group_row(group: &WorkspaceGroupState) -> serde_json::Value {
     serde_json::json!({
         "id": group.id.as_str(),
         "group_id": group.id.as_str(),
-        "ref": format!("workspace-group:{}", group.id),
-        "group_ref": format!("workspace-group:{}", group.id),
+        "ref": workspace_group_ref(&group.id),
+        "group_ref": workspace_group_ref(&group.id),
         "name": group.name.as_str(),
         "title": group.name.as_str(),
         "isCollapsed": group.is_collapsed,
@@ -318,6 +318,33 @@ fn workspace_group_row(group: &WorkspaceGroupState) -> serde_json::Value {
         "anchorWorkspaceId": group.anchor_workspace_id.as_deref(),
         "customColor": group.custom_color.as_deref(),
         "iconSymbol": group.icon_symbol.as_deref(),
+    })
+}
+
+fn workspace_group_ref(id: &str) -> String {
+    format!("workspace_group:{id}")
+}
+
+fn normalize_workspace_group_handle(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("workspace_group:")
+        .or_else(|| raw.trim().strip_prefix("workspace-group:"))
+        .unwrap_or_else(|| raw.trim())
+}
+
+fn workspace_group_index(state: &AppState, raw: &str) -> Option<usize> {
+    let id = normalize_workspace_group_handle(raw);
+    state
+        .workspace_groups
+        .iter()
+        .position(|group| group.id == id)
+}
+
+fn workspace_group_payload(group: &WorkspaceGroupState) -> serde_json::Value {
+    serde_json::json!({
+        "group_id": group.id.as_str(),
+        "group_ref": workspace_group_ref(&group.id),
+        "group": workspace_group_row(group),
     })
 }
 
@@ -3962,6 +3989,405 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     request_session_save(state);
 }
 
+// purpose: Resolve a workspace id/ref against current host state.
+// inputs: Live app state plus raw UUID or CMUX/Limux workspace ref.
+// returns/effects: Returns the workspace vector index without mutating state.
+fn workspace_index_for_raw_id(state: &AppState, raw: &str) -> Option<usize> {
+    let id = normalize_workspace_handle(raw);
+    state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == id)
+}
+
+// purpose: Choose the next visible CMUX group name.
+// inputs: Current group list.
+// returns/effects: Returns an unused "Group N" label without mutating state.
+fn next_workspace_group_name(groups: &[WorkspaceGroupState]) -> String {
+    let mut index = groups.len() + 1;
+    loop {
+        let name = format!("Group {index}");
+        if !groups.iter().any(|group| group.name == name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+// purpose: Add a new anchor workspace for a workspace group.
+// inputs: Live state, group id/name, optional cwd, and activation preference.
+// returns/effects: Mutates GTK state by appending and optionally activating a workspace.
+fn add_group_anchor_workspace(
+    state: &State,
+    group_id: &str,
+    name: &str,
+    cwd: Option<&str>,
+    activate: bool,
+) -> String {
+    let workspace_id = uuid::Uuid::new_v4().to_string();
+    let workspace = WorkspaceState {
+        id: Some(workspace_id.clone()),
+        name: name.to_string(),
+        favorite: false,
+        cwd: cwd.map(ToOwned::to_owned),
+        folder_path: cwd.map(ToOwned::to_owned),
+        group_id: Some(group_id.to_string()),
+        layout: LayoutNodeState::Pane(PaneState::fallback(cwd)),
+    };
+    add_workspace_from_state_internal(state, &workspace, activate);
+    workspace_id
+}
+
+// purpose: Apply one CMUX workspace-group operation to live host state.
+// inputs: Group action parsed by the control bridge.
+// returns/effects: Mutates group/workspace state, may create/close workspaces, and queues save.
+fn apply_workspace_group_action(
+    state: &State,
+    action: WorkspaceGroupAction,
+) -> Result<serde_json::Value, BridgeError> {
+    match action {
+        WorkspaceGroupAction::Create {
+            name,
+            cwd,
+            from_workspace_ids,
+        } => create_workspace_group(state, name, cwd, from_workspace_ids),
+        WorkspaceGroupAction::Ungroup { group_id } => ungroup_workspace_group(state, &group_id),
+        WorkspaceGroupAction::Delete { group_id } => delete_workspace_group(state, &group_id),
+        WorkspaceGroupAction::Rename { group_id, name } => {
+            update_workspace_group(state, &group_id, |group| group.name = name)
+        }
+        WorkspaceGroupAction::Collapse { group_id } => {
+            update_workspace_group(state, &group_id, |group| group.is_collapsed = true)
+        }
+        WorkspaceGroupAction::Expand { group_id } => {
+            update_workspace_group(state, &group_id, |group| group.is_collapsed = false)
+        }
+        WorkspaceGroupAction::Pin { group_id } => {
+            update_workspace_group(state, &group_id, |group| group.is_pinned = true)
+        }
+        WorkspaceGroupAction::Unpin { group_id } => {
+            update_workspace_group(state, &group_id, |group| group.is_pinned = false)
+        }
+        WorkspaceGroupAction::Add {
+            group_id,
+            workspace_id,
+        } => add_workspace_to_group(state, &group_id, &workspace_id),
+        WorkspaceGroupAction::Remove { workspace_id } => {
+            remove_workspace_from_group(state, &workspace_id)
+        }
+        WorkspaceGroupAction::SetAnchor {
+            group_id,
+            workspace_id,
+        } => set_workspace_group_anchor(state, &group_id, &workspace_id),
+        WorkspaceGroupAction::NewWorkspace {
+            group_id,
+            placement: _,
+        } => new_workspace_in_group(state, &group_id),
+        WorkspaceGroupAction::SetColor { group_id, color } => {
+            update_workspace_group(state, &group_id, |group| group.custom_color = color)
+        }
+        WorkspaceGroupAction::SetIcon { group_id, symbol } => {
+            update_workspace_group(state, &group_id, |group| group.icon_symbol = symbol)
+        }
+        WorkspaceGroupAction::Move { group_id, index } => {
+            move_workspace_group(state, &group_id, index)
+        }
+        WorkspaceGroupAction::Focus { group_id } => focus_workspace_group(state, &group_id),
+    }
+}
+
+// purpose: Create a group with a fresh anchor and optional existing members.
+// inputs: Requested name, cwd, and workspace ids to include.
+// returns/effects: Mutates workspace/group state and queues session persistence.
+fn create_workspace_group(
+    state: &State,
+    name: Option<String>,
+    cwd: Option<String>,
+    from_workspace_ids: Vec<String>,
+) -> Result<serde_json::Value, BridgeError> {
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let group_name = {
+        let s = state.borrow();
+        name.filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| next_workspace_group_name(&s.workspace_groups))
+    };
+    let anchor_workspace_id =
+        add_group_anchor_workspace(state, &group_id, &group_name, cwd.as_deref(), true);
+
+    let group = WorkspaceGroupState {
+        id: group_id.clone(),
+        name: group_name,
+        is_collapsed: false,
+        is_pinned: false,
+        anchor_workspace_id: Some(anchor_workspace_id.clone()),
+        custom_color: None,
+        icon_symbol: None,
+    };
+
+    {
+        let mut s = state.borrow_mut();
+        for raw in from_workspace_ids {
+            let Some(index) = workspace_index_for_raw_id(&s, &raw) else {
+                return Err(BridgeError::not_found("workspace not found"));
+            };
+            s.workspaces[index].group_id = Some(group_id.clone());
+        }
+        s.workspace_groups.push(group.clone());
+    }
+    request_session_save(state);
+
+    let mut payload = workspace_group_payload(&group);
+    payload["anchor_workspace_id"] = serde_json::Value::String(anchor_workspace_id.clone());
+    payload["anchor_workspace_ref"] =
+        serde_json::Value::String(workspace_ref(&anchor_workspace_id));
+    Ok(payload)
+}
+
+// purpose: Remove a group wrapper while keeping all member workspaces.
+// inputs: Group id/ref.
+// returns/effects: Clears member group ids, removes the group, and queues persistence.
+fn ungroup_workspace_group(
+    state: &State,
+    group_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let group = {
+        let mut s = state.borrow_mut();
+        let Some(index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let group = s.workspace_groups.remove(index);
+        for workspace in &mut s.workspaces {
+            if workspace.group_id.as_deref() == Some(group.id.as_str()) {
+                workspace.group_id = None;
+            }
+        }
+        group
+    };
+    request_session_save(state);
+    Ok(serde_json::json!({ "ok": true, "group": workspace_group_row(&group) }))
+}
+
+// purpose: Delete a group and close every workspace that belongs to it.
+// inputs: Group id/ref.
+// returns/effects: Removes grouped workspaces from GTK state and queues persistence.
+fn delete_workspace_group(state: &State, group_id: &str) -> Result<serde_json::Value, BridgeError> {
+    let (group, workspace_ids) = {
+        let s = state.borrow();
+        let Some(index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let group = s.workspace_groups[index].clone();
+        let workspace_ids = s
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.group_id.as_deref() == Some(group.id.as_str()))
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        (group, workspace_ids)
+    };
+    for workspace_id in &workspace_ids {
+        close_workspace_by_id(state, workspace_id);
+    }
+    {
+        let mut s = state.borrow_mut();
+        s.workspace_groups
+            .retain(|candidate| candidate.id != group.id);
+    }
+    request_session_save(state);
+    Ok(serde_json::json!({
+        "ok": true,
+        "deleted_workspace_count": workspace_ids.len(),
+        "group": workspace_group_row(&group),
+    }))
+}
+
+// purpose: Mutate one group row and return the updated payload.
+// inputs: Group id/ref plus a narrow mutation callback.
+// returns/effects: Updates group metadata and queues persistence.
+fn update_workspace_group(
+    state: &State,
+    group_id: &str,
+    mutate: impl FnOnce(&mut WorkspaceGroupState),
+) -> Result<serde_json::Value, BridgeError> {
+    let group = {
+        let mut s = state.borrow_mut();
+        let Some(index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        mutate(&mut s.workspace_groups[index]);
+        s.workspace_groups[index].clone()
+    };
+    request_session_save(state);
+    Ok(workspace_group_payload(&group))
+}
+
+// purpose: Attach an existing workspace to a group.
+// inputs: Group id/ref and workspace id/ref.
+// returns/effects: Updates membership and queues persistence.
+fn add_workspace_to_group(
+    state: &State,
+    group_id: &str,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let (group, workspace) = {
+        let mut s = state.borrow_mut();
+        let Some(group_index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let Some(workspace_index) = workspace_index_for_raw_id(&s, workspace_id) else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        let group_id = s.workspace_groups[group_index].id.clone();
+        s.workspaces[workspace_index].group_id = Some(group_id);
+        (
+            s.workspace_groups[group_index].clone(),
+            workspace_row(
+                workspace_index,
+                s.active_idx,
+                &s.workspaces[workspace_index],
+            ),
+        )
+    };
+    request_session_save(state);
+    Ok(serde_json::json!({ "group": workspace_group_row(&group), "workspace": workspace }))
+}
+
+// purpose: Detach an existing workspace from whichever group contains it.
+// inputs: Workspace id/ref.
+// returns/effects: Clears membership and queues persistence.
+fn remove_workspace_from_group(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let workspace = {
+        let mut s = state.borrow_mut();
+        let Some(workspace_index) = workspace_index_for_raw_id(&s, workspace_id) else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        s.workspaces[workspace_index].group_id = None;
+        workspace_row(
+            workspace_index,
+            s.active_idx,
+            &s.workspaces[workspace_index],
+        )
+    };
+    request_session_save(state);
+    Ok(serde_json::json!({ "workspace": workspace }))
+}
+
+// purpose: Update the anchor workspace for an existing group.
+// inputs: Group id/ref and workspace id/ref.
+// returns/effects: Ensures the workspace belongs to the group and queues persistence.
+fn set_workspace_group_anchor(
+    state: &State,
+    group_id: &str,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let (group, workspace) = {
+        let mut s = state.borrow_mut();
+        let Some(group_index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let Some(workspace_index) = workspace_index_for_raw_id(&s, workspace_id) else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        let group_id = s.workspace_groups[group_index].id.clone();
+        let workspace_id = s.workspaces[workspace_index].id.clone();
+        s.workspaces[workspace_index].group_id = Some(group_id);
+        s.workspace_groups[group_index].anchor_workspace_id = Some(workspace_id);
+        (
+            s.workspace_groups[group_index].clone(),
+            workspace_row(
+                workspace_index,
+                s.active_idx,
+                &s.workspaces[workspace_index],
+            ),
+        )
+    };
+    request_session_save(state);
+    Ok(serde_json::json!({ "group": workspace_group_row(&group), "workspace": workspace }))
+}
+
+// purpose: Create a workspace inside an existing group.
+// inputs: Group id/ref.
+// returns/effects: Appends a grouped workspace, activates it, and queues persistence.
+fn new_workspace_in_group(state: &State, group_id: &str) -> Result<serde_json::Value, BridgeError> {
+    let (group_id, name, cwd) = {
+        let s = state.borrow();
+        let Some(group_index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let group = &s.workspace_groups[group_index];
+        let cwd = group.anchor_workspace_id.as_deref().and_then(|anchor_id| {
+            s.workspaces
+                .iter()
+                .find(|workspace| workspace.id == anchor_id)
+                .and_then(|workspace| workspace.cwd.borrow().clone())
+        });
+        (group.id.clone(), group.name.clone(), cwd)
+    };
+    let workspace_id = add_group_anchor_workspace(state, &group_id, &name, cwd.as_deref(), true);
+    let payload = {
+        let s = state.borrow();
+        let Some(index) = workspace_index_for_raw_id(&s, &workspace_id) else {
+            return Err(BridgeError::internal(
+                "workspace.group.new_workspace did not create workspace",
+            ));
+        };
+        workspace_payload(&s, index)
+    };
+    request_session_save(state);
+    payload.ok_or_else(|| BridgeError::internal("workspace payload missing after create"))
+}
+
+// purpose: Move a group metadata row to a requested order index.
+// inputs: Group id/ref and target index.
+// returns/effects: Reorders group metadata and queues persistence.
+fn move_workspace_group(
+    state: &State,
+    group_id: &str,
+    index: usize,
+) -> Result<serde_json::Value, BridgeError> {
+    let group = {
+        let mut s = state.borrow_mut();
+        let Some(current_index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        let group = s.workspace_groups.remove(current_index);
+        let target_index = index.min(s.workspace_groups.len());
+        s.workspace_groups.insert(target_index, group.clone());
+        group
+    };
+    request_session_save(state);
+    Ok(workspace_group_payload(&group))
+}
+
+// purpose: Focus a group's anchor workspace.
+// inputs: Group id/ref.
+// returns/effects: Switches active workspace when the anchor exists.
+fn focus_workspace_group(state: &State, group_id: &str) -> Result<serde_json::Value, BridgeError> {
+    let anchor_id = {
+        let s = state.borrow();
+        let Some(group_index) = workspace_group_index(&s, group_id) else {
+            return Err(BridgeError::not_found("workspace group not found"));
+        };
+        s.workspace_groups[group_index].anchor_workspace_id.clone()
+    };
+    let Some(anchor_id) = anchor_id else {
+        return Err(BridgeError::not_found("workspace group anchor not found"));
+    };
+    let index = {
+        let s = state.borrow();
+        workspace_index_for_raw_id(&s, &anchor_id)
+    };
+    let Some(index) = index else {
+        return Err(BridgeError::not_found("workspace group anchor not found"));
+    };
+    switch_workspace(state, index);
+    let s = state.borrow();
+    workspace_payload(&s, index).ok_or_else(|| BridgeError::not_found("workspace not found"))
+}
+
 fn terminal_pane_state(
     tab_count: usize,
     working_directory: Option<&str>,
@@ -4084,6 +4510,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "groups": groups })));
+        }
+        ControlCommand::WorkspaceGroupAction { action, reply } => {
+            let result = apply_workspace_group_action(state, action);
+            let _ = reply.send(result);
         }
         ControlCommand::ListPanes { target, reply } => {
             let resolved = {
