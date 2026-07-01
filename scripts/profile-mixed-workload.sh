@@ -19,6 +19,7 @@ ACTIVITY_SECONDS="${LIMUX_MIXED_ACTIVITY_SECONDS:-15}"
 ACTIVITY_LINES="${LIMUX_MIXED_ACTIVITY_LINES:-1000}"
 ACTIVITY_SLEEP_SECONDS="${LIMUX_MIXED_ACTIVITY_SLEEP_SECONDS:-0.02}"
 ACTIVITY_SYNC_LEAD_SECONDS="${LIMUX_MIXED_ACTIVITY_SYNC_LEAD_SECONDS:-5}"
+ACTIVITY_DRAIN_SECONDS="${LIMUX_MIXED_ACTIVITY_DRAIN_SECONDS:-10}"
 
 if [[ ! -x "$HOST_BIN" ]]; then
   echo "FATAL: host binary is not executable: $HOST_BIN" >&2
@@ -495,6 +496,7 @@ if [[ "$ACTIVITY" == "echo" ]]; then
     echo "FATAL: activity readback did not contain expected limux-active output" >&2
     exit 1
   fi
+  sleep "$ACTIVITY_DRAIN_SECONDS"
 fi
 
 read -r idle_user_ticks_start idle_system_ticks_start < <(awk '{print $14, $15}' "/proc/$HOST_PID/stat")
@@ -540,6 +542,7 @@ echo "activity_mode=$ACTIVITY"
 echo "activity_sample_seconds=$ACTIVITY_SECONDS"
 echo "activity_lines_per_surface=$ACTIVITY_LINES"
 echo "activity_sleep_seconds=$ACTIVITY_SLEEP_SECONDS"
+echo "activity_drain_seconds=$ACTIVITY_DRAIN_SECONDS"
 echo "activity_surfaces=$activity_surfaces"
 echo "activity_readback_sample=$activity_readback_sample"
 awk -v ticks="$activity_ticks_delta" -v hz="$clock_ticks" -v seconds="$ACTIVITY_SECONDS" \
@@ -588,5 +591,9 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi pmon -s um -c 2 | awk -v pid="$HOST_PID" '$2 == pid || /^#/'
   echo "gpu_pmon_sample_end"
 fi
+
+echo "memory_diagnostic_begin"
+"$CLI_BIN" --json memory --groups 8
+echo "memory_diagnostic_end"
 
 echo "profile_root=$PROFILE_ROOT"

@@ -3966,6 +3966,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 crate::control_bridge::BridgeError::not_found("no active workspace")
             }));
         }
+        ControlCommand::Memory {
+            top_group_limit,
+            reply,
+        } => {
+            let result = crate::memory_diagnostics::memory_diagnostic_payload(top_group_limit)
+                .map_err(BridgeError::internal);
+            let _ = reply.send(result);
+        }
         ControlCommand::ListWorkspaces { reply } => {
             let workspaces = {
                 let app_state = state.borrow();
@@ -4973,7 +4981,10 @@ pub(crate) fn create_pane_for_workspace(
             glib::idle_add_local_once(move || {
                 let s = state.borrow();
                 if let Some(ws) = s.workspaces.iter().find(|w| w.id == ws_id) {
-                    *ws.cwd.borrow_mut() = Some(pwd);
+                    let mut cwd = ws.cwd.borrow_mut();
+                    if cwd.as_deref() != Some(pwd.as_str()) {
+                        *cwd = Some(pwd);
+                    }
                 }
             });
         }),

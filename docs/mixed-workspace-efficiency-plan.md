@@ -131,9 +131,11 @@ The active-output benchmark keeps the optimized triple layout open and sends a s
 - 1000 printed lines per terminal
 - 0.02 seconds between printed lines per terminal
 - 15-second active sample window
+- 10-second drain before post-activity idle sampling
 - verified `read-screen` sample containing `limux-active-` output
 
 The profiler samples host-only CPU/RSS/write bytes and process-tree CPU/RSS/write bytes. The process-tree numbers include the Limux host plus terminal child processes, so the active result reflects terminals running commands rather than just opening surfaces.
+It also emits a `memory_diagnostic` block from `limux memory --json`, matching CMUX's child-process memory inspection workflow on Linux.
 
 Old continuous GLArea auto-render mode:
 
@@ -169,6 +171,22 @@ Measured sustained-usage change:
 - disk writes: unchanged at 0 during active output and post-activity idle
 
 This result does not prove an 80% sustained-runtime efficiency gain. The strongest proven runtime result is that all 120 terminals can be targeted, run output, be read back, and hold zero disk writes while explicit render queueing reduces idle repaint work. The earlier 88.7% improvement applies to triple-workload creation latency, not sustained command execution.
+
+Follow-up optimization pass:
+
+- active surfaces reached: 120
+- activity readback sample: ok
+- active host CPU: 0.133%
+- active process-tree CPU: 0.133%
+- active host/process-tree write bytes: 0
+- post-drain idle host CPU: 0.133%
+- post-drain idle process-tree CPU: 0.133%
+- post-drain idle RSS delta: 0 KB
+- post-drain idle host/process-tree write bytes: 0
+- NVIDIA framebuffer: 43 MB
+- memory diagnostic: app RSS 254.4 MiB, child RSS 89.4 MiB across 16 processes
+
+This pass also skips no-op terminal title and PWD callbacks before they relabel tabs or request session persistence. The drained idle sample is the stronger post-activity proof: after output finishes, Limux showed no continuing RSS growth and no disk writes.
 
 Run the active-output triple profile:
 

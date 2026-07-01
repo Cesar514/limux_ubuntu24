@@ -22,6 +22,7 @@ const METHODS: &[&str] = &[
     "system.ping",
     "system.identify",
     "system.capabilities",
+    "system.memory",
     "workspace.current",
     "workspace.list",
     "workspace.create",
@@ -117,6 +118,10 @@ pub struct CreatePanesRequest {
 pub enum ControlCommand {
     Identify {
         caller: Option<Value>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    Memory {
+        top_group_limit: usize,
         reply: mpsc::Sender<BridgeResult>,
     },
     CurrentWorkspace {
@@ -223,6 +228,7 @@ impl ControlCommand {
     pub fn respond(self, result: BridgeResult) {
         match self {
             Self::Identify { reply, .. }
+            | Self::Memory { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListPanes { reply, .. }
@@ -560,6 +566,29 @@ fn handle_method(
             (
                 ControlCommand::Identify {
                     caller: params.get("caller").cloned(),
+                    reply,
+                },
+                rx,
+            )
+        }
+        "system.memory" | "memory" => {
+            let top_group_limit = match optional_index(params, "top_group_limit") {
+                Ok(Some(limit)) if (1..=100).contains(&limit) => limit,
+                Ok(Some(_)) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "system.memory top_group_limit must be 1..=100",
+                        ),
+                    );
+                }
+                Ok(None) => 12,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::Memory {
+                    top_group_limit,
                     reply,
                 },
                 rx,
@@ -1214,6 +1243,38 @@ mod tests {
         assert_eq!(
             response.result.expect("surface.create result")["surface_ref"],
             "surface:1:tab"
+        );
+    }
+
+    #[test]
+    fn system_memory_route_validates_group_limit() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"system.memory","params":{"top_group_limit":5}}"#,
+            &|command| match command {
+                ControlCommand::Memory {
+                    top_group_limit,
+                    reply,
+                } => {
+                    assert_eq!(top_group_limit, 5);
+                    let _ = reply.send(Ok(json!({ "memory_diagnostic": { "ok": true } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("system.memory result")["memory_diagnostic"]["ok"],
+            true
+        );
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"system.memory","params":{"top_group_limit":101}}"#,
+            &|command| panic!("invalid system.memory should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
         );
     }
 

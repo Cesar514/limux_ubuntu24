@@ -2,6 +2,13 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T15:50:37Z Move completed TODO items to TODO_COMPLETED.md, commit verified changes, and push only to the fork remote. \
+[x] 2026-07-01T15:50:37Z Verify with active-output benchmarks, targeted functionality checks, repository checks, and no pushes to am-will. \
+[x] 2026-07-01T15:50:37Z Implement or patch missing CMUX parity functionality selected from the audit. \
+[x] 2026-07-01T15:50:37Z Implement the highest-confidence additional performance or leak fixes found in the audit. \
+[x] 2026-07-01T15:50:37Z Identify missing high-value CMUX functionality or behavioral gaps that can be migrated without breaking existing Limux workflows. \
+[x] 2026-07-01T15:50:37Z Pull or inspect the current CMUX codebase and build a concrete CMUX-to-Limux functionality parity matrix. \
+[x] 2026-07-01T15:50:37Z Re-audit Limux runtime code paths for additional active-usage CPU, memory, GPU, disk-write, latency, and leak bottlenecks. \
 [x] 2026-07-01T13:58:15Z Move completed active-output TODO entries to TODO_COMPLETED.md, commit verified changes, and push only to the fork remote. \
 [x] 2026-07-01T13:58:15Z Re-run active-output profiling and repository checks to verify runtime efficiency, stability, and no continuous disk writes. \
 [x] 2026-07-01T13:58:15Z Patch the verified active-runtime bottleneck while preserving terminal functionality. \

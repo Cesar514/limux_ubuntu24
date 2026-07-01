@@ -70,6 +70,7 @@ cmux parity audit, based on public `manaflow-ai/cmux` commit `2313855c4988ea20e0
 | Notifications | OSC/CLI notifications, unread rings/badges, panel, jump/read/dismiss | Partial; Limux has notify/toast/sidebar unread, no full notification panel/history commands yet |
 | Agent hooks/teams | Many agent hook providers and native split/team flows | Partial; Limux has Codex/Claude/Gemini hooks and `agent-team`, broader provider and lifecycle parity remains |
 | Feed approvals | Native approval/question/feed surface with audit log | Missing |
+| Memory diagnostics | `cmux memory` reports app memory plus child process groups and attribution | Added `limux memory` / `system.memory` with Linux `/proc` app RSS, descendant RSS, child groups, and Limux workspace/pane/surface attribution |
 | Events stream | Reconnectable NDJSON event stream with replay cursor | Missing |
 | Session restore/hibernation | Restore panes/surfaces/browser state and hibernate idle agents | Partial restore exists; hibernation missing |
 | SSH/remotes/tmux | Remote SSH workspaces, remote localhost browser routing, tmux mirroring | Missing |

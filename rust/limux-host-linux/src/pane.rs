@@ -1096,8 +1096,8 @@ fn make_terminal_callbacks(
 
     TerminalCallbacks {
         on_title_changed: Box::new(move |title: &str| {
-            let has_custom = state_for_title
-                .borrow()
+            let title_state = state_for_title.borrow();
+            let has_custom = title_state
                 .tabs
                 .iter()
                 .any(|entry| entry.id == tid_for_title && entry.custom_name.is_some());
@@ -1109,10 +1109,18 @@ fn make_terminal_callbacks(
             } else {
                 title.to_string()
             };
+            if title_label.label().as_str() == display {
+                return;
+            }
             title_label.set_label(&display);
         }),
         on_pwd_changed: Box::new(move |pwd: &str| {
-            *term_cwd_for_pwd.borrow_mut() = Some(pwd.to_string());
+            let mut term_cwd = term_cwd_for_pwd.borrow_mut();
+            if term_cwd.as_deref() == Some(pwd) {
+                return;
+            }
+            *term_cwd = Some(pwd.to_string());
+            drop(term_cwd);
             (callbacks_for_pwd.on_pwd_changed)(pwd);
             (callbacks_for_pwd.on_state_changed)();
         }),

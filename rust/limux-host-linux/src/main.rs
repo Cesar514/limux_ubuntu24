@@ -3,6 +3,7 @@ mod control_bridge;
 mod ghostty_config;
 mod keybind_editor;
 mod layout_state;
+mod memory_diagnostics;
 mod pane;
 mod settings_editor;
 mod shortcut_config;

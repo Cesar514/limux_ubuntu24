@@ -207,7 +207,7 @@ fn parse_global_args() -> Result<GlobalOptions> {
 
 fn print_help() {
     println!(
-        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
+        "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\n       limux\n\nRunning `limux` with no arguments launches the GTK app.\n\nCommon commands:\n  identify [--workspace <id|ref>] [--surface <id|ref>]\n  list-panels [--workspace <id|ref>]\n  list-panes [--workspace <id|ref>]\n  list-workspaces\n  memory [--groups <count>]\n  surface-health [--workspace <id|ref>]\n  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n  new-workspace [--cwd <path>] [--command <text>]\n  close-workspace --workspace <id|ref>\n  sidebar-state --workspace <id|ref>\n  new-surface [--workspace <id|ref>]\n  new-pane [--workspace <id|ref>] [--pane <id|ref>] [--surface <id|ref>] [--direction <left|right|up|down>] [--type <terminal|browser>] [--command <text>] [--url <url>]\n      Live GTK self-spawn currently supports terminal panes only; browser panes remain deferred.\n  rename-workspace [--workspace <id|ref>] <title>\n  rename-window [--workspace <id|ref>] <title>\n  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n  read-screen [--workspace <id|ref>] [--surface <id|ref>] [--scrollback] [--lines <n>]\n  capture-pane (alias of read-screen)\n  tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\n  browser [--surface <id|ref>|<surface>] <subcommand> ...\n\nAgent integrations:\n  notify [--workspace <id|ref>] [--subtitle <text>] [--body <text>] <title>\n  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n  claude-hook | opencode-hook | gemini-hook --event <name> [--subtitle <text>] [--body <text>] [--title <text>]\n  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>] [--no-launch] [--dry-run]\n      Splits the active workspace into one pane per agent (caller's pane stays\n      as the orchestrator on the left, peers stack down the right), launches\n      each CLI in its pane, and writes AGENTS.md describing the <agent-msg>\n      XML protocol so peers can talk via\n      `limux send --surface <peer-surface-id> <envelope>`.\n"
     );
 }
 
@@ -800,6 +800,175 @@ fn render_list_text(command: &str, payload: &Value) -> String {
                 .join("\n")
         }
         _ => "".to_string(),
+    }
+}
+
+async fn run_memory(client: &mut Client, args: &[String]) -> Result<Value> {
+    let group_limit = parse_opt(args, "--groups")
+        .map(|raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|value| (1..=100).contains(value))
+                .ok_or_else(|| anyhow!("memory --groups must be an integer from 1 to 100"))
+        })
+        .transpose()?
+        .unwrap_or(12);
+
+    client
+        .call("system.memory", json!({ "top_group_limit": group_limit }))
+        .await
+}
+
+fn render_memory_text(payload: &Value, id_format: IdFormat) -> String {
+    let Some(diagnostic) = payload.get("memory_diagnostic").and_then(Value::as_object) else {
+        return "No memory diagnostic available".to_string();
+    };
+    let app = diagnostic.get("app").and_then(Value::as_object);
+    let children = diagnostic.get("children").and_then(Value::as_object);
+    let summary = diagnostic
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+    if !summary.is_empty() {
+        lines.push(summary.to_string());
+        lines.push(String::new());
+    }
+
+    let app_name = app
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("limux");
+    let app_pid = app
+        .and_then(|value| value.get("pid"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let app_rss = app
+        .and_then(|value| value.get("resident_bytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    lines.push("APP".to_string());
+    lines.push(format!("  {app_name} pid={app_pid}"));
+    lines.push(format!("  rss       {}", format_bytes(app_rss)));
+    lines.push(String::new());
+
+    let child_rss = children
+        .and_then(|value| value.get("recursive_rss_bytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let child_count = children
+        .and_then(|value| value.get("process_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    lines.push("CHILD PROCESSES".to_string());
+    lines.push(format!(
+        "  recursive RSS {} across {}",
+        format_bytes(child_rss),
+        process_count_text(child_count)
+    ));
+
+    let groups = children
+        .and_then(|value| value.get("groups"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if groups.is_empty() {
+        lines.push("  no child process groups".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    lines.push("TOP CHILD GROUPS".to_string());
+    lines.push("      RSS  PROC  COMMAND                    ATTRIBUTION".to_string());
+    for group in groups {
+        let rss = format_bytes(group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0));
+        let process_count = group
+            .get("process_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let command = group
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("process");
+        let attribution = memory_attribution_text(group.get("top_attribution"), id_format);
+        lines.push(format!(
+            "{rss:>9} {process_count:>5}  {command:<26} {attribution}"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn memory_attribution_text(raw: Option<&Value>, id_format: IdFormat) -> String {
+    let Some(attribution) = raw.and_then(Value::as_object) else {
+        return "unattributed".to_string();
+    };
+    let mut parts = Vec::new();
+    for prefix in ["workspace", "pane", "surface"] {
+        if let Some(handle) = memory_attribution_handle(attribution, prefix, id_format) {
+            parts.push(format!("{prefix} {handle}"));
+        }
+    }
+    if parts.is_empty() {
+        "unattributed".to_string()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn memory_attribution_handle(
+    attribution: &Map<String, Value>,
+    prefix: &str,
+    id_format: IdFormat,
+) -> Option<String> {
+    let id_key = format!("{prefix}_id");
+    let ref_key = format!("{prefix}_ref");
+    let id = attribution
+        .get(&id_key)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let reference = attribution
+        .get(&ref_key)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match id_format {
+        IdFormat::Refs => (!reference.is_empty())
+            .then(|| reference.to_string())
+            .or_else(|| (!id.is_empty()).then(|| id.to_string())),
+        IdFormat::Uuids => (!id.is_empty())
+            .then(|| id.to_string())
+            .or_else(|| (!reference.is_empty()).then(|| reference.to_string())),
+        IdFormat::Both => {
+            let values = [reference, id]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            (!values.is_empty()).then(|| values.join(" "))
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", units[unit])
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
+}
+
+fn process_count_text(count: u64) -> String {
+    if count == 1 {
+        "1 process".to_string()
+    } else {
+        format!("{count} processes")
     }
 }
 
@@ -3445,6 +3614,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Json(payload)
             } else {
                 CommandOutput::Text(render_list_text(command, &payload))
+            }
+        }
+        "memory" => {
+            let payload = run_memory(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_memory_text(&payload, opts.id_format))
             }
         }
         "send" => {
