@@ -110,13 +110,20 @@ request_json() {
 
 create_workspace() {
   local index="$1"
-  local command="printf 'limux-mixed-w${index}-seed-ready\n'; sleep 3600"
   local request
-  request="$(jq -cn \
-    --arg cwd "$PWD" \
-    --arg name "mixed-$index" \
-    --arg command "$command" \
-    '{method:"workspace.create",params:{cwd:$cwd,name:$name,command:$command}}')"
+  if [[ "$MODE" == "batch" ]]; then
+    request="$(jq -cn \
+      --arg cwd "$PWD" \
+      --arg name "mixed-$index" \
+      '{method:"workspace.create",params:{cwd:$cwd,name:$name}}')"
+  else
+    local command="printf 'limux-mixed-w${index}-seed-ready\n'; sleep 3600"
+    request="$(jq -cn \
+      --arg cwd "$PWD" \
+      --arg name "mixed-$index" \
+      --arg command "$command" \
+      '{method:"workspace.create",params:{cwd:$cwd,name:$name,command:$command}}')"
+  fi
   request_json "$request"
 }
 
@@ -196,7 +203,13 @@ sequential_create_panes() {
       echo "$created_json" >&2
       exit 1
     fi
-    wait_for_pane_count "$workspace" "$((i + 1))"
+    if [[ "$command_mode" == "with-command" ]]; then
+      wait_for_pane_count "$workspace" "$((i + 1))"
+    elif [[ -n "${LIMUX_MIXED_SPLIT_TICK_SECONDS:-}" ]]; then
+      sleep "$LIMUX_MIXED_SPLIT_TICK_SECONDS"
+    else
+      wait_for_pane_count "$workspace" "$((i + 1))"
+    fi
   done
 }
 
@@ -210,6 +223,18 @@ batch_distribute_extra_surfaces() {
   if (( ${#panes[@]} == 0 )); then
     echo "FATAL: workspace has no panes for distributed surface creation: $workspace" >&2
     exit 1
+  fi
+  if [[ "${LIMUX_MIXED_DISTRIBUTE_SURFACES:-0}" != "1" ]]; then
+    local command_template="printf 'limux-mixed-tab-{i}-ready\n'; sleep 3600"
+    local request
+    request="$(jq -cn \
+      --arg workspace "$workspace" \
+      --arg pane_id "${panes[0]}" \
+      --argjson count "$extra" \
+      --arg command_template "$command_template" \
+      '{method:"surface.create_many",params:{workspace_id:$workspace,pane_id:$pane_id,count:$count,command_template:$command_template}}')"
+    request_json "$request" >/dev/null
+    return
   fi
   for index in "${!panes[@]}"; do
     local pane_extra=$((extra / ${#panes[@]}))
@@ -240,6 +265,18 @@ sequential_create_extra_surfaces() {
   done
 }
 
+batch_create_workspaces() {
+  local request
+  request="$(jq -cn \
+    --arg cwd "$PWD" \
+    --arg name_prefix "mixed" \
+    --argjson count "$WORKSPACES" \
+    --argjson panes "$PANES_PER_WORKSPACE" \
+    --argjson terminals "$TERMINALS_PER_WORKSPACE" \
+    '{method:"workspace.create_many",params:{cwd:$cwd,name_prefix:$name_prefix,count:$count,panes_per_workspace:$panes,terminals_per_workspace:$terminals}}')"
+  request_json "$request"
+}
+
 read -r create_user_ticks_start create_system_ticks_start < <(awk '{print $14, $15}' "/proc/$HOST_PID/stat")
 write_bytes_create_start="$(awk '$1=="write_bytes:" {print $2}' "/proc/$HOST_PID/io")"
 create_start_ns="$(date +%s%N)"
@@ -248,37 +285,36 @@ created_workspaces=0
 created_panes=0
 created_surfaces=0
 workspace_ids=()
-for workspace_index in $(seq 1 "$WORKSPACES"); do
-  workspace_json="$(create_workspace "$workspace_index")"
-  workspace="$(workspace_id_from_json <<<"$workspace_json")"
-  if [[ -z "$workspace" ]]; then
-    echo "FATAL: workspace.create did not return a workspace id/ref" >&2
-    echo "$workspace_json" >&2
-    exit 1
-  fi
-  workspace_ids+=("$workspace")
-  created_workspaces=$((created_workspaces + 1))
-  created_panes=$((created_panes + 1))
-  created_surfaces=$((created_surfaces + 1))
+if [[ "$MODE" == "batch" && "${LIMUX_MIXED_LAYOUT_BATCH:-1}" == "1" ]]; then
+  workspace_json="$(batch_create_workspaces)"
+  mapfile -t workspace_ids < <(jq -r '.workspaces[] | .workspace_id // .workspace_ref // .workspace.workspace_id // .workspace.workspace_ref // .workspace.ref' <<<"$workspace_json")
+  created_workspaces="$(jq -r '.count' <<<"$workspace_json")"
+  created_panes=$((created_workspaces * PANES_PER_WORKSPACE))
+  created_surfaces=$((created_workspaces * TERMINALS_PER_WORKSPACE))
+else
+  for workspace_index in $(seq 1 "$WORKSPACES"); do
+    workspace_json="$(create_workspace "$workspace_index")"
+    workspace="$(workspace_id_from_json <<<"$workspace_json")"
+    if [[ -z "$workspace" ]]; then
+      echo "FATAL: workspace.create did not return a workspace id/ref" >&2
+      echo "$workspace_json" >&2
+      exit 1
+    fi
+    workspace_ids+=("$workspace")
+    created_workspaces=$((created_workspaces + 1))
+    created_panes=$((created_panes + 1))
+    created_surfaces=$((created_surfaces + 1))
 
-  pane_splits=$((PANES_PER_WORKSPACE - 1))
-  if [[ "$MODE" == "batch" ]]; then
-    sequential_create_panes "$workspace" "$pane_splits" "no-command"
-    wait_for_pane_count "$workspace" "$PANES_PER_WORKSPACE"
-  else
+    pane_splits=$((PANES_PER_WORKSPACE - 1))
     sequential_create_panes "$workspace" "$pane_splits"
-  fi
-  created_panes=$((created_panes + pane_splits))
-  created_surfaces=$((created_surfaces + pane_splits))
+    created_panes=$((created_panes + pane_splits))
+    created_surfaces=$((created_surfaces + pane_splits))
 
-  extra_surfaces=$((TERMINALS_PER_WORKSPACE - PANES_PER_WORKSPACE))
-  if [[ "$MODE" == "batch" ]]; then
-    batch_distribute_extra_surfaces "$workspace" "$extra_surfaces"
-  else
+    extra_surfaces=$((TERMINALS_PER_WORKSPACE - PANES_PER_WORKSPACE))
     sequential_create_extra_surfaces "$workspace" "$extra_surfaces"
-  fi
-  created_surfaces=$((created_surfaces + extra_surfaces))
-done
+    created_surfaces=$((created_surfaces + extra_surfaces))
+  done
+fi
 
 create_end_ns="$(date +%s%N)"
 read -r create_user_ticks_end create_system_ticks_end < <(awk '{print $14, $15}' "/proc/$HOST_PID/stat")

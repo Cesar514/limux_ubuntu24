@@ -977,6 +977,16 @@ fn restore_tabs_from_state(
     }
 
     for saved_tab in &saved_state.tabs {
+        let restore_active = saved_state
+            .active_tab_id
+            .as_deref()
+            .map(|active_id| active_id == saved_tab.id)
+            .unwrap_or_else(|| {
+                saved_state
+                    .tabs
+                    .first()
+                    .is_some_and(|first| first.id == saved_tab.id)
+            });
         match &saved_tab.content {
             TabContentState::Terminal { cwd, agent } => {
                 add_terminal_tab_inner(
@@ -989,7 +999,7 @@ fn restore_tabs_from_state(
                         cwd: cwd.as_deref().or(working_directory),
                         agent: agent.clone(),
                         startup_command: None,
-                        activate: true,
+                        activate: restore_active,
                     }),
                 );
             }

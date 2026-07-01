@@ -25,6 +25,7 @@ const METHODS: &[&str] = &[
     "workspace.current",
     "workspace.list",
     "workspace.create",
+    "workspace.create_many",
     "workspace.select",
     "workspace.rename",
     "workspace.close",
@@ -173,6 +174,14 @@ pub enum ControlCommand {
         command: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    CreateWorkspaces {
+        count: usize,
+        name_prefix: String,
+        cwd: Option<String>,
+        panes_per_workspace: usize,
+        terminals_per_workspace: usize,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SelectWorkspace {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
@@ -226,6 +235,7 @@ impl ControlCommand {
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
+            | Self::CreateWorkspaces { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
             | Self::CloseWorkspace { reply, .. }
@@ -708,6 +718,57 @@ fn handle_method(
                 rx,
             )
         }
+        "workspace.create_many" => {
+            let count = match optional_index(params, "count") {
+                Ok(Some(count)) if (1..=64).contains(&count) => count,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("workspace.create_many count must be 1..=64"),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let panes_per_workspace = match optional_index(params, "panes_per_workspace") {
+                Ok(Some(count)) if (1..=16).contains(&count) => count,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "workspace.create_many panes_per_workspace must be 1..=16",
+                        ),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let terminals_per_workspace = match optional_index(params, "terminals_per_workspace") {
+                Ok(Some(count)) if count >= panes_per_workspace && (1..=200).contains(&count) => {
+                    count
+                }
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params(
+                            "workspace.create_many terminals_per_workspace must be >= panes_per_workspace and <= 200",
+                        ),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreateWorkspaces {
+                    count,
+                    name_prefix: optional_string(params, &["name_prefix"])
+                        .unwrap_or_else(|| "mixed".to_string()),
+                    cwd: optional_string(params, &["cwd"]),
+                    panes_per_workspace,
+                    terminals_per_workspace,
+                    reply,
+                },
+                rx,
+            )
+        }
         "workspace.select" | "workspace.activate" | "activate-workspace" => {
             let target = match parse_required_workspace_target(params, true, method) {
                 Ok(target) => target,
@@ -1153,6 +1214,46 @@ mod tests {
         assert_eq!(
             response.result.expect("surface.create result")["surface_ref"],
             "surface:1:tab"
+        );
+    }
+
+    #[test]
+    fn workspace_create_many_route_validates_shape() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"workspace.create_many","params":{"count":12,"name_prefix":"triple","cwd":"/tmp","panes_per_workspace":4,"terminals_per_workspace":10}}"#,
+            &|command| match command {
+                ControlCommand::CreateWorkspaces {
+                    count,
+                    name_prefix,
+                    cwd,
+                    panes_per_workspace,
+                    terminals_per_workspace,
+                    reply,
+                } => {
+                    assert_eq!(count, 12);
+                    assert_eq!(name_prefix, "triple");
+                    assert_eq!(cwd, Some("/tmp".to_string()));
+                    assert_eq!(panes_per_workspace, 4);
+                    assert_eq!(terminals_per_workspace, 10);
+                    let _ = reply.send(Ok(json!({ "count": count, "workspaces": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("workspace.create_many result")["count"],
+            12
+        );
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"workspace.create_many","params":{"count":1,"panes_per_workspace":4,"terminals_per_workspace":3}}"#,
+            &|command| panic!("invalid workspace.create_many should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
         );
     }
 

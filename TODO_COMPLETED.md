@@ -2,6 +2,12 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T13:34:55Z Move completed triple-workload TODO entries to TODO_COMPLETED.md, commit the verified changes, and push only to the fork remote. \
+[x] 2026-07-01T13:34:55Z Run repository verification after any code/script/docs changes. \
+[x] 2026-07-01T13:34:55Z Re-run the optimized triple workload and verify whether the 80% creation-latency target is achieved or blocked by a measured constraint. \
+[x] 2026-07-01T13:34:55Z Patch the dominant triple-workload bottleneck while preserving existing Limux behavior and hard-failing unsafe split batching. \
+[x] 2026-07-01T13:34:55Z Measure the triple sequential baseline for latency, CPU, RSS, disk writes, GPU state, pane count, surface count, and stability. \
+[x] 2026-07-01T13:34:55Z Define the triple mixed workload as 12 workspaces, 48 split panes, and 120 terminal surfaces. \
 [x] 2026-07-01T12:59:37Z Move completed mixed-workload TODO entries to TODO_COMPLETED.md, commit the verified changes, and push only to the fork remote. \
 [x] 2026-07-01T12:59:37Z Re-run repository checks and the mixed-workload profiler to verify stability and resource behavior. \
 [x] 2026-07-01T12:59:37Z Patch the verified mixed-workload bottleneck without removing existing Limux functionality. \

@@ -23,7 +23,8 @@ use crate::control_bridge::{
 };
 use crate::keybind_editor;
 use crate::layout_state::{
-    self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, WorkspaceState,
+    self, AppSessionState, LayoutNodeState, LoadedSession, PaneState, SplitOrientation, SplitState,
+    TabState, WorkspaceState,
 };
 use crate::pane::{self, PaneCallbacks};
 use crate::shortcut_config::{
@@ -3873,6 +3874,61 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     request_session_save(state);
 }
 
+fn terminal_pane_state(
+    tab_count: usize,
+    working_directory: Option<&str>,
+    pane_index: usize,
+) -> PaneState {
+    let tabs = (0..tab_count)
+        .map(|tab_index| {
+            TabState::terminal(
+                format!("terminal-{pane_index}-{tab_index}"),
+                working_directory,
+            )
+        })
+        .collect::<Vec<_>>();
+    let active_tab_id = tabs.first().map(|tab| tab.id.clone());
+    PaneState {
+        pane_id: None,
+        active_tab_id,
+        tabs,
+    }
+}
+
+fn split_layout_from_panes(mut panes: Vec<PaneState>, depth: usize) -> LayoutNodeState {
+    if panes.len() == 1 {
+        return LayoutNodeState::Pane(panes.remove(0));
+    }
+
+    let right = panes.split_off(panes.len() / 2);
+    let orientation = if depth.is_multiple_of(2) {
+        SplitOrientation::Horizontal
+    } else {
+        SplitOrientation::Vertical
+    };
+    LayoutNodeState::Split(SplitState {
+        orientation,
+        ratio: layout_state::DEFAULT_SPLIT_RATIO,
+        start: Box::new(split_layout_from_panes(panes, depth + 1)),
+        end: Box::new(split_layout_from_panes(right, depth + 1)),
+    })
+}
+
+fn mixed_workspace_layout(
+    panes_per_workspace: usize,
+    terminals_per_workspace: usize,
+    working_directory: Option<&str>,
+) -> LayoutNodeState {
+    let extra_tabs = terminals_per_workspace - panes_per_workspace;
+    let panes = (0..panes_per_workspace)
+        .map(|pane_index| {
+            let tab_count = if pane_index == 0 { 1 + extra_tabs } else { 1 };
+            terminal_pane_state(tab_count, working_directory, pane_index)
+        })
+        .collect::<Vec<_>>();
+    split_layout_from_panes(panes, 0)
+}
+
 fn dispatch_control_command(command: ControlCommand) {
     CONTROL_STATE.with(|slot| {
         let state = slot.borrow().clone();
@@ -4359,6 +4415,73 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 )
             }));
         }
+        ControlCommand::CreateWorkspaces {
+            count,
+            name_prefix,
+            cwd,
+            panes_per_workspace,
+            terminals_per_workspace,
+            reply,
+        } => {
+            let home = dirs::home_dir()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let folder_path = cwd.as_deref().unwrap_or(&home);
+
+            let mut created = Vec::with_capacity(count);
+            for index in 1..=count {
+                let workspace = WorkspaceState {
+                    id: None,
+                    name: format!("{name_prefix}-{index}"),
+                    favorite: false,
+                    cwd: Some(folder_path.to_string()),
+                    folder_path: Some(folder_path.to_string()),
+                    layout: mixed_workspace_layout(
+                        panes_per_workspace,
+                        terminals_per_workspace,
+                        Some(folder_path),
+                    ),
+                };
+                add_workspace_from_state_internal(state, &workspace, false);
+                let payload = {
+                    let app_state = state.borrow();
+                    workspace_payload(&app_state, app_state.workspaces.len() - 1)
+                };
+                let Some(payload) = payload else {
+                    let _ = reply.send(Err(BridgeError::internal(
+                        "workspace.create_many did not produce a workspace",
+                    )));
+                    return;
+                };
+                created.push(payload);
+            }
+
+            let activation = {
+                let mut app_state = state.borrow_mut();
+                app_state.workspaces.len().checked_sub(1).map(|last_index| {
+                    app_state.active_idx = last_index;
+                    let workspace = &app_state.workspaces[last_index];
+                    (
+                        app_state.stack.clone(),
+                        app_state.sidebar_list.clone(),
+                        format!("ws-{}", workspace.id),
+                        workspace.sidebar_row.clone(),
+                    )
+                })
+            };
+            if let Some((stack, sidebar_list, stack_name, row)) = activation {
+                stack.set_visible_child_name(&stack_name);
+                sidebar_list.select_row(Some(&row));
+            }
+            request_session_save(state);
+            let _ = reply.send(Ok(serde_json::json!({
+                "ok": true,
+                "count": count,
+                "panes_per_workspace": panes_per_workspace,
+                "terminals_per_workspace": terminals_per_workspace,
+                "workspaces": created,
+            })));
+        }
         ControlCommand::SelectWorkspace { target, reply } => {
             let resolved = {
                 let app_state = state.borrow();
@@ -4670,6 +4793,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 }
 
 fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
+    add_workspace_from_state_internal(state, workspace, true);
+}
+
+fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, activate: bool) {
     let shortcuts = {
         let s = state.borrow();
         s.shortcuts.clone()
@@ -4722,12 +4849,17 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
 
     {
         let mut s = state.borrow_mut();
+        let was_empty = s.workspaces.is_empty();
         s.workspaces.push(ws);
-        s.active_idx = s.workspaces.len() - 1;
+        if activate || was_empty {
+            s.active_idx = s.workspaces.len() - 1;
+        }
     }
 
-    stack.set_visible_child_name(&stack_name);
-    sidebar_list.select_row(Some(&row));
+    if activate {
+        stack.set_visible_child_name(&stack_name);
+        sidebar_list.select_row(Some(&row));
+    }
 }
 
 /// Create a PaneWidget wired up with callbacks for a specific workspace.

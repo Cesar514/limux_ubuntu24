@@ -71,3 +71,52 @@ Run the baseline:
 Run the optimized mixed profile:
 
     LIMUX_MIXED_MODE=batch LIMUX_MIXED_WORKSPACES=4 LIMUX_MIXED_PANES_PER_WORKSPACE=4 LIMUX_MIXED_TERMINALS_PER_WORKSPACE=10 ./scripts/profile-mixed-workload.sh
+
+## Triple Workload Result
+
+The triple-size benchmark uses:
+
+- 12 workspaces
+- 4 panes per workspace
+- 10 terminals per workspace
+- 48 total split panes
+- 120 total terminal surfaces
+
+Current sequential baseline:
+
+- observed panes: 48
+- observed surfaces: 120
+- creation wall time: 8373 ms
+- host CPU during creation: 3.0700 seconds
+- creation write bytes: 5230592
+- idle CPU: 0.400%
+- idle write bytes: 0
+- NVIDIA framebuffer: 492 MB
+
+Optimized layout-batched mode:
+
+- observed panes: 48
+- observed surfaces: 120
+- creation wall time: 946 ms
+- host CPU during creation: 0.1900 seconds
+- creation write bytes: 0
+- idle CPU: 0.333%
+- idle write bytes: 0
+- NVIDIA framebuffer: 43 MB
+
+Measured triple-workload improvement:
+
+- creation wall time: 88.7% faster
+- host CPU during creation: 93.8% lower
+- creation write bytes: eliminated for the creation window
+- idle disk writes: unchanged at 0
+
+The optimized path uses `workspace.create_many` to build the requested workspace/pane/tab layout directly in host state and activates only the final workspace once. It also avoids activating every restored terminal tab; only the saved active tab is focused during pane restoration.
+
+Run the triple baseline:
+
+    LIMUX_MIXED_MODE=sequential LIMUX_MIXED_WORKSPACES=12 LIMUX_MIXED_PANES_PER_WORKSPACE=4 LIMUX_MIXED_TERMINALS_PER_WORKSPACE=10 ./scripts/profile-mixed-workload.sh
+
+Run the optimized triple profile:
+
+    LIMUX_MIXED_MODE=batch LIMUX_MIXED_WORKSPACES=12 LIMUX_MIXED_PANES_PER_WORKSPACE=4 LIMUX_MIXED_TERMINALS_PER_WORKSPACE=10 ./scripts/profile-mixed-workload.sh
