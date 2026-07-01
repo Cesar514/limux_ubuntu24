@@ -287,6 +287,8 @@ fn full_help_text() -> &'static str {
         "      [--direction <left|right|up|down>]\n",
         "  focus-panel --panel <id|ref> [--workspace <id|ref>]\n",
         "  close-surface --surface <id|ref>\n",
+        "  reorder-surface --surface <id|ref>\n",
+        "      (--index <n>|--before-surface <id|ref>|--after-surface <id|ref>)\n",
         "  refresh-surfaces [--surface <id|ref>]\n",
         "  rename-workspace [--workspace <id|ref>] <title>\n",
         "  rename-window [--workspace <id|ref>] <title>\n",
@@ -305,6 +307,7 @@ fn full_help_text() -> &'static str {
         "  themes [list|set|clear]\n",
         "  new-window | current-window | list-windows | focus-window | close-window\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
+        "  move-surface | reorder-surface\n",
         "  refresh-surfaces\n",
         "  list-notifications | dismiss-notification | mark-notification-read\n",
         "  open-notification | jump-to-unread | clear-notifications\n\n",
@@ -4280,6 +4283,7 @@ fn build_surface_alias_request(
         "focus-panel" => "surface.focus",
         "close-surface" => "surface.close",
         "move-surface" => "surface.move",
+        "reorder-surface" => "surface.reorder",
         "new-split" => "surface.split",
         "refresh-surfaces" => "surface.refresh",
         _ => return Ok(None),
@@ -4311,6 +4315,39 @@ fn build_surface_alias_request(
                 .parse::<u64>()
                 .with_context(|| format!("invalid move-surface --index: {}", index))?;
             params.insert("index".to_string(), Value::Number(parsed.into()));
+        }
+    }
+    if command == "reorder-surface" {
+        if !params.contains_key("surface_id") {
+            bail!("reorder-surface requires --surface, --panel, or a surface positional");
+        }
+        let index = parse_opt(args, "--index");
+        let before_surface =
+            parse_opt(args, "--before-surface").or_else(|| parse_opt(args, "--before"));
+        let after_surface =
+            parse_opt(args, "--after-surface").or_else(|| parse_opt(args, "--after"));
+        let target_count = usize::from(index.is_some())
+            + usize::from(before_surface.is_some())
+            + usize::from(after_surface.is_some());
+        if target_count != 1 {
+            bail!(
+                "reorder-surface requires exactly one of --index, --before-surface, or --after-surface"
+            );
+        }
+        if let Some(index) = index {
+            let parsed = index
+                .parse::<u64>()
+                .with_context(|| format!("invalid reorder-surface --index: {}", index))?;
+            params.insert("index".to_string(), Value::Number(parsed.into()));
+        }
+        if let Some(before_surface) = before_surface {
+            params.insert(
+                "before_surface_id".to_string(),
+                Value::String(before_surface),
+            );
+        }
+        if let Some(after_surface) = after_surface {
+            params.insert("after_surface_id".to_string(), Value::String(after_surface));
         }
     }
     if command == "focus-panel" && !params.contains_key("surface_id") {
@@ -4465,6 +4502,12 @@ fn first_positional(args: &[String]) -> Option<String> {
         "--id",
         "--key",
         "--text",
+        "--target-pane",
+        "--index",
+        "--before-surface",
+        "--before",
+        "--after-surface",
+        "--after",
     ];
     let mut skip = false;
     for arg in args {
@@ -5687,7 +5730,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_list_text("list-panels", &payload))
             }
         }
-        "new-split" | "focus-panel" | "close-surface" | "move-surface" | "refresh-surfaces" => {
+        "new-split" | "focus-panel" | "close-surface" | "move-surface" | "reorder-surface"
+        | "refresh-surfaces" => {
             let Some((method, params)) = build_surface_alias_request(command, args)? else {
                 bail!("unsupported surface alias: {}", command);
             };
@@ -6306,6 +6350,34 @@ mod cli_arg_tests {
         assert_eq!(moved.1["surface_id"], "surface:7:tab-a");
         assert_eq!(moved.1["target_pane_id"], "pane:12");
         assert_eq!(moved.1["index"], 2);
+
+        let reordered = build_surface_alias_request(
+            "reorder-surface",
+            &args(&[
+                "--surface",
+                "surface:7:tab-a",
+                "--after-surface",
+                "surface:7:tab-b",
+            ]),
+        )
+        .expect("reorder-surface parses")
+        .expect("reorder-surface maps");
+        assert_eq!(reordered.0, "surface.reorder");
+        assert_eq!(reordered.1["surface_id"], "surface:7:tab-a");
+        assert_eq!(reordered.1["after_surface_id"], "surface:7:tab-b");
+
+        let ambiguous = build_surface_alias_request(
+            "reorder-surface",
+            &args(&[
+                "--surface",
+                "surface:7:tab-a",
+                "--index",
+                "1",
+                "--before",
+                "surface:7:tab-b",
+            ]),
+        );
+        assert!(ambiguous.is_err());
     }
 
     #[test]

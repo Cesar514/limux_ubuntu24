@@ -131,6 +131,7 @@ const METHODS: &[&str] = &[
     "surface.focus",
     "surface.close",
     "surface.move",
+    "surface.reorder",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -542,6 +543,14 @@ pub enum ControlCommand {
         index: Option<usize>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ReorderSurface {
+        target: WorkspaceTarget,
+        surface_hint: String,
+        index: Option<usize>,
+        before_surface_hint: Option<String>,
+        after_surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -651,6 +660,7 @@ impl ControlCommand {
             | Self::FocusSurface { reply, .. }
             | Self::CloseSurface { reply, .. }
             | Self::MoveSurface { reply, .. }
+            | Self::ReorderSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2231,6 +2241,60 @@ fn handle_method(
                     surface_hint,
                     target_pane_id,
                     index,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.reorder" | "reorder-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("surface.reorder requires surface_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let index = match optional_index(params, "index") {
+                Ok(index) => index,
+                Err(error) => return error_response(id, error),
+            };
+            let before_surface_hint =
+                match optional_ref_handle(params, &["before_surface_id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let after_surface_hint =
+                match optional_ref_handle(params, &["after_surface_id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let target_count = usize::from(index.is_some())
+                + usize::from(before_surface_hint.is_some())
+                + usize::from(after_surface_hint.is_some());
+            if target_count != 1 {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(
+                        "surface.reorder requires exactly one target: index|before_surface_id|after_surface_id",
+                    ),
+                );
+            }
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ReorderSurface {
+                    target,
+                    surface_hint,
+                    index,
+                    before_surface_hint,
+                    after_surface_hint,
                     reply,
                 },
                 rx,
@@ -4332,6 +4396,106 @@ mod tests {
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn surface_reorder_route_accepts_index_and_relative_targets() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"reorder-surface","params":{"workspace_id":"codex","#,
+                r#""surface_id":"surface:4:tab","index":2}}"#
+            ),
+            &|command| match command {
+                ControlCommand::ReorderSurface {
+                    target,
+                    surface_hint,
+                    index,
+                    before_surface_hint,
+                    after_surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, "4:tab");
+                    assert_eq!(index, Some(2));
+                    assert_eq!(before_surface_hint, None);
+                    assert_eq!(after_surface_hint, None);
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:4:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.reorder result")["surface_ref"],
+            "surface:4:tab"
+        );
+
+        let before = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"surface.reorder","params":{"surface_id":"surface:4:tab","#,
+                r#""before_surface_id":"surface:4:other"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::ReorderSurface {
+                    before_surface_hint,
+                    after_surface_hint,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(before_surface_hint, Some("4:other".to_string()));
+                    assert_eq!(after_surface_hint, None);
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:4:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(before.error, None);
+
+        let after = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"surface.reorder","params":{"surface_id":"surface:4:tab","#,
+                r#""after_surface_id":"surface:4:other"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::ReorderSurface {
+                    before_surface_hint,
+                    after_surface_hint,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(before_surface_hint, None);
+                    assert_eq!(after_surface_hint, Some("4:other".to_string()));
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:4:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(after.error, None);
+    }
+
+    #[test]
+    fn surface_reorder_route_rejects_missing_or_multiple_targets() {
+        let missing = dispatch_request(
+            r#"{"id":1,"method":"surface.reorder","params":{"surface_id":"surface:4:tab"}}"#,
+            &|command| panic!("invalid surface.reorder should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            missing.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let multiple = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"surface.reorder","params":{"surface_id":"surface:4:tab","#,
+                r#""index":1,"after_surface_id":"surface:4:other"}}"#
+            ),
+            &|command| panic!("invalid surface.reorder should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            multiple.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }

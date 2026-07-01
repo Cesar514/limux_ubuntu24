@@ -2332,6 +2332,66 @@ pub fn move_surface_for_root(
     None
 }
 
+// purpose: Reorder a surface within its current pane.
+// inputs: Workspace root, source surface handle, and one target index/before/after hint.
+// returns/effects: Reorders the tab strip and returns the reordered surface summary.
+pub fn reorder_surface_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+    index: Option<usize>,
+    before_surface_hint: Option<&str>,
+    after_surface_hint: Option<&str>,
+) -> Option<SurfaceSummary> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested).then(|| entry.id.clone())
+            })
+        };
+        let Some(tab_id) = tab_id else {
+            continue;
+        };
+        let insert_idx = {
+            let tab_state = internals.tab_state.borrow();
+            if let Some(index) = index {
+                index
+            } else if let Some(before_hint) = before_surface_hint.map(normalize_surface_hint) {
+                tab_state.tabs.iter().position(|entry| {
+                    let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                    surface_hint_matches(&surface_id, &entry.id, before_hint)
+                })?
+            } else if let Some(after_hint) = after_surface_hint.map(normalize_surface_hint) {
+                tab_state
+                    .tabs
+                    .iter()
+                    .position(|entry| {
+                        let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                        surface_hint_matches(&surface_id, &entry.id, after_hint)
+                    })?
+                    .saturating_add(1)
+            } else {
+                return None;
+            }
+        };
+        let _ = reorder_tab_to_index(
+            &internals.tab_strip,
+            &internals.tab_state,
+            &internals.callbacks,
+            &tab_id,
+            insert_idx,
+        );
+        return surface_summary_for_tab(&internals, &tab_id);
+    }
+    None
+}
+
 pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarget {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return FocusedShortcutTarget::None;

@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T23:47:48Z Implement and verify CLI and live bridge CMUX `surface.reorder` and `reorder-surface` parity for reordering surfaces within panes. \
 [x] 2026-07-01T23:41:59Z Implement and verify CLI and live bridge CMUX `surface.move` and `move-surface` parity for moving surfaces between panes. \
 [x] 2026-07-01T23:38:20Z Implement and verify live bridge CMUX `surface.close` and `close-surface` parity for GTK surfaces. \
 [x] 2026-07-01T23:33:49Z Implement and verify live bridge and CLI CMUX browser visible, enabled, and checked state checks. \

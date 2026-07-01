@@ -6566,6 +6566,51 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             request_session_save(state);
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::ReorderSurface {
+            target,
+            surface_hint,
+            index,
+            before_surface_hint,
+            after_surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(workspace_index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[workspace_index];
+                pane::reorder_surface_for_root(
+                    &workspace.root,
+                    &surface_hint,
+                    index,
+                    before_surface_hint.as_deref(),
+                    after_surface_hint.as_deref(),
+                )
+                .map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(result) = result else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface or reorder target not found",
+                )));
+                return;
+            };
+
+            request_session_save(state);
+            let _ = reply.send(Ok(result));
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,
