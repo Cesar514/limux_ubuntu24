@@ -266,6 +266,132 @@ return {{ action: 'addstyle', ok: true }};
     )
 }
 
+// purpose: Build JavaScript that visually marks a selected element without changing app state.
+// inputs: CSS selector supplied to browser.highlight.
+// returns/effects: Returns a script that outlines the element or fails when it is missing.
+fn browser_highlight_script(selector: &str) -> String {
+    browser_element_action_script(
+        selector,
+        r#"
+node.setAttribute('data-limux-highlighted', 'true');
+node.style.outline = '3px solid #ffcc00';
+return { action: 'highlight', selector, ok: true };
+"#,
+    )
+}
+
+// purpose: Build JavaScript that reads document cookies in CMUX-compatible row form.
+// inputs: Optional cookie name filter.
+// returns/effects: Returns an array of {name, value} cookie rows.
+fn browser_cookies_get_script(name: Option<&str>) -> String {
+    let name = serde_json::to_string(&name).expect("json cookie name");
+    format!(
+        r#"(function() {{
+const requestedName = {name};
+const rows = document.cookie.split(';').map((raw) => raw.trim()).filter(Boolean).map((raw) => {{
+  const index = raw.indexOf('=');
+  const name = decodeURIComponent(index >= 0 ? raw.slice(0, index) : raw);
+  const value = decodeURIComponent(index >= 0 ? raw.slice(index + 1) : '');
+  return {{ name, value }};
+}});
+return requestedName === null ? rows : rows.filter((row) => row.name === requestedName);
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript that writes one cookie in the current document.
+// inputs: Cookie name and value.
+// returns/effects: Returns action metadata after setting the cookie path to root.
+fn browser_cookie_set_script(name: &str, value: &str) -> String {
+    let name = serde_json::to_string(name).expect("json cookie name");
+    let value = serde_json::to_string(value).expect("json cookie value");
+    format!(
+        r#"(function() {{
+const name = {name};
+const value = {value};
+const separator = String.fromCharCode(59);
+document.cookie = encodeURIComponent(name) + '=' + encodeURIComponent(value) + separator + ' path=/';
+return {{ action: 'cookies.set', ok: true, name, value }};
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript that clears one or all document cookies.
+// inputs: Optional cookie name filter.
+// returns/effects: Expires matching cookies and returns the count selected for clearing.
+fn browser_cookies_clear_script(name: Option<&str>) -> String {
+    let name = serde_json::to_string(&name).expect("json cookie name");
+    format!(
+        r#"(function() {{
+const requestedName = {name};
+const names = document.cookie.split(';').map((raw) => raw.trim()).filter(Boolean).map((raw) => {{
+  const index = raw.indexOf('=');
+  return decodeURIComponent(index >= 0 ? raw.slice(0, index) : raw);
+}}).filter((name) => requestedName === null || name === requestedName);
+for (const name of names) {{
+  const separator = String.fromCharCode(59);
+  const expires = ' expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  document.cookie = encodeURIComponent(name) + '=' + separator + expires + separator + ' path=/';
+}}
+return {{ action: 'cookies.clear', ok: true, cleared: names.length }};
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript that reads localStorage or sessionStorage.
+// inputs: Storage type and key.
+// returns/effects: Returns the stored string value or null when the key is absent.
+fn browser_storage_get_script(storage_type: &str, key: &str) -> String {
+    let storage_type = serde_json::to_string(storage_type).expect("json storage type");
+    let key = serde_json::to_string(key).expect("json storage key");
+    format!(
+        r#"(function() {{
+const storage = {storage_type} === 'session' ? window.sessionStorage : window.localStorage;
+return storage.getItem({key});
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript that writes localStorage or sessionStorage.
+// inputs: Storage type, key, and value.
+// returns/effects: Stores the string value and returns action metadata.
+fn browser_storage_set_script(storage_type: &str, key: &str, value: &str) -> String {
+    let storage_type = serde_json::to_string(storage_type).expect("json storage type");
+    let key = serde_json::to_string(key).expect("json storage key");
+    let value = serde_json::to_string(value).expect("json storage value");
+    format!(
+        r#"(function() {{
+const storageType = {storage_type};
+const storage = storageType === 'session' ? window.sessionStorage : window.localStorage;
+const key = {key};
+const value = {value};
+storage.setItem(key, value);
+return {{ action: 'storage.set', ok: true, type: storageType, key, value }};
+}})()"#,
+    )
+}
+
+// purpose: Build JavaScript that clears localStorage or sessionStorage.
+// inputs: Storage type and optional key.
+// returns/effects: Removes one key or clears the namespace and returns action metadata.
+fn browser_storage_clear_script(storage_type: &str, key: Option<&str>) -> String {
+    let storage_type = serde_json::to_string(storage_type).expect("json storage type");
+    let key = serde_json::to_string(&key).expect("json storage key");
+    format!(
+        r#"(function() {{
+const storageType = {storage_type};
+const key = {key};
+const storage = storageType === 'session' ? window.sessionStorage : window.localStorage;
+if (key === null) {{
+  storage.clear();
+}} else {{
+  storage.removeItem(key);
+}}
+return {{ action: 'storage.clear', ok: true, type: storageType, key }};
+}})()"#,
+    )
+}
+
 // purpose: Build JavaScript that reads a selected element's computed styles.
 // inputs: CSS selector and optional style property name.
 // returns/effects: Returns a JavaScript snippet that fails on missing elements and returns a string or style map.
@@ -5355,6 +5481,59 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     let _ = reply.send(Ok(payload));
                     return;
                 }
+                BrowserAction::Highlight { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_highlight_script(selector);
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::CookiesGet { name } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_cookies_get_script(name.as_deref());
+                    send_browser_eval_response(browser, script, payload, "cookies", reply);
+                    return;
+                }
+                BrowserAction::CookiesSet { name, value } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_cookie_set_script(name, value);
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::CookiesClear { name } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_cookies_clear_script(name.as_deref());
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::StorageGet { storage_type, key } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_storage_get_script(storage_type, key);
+                    send_browser_eval_response(browser, script, payload, "value", reply);
+                    return;
+                }
+                BrowserAction::StorageSet {
+                    storage_type,
+                    key,
+                    value,
+                } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_storage_set_script(storage_type, key, value);
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::StorageClear { storage_type, key } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_storage_clear_script(storage_type, key.as_deref());
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
                 _ => {}
             }
             let ok = match &action {
@@ -5394,7 +5573,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::ConsoleList
                 | BrowserAction::ConsoleClear
                 | BrowserAction::ErrorsList
-                | BrowserAction::ErrorsClear => {
+                | BrowserAction::ErrorsClear
+                | BrowserAction::Highlight { .. }
+                | BrowserAction::CookiesGet { .. }
+                | BrowserAction::CookiesSet { .. }
+                | BrowserAction::CookiesClear { .. }
+                | BrowserAction::StorageGet { .. }
+                | BrowserAction::StorageSet { .. }
+                | BrowserAction::StorageClear { .. } => {
                     unreachable!("read-only browser action handled above")
                 }
                 BrowserAction::IsFocused | BrowserAction::Eval { .. } => {

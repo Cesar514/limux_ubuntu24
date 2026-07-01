@@ -98,6 +98,13 @@ const METHODS: &[&str] = &[
     "browser.console.clear",
     "browser.errors.list",
     "browser.errors.clear",
+    "browser.highlight",
+    "browser.cookies.get",
+    "browser.cookies.set",
+    "browser.cookies.clear",
+    "browser.storage.get",
+    "browser.storage.set",
+    "browser.storage.clear",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -260,6 +267,32 @@ pub enum BrowserAction {
     ConsoleClear,
     ErrorsList,
     ErrorsClear,
+    Highlight {
+        selector: String,
+    },
+    CookiesGet {
+        name: Option<String>,
+    },
+    CookiesSet {
+        name: String,
+        value: String,
+    },
+    CookiesClear {
+        name: Option<String>,
+    },
+    StorageGet {
+        storage_type: String,
+        key: String,
+    },
+    StorageSet {
+        storage_type: String,
+        key: String,
+        value: String,
+    },
+    StorageClear {
+        storage_type: String,
+        key: Option<String>,
+    },
 }
 
 /// Parser-level contract for the live-GTK `pane.create` route.
@@ -647,6 +680,19 @@ fn required_browser_selector(
 fn required_browser_key(method: &str, params: &Map<String, Value>) -> Result<String, BridgeError> {
     optional_string(params, &["key"])
         .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires key")))
+}
+
+// purpose: Read and validate the CMUX browser storage namespace, defaulting to local storage.
+// inputs: Browser RPC parameter map with optional `type`.
+// returns/effects: Returns local/session or an invalid_params error for unknown storage types.
+fn browser_storage_type(params: &Map<String, Value>) -> Result<String, BridgeError> {
+    let storage_type = optional_string(params, &["type"]).unwrap_or_else(|| "local".to_string());
+    match storage_type.as_str() {
+        "local" | "session" => Ok(storage_type),
+        other => Err(BridgeError::invalid_params(format!(
+            "unsupported browser storage type: {other}"
+        ))),
+    }
 }
 
 // purpose: Identify CMUX browser APIs documented as unsupported by WKWebView.
@@ -1302,7 +1348,14 @@ fn handle_method(
         | "browser.console.list"
         | "browser.console.clear"
         | "browser.errors.list"
-        | "browser.errors.clear" => {
+        | "browser.errors.clear"
+        | "browser.highlight"
+        | "browser.cookies.get"
+        | "browser.cookies.set"
+        | "browser.cookies.clear"
+        | "browser.storage.get"
+        | "browser.storage.set"
+        | "browser.storage.clear" => {
             let surface_hint =
                 match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
                     Ok(Some(value)) => value,
@@ -1591,6 +1644,77 @@ fn handle_method(
                 "browser.console.clear" => BrowserAction::ConsoleClear,
                 "browser.errors.list" => BrowserAction::ErrorsList,
                 "browser.errors.clear" => BrowserAction::ErrorsClear,
+                "browser.highlight" => BrowserAction::Highlight {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.cookies.get" => BrowserAction::CookiesGet {
+                    name: optional_string(params, &["name"]),
+                },
+                "browser.cookies.set" => {
+                    let Some(name) = optional_string(params, &["name"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.cookies.set requires name"),
+                        );
+                    };
+                    let Some(value) = optional_string(params, &["value"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.cookies.set requires value"),
+                        );
+                    };
+                    BrowserAction::CookiesSet { name, value }
+                }
+                "browser.cookies.clear" => BrowserAction::CookiesClear {
+                    name: optional_string(params, &["name"]),
+                },
+                "browser.storage.get" => {
+                    let Some(key) = optional_string(params, &["key"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.storage.get requires key"),
+                        );
+                    };
+                    BrowserAction::StorageGet {
+                        storage_type: match browser_storage_type(params) {
+                            Ok(value) => value,
+                            Err(error) => return error_response(id, error),
+                        },
+                        key,
+                    }
+                }
+                "browser.storage.set" => {
+                    let Some(key) = optional_string(params, &["key"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.storage.set requires key"),
+                        );
+                    };
+                    let Some(value) = optional_string(params, &["value"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.storage.set requires value"),
+                        );
+                    };
+                    BrowserAction::StorageSet {
+                        storage_type: match browser_storage_type(params) {
+                            Ok(value) => value,
+                            Err(error) => return error_response(id, error),
+                        },
+                        key,
+                        value,
+                    }
+                }
+                "browser.storage.clear" => BrowserAction::StorageClear {
+                    storage_type: match browser_storage_type(params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                    key: optional_string(params, &["key"]),
+                },
                 _ => unreachable!("browser method matched above"),
             };
             let target = match parse_optional_workspace_target(params, true) {
@@ -3274,6 +3398,77 @@ mod tests {
         }
     }
 
+    #[test]
+    // purpose: Verify CMUX browser highlight and cookie methods reach the live bridge.
+    // inputs: JSON-RPC requests for highlight and cookie get/set/clear actions.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    fn browser_highlight_and_cookie_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r##"{"id":1,"method":"browser.highlight","params":{"surface_id":"surface:9:browser","selector":"#submit"}}"##,
+                BrowserAction::Highlight {
+                    selector: "#submit".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.cookies.get","params":{"surface_id":"surface:9:browser","name":"sid"}}"#,
+                BrowserAction::CookiesGet {
+                    name: Some("sid".to_string()),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.cookies.set","params":{"surface_id":"surface:9:browser","name":"sid","value":"abc"}}"#,
+                BrowserAction::CookiesSet {
+                    name: "sid".to_string(),
+                    value: "abc".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.cookies.clear","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserAction::CookiesClear { name: None },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
+    #[test]
+    // purpose: Verify CMUX browser Web Storage methods reach the live bridge.
+    // inputs: JSON-RPC requests for local/session storage get/set/clear actions.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    fn browser_storage_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.storage.get","params":{"surface_id":"surface:9:browser","type":"session","key":"mode"}}"#,
+                BrowserAction::StorageGet {
+                    storage_type: "session".to_string(),
+                    key: "mode".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.storage.set","params":{"surface_id":"surface:9:browser","key":"mode","value":"dark"}}"#,
+                BrowserAction::StorageSet {
+                    storage_type: "local".to_string(),
+                    key: "mode".to_string(),
+                    value: "dark".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.storage.clear","params":{"surface_id":"surface:9:browser","type":"local","key":"mode"}}"#,
+                BrowserAction::StorageClear {
+                    storage_type: "local".to_string(),
+                    key: Some("mode".to_string()),
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
     // purpose: Verify injection routes reject requests missing required script or CSS payloads.
     // inputs: Malformed addscript and addstyle JSON-RPC requests.
     // returns/effects: Panics when invalid requests dispatch instead of returning invalid_params.
@@ -3296,6 +3491,28 @@ mod tests {
             missing_css.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    // purpose: Verify stateful page routes reject missing or invalid parameters before dispatch.
+    // inputs: Malformed highlight, cookie, and storage JSON-RPC requests.
+    // returns/effects: Panics when invalid requests dispatch instead of returning invalid_params.
+    #[test]
+    fn browser_stateful_page_routes_reject_invalid_params() {
+        for request in [
+            r#"{"id":1,"method":"browser.highlight","params":{"surface_id":"surface:9:browser"}}"#,
+            r#"{"id":1,"method":"browser.cookies.set","params":{"surface_id":"surface:9:browser","name":"sid"}}"#,
+            r#"{"id":1,"method":"browser.storage.get","params":{"surface_id":"surface:9:browser"}}"#,
+            r#"{"id":1,"method":"browser.storage.set","params":{"surface_id":"surface:9:browser","key":"mode"}}"#,
+            r#"{"id":1,"method":"browser.storage.clear","params":{"surface_id":"surface:9:browser","type":"global"}}"#,
+        ] {
+            let response = dispatch_request(request, &|command| {
+                panic!("invalid stateful browser action should not dispatch: {command:?}")
+            });
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(INVALID_PARAMS_CODE)
+            );
+        }
     }
 
     #[test]
