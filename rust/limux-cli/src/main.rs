@@ -263,6 +263,7 @@ fn full_help_text() -> &'static str {
         "Common commands:\n",
         "  identify [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  rpc <method> [json-params]\n",
+        "  events [--after <seq>] [--category <name>] [--name <event>] [--limit <n>]\n",
         "  capabilities\n",
         "  list-panels [--workspace <id|ref>]\n",
         "  list-panes [--workspace <id|ref>]\n",
@@ -754,6 +755,18 @@ fn parse_opt(args: &[String], name: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn parse_opts(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter_map(|w| {
+            if w[0] == name {
+                Some(w[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn parse_flag(args: &[String], name: &str) -> bool {
@@ -3136,6 +3149,127 @@ async fn run_rpc_command(client: &mut Client, args: &[String]) -> Result<Value> 
     client.call(method, params).await
 }
 
+/// purpose: Build CMUX event stream params from CLI flags.
+/// inputs: events command arguments.
+/// returns/effects: Reads cursor file when provided; does not contact the socket.
+fn build_events_stream_params(args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    let after =
+        if let Some(raw) = parse_opt(args, "--after").or_else(|| parse_opt(args, "--after-seq")) {
+            Some(
+                raw.parse::<u64>()
+                    .with_context(|| format!("event sequence must be an integer, got {raw}"))?,
+            )
+        } else {
+            read_cursor_file_arg(args).transpose()?
+        };
+    if let Some(after) = after {
+        params.insert("after_seq".to_string(), Value::Number(after.into()));
+    }
+    let names = parse_opts(args, "--name");
+    if !names.is_empty() {
+        params.insert("names".to_string(), json!(names));
+    }
+    let categories = parse_opts(args, "--category");
+    if !categories.is_empty() {
+        params.insert("categories".to_string(), json!(categories));
+    }
+    if parse_flag(args, "--no-heartbeat") {
+        params.insert("include_heartbeats".to_string(), Value::Bool(false));
+    }
+    Ok(Value::Object(params))
+}
+
+fn read_cursor_file_arg(args: &[String]) -> Option<Result<u64>> {
+    parse_opt(args, "--cursor-file").map(|path| {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read cursor file {path}"))?;
+        raw.trim()
+            .parse::<u64>()
+            .with_context(|| format!("cursor file {path} must contain an integer sequence"))
+    })
+}
+
+fn parse_events_limit(args: &[String]) -> Result<Option<usize>> {
+    parse_opt(args, "--limit")
+        .map(|raw| {
+            raw.parse::<usize>()
+                .with_context(|| format!("--limit must be a non-negative integer, got {raw}"))
+        })
+        .transpose()
+}
+
+fn update_events_cursor(args: &[String], frame: &Value) -> Result<()> {
+    let Some(path) = parse_opt(args, "--cursor-file") else {
+        return Ok(());
+    };
+    let Some(seq) = frame.get("seq").and_then(Value::as_u64) else {
+        return Ok(());
+    };
+    if let Some(parent) = Path::new(&path).parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create cursor directory {}", parent.display()))?;
+    }
+    fs::write(&path, seq.to_string()).with_context(|| format!("failed to write cursor file {path}"))
+}
+
+/// purpose: Run the CMUX-compatible event stream CLI command.
+/// inputs: Socket client metadata and events command arguments.
+/// returns/effects: Prints JSONL frames from the stream and updates cursor files for event frames.
+async fn run_events(client: &Client, args: &[String]) -> Result<CommandOutput> {
+    if parse_flag(args, "--reconnect") {
+        bail!("events --reconnect requires the live event bus; retry without --reconnect");
+    }
+
+    let request = V2Request {
+        id: Some(Value::String("events-cli".to_string())),
+        method: "events.stream".to_string(),
+        params: build_events_stream_params(args)?,
+    };
+    let mut payload = serde_json::to_string(&request).context("failed to encode events request")?;
+    payload.push('\n');
+
+    let stream = UnixStream::connect(&client.socket)
+        .await
+        .with_context(|| format!("failed to connect to socket {}", client.socket.display()))?;
+    let (reader_half, mut writer_half) = stream.into_split();
+    writer_half
+        .write_all(payload.as_bytes())
+        .await
+        .context("failed to write events request")?;
+    writer_half
+        .flush()
+        .await
+        .context("failed to flush events request")?;
+
+    let mut reader = BufReader::new(reader_half);
+    let mut line = String::new();
+    let mut printed = Vec::new();
+    let limit = parse_events_limit(args)?;
+    let hide_ack = parse_flag(args, "--no-ack");
+    while reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read events frame")?
+        > 0
+    {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if !trimmed.is_empty() {
+            let frame: Value = serde_json::from_str(trimmed).context("event frame was not JSON")?;
+            update_events_cursor(args, &frame)?;
+            let is_ack = frame.get("type").and_then(Value::as_str) == Some("ack");
+            if !(hide_ack && is_ack) {
+                printed.push(trimmed.to_string());
+                if limit.is_some_and(|max| printed.len() >= max) {
+                    break;
+                }
+            }
+        }
+        line.clear();
+    }
+    Ok(CommandOutput::Text(printed.join("\n")))
+}
+
 /// purpose: Build a CMUX-compatible surface lifecycle request.
 /// inputs: command is a CMUX alias and args are its CLI flags/positionals.
 /// returns/effects: Returns the target Limux method plus JSON params.
@@ -4297,6 +4431,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
+        "events" => return run_events(client, args).await,
         "capabilities" | "current-workspace" | "select-workspace" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
                 bail!("unsupported workspace alias: {}", command);
@@ -4771,6 +4906,45 @@ mod cli_arg_tests {
             fs::read_to_string(&path).expect("read settings"),
             r#"{"appearance":{"color_scheme":"dark"}}"#
         );
+    }
+
+    #[test]
+    fn events_params_include_filters_after_and_no_heartbeat() {
+        let params = build_events_stream_params(&args(&[
+            "--after",
+            "12",
+            "--name",
+            "notification.created",
+            "--name",
+            "workspace.selected",
+            "--category",
+            "notification",
+            "--no-heartbeat",
+        ]))
+        .expect("events params");
+
+        assert_eq!(params["after_seq"], 12);
+        assert_eq!(
+            params["names"],
+            json!(["notification.created", "workspace.selected"])
+        );
+        assert_eq!(params["categories"], json!(["notification"]));
+        assert_eq!(params["include_heartbeats"], false);
+    }
+
+    #[test]
+    fn events_params_read_after_from_cursor_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.seq");
+        fs::write(&path, "41\n").expect("write cursor");
+
+        let params = build_events_stream_params(&args(&[
+            "--cursor-file",
+            path.to_str().expect("utf8 path"),
+        ]))
+        .expect("events params");
+
+        assert_eq!(params["after_seq"], 41);
     }
 
     #[test]
