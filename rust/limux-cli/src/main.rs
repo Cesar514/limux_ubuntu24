@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use limux_control::socket_path::{resolve_socket_path, SocketMode};
+use limux_control::socket_path::{resolve_socket_path_checked, SocketMode};
 use limux_protocol::{V2Request, V2Response};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -49,6 +49,8 @@ impl IdFormat {
 struct GlobalOptions {
     socket: Option<PathBuf>,
     socket_mode: SocketMode,
+    password: Option<String>,
+    window: Option<String>,
     json_output: bool,
     id_format: IdFormat,
     request: Option<String>,
@@ -129,9 +131,17 @@ impl Client {
 }
 
 fn parse_global_args() -> Result<GlobalOptions> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    parse_global_args_from(env::args().skip(1).collect())
+}
+
+/// purpose: Parse Limux and CMUX-compatible global CLI flags.
+/// inputs: args are raw process arguments after argv[0].
+/// returns/effects: Returns structured options, failing loudly on malformed globals.
+fn parse_global_args_from(mut args: Vec<String>) -> Result<GlobalOptions> {
     let mut socket: Option<PathBuf> = None;
     let mut socket_mode = SocketMode::Runtime;
+    let mut password: Option<String> = None;
+    let mut window: Option<String> = None;
     let mut json_output = false;
     let mut id_format = IdFormat::Refs;
     let mut request: Option<String> = None;
@@ -149,6 +159,20 @@ fn parse_global_args() -> Result<GlobalOptions> {
                     .get(command_start + 1)
                     .ok_or_else(|| anyhow!("--socket requires a value"))?;
                 socket = Some(PathBuf::from(value));
+                command_start += 2;
+            }
+            "--password" => {
+                let value = args
+                    .get(command_start + 1)
+                    .ok_or_else(|| anyhow!("--password requires a value"))?;
+                password = Some(value.clone());
+                command_start += 2;
+            }
+            "--window" => {
+                let value = args
+                    .get(command_start + 1)
+                    .ok_or_else(|| anyhow!("--window requires a value"))?;
+                window = Some(value.clone());
                 command_start += 2;
             }
             "--socket-mode" => {
@@ -188,6 +212,11 @@ fn parse_global_args() -> Result<GlobalOptions> {
                 print_help();
                 std::process::exit(0);
             }
+            "--version" | "-v" => {
+                args = vec!["version".to_string()];
+                command_start = 0;
+                break;
+            }
             _ => break,
         }
     }
@@ -197,6 +226,8 @@ fn parse_global_args() -> Result<GlobalOptions> {
     Ok(GlobalOptions {
         socket,
         socket_mode,
+        password,
+        window,
         json_output,
         id_format,
         request,
@@ -211,11 +242,21 @@ fn print_help() {
     );
 }
 
+fn help_text() -> &'static str {
+    "limux CLI\n\nUsage: limux [--socket <path>] [--json] [--id-format refs|both|uuids] <command> [args...]\nUse `limux --help` for the full command list."
+}
+
+fn version_text() -> String {
+    format!("limux {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn should_launch_host(opts: &GlobalOptions) -> bool {
     opts.command_args.is_empty()
         && opts.request.is_none()
         && opts.socket.is_none()
         && opts.socket_mode == SocketMode::Runtime
+        && opts.password.is_none()
+        && opts.window.is_none()
         && !opts.json_output
         && !opts.pretty
         && opts.id_format == IdFormat::Refs
@@ -685,7 +726,7 @@ async fn run_identify(client: &mut Client, args: &[String]) -> Result<Value> {
 
 async fn run_list(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|value| !value.trim().is_empty());
     let params = if let Some(workspace) = workspace.as_ref() {
         json!({ "workspace_id": workspace })
@@ -988,9 +1029,11 @@ fn default_text_output(payload: &Value) -> String {
 
 async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface")
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+        .filter(|s| !s.is_empty());
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
 
@@ -1011,9 +1054,11 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
 
 async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
-    let surface = parse_opt(args, "--surface").filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface")
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+        .filter(|s| !s.is_empty());
     let key = trailing_title(args).ok_or_else(|| anyhow!("send-key requires key"))?;
 
     let mut params = Map::new();
@@ -1036,7 +1081,7 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
 /// workspace via LIMUX_WORKSPACE_ID when --workspace isn't given.
 async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
 
     // Title can be provided either via --title or as the trailing positional
@@ -1192,7 +1237,7 @@ async fn run_agent_hook(
         .unwrap_or_default();
 
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
 
     let mut params = Map::new();
@@ -1325,10 +1370,10 @@ fn persist_agent_hook_session(
     }
 
     let workspace_id = parse_opt(args, "--workspace")
-        .or_else(|| limux_env_value("LIMUX_WORKSPACE_ID"))
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|value| !value.trim().is_empty());
     let surface_id = parse_opt(args, "--surface")
-        .or_else(|| limux_env_value("LIMUX_SURFACE_ID"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
         .filter(|value| !value.trim().is_empty());
     let (Some(workspace_id), Some(surface_id)) = (workspace_id, surface_id) else {
         write_agent_hook_debug(
@@ -1339,8 +1384,8 @@ fn persist_agent_hook_session(
                 "session_id": session_id,
                 "has_workspace_arg": parse_opt(args, "--workspace").is_some(),
                 "has_surface_arg": parse_opt(args, "--surface").is_some(),
-                "has_workspace_env": limux_env_value("LIMUX_WORKSPACE_ID").is_some(),
-                "has_surface_env": limux_env_value("LIMUX_SURFACE_ID").is_some(),
+                "has_workspace_env": context_env_value("LIMUX_WORKSPACE_ID").is_some(),
+                "has_surface_env": context_env_value("LIMUX_SURFACE_ID").is_some(),
                 "payload_keys": payload_keys(payload),
             }),
         );
@@ -1463,6 +1508,22 @@ fn limux_env_value(name: &str) -> Option<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| ancestor_env_value(name))
+}
+
+/// purpose: Read Limux context env with CMUX-compatible aliases.
+/// inputs: name is a Limux context variable such as LIMUX_WORKSPACE_ID.
+/// returns/effects: Returns the first non-empty Limux or matching CMUX value.
+fn context_env_value(name: &str) -> Option<String> {
+    limux_env_value(name).or_else(|| {
+        let cmux_name = match name {
+            "LIMUX_WORKSPACE_ID" => "CMUX_WORKSPACE_ID",
+            "LIMUX_SURFACE_ID" => "CMUX_SURFACE_ID",
+            "LIMUX_TAB_ID" => "CMUX_TAB_ID",
+            "LIMUX_SOCKET" => "CMUX_SOCKET_PATH",
+            _ => return None,
+        };
+        limux_env_value(cmux_name)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2267,14 +2328,12 @@ async fn run_agent_team(client: &mut Client, args: &[String]) -> Result<Value> {
         }));
     }
 
-    // 1. Resolve the orchestrator's workspace + pane. Prefer LIMUX_* env (set
-    //    in every limux-spawned terminal) and fall back to the host's active
+    // 1. Resolve the orchestrator's workspace + pane. Prefer Limux/CMUX env
+    //    (set in every Limux-spawned terminal) and fall back to the host's active
     //    focus so callers from a regular shell still work.
-    let orchestrator_workspace = env::var("LIMUX_WORKSPACE_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let orchestrator_surface_env = env::var("LIMUX_SURFACE_ID").ok().filter(|s| !s.is_empty());
-    let orchestrator_pane_env = env::var("LIMUX_PANE_ID").ok().filter(|s| !s.is_empty());
+    let orchestrator_workspace = context_env_value("LIMUX_WORKSPACE_ID").filter(|s| !s.is_empty());
+    let orchestrator_surface_env = context_env_value("LIMUX_SURFACE_ID").filter(|s| !s.is_empty());
+    let orchestrator_pane_env = context_env_value("LIMUX_PANE_ID").filter(|s| !s.is_empty());
 
     let workspace_id = match orchestrator_workspace.clone() {
         Some(id) => id,
@@ -2522,10 +2581,8 @@ fn build_agents_md(
     out.push_str("limux new-pane --direction right --command bash\n");
     out.push_str("```\n\n");
     out.push_str(
-        "`new-pane` reads `LIMUX_WORKSPACE_ID`, `LIMUX_SURFACE_ID`, and\n\
-         `LIMUX_PANE_ID`, so it splits your current pane even if GTK focus has\n\
-         moved elsewhere. Live GTK self-spawn currently supports terminal\n\
-         panes only; browser pane creation is deferred.\n\n",
+        "`new-pane` reads `LIMUX_*` and CMUX-compatible context variables, so\n\
+         it splits your current pane even if GTK focus has moved elsewhere.\n\n",
     );
 
     out.push_str("## Policies (edit these freely)\n\n");
@@ -2549,7 +2606,7 @@ fn build_agents_md(
 
 async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .ok_or_else(|| anyhow!("close-workspace requires --workspace <id|ref>"))?;
     client
         .call("workspace.close", json!({ "workspace_id": workspace }))
@@ -2558,7 +2615,7 @@ async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Val
 
 async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .ok_or_else(|| anyhow!("sidebar-state requires --workspace <id|ref>"))?;
 
     let listed = client.call("workspace.list", json!({})).await?;
@@ -2616,20 +2673,40 @@ async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> 
 }
 
 fn env_opt(name: &str) -> Option<String> {
-    env::var(name).ok()
+    context_env_value(name)
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
+/// purpose: Read context variables from an injected environment lookup.
+/// inputs: env_lookup is usually process env; name is a Limux context key.
+/// returns/effects: Returns Limux value first, then CMUX-compatible alias.
+fn context_lookup(env_lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    env_lookup(name).or_else(|| {
+        let cmux_name = match name {
+            "LIMUX_WORKSPACE_ID" => "CMUX_WORKSPACE_ID",
+            "LIMUX_SURFACE_ID" => "CMUX_SURFACE_ID",
+            "LIMUX_TAB_ID" => "CMUX_TAB_ID",
+            "LIMUX_SOCKET" => "CMUX_SOCKET_PATH",
+            _ => return None,
+        };
+        env_lookup(cmux_name)
+    })
+}
+
 fn build_new_pane_request(
     args: &[String],
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> (Option<String>, Value) {
-    let workspace =
-        nonempty(parse_opt(args, "--workspace").or_else(|| env_lookup("LIMUX_WORKSPACE_ID")));
-    let surface = nonempty(parse_opt(args, "--surface").or_else(|| env_lookup("LIMUX_SURFACE_ID")));
+    let workspace = nonempty(
+        parse_opt(args, "--workspace")
+            .or_else(|| context_lookup(&env_lookup, "LIMUX_WORKSPACE_ID")),
+    );
+    let surface = nonempty(
+        parse_opt(args, "--surface").or_else(|| context_lookup(&env_lookup, "LIMUX_SURFACE_ID")),
+    );
     let pane = nonempty(parse_opt(args, "--pane").or_else(|| env_lookup("LIMUX_PANE_ID")));
     let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
     let pane_type = parse_opt(args, "--type").unwrap_or_else(|| "terminal".to_string());
@@ -2720,7 +2797,7 @@ fn build_surface_alias_request(
 
     let mut params = Map::new();
     if let Some(workspace) =
-        parse_opt(args, "--workspace").or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
     {
         if !workspace.trim().is_empty() {
             params.insert("workspace_id".to_string(), Value::String(workspace));
@@ -2759,6 +2836,20 @@ fn build_window_alias_request(
         params.insert("window_id".to_string(), Value::String(window));
     }
     Ok(Some((method, Value::Object(params))))
+}
+
+/// purpose: Apply a global CMUX `--window` option to command-local args.
+/// inputs: command args and an optional global window selector.
+/// returns/effects: Returns args with `--window` appended only when absent.
+fn args_with_global_window(args: &[String], window: Option<&str>) -> Vec<String> {
+    let mut merged = args.to_vec();
+    if let Some(window) = window.filter(|value| !value.trim().is_empty()) {
+        if parse_opt(args, "--window").is_none() {
+            merged.push("--window".to_string());
+            merged.push(window.to_string());
+        }
+    }
+    merged
 }
 
 /// purpose: Build a CMUX-compatible workspace request where Limux already has an API.
@@ -2897,7 +2988,7 @@ fn surface_arg(args: &[String]) -> Option<String> {
     parse_opt(args, "--surface")
         .or_else(|| parse_opt(args, "--panel"))
         .or_else(|| first_positional(args))
-        .or_else(|| env::var("LIMUX_SURFACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
         .filter(|value| !value.trim().is_empty())
 }
 
@@ -2906,7 +2997,8 @@ async fn run_rename_workspace_like(
     command: &str,
     args: &[String],
 ) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace").or_else(|| env::var("LIMUX_WORKSPACE_ID").ok());
+    let workspace =
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"));
     let title = trailing_title(args).ok_or_else(|| {
         if command == "rename-window" {
             anyhow!("rename-window requires a title")
@@ -2926,10 +3018,10 @@ async fn run_rename_workspace_like(
 
 async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
-        .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .unwrap_or_default();
     let tab = parse_opt(args, "--tab")
-        .or_else(|| env::var("LIMUX_TAB_ID").ok())
+        .or_else(|| context_env_value("LIMUX_TAB_ID"))
         .unwrap_or_default();
     let title = trailing_title(args).ok_or_else(|| anyhow!("rename-tab requires a title"))?;
 
@@ -2955,8 +3047,9 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
 
     let action = parse_opt(args, "--action")
         .ok_or_else(|| anyhow!("tab-action requires --action <name>"))?;
-    let workspace = parse_opt(args, "--workspace").or_else(|| env::var("LIMUX_WORKSPACE_ID").ok());
-    let tab = parse_opt(args, "--tab").or_else(|| env::var("LIMUX_TAB_ID").ok());
+    let workspace =
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"));
+    let tab = parse_opt(args, "--tab").or_else(|| context_env_value("LIMUX_TAB_ID"));
     let title = parse_opt(args, "--title").or_else(|| trailing_title(args));
     let url = parse_opt(args, "--url");
 
@@ -3826,6 +3919,12 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
 
     let command = opts.command_args[0].as_str();
     let args = &opts.command_args[1..];
+    if matches!(command, "help") {
+        return Ok(CommandOutput::Text(help_text().to_string()));
+    }
+    if matches!(command, "version") {
+        return Ok(CommandOutput::Text(version_text()));
+    }
     let mut effective_id_format = opts.id_format;
     if command == "browser" {
         if let Some(raw) = parse_opt(args, "--id-format") {
@@ -3854,7 +3953,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "new-window" | "current-window" | "list-windows" | "focus-window" | "close-window" => {
-            let Some((method, params)) = build_window_alias_request(command, args)? else {
+            let merged_args = args_with_global_window(args, opts.window.as_deref());
+            let Some((method, params)) = build_window_alias_request(command, &merged_args)? else {
                 bail!("unsupported window alias: {}", command);
             };
             let payload = client.call(method, params).await?;
@@ -4129,7 +4229,8 @@ async fn main() -> Result<()> {
         return launch_host();
     }
 
-    let socket = resolve_socket_path(opts.socket.clone(), opts.socket_mode);
+    let socket = resolve_socket_path_checked(opts.socket.clone(), opts.socket_mode)
+        .map_err(anyhow::Error::msg)?;
 
     let mut client = Client::new(socket);
     let output = execute_command(&mut client, &opts).await;
@@ -4173,6 +4274,8 @@ mod cli_arg_tests {
         GlobalOptions {
             socket: None,
             socket_mode: SocketMode::Runtime,
+            password: None,
+            window: None,
             json_output: false,
             id_format: IdFormat::Refs,
             request: None,
@@ -4189,9 +4292,40 @@ mod cli_arg_tests {
         json_only.json_output = true;
         assert!(!should_launch_host(&json_only));
 
+        let mut window_only = default_opts(Vec::new());
+        window_only.window = Some("window:1".to_string());
+        assert!(!should_launch_host(&window_only));
+
         assert!(!should_launch_host(&default_opts(args(&[
             "list-workspaces"
         ]))));
+    }
+
+    #[test]
+    fn cmux_global_window_and_password_parse_before_command() {
+        let opts = parse_global_args_from(args(&[
+            "--window",
+            "window:3",
+            "--password",
+            "secret",
+            "focus-window",
+        ]))
+        .expect("global args parse");
+
+        assert_eq!(opts.window.as_deref(), Some("window:3"));
+        assert_eq!(opts.password.as_deref(), Some("secret"));
+        assert_eq!(opts.command_args, args(&["focus-window"]));
+    }
+
+    #[test]
+    fn cmux_global_version_parses_without_command_socket() {
+        let opts = parse_global_args_from(args(&["--version"])).expect("version parses");
+
+        assert_eq!(opts.command_args, args(&["version"]));
+        assert_eq!(
+            version_text(),
+            format!("limux {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -4281,6 +4415,12 @@ mod cli_arg_tests {
             .expect("window maps");
         assert_eq!(window.0, "window.focus");
         assert_eq!(window.1["window_id"], "window:3");
+
+        let merged = args_with_global_window(&args(&[]), Some("window:5"));
+        let global_window = build_window_alias_request("focus-window", &merged)
+            .expect("global window parses")
+            .expect("global window maps");
+        assert_eq!(global_window.1["window_id"], "window:5");
 
         let workspace = build_workspace_alias_request("select-workspace", &args(&["workspace:4"]))
             .expect("workspace parses")
@@ -4624,7 +4764,7 @@ mod agent_team_tests {
         assert!(md.contains("LIMUX_WORKSPACE_ID"));
         assert!(md.contains("LIMUX_SURFACE_ID"));
         assert!(md.contains("limux new-pane --direction right --command bash"));
-        assert!(md.contains("Live GTK self-spawn currently supports terminal"));
+        assert!(md.contains("CMUX-compatible context variables"));
     }
 }
 
@@ -4645,6 +4785,14 @@ mod new_pane_tests {
         }
     }
 
+    fn cmux_only_env(name: &str) -> Option<String> {
+        match name {
+            "CMUX_WORKSPACE_ID" => Some("workspace:cmux".to_string()),
+            "CMUX_SURFACE_ID" => Some("surface:12:tab-b".to_string()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn new_pane_serializes_env_defaults_and_command() {
         let (workspace, params) = build_new_pane_request(&args(&["--command", "claude"]), test_env);
@@ -4660,6 +4808,15 @@ mod new_pane_tests {
                 "command": "claude"
             })
         );
+    }
+
+    #[test]
+    fn new_pane_accepts_cmux_context_env_aliases() {
+        let (workspace, params) = build_new_pane_request(&args(&[]), cmux_only_env);
+
+        assert_eq!(workspace.as_deref(), Some("workspace:cmux"));
+        assert_eq!(params["surface_id"], "surface:12:tab-b");
+        assert!(params.get("pane_id").is_none());
     }
 
     #[test]

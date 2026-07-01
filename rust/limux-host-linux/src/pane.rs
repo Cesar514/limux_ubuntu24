@@ -1285,11 +1285,14 @@ fn add_terminal_tab_inner(
     let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
     let mut extra_env: Vec<(String, String)> = Vec::new();
     if let Some(ws) = workspace_id_for_env {
-        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws.clone()));
+        extra_env.push(("CMUX_WORKSPACE_ID".to_string(), ws));
     }
-    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
+    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env.clone()));
+    extra_env.push(("CMUX_SURFACE_ID".to_string(), surface_id_for_env.clone()));
     extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
     extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
+    extra_env.push(("CMUX_TAB_ID".to_string(), tab_id.clone()));
     if let Some(sock) = limux_control::socket_path::resolve_socket_path(
         None,
         limux_control::socket_path::SocketMode::Runtime,
@@ -1297,6 +1300,9 @@ fn add_terminal_tab_inner(
     .to_str()
     {
         extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+        extra_env.push(("LIMUX_SOCKET_PATH".to_string(), sock.to_string()));
+        extra_env.push(("CMUX_SOCKET".to_string(), sock.to_string()));
+        extra_env.push(("CMUX_SOCKET_PATH".to_string(), sock.to_string()));
     }
     let startup_command = options
         .as_ref()

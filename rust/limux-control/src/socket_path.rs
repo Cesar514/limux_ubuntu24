@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 const LIMUX_SOCKET_ENV: &str = "LIMUX_SOCKET";
 const LIMUX_SOCKET_PATH_ENV: &str = "LIMUX_SOCKET_PATH";
+const CMUX_SOCKET_ENV: &str = "CMUX_SOCKET";
+const CMUX_SOCKET_PATH_ENV: &str = "CMUX_SOCKET_PATH";
 const RUNTIME_SUBDIR: &str = "limux";
 const RUNTIME_SOCKET_NAME: &str = "limux.sock";
 const FALLBACK_RUNTIME_SOCKET: &str = "/tmp/limux.sock";
@@ -32,18 +34,43 @@ impl SocketMode {
 }
 
 pub fn resolve_socket_path(explicit: Option<PathBuf>, mode: SocketMode) -> PathBuf {
+    resolve_socket_path_checked(explicit, mode).unwrap_or_else(|_| SocketMode::default_for(mode))
+}
+
+pub fn resolve_socket_path_checked(
+    explicit: Option<PathBuf>,
+    mode: SocketMode,
+) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
-        return path;
+        return Ok(path);
     }
 
     if let Some(path) = get_env_path(LIMUX_SOCKET_ENV) {
-        return path;
+        return Ok(path);
     }
     if let Some(path) = get_env_path(LIMUX_SOCKET_PATH_ENV) {
-        return path;
+        return Ok(path);
     }
 
-    SocketMode::default_for(mode)
+    let cmux_socket_path = get_env_path(CMUX_SOCKET_PATH_ENV);
+    let cmux_socket = get_env_path(CMUX_SOCKET_ENV);
+    if let (Some(path), Some(alias)) = (&cmux_socket_path, &cmux_socket) {
+        if path != alias {
+            return Err(format!(
+                "{CMUX_SOCKET_PATH_ENV} and {CMUX_SOCKET_ENV} differ: {} != {}",
+                path.display(),
+                alias.display()
+            ));
+        }
+    }
+    if let Some(path) = cmux_socket_path {
+        return Ok(path);
+    }
+    if let Some(path) = cmux_socket {
+        return Ok(path);
+    }
+
+    Ok(SocketMode::default_for(mode))
 }
 
 pub fn prepare_socket_path(path: &Path, mode: SocketMode, owner_only: bool) -> io::Result<()> {
@@ -201,6 +228,9 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, Some("/tmp/from-env.sock"));
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, Some("/tmp/from-env-path.sock"));
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, Some("/tmp/from-cmux-env.sock"));
+        let _cmux_socket_path =
+            EnvGuard::set(CMUX_SOCKET_PATH_ENV, Some("/tmp/from-cmux-env-path.sock"));
 
         let resolved = resolve_socket_path(
             Some(PathBuf::from("/tmp/from-arg.sock")),
@@ -217,6 +247,9 @@ mod tests {
             LIMUX_SOCKET_PATH_ENV,
             Some("/tmp/from-limux-socket-path.sock"),
         );
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, Some("/tmp/from-cmux-env.sock"));
+        let _cmux_socket_path =
+            EnvGuard::set(CMUX_SOCKET_PATH_ENV, Some("/tmp/from-cmux-env-path.sock"));
 
         let resolved = resolve_socket_path(None, SocketMode::Runtime);
         assert_eq!(resolved, PathBuf::from("/tmp/from-limux-socket.sock"));
@@ -230,9 +263,45 @@ mod tests {
             LIMUX_SOCKET_PATH_ENV,
             Some("/tmp/from-limux-socket-path.sock"),
         );
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, Some("/tmp/from-cmux-env.sock"));
+        let _cmux_socket_path =
+            EnvGuard::set(CMUX_SOCKET_PATH_ENV, Some("/tmp/from-cmux-env-path.sock"));
 
         let resolved = resolve_socket_path(None, SocketMode::Runtime);
         assert_eq!(resolved, PathBuf::from("/tmp/from-limux-socket-path.sock"));
+    }
+
+    #[test]
+    fn cmux_socket_path_is_supported_after_limux_envs() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
+        let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, None);
+        let _cmux_socket_path = EnvGuard::set(
+            CMUX_SOCKET_PATH_ENV,
+            Some("/tmp/from-cmux-socket-path.sock"),
+        );
+
+        let resolved = resolve_socket_path_checked(None, SocketMode::Runtime)
+            .expect("cmux socket path resolves");
+        assert_eq!(resolved, PathBuf::from("/tmp/from-cmux-socket-path.sock"));
+    }
+
+    #[test]
+    fn cmux_socket_conflict_is_reported_by_checked_resolver() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
+        let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, Some("/tmp/from-cmux-socket.sock"));
+        let _cmux_socket_path = EnvGuard::set(
+            CMUX_SOCKET_PATH_ENV,
+            Some("/tmp/from-cmux-socket-path.sock"),
+        );
+
+        let error = resolve_socket_path_checked(None, SocketMode::Runtime)
+            .expect_err("conflicting CMUX socket envs should fail");
+        assert!(error.contains(CMUX_SOCKET_PATH_ENV));
+        assert!(error.contains(CMUX_SOCKET_ENV));
     }
 
     #[test]
@@ -240,6 +309,8 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, None);
+        let _cmux_socket_path = EnvGuard::set(CMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
@@ -255,6 +326,8 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, None);
+        let _cmux_socket_path = EnvGuard::set(CMUX_SOCKET_PATH_ENV, None);
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", None);
 
         let resolved = resolve_socket_path(None, SocketMode::Debug);
@@ -266,6 +339,8 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, None);
+        let _cmux_socket_path = EnvGuard::set(CMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
@@ -303,6 +378,8 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _socket = EnvGuard::set(LIMUX_SOCKET_ENV, None);
         let _socket_path = EnvGuard::set(LIMUX_SOCKET_PATH_ENV, None);
+        let _cmux_socket = EnvGuard::set(CMUX_SOCKET_ENV, None);
+        let _cmux_socket_path = EnvGuard::set(CMUX_SOCKET_PATH_ENV, None);
         let xdg = TempDir::new().expect("xdg runtime dir temp path");
         let _xdg = EnvGuard::set("XDG_RUNTIME_DIR", Some(xdg.path().to_str().expect("utf8")));
 
