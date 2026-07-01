@@ -243,6 +243,44 @@ fn send_browser_object_response(
     });
 }
 
+// purpose: Save evaluated browser state to disk and reply with the written payload.
+// inputs: Browser target, destination path, base response payload, and socket reply channel.
+// returns/effects: Writes JSON state to the requested path or sends a fatal bridge error.
+fn send_browser_state_save_response(
+    browser: pane::BrowserSurfaceTarget,
+    path: String,
+    mut payload: serde_json::Value,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    browser.evaluate_javascript(browser_state_save_script(), move |result| match result {
+        Ok(state_json) => {
+            let encoded = match serde_json::to_vec_pretty(&state_json) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = reply.send(Err(BridgeError::internal(format!(
+                        "browser state encoding failed: {error}"
+                    ))));
+                    return;
+                }
+            };
+            if let Err(error) = std::fs::write(&path, encoded) {
+                let _ = reply.send(Err(BridgeError::internal(format!(
+                    "browser state write failed: {error}"
+                ))));
+                return;
+            }
+            payload["path"] = serde_json::Value::String(path);
+            payload["state"] = state_json;
+            let _ = reply.send(Ok(payload));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(BridgeError::internal(format!(
+                "browser JavaScript evaluation failed: {error}"
+            ))));
+        }
+    });
+}
+
 // purpose: Resolve the destination used by live browser screenshot capture.
 // inputs: Optional user-supplied output path from browser.screenshot params.
 // returns/effects: Returns the explicit path or a unique temp-file destination.
@@ -585,6 +623,52 @@ if (key === null) {{
 return {{ action: 'storage.clear', ok: true, type: storageType, key }};
 }})()"#,
     )
+}
+
+// purpose: Build JavaScript that snapshots browser session state from the current page.
+// inputs: None; the script reads URL, title, localStorage, and sessionStorage.
+// returns/effects: Returns JSON-serializable browser state without mutating the page.
+fn browser_state_save_script() -> &'static str {
+    r#"(() => {
+  const dumpStorage = (storage) => {
+    const out = {};
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key !== null) out[key] = storage.getItem(key);
+    }
+    return out;
+  };
+  return {
+    url: location.href,
+    title: document.title,
+    local_storage: dumpStorage(localStorage),
+    session_storage: dumpStorage(sessionStorage)
+  };
+})()"#
+}
+
+// purpose: Build JavaScript that restores browser session state into the current page.
+// inputs: Parsed state JSON with optional URL, local_storage, and session_storage fields.
+// returns/effects: Clears and rewrites Web Storage, then navigates to the saved URL when present.
+fn browser_state_load_script(state_json: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let encoded = serde_json::to_string(state_json)?;
+    Ok(format!(
+        r#"(() => {{
+  const state = {encoded};
+  const applyStorage = (storage, values) => {{
+    storage.clear();
+    for (const [key, value] of Object.entries(values || {{}})) {{
+      storage.setItem(key, value === null || value === undefined ? "" : String(value));
+    }}
+  }};
+  applyStorage(localStorage, state.local_storage);
+  applyStorage(sessionStorage, state.session_storage);
+  if (state.url && location.href !== state.url) {{
+    location.href = state.url;
+  }}
+  return {{ ok: true, url: state.url || location.href, title: state.title || document.title }};
+}})()"#
+    ))
 }
 
 // purpose: Build JavaScript that reads a selected element's computed styles.
@@ -5897,6 +5981,45 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_eval_response(browser, script, payload, "action", reply);
                     return;
                 }
+                BrowserAction::StateSave { path } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_state_save_response(browser, path.clone(), payload, reply);
+                    return;
+                }
+                BrowserAction::StateLoad { path } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let raw = match std::fs::read_to_string(path) {
+                        Ok(raw) => raw,
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::invalid_params(format!(
+                                "browser state read failed: {error}"
+                            ))));
+                            return;
+                        }
+                    };
+                    let state_json = match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::invalid_params(format!(
+                                "browser state JSON is invalid: {error}"
+                            ))));
+                            return;
+                        }
+                    };
+                    let script = match browser_state_load_script(&state_json) {
+                        Ok(script) => script,
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::internal(format!(
+                                "browser state restore encoding failed: {error}"
+                            ))));
+                            return;
+                        }
+                    };
+                    send_browser_eval_response(browser, script, payload, "state", reply);
+                    return;
+                }
                 _ => {}
             }
             let ok = match &action {
@@ -5945,7 +6068,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::CookiesClear { .. }
                 | BrowserAction::StorageGet { .. }
                 | BrowserAction::StorageSet { .. }
-                | BrowserAction::StorageClear { .. } => {
+                | BrowserAction::StorageClear { .. }
+                | BrowserAction::StateSave { .. }
+                | BrowserAction::StateLoad { .. } => {
                     unreachable!("read-only browser action handled above")
                 }
                 BrowserAction::IsFocused | BrowserAction::Eval { .. } => {

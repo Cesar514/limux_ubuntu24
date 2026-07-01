@@ -116,6 +116,8 @@ const METHODS: &[&str] = &[
     "browser.storage.get",
     "browser.storage.set",
     "browser.storage.clear",
+    "browser.state.save",
+    "browser.state.load",
     "browser.tab.list",
     "browser.tab.new",
     "browser.tab.switch",
@@ -319,6 +321,12 @@ pub enum BrowserAction {
     StorageClear {
         storage_type: String,
         key: Option<String>,
+    },
+    StateSave {
+        path: String,
+    },
+    StateLoad {
+        path: String,
     },
 }
 
@@ -1514,7 +1522,9 @@ fn handle_method(
         | "browser.cookies.clear"
         | "browser.storage.get"
         | "browser.storage.set"
-        | "browser.storage.clear" => {
+        | "browser.storage.clear"
+        | "browser.state.save"
+        | "browser.state.load" => {
             let surface_hint =
                 match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
                     Ok(Some(value)) => value,
@@ -1898,6 +1908,27 @@ fn handle_method(
                     },
                     key: optional_string(params, &["key"]),
                 },
+                "browser.state.save" | "browser.state.load" => {
+                    let Some(path) = optional_string(params, &["path"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(format!("{method} requires path")),
+                        );
+                    };
+                    if path.trim().is_empty() {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(format!(
+                                "{method} requires non-empty path"
+                            )),
+                        );
+                    }
+                    if method == "browser.state.save" {
+                        BrowserAction::StateSave { path }
+                    } else {
+                        BrowserAction::StateLoad { path }
+                    }
+                }
                 _ => unreachable!("browser method matched above"),
             };
             let target = match parse_optional_workspace_target(params, true) {
@@ -3741,6 +3772,31 @@ mod tests {
         }
     }
 
+    // purpose: Verify CMUX browser state save/load methods reach the live bridge.
+    // inputs: JSON-RPC requests for state save and load with explicit paths.
+    // returns/effects: Panics when either request fails validation or dispatches the wrong action.
+    #[test]
+    fn browser_state_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.state.save","params":{"surface_id":"surface:9:browser","path":"/tmp/state.json"}}"#,
+                BrowserAction::StateSave {
+                    path: "/tmp/state.json".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.state.load","params":{"surface_id":"surface:9:browser","path":"/tmp/state.json"}}"#,
+                BrowserAction::StateLoad {
+                    path: "/tmp/state.json".to_string(),
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
     // purpose: Verify CMUX browser tab methods reach the live bridge with validated targets.
     // inputs: JSON-RPC requests for tab list, new, switch, and close.
     // returns/effects: Panics when any request fails validation or dispatches the wrong command.
@@ -3911,6 +3967,8 @@ mod tests {
             r#"{"id":1,"method":"browser.storage.get","params":{"surface_id":"surface:9:browser"}}"#,
             r#"{"id":1,"method":"browser.storage.set","params":{"surface_id":"surface:9:browser","key":"mode"}}"#,
             r#"{"id":1,"method":"browser.storage.clear","params":{"surface_id":"surface:9:browser","type":"global"}}"#,
+            r#"{"id":1,"method":"browser.state.save","params":{"surface_id":"surface:9:browser"}}"#,
+            r#"{"id":1,"method":"browser.state.load","params":{"surface_id":"surface:9:browser","path":""}}"#,
         ] {
             let response = dispatch_request(request, &|command| {
                 panic!("invalid stateful browser action should not dispatch: {command:?}")
