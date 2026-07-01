@@ -91,6 +91,13 @@ const METHODS: &[&str] = &[
     "browser.get.styles",
     "browser.snapshot",
     "browser.wait",
+    "browser.addscript",
+    "browser.addinitscript",
+    "browser.addstyle",
+    "browser.console.list",
+    "browser.console.clear",
+    "browser.errors.list",
+    "browser.errors.clear",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -240,6 +247,19 @@ pub enum BrowserAction {
         function: Option<String>,
         timeout_ms: u64,
     },
+    AddScript {
+        script: String,
+    },
+    AddInitScript {
+        script: String,
+    },
+    AddStyle {
+        css: String,
+    },
+    ConsoleList,
+    ConsoleClear,
+    ErrorsList,
+    ErrorsClear,
 }
 
 /// Parser-level contract for the live-GTK `pane.create` route.
@@ -1275,7 +1295,14 @@ fn handle_method(
         | "browser.get.html"
         | "browser.get.styles"
         | "browser.snapshot"
-        | "browser.wait" => {
+        | "browser.wait"
+        | "browser.addscript"
+        | "browser.addinitscript"
+        | "browser.addstyle"
+        | "browser.console.list"
+        | "browser.console.clear"
+        | "browser.errors.list"
+        | "browser.errors.clear" => {
             let surface_hint =
                 match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
                     Ok(Some(value)) => value,
@@ -1533,6 +1560,37 @@ fn handle_method(
                     }
                     action
                 }
+                "browser.addscript" => {
+                    let Some(script) = optional_string(params, &["script"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.addscript requires script"),
+                        );
+                    };
+                    BrowserAction::AddScript { script }
+                }
+                "browser.addinitscript" => {
+                    let Some(script) = optional_string(params, &["script"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.addinitscript requires script"),
+                        );
+                    };
+                    BrowserAction::AddInitScript { script }
+                }
+                "browser.addstyle" => {
+                    let Some(css) = optional_string(params, &["css", "style"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.addstyle requires css or style"),
+                        );
+                    };
+                    BrowserAction::AddStyle { css }
+                }
+                "browser.console.list" => BrowserAction::ConsoleList,
+                "browser.console.clear" => BrowserAction::ConsoleClear,
+                "browser.errors.list" => BrowserAction::ErrorsList,
+                "browser.errors.clear" => BrowserAction::ErrorsClear,
                 _ => unreachable!("browser method matched above"),
             };
             let target = match parse_optional_workspace_target(params, true) {
@@ -3133,6 +3191,111 @@ mod tests {
             assert!(error.message.contains("not_supported"));
             assert!(error.message.contains(method));
         }
+    }
+
+    // purpose: Assert a browser RPC request queues the expected live bridge action.
+    // inputs: Raw JSON-RPC request and expected BrowserAction payload.
+    // returns/effects: Panics when parsing dispatches the wrong command or returns an error.
+    fn assert_browser_action_route(request: &str, expected_action: BrowserAction) {
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::BrowserAction {
+                surface_hint,
+                action,
+                reply,
+                ..
+            } => {
+                assert_eq!(surface_hint, "9:browser");
+                assert_eq!(action, expected_action);
+                let _ = reply.send(Ok(json!({ "ok": true })));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+    }
+
+    // purpose: Verify CMUX browser script and style injection methods reach the live bridge.
+    // inputs: JSON-RPC requests for addscript, addinitscript, and addstyle.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    #[test]
+    fn browser_injection_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.addscript","params":{"surface_id":"surface:9:browser","script":"1 + 2"}}"#,
+                BrowserAction::AddScript {
+                    script: "1 + 2".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.addinitscript","params":{"surface_id":"surface:9:browser","script":"window.ready = true"}}"#,
+                BrowserAction::AddInitScript {
+                    script: "window.ready = true".to_string(),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"browser.addstyle","params":{"surface_id":"surface:9:browser","css":"body { color: red; }"}}"#,
+                BrowserAction::AddStyle {
+                    css: "body { color: red; }".to_string(),
+                },
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
+    // purpose: Verify CMUX browser console and error diagnostic methods reach the live bridge.
+    // inputs: JSON-RPC requests for console and error list/clear methods.
+    // returns/effects: Panics when any request fails validation or dispatches the wrong action.
+    #[test]
+    fn browser_diagnostics_routes_queue_browser_actions() {
+        let cases = [
+            (
+                r#"{"id":1,"method":"browser.console.list","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserAction::ConsoleList,
+            ),
+            (
+                r#"{"id":1,"method":"browser.console.clear","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserAction::ConsoleClear,
+            ),
+            (
+                r#"{"id":1,"method":"browser.errors.list","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserAction::ErrorsList,
+            ),
+            (
+                r#"{"id":1,"method":"browser.errors.clear","params":{"surface_id":"surface:9:browser"}}"#,
+                BrowserAction::ErrorsClear,
+            ),
+        ];
+
+        for (request, expected_action) in cases {
+            assert_browser_action_route(request, expected_action);
+        }
+    }
+
+    // purpose: Verify injection routes reject requests missing required script or CSS payloads.
+    // inputs: Malformed addscript and addstyle JSON-RPC requests.
+    // returns/effects: Panics when invalid requests dispatch instead of returning invalid_params.
+    #[test]
+    fn browser_injection_routes_reject_missing_payloads() {
+        let missing_script = dispatch_request(
+            r#"{"id":1,"method":"browser.addscript","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid addscript should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            missing_script.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let missing_css = dispatch_request(
+            r#"{"id":1,"method":"browser.addstyle","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid addstyle should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            missing_css.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]

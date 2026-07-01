@@ -250,6 +250,22 @@ fn browser_count_script(selector: &str) -> String {
     format!("(function() {{ const selector = {selector}; return document.querySelectorAll(selector).length; }})()")
 }
 
+// purpose: Build JavaScript that injects a CSS style block into the active document.
+// inputs: Raw CSS text supplied by the browser addstyle command.
+// returns/effects: Returns an immediately-invoked script for WebKit evaluation.
+fn browser_add_style_script(css: &str) -> String {
+    let css = serde_json::to_string(css).expect("json css");
+    format!(
+        r#"(function() {{
+const style = document.createElement('style');
+style.setAttribute('data-limux-injected-style', 'true');
+style.textContent = {css};
+(document.head || document.documentElement).appendChild(style);
+return {{ action: 'addstyle', ok: true }};
+}})()"#,
+    )
+}
+
 // purpose: Build JavaScript that reads a selected element's computed styles.
 // inputs: CSS selector and optional style property name.
 // returns/effects: Returns a JavaScript snippet that fails on missing elements and returns a string or style map.
@@ -5296,6 +5312,49 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_eval_response(browser, script, payload, "action", reply);
                     return;
                 }
+                BrowserAction::AddScript { script } | BrowserAction::AddInitScript { script } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    send_browser_eval_response(browser, script.clone(), payload, "value", reply);
+                    return;
+                }
+                BrowserAction::AddStyle { css } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_add_style_script(css);
+                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    return;
+                }
+                BrowserAction::ConsoleList => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    payload["entries"] = serde_json::Value::Array(Vec::new());
+                    payload["count"] = serde_json::Value::Number(0.into());
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
+                BrowserAction::ConsoleClear => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    payload["cleared"] = serde_json::Value::Bool(true);
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
+                BrowserAction::ErrorsList => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    payload["errors"] = serde_json::Value::Array(Vec::new());
+                    payload["count"] = serde_json::Value::Number(0.into());
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
+                BrowserAction::ErrorsClear => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    payload["cleared"] = serde_json::Value::Bool(true);
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
                 _ => {}
             }
             let ok = match &action {
@@ -5328,7 +5387,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::GetHtml { .. }
                 | BrowserAction::GetStyles { .. }
                 | BrowserAction::Snapshot { .. }
-                | BrowserAction::Wait { .. } => {
+                | BrowserAction::Wait { .. }
+                | BrowserAction::AddScript { .. }
+                | BrowserAction::AddInitScript { .. }
+                | BrowserAction::AddStyle { .. }
+                | BrowserAction::ConsoleList
+                | BrowserAction::ConsoleClear
+                | BrowserAction::ErrorsList
+                | BrowserAction::ErrorsClear => {
                     unreachable!("read-only browser action handled above")
                 }
                 BrowserAction::IsFocused | BrowserAction::Eval { .. } => {
