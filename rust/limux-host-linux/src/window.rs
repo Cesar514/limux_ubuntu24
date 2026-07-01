@@ -698,6 +698,35 @@ return result;
     )
 }
 
+// purpose: Build JavaScript that reads one boolean DOM state from a selected element.
+// inputs: CSS selector and one of checked, enabled, or visible.
+// returns/effects: Returns the state value while failing loudly for missing selectors.
+fn browser_is_script(selector: &str, state_name: &str) -> String {
+    let expression = match state_name {
+        "checked" => {
+            r#"(() => {
+  if ('checked' in node) return Boolean(node.checked);
+  return node.getAttribute('aria-checked') === 'true';
+})()"#
+        }
+        "enabled" => {
+            r#"(() => {
+  if (node.disabled === true) return false;
+  return node.getAttribute('aria-disabled') !== 'true';
+})()"#
+        }
+        "visible" => {
+            r#"(() => {
+  const style = window.getComputedStyle(node);
+  const hasBox = Boolean(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+  return hasBox && style.visibility !== 'hidden' && style.display !== 'none';
+})()"#
+        }
+        _ => unreachable!("browser is state should be checked, enabled, or visible"),
+    };
+    browser_required_element_script(selector, expression)
+}
+
 // purpose: Build JavaScript for a DOM action against one required CSS selector.
 // inputs: CSS selector and JavaScript body that operates on `node`.
 // returns/effects: Returns a script that throws when the element cannot be resolved.
@@ -5737,6 +5766,27 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_eval_response(browser, script, payload, "value", reply);
                     return;
                 }
+                BrowserAction::IsChecked { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_is_script(selector, "checked");
+                    send_browser_eval_response(browser, script, payload, "checked", reply);
+                    return;
+                }
+                BrowserAction::IsEnabled { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_is_script(selector, "enabled");
+                    send_browser_eval_response(browser, script, payload, "enabled", reply);
+                    return;
+                }
+                BrowserAction::IsVisible { selector } => {
+                    let payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let script = browser_is_script(selector, "visible");
+                    send_browser_eval_response(browser, script, payload, "visible", reply);
+                    return;
+                }
                 BrowserAction::Find { .. } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
@@ -6051,6 +6101,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::GetBox { .. }
                 | BrowserAction::GetHtml { .. }
                 | BrowserAction::GetStyles { .. }
+                | BrowserAction::IsChecked { .. }
+                | BrowserAction::IsEnabled { .. }
+                | BrowserAction::IsVisible { .. }
                 | BrowserAction::Screenshot { .. }
                 | BrowserAction::Find { .. }
                 | BrowserAction::Snapshot { .. }

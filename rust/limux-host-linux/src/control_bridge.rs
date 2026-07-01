@@ -89,6 +89,9 @@ const METHODS: &[&str] = &[
     "browser.get.box",
     "browser.get.html",
     "browser.get.styles",
+    "browser.is.checked",
+    "browser.is.enabled",
+    "browser.is.visible",
     "browser.screenshot",
     "browser.find.role",
     "browser.find.text",
@@ -257,6 +260,15 @@ pub enum BrowserAction {
     GetStyles {
         selector: String,
         property: Option<String>,
+    },
+    IsChecked {
+        selector: String,
+    },
+    IsEnabled {
+        selector: String,
+    },
+    IsVisible {
+        selector: String,
     },
     Screenshot {
         path: Option<String>,
@@ -1496,6 +1508,9 @@ fn handle_method(
         | "browser.get.box"
         | "browser.get.html"
         | "browser.get.styles"
+        | "browser.is.checked"
+        | "browser.is.enabled"
+        | "browser.is.visible"
         | "browser.screenshot"
         | "browser.find.role"
         | "browser.find.text"
@@ -1730,6 +1745,24 @@ fn handle_method(
                         property: optional_string(params, &["property", "name"]),
                     }
                 }
+                "browser.is.checked" => BrowserAction::IsChecked {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.is.enabled" => BrowserAction::IsEnabled {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
+                "browser.is.visible" => BrowserAction::IsVisible {
+                    selector: match required_browser_selector(method, params) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                },
                 "browser.screenshot" => BrowserAction::Screenshot {
                     path: optional_string(params, &["path", "out"]),
                     full_page: match optional_bool(params, "full_page") {
@@ -3371,6 +3404,57 @@ mod tests {
         );
         assert_eq!(styles.error, None);
 
+        let visible = dispatch_request(
+            r##"{"id":1,"method":"browser.is.visible","params":{"surface_id":"surface:9:browser","selector":"main"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::IsVisible {
+                            selector: "main".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "visible": true, "value": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(visible.error, None);
+
+        let enabled = dispatch_request(
+            r##"{"id":1,"method":"browser.is.enabled","params":{"surface_id":"surface:9:browser","selector":"button"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::IsEnabled {
+                            selector: "button".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "enabled": true, "value": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(enabled.error, None);
+
+        let checked = dispatch_request(
+            r##"{"id":1,"method":"browser.is.checked","params":{"surface_id":"surface:9:browser","selector":"input"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::IsChecked {
+                            selector: "input".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "checked": false, "value": false })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(checked.error, None);
+
         let click = dispatch_request(
             r##"{"id":1,"method":"browser.click","params":{"surface_id":"surface:9:browser","selector":"#submit"}}"##,
             &|command| match command {
@@ -3969,6 +4053,7 @@ mod tests {
             r#"{"id":1,"method":"browser.storage.clear","params":{"surface_id":"surface:9:browser","type":"global"}}"#,
             r#"{"id":1,"method":"browser.state.save","params":{"surface_id":"surface:9:browser"}}"#,
             r#"{"id":1,"method":"browser.state.load","params":{"surface_id":"surface:9:browser","path":""}}"#,
+            r#"{"id":1,"method":"browser.is.visible","params":{"surface_id":"surface:9:browser"}}"#,
         ] {
             let response = dispatch_request(request, &|command| {
                 panic!("invalid stateful browser action should not dispatch: {command:?}")

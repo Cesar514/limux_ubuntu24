@@ -4931,6 +4931,41 @@ async fn run_browser(
                 )
             }
         }
+        "is" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser is requires a surface"))?;
+            let requested_state = rest
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "visible".to_string());
+            let known_state = matches!(requested_state.as_str(), "visible" | "enabled" | "checked");
+            let state_name = if known_state {
+                requested_state.as_str()
+            } else {
+                "visible"
+            };
+            let selector = parse_opt(&browser_args, "--selector")
+                .or_else(|| rest.get(usize::from(known_state)).cloned())
+                .ok_or_else(|| anyhow!("browser is {} requires a selector", state_name))?;
+            let method = format!("browser.is.{}", state_name);
+            let payload = browser_call(client, Some(sid), &method, {
+                let mut p = Map::new();
+                p.insert("selector".to_string(), Value::String(selector));
+                p
+            })
+            .await?;
+            if local_json {
+                CommandOutput::Json(payload)
+            } else {
+                let value = payload
+                    .get(state_name)
+                    .or_else(|| payload.get("value"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                CommandOutput::Text(value.to_string())
+            }
+        }
         "frame" => {
             let sid = surface
                 .clone()
