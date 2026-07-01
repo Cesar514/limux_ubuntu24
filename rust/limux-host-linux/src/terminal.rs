@@ -1,3 +1,8 @@
+// summary: Integrate Ghostty terminal surfaces with GTK widgets and Limux controls.
+// purpose: Manage terminal rendering, input, clipboard, search, notifications, and Ghostty runtime callbacks.
+// inputs: GTK events, Ghostty callbacks, terminal options, shortcut actions, and control bridge requests.
+// returns/effects: Creates interactive terminal widgets and schedules Ghostty draw/tick work on the GTK main loop.
+
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -36,6 +41,7 @@ static CURRENT_COLOR_SCHEME: AtomicI32 = AtomicI32::new(GHOSTTY_COLOR_SCHEME_LIG
 static CURRENT_SCROLLBAR_ENABLED: AtomicBool = AtomicBool::new(true);
 static WAKEUP_IDLE_QUEUED: AtomicBool = AtomicBool::new(false);
 static EMPTY_CLIPBOARD_TEXT: [u8; 1] = [0];
+const GHOSTTY_MAILBOX_TICK_MS: u64 = 16;
 
 type TitleChangedCallback = dyn Fn(&str);
 type PwdChangedCallback = dyn Fn(&str);
@@ -534,11 +540,10 @@ pub fn init_ghostty() {
         let app = unsafe { ghostty_app_new(&runtime_config, config) };
 
         // Ghostty's GTK apprt calls core_app.tick() on every GLib main
-        // loop iteration to drain the app mailbox (which includes
-        // redraw_surface messages from the renderer thread). The renderer
-        // thread pushes these messages but doesn't wake the app.
-        // We replicate this with a high-frequency timer (~8ms ≈ 120Hz).
-        glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
+        // loop iteration to drain the app mailbox. Limux also ticks from
+        // ghostty_wakeup_cb, so the timer only needs to cap latency for
+        // renderer messages that arrive without a wakeup.
+        glib::timeout_add_local(Duration::from_millis(GHOSTTY_MAILBOX_TICK_MS), move || {
             unsafe { ghostty_app_tick(app) };
             glib::ControlFlow::Continue
         });

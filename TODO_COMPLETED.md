@@ -2,6 +2,14 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T11:18:21Z Move completed performance-goal items to TODO_COMPLETED.md and leave TODO.md clean. \
+[x] 2026-07-01T11:18:21Z Re-run profiling and tests to prove measurable improvements and document the Xvfb privilege blocker. \
+[x] 2026-07-01T11:18:21Z Patch the verified Ghostty mailbox polling inefficiency while preserving functionality and hard-cutout behavior. \
+[x] 2026-07-01T11:18:21Z Identify Ghostty's unconditional 8 ms mailbox timer as the measured runtime hotspot. \
+[x] 2026-07-01T11:18:21Z Compare patched Limux measurements against a reproducible pre-performance git baseline. \
+[x] 2026-07-01T11:18:21Z Run live-display runtime profiling for disk writes, memory growth, CPU, and NVIDIA GPU behavior. \
+[x] 2026-07-01T11:18:21Z Establish the installed/current-version baseline and build profileable optimized Limux binaries. \
+[x] 2026-07-01T11:02:53Z Create a reproducible performance and leak profiling plan for Limux. \
 [x] 2026-07-01T10:54:59Z Move completed work items to TODO_COMPLETED.md and leave TODO.md clean. \
 [x] 2026-07-01T10:54:59Z Verify the patched behavior with the strongest local checks available. \
 [x] 2026-07-01T10:54:59Z Compare Limux with similar terminal multiplexers and document practical missing functions. \
