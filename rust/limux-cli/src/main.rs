@@ -3022,7 +3022,7 @@ fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
 
 fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
     match agent {
-        agent_hooks::AgentKind::Codex => install_json_hooks(
+        agent_hooks::AgentKind::Codex => install_json_hooks_with_feed(
             &codex_hooks_path(),
             agent,
             &[
@@ -3030,6 +3030,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("UserPromptSubmit", "prompt-submit"),
                 ("Stop", "stop"),
             ],
+            codex_feed_hook_events(),
         ),
         agent_hooks::AgentKind::Claude => install_json_hooks(
             &claude_settings_path(),
@@ -3077,6 +3078,18 @@ fn install_json_hooks(
     agent: agent_hooks::AgentKind,
     events: &[(&str, &str)],
 ) -> Result<()> {
+    install_json_hooks_with_feed(path, agent, events, &[])
+}
+
+// purpose: Install session lifecycle hooks and optional Feed hooks into an agent JSON hook file.
+// inputs: Target JSON path, agent kind, lifecycle event mappings, and Feed hook event names.
+// returns/effects: Rewrites the hook file after removing stale Limux entries for that agent.
+fn install_json_hooks_with_feed(
+    path: &Path,
+    agent: agent_hooks::AgentKind,
+    events: &[(&str, &str)],
+    feed_events: &[&str],
+) -> Result<()> {
     let mut root = read_json_object(path)?;
     let hooks = root
         .entry("hooks".to_string())
@@ -3087,7 +3100,7 @@ fn install_json_hooks(
     let marker = hook_marker(agent);
     for value in hooks.values_mut() {
         if let Some(entries) = value.as_array_mut() {
-            entries.retain(|entry| !json_value_contains(entry, marker));
+            entries.retain(|entry| !hook_entry_matches_agent(agent, entry, marker));
         }
     }
     hooks.retain(|_, value| {
@@ -3118,14 +3131,57 @@ fn install_json_hooks(
         }
         entries.push(entry);
     }
+    for agent_event in feed_events {
+        let entries = hooks
+            .entry((*agent_event).to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let entries = entries
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("{} hook {agent_event} is not an array", path.display()))?;
+        entries.retain(|entry| !hook_entry_matches_agent(agent, entry, marker));
+        entries.push(json!({
+            "hooks": [{
+                "type": "command",
+                "command": feed_hook_command(agent, agent_event)?,
+                "statusMessage": format!("Limux {} Feed", agent.label()),
+                "timeout": feed_hook_timeout(agent)
+            }]
+        }));
+    }
 
     write_json_object(path, &root)
+}
+
+// purpose: List the Codex hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Codex hook event names without side effects.
+fn codex_feed_hook_events() -> &'static [&'static str] {
+    &[
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PreCompact",
+        "PostCompact",
+        "SubagentStart",
+        "SubagentStop",
+    ]
 }
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Claude => 5,
         agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
+        agent_hooks::AgentKind::OpenCode => 0,
+    }
+}
+
+// purpose: Match CMUX's Feed hook timeout units for each supported agent schema.
+// inputs: Agent kind whose hook schema is being written.
+// returns/effects: Returns the timeout value stored in that agent's hook JSON.
+fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
+    match agent {
+        agent_hooks::AgentKind::Codex => 5,
+        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Gemini => 120_000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
 }
@@ -3139,7 +3195,7 @@ fn uninstall_json_hooks(path: &Path, agent: agent_hooks::AgentKind) -> Result<()
         let marker = hook_marker(agent);
         for value in hooks.values_mut() {
             if let Some(entries) = value.as_array_mut() {
-                entries.retain(|entry| !json_value_contains(entry, marker));
+                entries.retain(|entry| !hook_entry_matches_agent(agent, entry, marker));
             }
         }
         hooks.retain(|_, value| {
@@ -3150,6 +3206,15 @@ fn uninstall_json_hooks(path: &Path, agent: agent_hooks::AgentKind) -> Result<()
         });
     }
     write_json_object(path, &root)
+}
+
+// purpose: Detect any lifecycle or Feed hook entry owned by a specific Limux agent integration.
+// inputs: Agent kind, candidate JSON hook entry, and lifecycle command marker.
+// returns/effects: Returns true when the entry should be replaced or removed.
+fn hook_entry_matches_agent(agent: agent_hooks::AgentKind, entry: &Value, marker: &str) -> bool {
+    json_value_contains(entry, marker)
+        || feed_hook_marker(agent)
+            .is_some_and(|feed_marker| json_value_contains(entry, &feed_marker))
 }
 
 fn install_opencode_plugin() -> Result<()> {
@@ -3205,6 +3270,22 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
     ))
 }
 
+// purpose: Build the shell command installed for a Feed hook event.
+// inputs: Agent kind and raw agent hook event name.
+// returns/effects: Returns the command string or fails if the Limux CLI path cannot be resolved.
+fn feed_hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
+    let disable_var = format!(
+        "LIMUX_{}_HOOKS_DISABLED",
+        agent.store_name().to_ascii_uppercase()
+    );
+    let limux_command = hook_cli_command()?;
+    Ok(format!(
+        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} hooks feed --source {} --event {} || echo '{{}}'",
+        agent.store_name(),
+        shell_single_quote(event)
+    ))
+}
+
 fn hook_cli_command() -> Result<String> {
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
@@ -3240,6 +3321,13 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
     }
+}
+
+// purpose: Build the stable marker used to identify installed Feed hook commands.
+// inputs: Agent kind whose Feed hook command should be matched.
+// returns/effects: Returns the marker substring without filesystem changes.
+fn feed_hook_marker(agent: agent_hooks::AgentKind) -> Option<String> {
+    Some(format!("hooks feed --source {}", agent.store_name()))
 }
 
 fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
@@ -6465,6 +6553,68 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks codex session-start"));
+    }
+
+    /// purpose: Verify Codex setup writes CMUX Feed hooks beside lifecycle hooks.
+    /// inputs: Temporary hook JSON file and the Codex hook installer.
+    /// returns/effects: Asserts installed Feed hook shape, timeout, and command markers.
+    #[test]
+    fn codex_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+
+        install_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Codex,
+            &[
+                ("SessionStart", "session-start"),
+                ("UserPromptSubmit", "prompt-submit"),
+                ("Stop", "stop"),
+            ],
+            codex_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        let feed = &root["hooks"]["PermissionRequest"][0];
+
+        assert!(feed.get("matcher").is_none());
+        assert_eq!(feed["hooks"][0]["timeout"], 5);
+        assert!(feed["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source codex --event 'PermissionRequest'"));
+        assert!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source codex --event 'PreToolUse'"));
+        assert!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks codex session-start"));
+    }
+
+    /// purpose: Verify Codex uninstall removes both lifecycle hooks and Feed hooks.
+    /// inputs: Temporary hook JSON file containing installed Codex hook entries.
+    /// returns/effects: Asserts no Codex-owned hook entries remain after uninstall.
+    #[test]
+    fn codex_hook_uninstall_removes_lifecycle_and_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+
+        install_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Codex,
+            &[("SessionStart", "session-start")],
+            &["PermissionRequest"],
+        )
+        .expect("install hooks");
+        uninstall_json_hooks(&path, agent_hooks::AgentKind::Codex).expect("uninstall hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        assert!(root["hooks"].as_object().expect("hooks").is_empty());
     }
 
     #[test]
