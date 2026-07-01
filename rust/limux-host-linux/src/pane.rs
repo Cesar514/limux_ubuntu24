@@ -277,6 +277,38 @@ pub struct BrowserShortcutTarget {
 }
 
 #[derive(Clone)]
+pub struct BrowserSurfaceTarget {
+    pub surface: SurfaceSummary,
+    target: BrowserShortcutTarget,
+}
+
+impl BrowserSurfaceTarget {
+    pub fn current_uri(&self) -> Option<String> {
+        self.target.current_uri()
+    }
+
+    pub fn navigate(&self, url: &str) -> bool {
+        self.target.navigate(url)
+    }
+
+    pub fn focus_content(&self) -> bool {
+        self.target.focus_content()
+    }
+
+    pub fn go_back(&self) -> bool {
+        self.target.go_back()
+    }
+
+    pub fn go_forward(&self) -> bool {
+        self.target.go_forward()
+    }
+
+    pub fn reload(&self) -> bool {
+        self.target.reload()
+    }
+}
+
+#[derive(Clone)]
 pub enum FocusedShortcutTarget {
     None,
     Terminal(TerminalShortcutTarget),
@@ -1852,6 +1884,97 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     })
 }
 
+/// purpose: Focus the active tab in a pane identified by pane id.
+/// inputs: root is the workspace root widget and pane_id is a live Limux pane id.
+/// returns/effects: Activates and focuses the pane's active tab when the pane exists.
+pub fn focus_pane_for_root(root: &gtk::Widget, pane_id: u32) -> Option<SurfaceSummary> {
+    for internals in pane_internals_for_root(root) {
+        if internals.pane_id != pane_id {
+            continue;
+        }
+        let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+        if !focus_active_tab_in_pane(&pane_widget) {
+            return None;
+        }
+        return active_surface_summary(&pane_widget);
+    }
+    None
+}
+
+/// purpose: Focus a surface by surface handle within a workspace root.
+/// inputs: root is the workspace root widget and surface_hint is a raw or `surface:` handle.
+/// returns/effects: Activates and focuses the matching tab when present.
+pub fn focus_surface_for_root(root: &gtk::Widget, surface_hint: &str) -> Option<SurfaceSummary> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let target_tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested).then(|| entry.id.clone())
+            })
+        };
+        let Some(tab_id) = target_tab_id else {
+            continue;
+        };
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+        );
+        (internals.callbacks.on_state_changed)();
+        let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+        return active_surface_summary(&pane_widget);
+    }
+    None
+}
+
+/// purpose: Resolve a browser surface target inside one workspace root.
+/// inputs: root is the workspace root widget; surface_hint targets a browser tab.
+/// returns/effects: Returns browser control handles without mutating focus.
+pub fn browser_target_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+) -> Option<BrowserSurfaceTarget> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let tab_state = internals.tab_state.borrow();
+        for entry in &tab_state.tabs {
+            let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+            if !surface_hint_matches(&surface_id, &entry.id, requested) {
+                continue;
+            }
+            let TabKind::Browser { state } = &entry.kind else {
+                return None;
+            };
+            let surface = SurfaceSummary {
+                pane_id: internals.pane_id,
+                surface_id,
+                title: entry.title_label.label().to_string(),
+                kind: "browser".to_string(),
+                selected: tab_state.active_tab.as_deref() == Some(entry.id.as_str()),
+                cwd: None,
+                uri: state.uri.borrow().clone(),
+            };
+            let target = BrowserShortcutTarget {
+                uri: state.uri.clone(),
+                handles: state.handles.clone(),
+            };
+            return Some(BrowserSurfaceTarget { surface, target });
+        }
+    }
+    None
+}
+
 pub fn terminal_handle_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
@@ -2866,6 +2989,14 @@ impl BrowserShortcutTarget {
         self.uri.borrow().clone()
     }
 
+    pub fn navigate(&self, url: &str) -> bool {
+        self.handles.navigate(url, self.uri.clone())
+    }
+
+    pub fn focus_content(&self) -> bool {
+        self.handles.focus_content()
+    }
+
     pub fn focus_location(&self) -> bool {
         self.handles.focus_location()
     }
@@ -2932,6 +3063,14 @@ impl BrowserHandles {
         } else {
             self.webview.grab_focus();
         }
+        true
+    }
+
+    fn navigate(&self, url: &str, saved_uri: Rc<RefCell<Option<String>>>) -> bool {
+        let normalized = normalize_browser_entry_input(url);
+        self.url_entry.set_text(&normalized);
+        *saved_uri.borrow_mut() = Some(normalized.clone());
+        self.webview.load_uri(&normalized);
         true
     }
 
@@ -3064,6 +3203,10 @@ impl BrowserHandles {
     }
 
     fn focus_content(&self) -> bool {
+        false
+    }
+
+    fn navigate(&self, _url: &str, _saved_uri: Rc<RefCell<Option<String>>>) -> bool {
         false
     }
 

@@ -34,14 +34,29 @@ const METHODS: &[&str] = &[
     "pane.surfaces",
     "pane.create",
     "pane.create_many",
+    "pane.focus",
+    "browser.open_split",
+    "browser.navigate",
+    "browser.url.get",
+    "browser.back",
+    "browser.forward",
+    "browser.reload",
+    "browser.focus_webview",
     "surface.create",
     "surface.create_many",
     "surface.list",
+    "surface.focus",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
     "notification.create",
+    "notification.list",
+    "notification.dismiss",
+    "notification.mark_read",
+    "notification.open",
+    "notification.jump_to_unread",
+    "notification.clear",
 ];
 
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -75,6 +90,16 @@ pub enum PaneCreateType {
     Browser,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserAction {
+    Navigate { url: String },
+    GetUrl,
+    Back,
+    Forward,
+    Reload,
+    Focus,
+}
+
 /// Parser-level contract for the live-GTK `pane.create` route.
 ///
 /// Request fields accepted by the bridge:
@@ -91,10 +116,9 @@ pub enum PaneCreateType {
 ///   newly-created surface after creation. The standalone core dispatcher may
 ///   accept the field for compatibility but does not launch a process.
 ///
-/// This delivery only implements live-GTK terminal panes. Browser pane support
-/// remains a follow-up, so `type=browser` and `url` fail at parse time before
-/// any GTK work is scheduled. Responses must keep the existing core/CLI field
-/// names: `pane_id`, `pane_ref`, `surface_id`, and `surface_ref`.
+/// Browser pane support uses the existing WebKit pane state path. Responses
+/// must keep the existing core/CLI field names: `pane_id`, `pane_ref`,
+/// `surface_id`, and `surface_ref`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePaneRequest {
     pub target: WorkspaceTarget,
@@ -103,6 +127,7 @@ pub struct CreatePaneRequest {
     pub direction: PaneCreateDirection,
     pub pane_type: PaneCreateType,
     pub command: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +172,17 @@ pub enum ControlCommand {
         request: CreatePanesRequest,
         reply: mpsc::Sender<BridgeResult>,
     },
+    FocusPane {
+        target: WorkspaceTarget,
+        pane_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    BrowserAction {
+        target: WorkspaceTarget,
+        surface_hint: String,
+        action: BrowserAction,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CreateSurface {
         target: WorkspaceTarget,
         command: Option<String>,
@@ -161,6 +197,11 @@ pub enum ControlCommand {
     },
     ListSurfaces {
         target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    FocusSurface {
+        target: WorkspaceTarget,
+        surface_hint: String,
         reply: mpsc::Sender<BridgeResult>,
     },
     SurfaceHealth {
@@ -222,6 +263,32 @@ pub enum ControlCommand {
         body: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ListNotifications {
+        unread_only: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    DismissNotification {
+        notification_id: Option<u64>,
+        all_read: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    MarkNotificationRead {
+        notification_id: Option<u64>,
+        target: Option<WorkspaceTarget>,
+        all: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    OpenNotification {
+        notification_id: u64,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    JumpToUnreadNotification {
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ClearNotifications {
+        notification_id: Option<u64>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
 }
 
 impl ControlCommand {
@@ -235,9 +302,12 @@ impl ControlCommand {
             | Self::ListPaneSurfaces { reply, .. }
             | Self::CreatePane { reply, .. }
             | Self::CreatePanes { reply, .. }
+            | Self::FocusPane { reply, .. }
+            | Self::BrowserAction { reply, .. }
             | Self::CreateSurface { reply, .. }
             | Self::CreateSurfaces { reply, .. }
             | Self::ListSurfaces { reply, .. }
+            | Self::FocusSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -247,7 +317,13 @@ impl ControlCommand {
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
-            | Self::CreateNotification { reply, .. } => {
+            | Self::CreateNotification { reply, .. }
+            | Self::ListNotifications { reply, .. }
+            | Self::DismissNotification { reply, .. }
+            | Self::MarkNotificationRead { reply, .. }
+            | Self::OpenNotification { reply, .. }
+            | Self::JumpToUnreadNotification { reply }
+            | Self::ClearNotifications { reply, .. } => {
                 let _ = reply.send(result);
             }
         }
@@ -387,6 +463,50 @@ fn optional_index(params: &Map<String, Value>, key: &str) -> Result<Option<usize
     )))
 }
 
+fn optional_bool(params: &Map<String, Value>, key: &str) -> Result<Option<bool>, BridgeError> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| BridgeError::invalid_params(format!("{key} must be a boolean")))
+}
+
+fn optional_u64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, BridgeError> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        if let Some(number) = value.as_u64() {
+            return Ok(Some(number));
+        }
+        if let Some(raw) = value.as_str() {
+            return raw.trim().parse::<u64>().map(Some).map_err(|_| {
+                BridgeError::invalid_params(format!("{key} must be a non-negative integer"))
+            });
+        }
+        return Err(BridgeError::invalid_params(format!(
+            "{key} must be a non-negative integer"
+        )));
+    }
+    Ok(None)
+}
+
+fn has_workspace_selector(params: &Map<String, Value>) -> bool {
+    [
+        "workspace_id",
+        "workspace",
+        "tab_id",
+        "tab",
+        "id",
+        "name",
+        "index",
+    ]
+    .iter()
+    .any(|key| params.contains_key(*key))
+}
+
 fn looks_like_workspace_handle(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.starts_with("workspace:") {
@@ -452,14 +572,16 @@ fn parse_create_pane_request(
         }
     };
 
-    if matches!(pane_type, PaneCreateType::Browser) {
-        return Err(BridgeError::invalid_params(
-            "pane.create live GTK bridge supports type=terminal only",
-        ));
-    }
-    if optional_string(params, &["url"]).is_some() {
+    let url = optional_string(params, &["url"]);
+    let command = optional_string(params, &["command"]);
+    if matches!(pane_type, PaneCreateType::Terminal) && url.is_some() {
         return Err(BridgeError::invalid_params(
             "pane.create url is only supported for browser panes",
+        ));
+    }
+    if matches!(pane_type, PaneCreateType::Browser) && command.is_some() {
+        return Err(BridgeError::invalid_params(
+            "pane.create command is only supported for terminal panes",
         ));
     }
 
@@ -469,7 +591,8 @@ fn parse_create_pane_request(
         source_surface_id: optional_ref_handle(params, &["surface_id"], "surface:")?,
         direction,
         pane_type,
-        command: optional_string(params, &["command"]),
+        command,
+        url,
     })
 }
 
@@ -633,6 +756,68 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
         }
+        "browser.open_split" => {
+            let mut create_params = params.clone();
+            create_params.insert("type".to_string(), Value::String("browser".to_string()));
+            if !create_params.contains_key("direction") {
+                create_params.insert("direction".to_string(), Value::String("right".to_string()));
+            }
+            let request = match parse_create_pane_request(&create_params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CreatePane { request, reply }, rx)
+        }
+        "browser.navigate"
+        | "browser.url.get"
+        | "browser.back"
+        | "browser.forward"
+        | "browser.reload"
+        | "browser.focus_webview" => {
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "surface", "id"], "surface:") {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(format!("{method} requires surface_id")),
+                        )
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let action = match method {
+                "browser.navigate" => {
+                    let Some(url) = optional_string(params, &["url"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("browser.navigate requires url"),
+                        );
+                    };
+                    BrowserAction::Navigate { url }
+                }
+                "browser.url.get" => BrowserAction::GetUrl,
+                "browser.back" => BrowserAction::Back,
+                "browser.forward" => BrowserAction::Forward,
+                "browser.reload" => BrowserAction::Reload,
+                "browser.focus_webview" => BrowserAction::Focus,
+                _ => unreachable!("browser method matched above"),
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BrowserAction {
+                    target,
+                    surface_hint,
+                    action,
+                    reply,
+                },
+                rx,
+            )
+        }
         "pane.create_many" => {
             let request = match parse_create_panes_request(params) {
                 Ok(request) => request,
@@ -640,6 +825,31 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePanes { request, reply }, rx)
+        }
+        "pane.focus" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_id = match optional_ref_handle(params, &["pane_id", "id"], "pane:") {
+                Ok(Some(value)) if !value.trim().is_empty() => value,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("pane.focus requires pane_id"),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusPane {
+                    target,
+                    pane_id,
+                    reply,
+                },
+                rx,
+            )
         }
         "surface.create" | "new-surface" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -694,6 +904,32 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListSurfaces { target, reply }, rx)
+        }
+        "surface.focus" | "focus-panel" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("surface.focus requires surface_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::FocusSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
         }
         "surface.health" | "surface-health" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -905,6 +1141,119 @@ fn handle_method(
                     title,
                     subtitle,
                     body,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "notification.list" => {
+            let unread_only = match optional_bool(params, "unread_only") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ListNotifications { unread_only, reply }, rx)
+        }
+        "notification.dismiss" => {
+            let notification_id = match optional_u64(params, &["notification_id", "id"]) {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let all_read = match optional_bool(params, "all_read") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            if notification_id.is_some() == all_read {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(
+                        "notification.dismiss requires exactly one of id or all_read",
+                    ),
+                );
+            }
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::DismissNotification {
+                    notification_id,
+                    all_read,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "notification.mark_read" => {
+            let notification_id = match optional_u64(params, &["notification_id", "id"]) {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let all = match optional_bool(params, "all") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let has_workspace = notification_id.is_none() && has_workspace_selector(params);
+            let target = if has_workspace {
+                match parse_required_workspace_target(params, true, "notification.mark_read") {
+                    Ok(target) => Some(target),
+                    Err(error) => return error_response(id, error),
+                }
+            } else {
+                None
+            };
+            let selector_count = usize::from(notification_id.is_some())
+                + usize::from(target.is_some())
+                + usize::from(all);
+            if selector_count != 1 {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(
+                        "notification.mark_read requires exactly one selector: id, workspace, or all",
+                    ),
+                );
+            }
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::MarkNotificationRead {
+                    notification_id,
+                    target,
+                    all,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "notification.open" => {
+            let notification_id = match optional_u64(params, &["notification_id", "id"]) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("notification.open requires id"),
+                    )
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::OpenNotification {
+                    notification_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "notification.jump_to_unread" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::JumpToUnreadNotification { reply }, rx)
+        }
+        "notification.clear" => {
+            let notification_id = match optional_u64(params, &["notification_id", "id"]) {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ClearNotifications {
+                    notification_id,
                     reply,
                 },
                 rx,
@@ -1165,16 +1514,22 @@ mod tests {
     }
 
     #[test]
-    fn pane_create_contract_rejects_deferred_browser_fields() {
+    fn pane_create_contract_accepts_browser_fields() {
         let browser = json!({ "type": "browser" });
-        let error = parse_create_pane_request(browser.as_object().expect("object params"))
-            .expect_err("browser panes are deferred");
-        assert_eq!(error.code, INVALID_PARAMS_CODE);
+        let request = parse_create_pane_request(browser.as_object().expect("object params"))
+            .expect("browser panes parse");
+        assert_eq!(request.pane_type, PaneCreateType::Browser);
 
         let url = json!({ "url": "https://example.com" });
         let error = parse_create_pane_request(url.as_object().expect("object params"))
             .expect_err("url is browser-only");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
+
+        let browser_with_url = json!({ "type": "browser", "url": "https://example.com" });
+        let request =
+            parse_create_pane_request(browser_with_url.as_object().expect("object params"))
+                .expect("browser url parses");
+        assert_eq!(request.url.as_deref(), Some("https://example.com"));
     }
 
     #[test]
@@ -1205,6 +1560,88 @@ mod tests {
     }
 
     #[test]
+    fn browser_open_split_route_queues_browser_pane() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"browser.open_split","params":{"workspace_id":"codex","url":"https://example.com"}}"#,
+            &|command| match command {
+                ControlCommand::CreatePane { request, reply } => {
+                    assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(request.pane_type, PaneCreateType::Browser);
+                    assert_eq!(request.direction, PaneCreateDirection::Right);
+                    assert_eq!(request.url.as_deref(), Some("https://example.com"));
+                    let _ = reply.send(Ok(json!({
+                        "pane_id": "9",
+                        "pane_ref": "pane:9",
+                        "surface_id": "9:browser",
+                        "surface_ref": "surface:9:browser"
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        let result = response
+            .result
+            .expect("browser.open_split should return a result");
+        assert_eq!(result["surface_ref"], "surface:9:browser");
+    }
+
+    #[test]
+    fn browser_action_routes_validate_surface_and_url() {
+        let navigated = dispatch_request(
+            r#"{"id":1,"method":"browser.navigate","params":{"workspace_id":"codex","surface_id":"surface:9:browser","url":"example.com"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    target,
+                    surface_hint,
+                    action,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(
+                        action,
+                        BrowserAction::Navigate {
+                            url: "example.com".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "url": "https://example.com" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(navigated.error, None);
+
+        let url = dispatch_request(
+            r#"{"id":1,"method":"browser.url.get","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "9:browser");
+                    assert_eq!(action, BrowserAction::GetUrl);
+                    let _ = reply.send(Ok(json!({ "url": "https://example.com" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(url.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"browser.navigate","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| panic!("invalid browser.navigate should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
     fn pane_create_route_rejects_invalid_params_before_dispatch() {
         let response = dispatch_request(
             r#"{"id":1,"method":"new-pane","params":{"direction":"diagonal"}}"#,
@@ -1215,6 +1652,31 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn pane_focus_route_accepts_pane_refs() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"pane.focus","params":{"workspace_id":"codex","pane_id":"pane:11"}}"#,
+            &|command| match command {
+                ControlCommand::FocusPane {
+                    target,
+                    pane_id,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(pane_id, "11");
+                    let _ = reply.send(Ok(json!({ "pane_ref": "pane:11" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.focus result")["pane_ref"],
+            "pane:11"
         );
     }
 
@@ -1243,6 +1705,136 @@ mod tests {
         assert_eq!(
             response.result.expect("surface.create result")["surface_ref"],
             "surface:1:tab"
+        );
+    }
+
+    #[test]
+    fn surface_focus_route_accepts_cmux_panel_alias() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"focus-panel","params":{"workspace_id":"codex","panel_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::FocusSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, "4:tab");
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:4:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.focus result")["surface_ref"],
+            "surface:4:tab"
+        );
+    }
+
+    #[test]
+    fn notification_list_and_clear_routes_validate_params() {
+        let listed = dispatch_request(
+            r#"{"id":1,"method":"notification.list","params":{"unread_only":true}}"#,
+            &|command| match command {
+                ControlCommand::ListNotifications { unread_only, reply } => {
+                    assert!(unread_only);
+                    let _ = reply.send(Ok(json!({ "notifications": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(listed.error, None);
+        assert_eq!(
+            listed.result.expect("notification.list result")["notifications"],
+            json!([])
+        );
+
+        let cleared = dispatch_request(
+            r#"{"id":1,"method":"notification.clear","params":{"notification_id":7}}"#,
+            &|command| match command {
+                ControlCommand::ClearNotifications {
+                    notification_id,
+                    reply,
+                } => {
+                    assert_eq!(notification_id, Some(7));
+                    let _ = reply.send(Ok(json!({ "notifications": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(cleared.error, None);
+
+        let dismissed = dispatch_request(
+            r#"{"id":1,"method":"notification.dismiss","params":{"id":"8"}}"#,
+            &|command| match command {
+                ControlCommand::DismissNotification {
+                    notification_id,
+                    all_read,
+                    reply,
+                } => {
+                    assert_eq!(notification_id, Some(8));
+                    assert!(!all_read);
+                    let _ = reply.send(Ok(json!({ "notifications": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(dismissed.error, None);
+
+        let marked = dispatch_request(
+            r#"{"id":1,"method":"notification.mark_read","params":{"workspace_id":"codex"}}"#,
+            &|command| match command {
+                ControlCommand::MarkNotificationRead {
+                    notification_id,
+                    target,
+                    all,
+                    reply,
+                } => {
+                    assert_eq!(notification_id, None);
+                    assert_eq!(target, Some(WorkspaceTarget::Name("codex".to_string())));
+                    assert!(!all);
+                    let _ = reply.send(Ok(json!({ "notifications": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(marked.error, None);
+
+        let opened = dispatch_request(
+            r#"{"id":1,"method":"notification.open","params":{"id":9}}"#,
+            &|command| match command {
+                ControlCommand::OpenNotification {
+                    notification_id,
+                    reply,
+                } => {
+                    assert_eq!(notification_id, 9);
+                    let _ = reply.send(Ok(json!({ "notification": { "id": 9 } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(opened.error, None);
+
+        let jumped = dispatch_request(
+            r#"{"id":1,"method":"notification.jump_to_unread","params":{}}"#,
+            &|command| match command {
+                ControlCommand::JumpToUnreadNotification { reply } => {
+                    let _ = reply.send(Ok(json!({ "notification": { "id": 10 } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(jumped.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"notification.list","params":{"unread_only":"yes"}}"#,
+            &|command| panic!("invalid notification.list should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
         );
     }
 

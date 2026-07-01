@@ -2,6 +2,9 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T18:13:19Z Convert the current CMUX and Limux inventories into a durable CMUX parity matrix with verification evidence and exact Limux files/tests for implemented or partial features. \
+[x] 2026-07-01T18:13:19Z Build a Limux feature inventory from the current fork and map every CMUX feature to implemented, partial, missing, intentionally incompatible, or blocked. \
+[x] 2026-07-01T18:13:19Z Build a complete current-CMUX feature inventory from commit 2313855c4988ea20e065a9a9e87413f014777f46, including CLI commands, server APIs, UI flows, workspace/session behavior, browser automation, notifications, agents, memory diagnostics, tmux/remote support, configuration, and persistence. \
 [x] 2026-07-01T15:50:37Z Move completed TODO items to TODO_COMPLETED.md, commit verified changes, and push only to the fork remote. \
 [x] 2026-07-01T15:50:37Z Verify with active-output benchmarks, targeted functionality checks, repository checks, and no pushes to am-will. \
 [x] 2026-07-01T15:50:37Z Implement or patch missing CMUX parity functionality selected from the audit. \

@@ -18,8 +18,8 @@ use libadwaita as adw;
 
 use crate::app_config;
 use crate::control_bridge::{
-    BridgeError, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType,
-    WorkspaceTarget,
+    BridgeError, BrowserAction, ControlCommand, PaneCreateDirection as BridgePaneCreateDirection,
+    PaneCreateType, WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -34,6 +34,7 @@ use crate::split_tree::{self, SplitTreeContainer};
 
 const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
+const MAX_HOST_NOTIFICATIONS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // State
@@ -69,6 +70,17 @@ struct Workspace {
     path_label: gtk::Label,
 }
 
+#[derive(Clone)]
+struct HostNotification {
+    id: u64,
+    workspace_id: String,
+    title: String,
+    subtitle: String,
+    body: String,
+    message: String,
+    unread: bool,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -90,6 +102,8 @@ pub(crate) struct AppState {
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
+    next_notification_id: u64,
+    notifications: Vec<HostNotification>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
     _theme_gnome_settings: Option<gio::Settings>,
@@ -1538,6 +1552,8 @@ pub fn build_window(app: &adw::Application) {
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
+        next_notification_id: 1,
+        notifications: Vec::new(),
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
         _theme_gnome_settings: None,
@@ -4051,14 +4067,112 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let _ = reply.send(Ok(result));
         }
-        ControlCommand::CreatePane { request, reply } => {
-            if !matches!(request.pane_type, PaneCreateType::Terminal) {
+        ControlCommand::FocusPane {
+            target,
+            pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let pane_id = parse_pane_handle(&pane_id).or_else(|| pane_id.parse::<u32>().ok());
+            let Some(pane_id) = pane_id else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.focus requires a valid pane_id",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::focus_pane_for_root(&workspace.root, pane_id).map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(result) = result else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found",
+                )));
+                return;
+            };
+
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::BrowserAction {
+            target,
+            surface_hint,
+            action,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let Some(browser) = pane::browser_target_for_root(&workspace_root, &surface_hint)
+            else {
+                let _ = reply.send(Err(BridgeError::not_found("browser surface not found")));
+                return;
+            };
+            let ok = match &action {
+                BrowserAction::Navigate { url } => browser.navigate(url),
+                BrowserAction::GetUrl => true,
+                BrowserAction::Back => browser.go_back(),
+                BrowserAction::Forward => browser.go_forward(),
+                BrowserAction::Reload => browser.reload(),
+                BrowserAction::Focus => browser.focus_content(),
+            };
+            if !ok {
                 let _ = reply.send(Err(BridgeError::invalid_params(
-                    "pane.create live GTK bridge supports type=terminal only",
+                    "browser action is not supported by this build",
                 )));
                 return;
             }
-
+            let url = match &action {
+                BrowserAction::Navigate { url } => Some(url.clone()),
+                _ => browser.current_uri(),
+            };
+            let surface_id = browser.surface.surface_id.clone();
+            let pane_id = browser.surface.pane_id;
+            let mut payload = serde_json::json!({
+                "ok": true,
+                "workspace_id": workspace_id,
+                "workspace_ref": workspace_ref(&workspace_id),
+                "workspace_name": workspace_name,
+                "surface_id": surface_id,
+                "surface_ref": surface_ref(&surface_id),
+                "pane_id": pane_id.to_string(),
+                "pane_ref": pane_ref(pane_id),
+            });
+            if let Some(url) = url {
+                payload["url"] = serde_json::Value::String(url);
+            }
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::CreatePane { request, reply } => {
             let source_pane_id = request
                 .source_pane_id
                 .as_deref()
@@ -4104,7 +4218,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 &resolved.pane_widget,
                 resolved.placement.orientation,
                 SplitPaneOptions {
-                    initial_state: None,
+                    initial_state: match request.pane_type {
+                        PaneCreateType::Terminal => None,
+                        PaneCreateType::Browser => {
+                            Some(PaneState::browser_only(request.url.as_deref()))
+                        }
+                    },
                     skip_default_tab: false,
                     new_pane_first: resolved.placement.new_pane_first,
                     persist: true,
@@ -4119,7 +4238,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let Some(surface) = pane::active_surface_summary(&new_pane) else {
                 let _ = reply.send(Err(BridgeError::internal(
-                    "pane.create did not produce a terminal surface",
+                    "pane.create did not produce a surface",
                 )));
                 return;
             };
@@ -4341,6 +4460,40 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let app_state = state.borrow();
                 surface_list_payload(state, &app_state.workspaces[index], None)
             };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::FocusSurface {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                pane::focus_surface_for_root(&workspace.root, &surface_hint).map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(result) = result else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
             let _ = reply.send(Ok(result));
         }
         ControlCommand::SurfaceHealth {
@@ -4787,6 +4940,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 show_desktop_notification(state, request);
             }
 
+            let notification = push_host_notification(
+                state,
+                ws_id.clone(),
+                title.clone(),
+                subtitle.clone(),
+                body.clone(),
+                message.clone(),
+            );
             let payload = serde_json::json!({
                 "ok": true,
                 "workspace_id": ws_id,
@@ -4794,8 +4955,51 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "title": title,
                 "subtitle": subtitle,
                 "body": body,
+                "notification_id": notification.id,
+                "notification": host_notification_row(&notification),
             });
             let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::ListNotifications { unread_only, reply } => {
+            let _ = reply.send(Ok(list_host_notifications(state, unread_only)));
+        }
+        ControlCommand::DismissNotification {
+            notification_id,
+            all_read,
+            reply,
+        } => {
+            let _ = reply.send(dismiss_host_notifications(state, notification_id, all_read));
+        }
+        ControlCommand::MarkNotificationRead {
+            notification_id,
+            target,
+            all,
+            reply,
+        } => {
+            let result = match (notification_id, target, all) {
+                (Some(id), None, false) => mark_host_notification_read(state, id),
+                (None, Some(target), false) => mark_workspace_notifications_read(state, &target),
+                (None, None, true) => Ok(mark_all_host_notifications_read(state)),
+                _ => Err(crate::control_bridge::BridgeError::invalid_params(
+                    "notification.mark_read requires exactly one selector",
+                )),
+            };
+            let _ = reply.send(result);
+        }
+        ControlCommand::OpenNotification {
+            notification_id,
+            reply,
+        } => {
+            let _ = reply.send(open_host_notification(state, notification_id));
+        }
+        ControlCommand::JumpToUnreadNotification { reply } => {
+            let _ = reply.send(jump_to_unread_notification(state));
+        }
+        ControlCommand::ClearNotifications {
+            notification_id,
+            reply,
+        } => {
+            let _ = reply.send(clear_host_notifications(state, notification_id));
         }
     }
 }
@@ -5127,6 +5331,12 @@ fn switch_workspace(state: &State, idx: usize) {
         let focus_root = s.workspaces[idx].root.clone();
 
         let unread_handles = if s.workspaces[idx].unread {
+            let workspace_id = s.workspaces[idx].id.clone();
+            for notification in &mut s.notifications {
+                if notification.workspace_id == workspace_id {
+                    notification.unread = false;
+                }
+            }
             let ws = &mut s.workspaces[idx];
             ws.unread = false;
             Some((
@@ -6147,6 +6357,350 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
         (true, false) => body.to_string(),
         (true, true) => "Process needs attention".to_string(),
     }
+}
+
+/// purpose: Render one live-host notification in the public control API shape.
+/// inputs: notification is a stored host notification.
+/// returns/effects: Returns JSON without mutating state.
+fn host_notification_row(notification: &HostNotification) -> serde_json::Value {
+    serde_json::json!({
+        "id": notification.id,
+        "notification_id": notification.id,
+        "message": notification.message,
+        "title": notification.title,
+        "subtitle": notification.subtitle,
+        "body": notification.body,
+        "workspace_id": notification.workspace_id,
+        "workspace_ref": workspace_ref(&notification.workspace_id),
+        "is_read": !notification.unread,
+        "unread": notification.unread,
+    })
+}
+
+/// purpose: Store a notification in the live host's bounded inbox.
+/// inputs: state plus normalized notification fields.
+/// returns/effects: Mutates the in-memory inbox and returns the stored notification.
+fn push_host_notification(
+    state: &State,
+    workspace_id: String,
+    title: String,
+    subtitle: String,
+    body: String,
+    message: String,
+) -> HostNotification {
+    let mut s = state.borrow_mut();
+    let id = s.next_notification_id;
+    s.next_notification_id = s.next_notification_id.saturating_add(1);
+    let notification = HostNotification {
+        id,
+        workspace_id,
+        title,
+        subtitle,
+        body,
+        message,
+        unread: true,
+    };
+    s.notifications.push(notification.clone());
+    if s.notifications.len() > MAX_HOST_NOTIFICATIONS {
+        s.notifications.remove(0);
+    }
+    notification
+}
+
+/// purpose: List notifications retained by the live GTK host.
+/// inputs: unread_only filters read entries when true.
+/// returns/effects: Returns JSON rows without mutating state.
+fn list_host_notifications(state: &State, unread_only: bool) -> serde_json::Value {
+    let rows = {
+        let s = state.borrow();
+        s.notifications
+            .iter()
+            .filter(|notification| !unread_only || notification.unread)
+            .map(host_notification_row)
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({ "notifications": rows })
+}
+
+/// purpose: Clear unread styling when a workspace has no remaining unread notifications.
+/// inputs: Mutable app state and a workspace id that may have changed notification state.
+/// returns/effects: Mutates sidebar row state when no unread notifications remain.
+fn clear_workspace_unread_if_empty(state: &mut AppState, workspace_id: &str) {
+    let still_unread = state
+        .notifications
+        .iter()
+        .any(|notification| notification.workspace_id == workspace_id && notification.unread);
+    if still_unread {
+        return;
+    }
+    if let Some(workspace) = state
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+    {
+        clear_workspace_unread_visual(workspace);
+    }
+}
+
+/// purpose: Clear the sidebar unread visual state for one workspace row.
+/// inputs: workspace is a mutable live workspace row.
+/// returns/effects: Mutates row CSS/classes to match a read workspace.
+fn clear_workspace_unread_visual(workspace: &mut Workspace) {
+    workspace.unread = false;
+    workspace.notify_dot.remove_css_class("limux-notify-dot");
+    workspace
+        .notify_dot
+        .add_css_class("limux-notify-dot-hidden");
+    workspace
+        .notify_label
+        .remove_css_class("limux-notify-msg-unread");
+    workspace.notify_label.add_css_class("limux-notify-msg");
+    workspace.notify_label.set_visible(false);
+    if let Some(row_box) = workspace.sidebar_row.child() {
+        row_box.remove_css_class("limux-sidebar-row-unread");
+    }
+}
+
+/// purpose: Remove one notification or all read notifications from the live inbox.
+/// inputs: notification_id targets one row; all_read removes only read rows.
+/// returns/effects: Mutates inbox and affected workspace unread state.
+fn dismiss_host_notifications(
+    state: &State,
+    notification_id: Option<u64>,
+    all_read: bool,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let rows = {
+        let mut s = state.borrow_mut();
+        let affected = if let Some(target_id) = notification_id {
+            let Some(workspace_id) = s
+                .notifications
+                .iter()
+                .find(|notification| notification.id == target_id)
+                .map(|notification| notification.workspace_id.clone())
+            else {
+                return Err(crate::control_bridge::BridgeError::not_found(
+                    "notification not found",
+                ));
+            };
+            s.notifications
+                .retain(|notification| notification.id != target_id);
+            vec![workspace_id]
+        } else if all_read {
+            let affected = s
+                .notifications
+                .iter()
+                .filter(|notification| !notification.unread)
+                .map(|notification| notification.workspace_id.clone())
+                .collect::<Vec<_>>();
+            s.notifications.retain(|notification| notification.unread);
+            affected
+        } else {
+            return Err(crate::control_bridge::BridgeError::invalid_params(
+                "dismiss requires id or all_read",
+            ));
+        };
+        for workspace_id in affected {
+            clear_workspace_unread_if_empty(&mut s, &workspace_id);
+        }
+        s.notifications
+            .iter()
+            .map(host_notification_row)
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({ "notifications": rows }))
+}
+
+/// purpose: Mark one notification as read and update the owning workspace row.
+/// inputs: notification_id identifies an existing live-host notification.
+/// returns/effects: Mutates notification unread state and sidebar visual state.
+fn mark_host_notification_read(
+    state: &State,
+    notification_id: u64,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let row = {
+        let mut s = state.borrow_mut();
+        let Some(index) = s
+            .notifications
+            .iter()
+            .position(|notification| notification.id == notification_id)
+        else {
+            return Err(crate::control_bridge::BridgeError::not_found(
+                "notification not found",
+            ));
+        };
+        s.notifications[index].unread = false;
+        let workspace_id = s.notifications[index].workspace_id.clone();
+        clear_workspace_unread_if_empty(&mut s, &workspace_id);
+        host_notification_row(&s.notifications[index])
+    };
+    Ok(serde_json::json!({ "notification": row }))
+}
+
+/// purpose: Mark all notifications for a workspace selector as read.
+/// inputs: target resolves to one live workspace.
+/// returns/effects: Mutates notifications and sidebar visual state for that workspace.
+fn mark_workspace_notifications_read(
+    state: &State,
+    target: &WorkspaceTarget,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let rows = {
+        let mut s = state.borrow_mut();
+        let Some(index) = workspace_index_for_target(&s, target) else {
+            return Err(crate::control_bridge::BridgeError::not_found(
+                "workspace not found",
+            ));
+        };
+        let workspace_id = s.workspaces[index].id.clone();
+        for notification in &mut s.notifications {
+            if notification.workspace_id == workspace_id {
+                notification.unread = false;
+            }
+        }
+        clear_workspace_unread_visual(&mut s.workspaces[index]);
+        s.notifications
+            .iter()
+            .filter(|notification| notification.workspace_id == workspace_id)
+            .map(host_notification_row)
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({ "notifications": rows }))
+}
+
+/// purpose: Mark every live-host notification as read.
+/// inputs: Mutable app state.
+/// returns/effects: Mutates all retained notifications and workspace unread visuals.
+fn mark_all_host_notifications_read(state: &State) -> serde_json::Value {
+    let rows = {
+        let mut s = state.borrow_mut();
+        for notification in &mut s.notifications {
+            notification.unread = false;
+        }
+        for workspace in &mut s.workspaces {
+            clear_workspace_unread_visual(workspace);
+        }
+        s.notifications
+            .iter()
+            .map(host_notification_row)
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({ "notifications": rows })
+}
+
+/// purpose: Focus the workspace behind one notification and mark it read.
+/// inputs: notification_id identifies an existing live-host notification.
+/// returns/effects: Mutates notification read state and switches workspace focus.
+fn open_host_notification(
+    state: &State,
+    notification_id: u64,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let (workspace_id, row) = {
+        let mut s = state.borrow_mut();
+        let Some(index) = s
+            .notifications
+            .iter()
+            .position(|notification| notification.id == notification_id)
+        else {
+            return Err(crate::control_bridge::BridgeError::not_found(
+                "notification not found",
+            ));
+        };
+        s.notifications[index].unread = false;
+        let workspace_id = s.notifications[index].workspace_id.clone();
+        clear_workspace_unread_if_empty(&mut s, &workspace_id);
+        (workspace_id, host_notification_row(&s.notifications[index]))
+    };
+    let target_index = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+    };
+    let Some(target_index) = target_index else {
+        return Err(crate::control_bridge::BridgeError::not_found(
+            "workspace not found",
+        ));
+    };
+    switch_workspace(state, target_index);
+    Ok(serde_json::json!({
+        "notification": row,
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(&workspace_id),
+    }))
+}
+
+/// purpose: Open the newest unread notification.
+/// inputs: Current live-host notification store.
+/// returns/effects: Mutates the selected notification read state and switches workspace focus.
+fn jump_to_unread_notification(
+    state: &State,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let notification_id = {
+        let s = state.borrow();
+        s.notifications
+            .iter()
+            .rev()
+            .find(|notification| notification.unread)
+            .map(|notification| notification.id)
+    };
+    let Some(notification_id) = notification_id else {
+        return Err(crate::control_bridge::BridgeError::not_found(
+            "unread notification not found",
+        ));
+    };
+    open_host_notification(state, notification_id)
+}
+
+/// purpose: Clear one notification or the entire live-host notification inbox.
+/// inputs: notification_id targets one item; None clears all.
+/// returns/effects: Mutates inbox and affected workspace unread state, returns remaining rows.
+fn clear_host_notifications(
+    state: &State,
+    notification_id: Option<u64>,
+) -> Result<serde_json::Value, crate::control_bridge::BridgeError> {
+    let rows = {
+        let mut s = state.borrow_mut();
+        let affected = if let Some(target_id) = notification_id {
+            let affected = s
+                .notifications
+                .iter()
+                .filter(|notification| notification.id == target_id)
+                .map(|notification| notification.workspace_id.clone())
+                .collect::<Vec<_>>();
+            if affected.is_empty() {
+                return Err(crate::control_bridge::BridgeError::not_found(
+                    "notification not found",
+                ));
+            }
+            s.notifications
+                .retain(|notification| notification.id != target_id);
+            affected
+        } else {
+            let affected = s
+                .notifications
+                .iter()
+                .map(|notification| notification.workspace_id.clone())
+                .collect::<Vec<_>>();
+            s.notifications.clear();
+            affected
+        };
+
+        let still_unread = s
+            .notifications
+            .iter()
+            .filter(|notification| notification.unread)
+            .map(|notification| notification.workspace_id.clone())
+            .collect::<Vec<_>>();
+        for workspace in &mut s.workspaces {
+            if affected.contains(&workspace.id) && !still_unread.contains(&workspace.id) {
+                clear_workspace_unread_visual(workspace);
+            }
+        }
+        s.notifications
+            .iter()
+            .map(host_notification_row)
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({ "notifications": rows }))
 }
 
 fn mark_workspace_unread_with_message(
