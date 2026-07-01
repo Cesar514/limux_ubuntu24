@@ -14,10 +14,10 @@ This plan updates the local Limux checkout with the latest `am-will/limux` main 
 - [x] (2026-07-01 10:49Z) Created the goal and added current tasks to TODO.md.
 - [x] (2026-07-01 10:55Z) Fetched `am-will/limux` and started merging `am-will/main` into local `main`.
 - [x] (2026-07-01 10:58Z) Resolved the only source merge conflict in `rust/limux-host-linux/src/layout_state.rs` by preserving both the local file header and upstream imports.
-- [ ] Complete the upstream merge commit and baseline verification.
-- [ ] Audit high-risk local runtime paths for leakage, data loss, filesystem damage, socket/auth, terminal escape, process, and FFI problems.
-- [ ] Patch validated safety issues.
-- [ ] Compare Limux against similar terminal multiplexers and document implementable missing functions.
+- [x] (2026-07-01 10:45Z) Completed the upstream merge commit `caa5ac4` and verified `cargo fmt --all --check`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` on the merged baseline.
+- [x] (2026-07-01 11:14Z) Audited high-risk local runtime paths for leakage, data loss, filesystem damage, socket/auth, terminal escape, process, and FFI problems with a parent-agent pass and a read-only explorer subagent.
+- [x] (2026-07-01 11:31Z) Patched validated safety issues in socket authorization, FFI request bounds, CLI wait markers, session/config loading, and shortcut loading.
+- [x] (2026-07-01 11:36Z) Compared Limux against similar terminal multiplexers and documented implementable missing functions.
 - [ ] Run final verification and close TODO.md.
 
 ## Surprises & Discoveries
@@ -28,6 +28,10 @@ This plan updates the local Limux checkout with the latest `am-will/limux` main 
   Evidence: `git ls-tree HEAD ghostty` and `git ls-tree am-will/main ghostty` both returned the same submodule commit.
 - Observation: Limux is already mostly Rust, so a full language conversion would add risk without satisfying a clear missing capability.
   Evidence: The repository root has `Cargo.toml`, Rust crates under `rust/`, and Rust sources for CLI, control socket, host UI, and protocol layers.
+- Observation: Malformed canonical session, app settings, and canonical shortcut files previously produced default-shaped state rather than aborting load.
+  Evidence: `rust/limux-host-linux/src/layout_state.rs`, `rust/limux-host-linux/src/app_config.rs`, and `rust/limux-host-linux/src/shortcut_config.rs` tests were updated from fallback expectations to explicit rejection expectations.
+- Observation: The CLI `wait-for` compatibility command used predictable marker paths under `/tmp`.
+  Evidence: `rust/limux-cli/src/main.rs` now scopes markers under `env::temp_dir()/limux-cli/<socket-hash>/wait/` and creates them with `create_new(true)`.
 
 ## Decision Log
 
@@ -36,6 +40,12 @@ This plan updates the local Limux checkout with the latest `am-will/limux` main 
   Date/Author: 2026-07-01 / Codex.
 - Decision: Treat a full Rust conversion as already satisfied by architecture evaluation unless the audit finds a non-Rust component that should be replaced.
   Rationale: Rewriting working Rust code or vendored Ghostty Zig/C APIs would be higher risk than targeted safety patches.
+  Date/Author: 2026-07-01 / Codex.
+- Decision: Keep competitor feature additions as a documented roadmap rather than implementing them in the same patch set.
+  Rationale: Browser automation parity, notification history, broadcast groups, pane resizing, sidebar metadata, and profiles each touch broad UI/control surfaces. Mixing those changes with security/data-loss fixes would make verification weaker.
+  Date/Author: 2026-07-01 / Codex.
+- Decision: Default the control socket policy to descendant-only and reject unknown socket mode values.
+  Rationale: The socket can inject text/keys and create command-running panes; accepting all same-UID processes by default is too broad for the current hard-cutout goal.
   Date/Author: 2026-07-01 / Codex.
 
 ## Outcomes & Retrospective
@@ -46,7 +56,20 @@ This section will be completed after final verification. It must state what was 
 
 The repository is a Rust workspace for Limux, a Linux terminal application that integrates Ghostty. The key local Rust crates are `rust/limux-host-linux` for the GTK host UI and terminal panes, `rust/limux-control` for control-socket behavior, `rust/limux-protocol` for protocol types, `rust/limux-cli` for command-line entry points, and `rust/limux-ghostty-sys` for Ghostty FFI bindings. A git submodule or vendored dependency named `ghostty` contains upstream terminal engine code and should not be rewritten as part of this goal unless a direct integration bug requires it.
 
-The strongest likely risk surfaces are session persistence in `rust/limux-host-linux/src/layout_state.rs`, control socket path and authentication code in `rust/limux-control/src/`, subprocess spawning and terminal working-directory handling in `rust/limux-host-linux/src/terminal.rs` and related host modules, and unsafe FFI in `rust/limux-ghostty-sys`.
+The strongest likely risk surfaces are session persistence in `rust/limux-host-linux/src/layout_state.rs`, control socket path and authentication code in `rust/limux-control/src/`, subprocess spawning and terminal working-directory handling in `rust/limux-host-linux/src/terminal.rs` and related host modules, CLI compatibility state in `rust/limux-cli/src/main.rs`, and unsafe FFI in `rust/limux-control/src/ffi.rs` plus `rust/limux-ghostty-sys`.
+
+## Feature-Parity Findings
+
+Limux already has panes, workspaces, tabs, live control commands, notifications, browser tabs, and agent team launching. The highest-value missing functions compared with similar tools are:
+
+1. Browser command bridge parity. Limux documents and implements browser tabs, but the live GTK control bridge still rejects or omits broader browser automation. This maps to `rust/limux-host-linux/src/control_bridge.rs`, `rust/limux-host-linux/src/window.rs`, `rust/limux-host-linux/src/pane.rs`, and `rust/limux-cli/src/main.rs`.
+2. Notification inbox and jump-to-unread. Limux can create notifications and mark sidebar unread state, but it does not yet expose a durable notification list or jump command. This maps to `window.rs`, `layout_state.rs`, and CLI/control methods.
+3. Broadcast input to explicit pane groups. tmux exposes synchronized panes and Terminator documents grouped/broadcast input. Limux currently sends text/key input to one target surface. This should be explicit-only, for example `--all-terminals`, because broadcast input can be destructive.
+4. Keyboard and CLI pane resize. tmux documents `resize-pane`, and Terminator exposes zoom/maximize and layout manipulation. Limux persists split ratios but lacks an explicit `pane.resize` control method.
+5. Rich workspace sidebar metadata. cmux-like workflows benefit from cwd, git branch, recent notification, and port/status metadata in sidebars. Limux already stores workspace folder/favorite/unread state, so this fits a small metadata module.
+6. Terminal profiles and per-pane appearance. Terminator supports profiles and profile switching. Limux currently has global app appearance/font settings, so a scoped profile model could preserve existing defaults while adding per-tab assignment.
+
+External references checked on 2026-07-01: tmux manual page for pane resize and pane/window capabilities at `https://man7.org/linux/man-pages/man1/tmux.1.html`; Terminator grouping documentation at `https://terminator-gtk3.readthedocs.io/en/latest/grouping.html`; Terminator config/profile documentation at `https://manpages.ubuntu.com/manpages/bionic/man5/terminator_config.5.html`; cmux README at `https://github.com/manaflow-ai/cmux`; and cmux Linux browser automation notes at `https://github.com/bradwilson331/cmux-linux`. The plan does not depend on exact competitor implementation internals.
 
 ## Plan of Work
 

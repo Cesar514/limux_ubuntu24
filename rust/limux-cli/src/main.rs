@@ -1,8 +1,14 @@
+// summary: Provide the Limux CLI for host launch, socket control, hooks, and compatibility commands.
+// purpose: Parse user commands into explicit Limux control requests and manage local CLI state safely.
+// inputs: CLI arguments, environment variables, Unix control sockets, and JSON hook/config files.
+// returns/effects: Launches the host or sends bounded control requests, writes local state, and exits nonzero on errors.
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +24,8 @@ mod agent_hooks;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
+const PRIVATE_CLI_DIR_MODE: u32 = 0o700;
+const WAIT_MARKER_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdFormat {
@@ -431,7 +439,7 @@ fn trailing_title(args: &[String]) -> Option<String> {
     }
 }
 
-fn wait_signal_path(name: &str) -> PathBuf {
+fn wait_signal_path(socket: &Path, name: &str) -> PathBuf {
     let sanitized: String = name
         .chars()
         .map(|ch| {
@@ -442,7 +450,42 @@ fn wait_signal_path(name: &str) -> PathBuf {
             }
         })
         .collect();
-    PathBuf::from(format!("/tmp/limux-wait-for-{}.sig", sanitized))
+    cli_state_dir(socket)
+        .join("wait")
+        .join(format!("{sanitized}.sig"))
+}
+
+fn ensure_private_cli_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_CLI_DIR_MODE))
+        .with_context(|| format!("failed to lock down {}", path.display()))
+}
+
+fn create_wait_signal(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("wait-for signal path has no parent: {}", path.display()))?;
+    ensure_private_cli_dir(parent)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(WAIT_MARKER_MODE)
+        .open(path)
+        .with_context(|| format!("failed to create wait-for signal {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_wait_signal(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect wait-for signal {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to remove non-file wait-for signal {}",
+            path.display()
+        );
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove wait-for signal {}", path.display()))
 }
 
 fn read_json_map(path: &str) -> BTreeMap<String, String> {
@@ -3146,15 +3189,15 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let timeout = parse_opt(args, "--timeout")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5);
-            let path = wait_signal_path(&name);
+            let path = wait_signal_path(&client.socket, &name);
             if signal {
-                fs::write(&path, b"1").context("failed to write wait-for signal")?;
+                create_wait_signal(&path)?;
                 Ok(json!({"ok": true, "name": name}))
             } else {
                 let deadline = Instant::now() + Duration::from_secs(timeout);
                 loop {
                     if path.exists() {
-                        let _ = fs::remove_file(&path);
+                        remove_wait_signal(&path)?;
                         return Ok(json!({"ok": true, "name": name}));
                     }
                     if Instant::now() >= deadline {
@@ -3685,6 +3728,36 @@ mod cli_arg_tests {
         let dev = Path::new("/repo/target/debug/limux-cli");
         let candidates = host_binary_candidates(dev);
         assert!(candidates.contains(&PathBuf::from("/repo/target/debug/limux")));
+    }
+
+    #[test]
+    fn wait_signal_path_uses_socket_scoped_private_state_dir() {
+        let socket = Path::new("/run/user/1000/limux/limux.sock");
+        let path = wait_signal_path(socket, "../unsafe name");
+
+        assert!(path.starts_with(env::temp_dir().join("limux-cli")));
+        assert!(path.ends_with("wait/___unsafe_name.sig"));
+        assert!(!path.starts_with("/tmp/limux-wait-for-"));
+    }
+
+    #[test]
+    fn wait_signal_creation_rejects_existing_marker_path() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let marker = temp_dir.path().join("marker.sig");
+        fs::write(&marker, b"existing").expect("existing marker");
+
+        let error = create_wait_signal(&marker).expect_err("existing marker should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create wait-for signal"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&marker).expect("existing marker remains"),
+            b"existing"
+        );
     }
 
     #[test]

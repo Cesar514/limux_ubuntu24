@@ -2,6 +2,14 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T10:54:59Z Move completed work items to TODO_COMPLETED.md and leave TODO.md clean. \
+[x] 2026-07-01T10:54:59Z Verify the patched behavior with the strongest local checks available. \
+[x] 2026-07-01T10:54:59Z Compare Limux with similar terminal multiplexers and document practical missing functions. \
+[x] 2026-07-01T10:54:59Z Evaluate whether a language conversion is useful now and keep existing functionality intact. \
+[x] 2026-07-01T10:54:59Z Patch validated safety issues without adding silent fallbacks. \
+[x] 2026-07-01T10:54:59Z Audit high-risk leak, socket, filesystem, process, and terminal-control paths that could expose data or damage user files. \
+[x] 2026-07-01T10:46:00Z Baseline the project build/test state after updating from upstream. \
+[x] 2026-07-01T10:45:49Z Fetch and integrate the latest upstream limux changes without discarding local fork work. \
 [x] 2026-04-30T08:36:47Z Verify Limux loads and renders the recovered workspace list through the control socket. \
 [x] 2026-04-30T08:36:47Z Apply the session recovery and GTK CSS parser fixes without adding silent runtime fallbacks. \
 [x] 2026-04-30T08:36:47Z Identify that an empty canonical session.json was masking the non-empty legacy workspaces.json file. \

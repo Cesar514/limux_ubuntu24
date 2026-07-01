@@ -767,7 +767,13 @@ pub fn start(dispatch: fn(ControlCommand)) {
         .name("limux-control".into())
         .spawn(move || {
             let path = resolve_socket_path(None, SocketMode::Runtime);
-            let control_mode = SocketControlMode::from_env();
+            let control_mode = match SocketControlMode::from_env() {
+                Ok(mode) => mode,
+                Err(error) => {
+                    eprintln!("limux: invalid control socket mode: {error}");
+                    return;
+                }
+            };
             let listener = match bind_listener(
                 &path,
                 SocketMode::Runtime,

@@ -1,3 +1,8 @@
+// summary: Serve Limux control requests over Unix sockets.
+// purpose: Bind authenticated local control sockets and dispatch bounded JSON requests.
+// inputs: Socket path/mode, dispatcher state, request frames, and socket authorization policy.
+// returns/effects: Runs an async accept loop, rejects unauthorized clients, and writes JSON responses.
+
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +23,7 @@ pub async fn run_server<P: AsRef<Path>>(
     dispatcher: Dispatcher,
 ) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
-    let control_mode = SocketControlMode::from_env();
+    let control_mode = SocketControlMode::from_env()?;
     let listener = bind_tokio_listener(
         socket_path,
         socket_mode,
@@ -28,7 +33,7 @@ pub async fn run_server<P: AsRef<Path>>(
 }
 
 pub async fn serve(listener: UnixListener, dispatcher: Dispatcher) -> io::Result<()> {
-    let control_mode = SocketControlMode::from_env();
+    let control_mode = SocketControlMode::from_env()?;
     serve_with_mode(listener, dispatcher, control_mode).await
 }
 

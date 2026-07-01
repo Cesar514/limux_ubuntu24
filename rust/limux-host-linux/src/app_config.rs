@@ -1,3 +1,8 @@
+// summary: Load, parse, and save Limux host application settings.
+// purpose: Preserve user-facing appearance, focus, font, and notification preferences.
+// inputs: XDG config paths and JSON settings files.
+// returns/effects: Creates first-run defaults, rejects corrupt persisted settings, and writes settings atomically.
+
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,20 +160,14 @@ pub struct LoadedAppConfig {
 
 pub fn load() -> LoadedAppConfig {
     let Some(path) = settings_path() else {
-        let mut loaded = LoadedAppConfig::default();
-        loaded
-            .warnings
-            .push("config_dir unavailable; using default app settings".to_string());
-        return loaded;
+        panic!("config_dir unavailable; cannot load app settings");
     };
 
     if let Err(err) = ensure_default_config_file(&path) {
-        let mut loaded = LoadedAppConfig::default();
-        loaded.warnings.push(format!(
+        panic!(
             "failed to create default app config `{}`: {err}",
             path.display()
-        ));
-        return loaded;
+        );
     }
 
     load_from_path(&path)
@@ -191,12 +190,7 @@ pub fn load_from_path(path: &Path) -> LoadedAppConfig {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) => {
-            let mut loaded = LoadedAppConfig::default();
-            loaded.warnings.push(format!(
-                "failed to read app config `{}`: {err}",
-                path.display()
-            ));
-            return loaded;
+            panic!("failed to read app config `{}`: {err}", path.display());
         }
     };
 
@@ -206,12 +200,7 @@ pub fn load_from_path(path: &Path) -> LoadedAppConfig {
             warnings: Vec::new(),
         },
         Err(err) => {
-            let mut loaded = LoadedAppConfig::default();
-            loaded.warnings.push(format!(
-                "failed to load app config `{}`: {err}",
-                path.display()
-            ));
-            loaded
+            panic!("failed to load app config `{}`: {err}", path.display());
         }
     }
 }
@@ -324,40 +313,9 @@ fn read_existing_config_root_for_save(
     let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
     match serde_json::from_str::<Value>(&raw) {
         Ok(Value::Object(map)) => Ok(map),
-        Ok(_) => {
-            backup_invalid_existing_config(path)?;
-            Ok(serde_json::Map::new())
-        }
-        Err(err) => {
-            let detail = format!("existing app config is invalid JSON: {err}");
-            backup_invalid_existing_config_with_detail(path, &detail)?;
-            Ok(serde_json::Map::new())
-        }
+        Ok(_) => Err("existing app config root must be a JSON object".to_string()),
+        Err(err) => Err(format!("existing app config is invalid JSON: {err}")),
     }
-}
-
-fn backup_invalid_existing_config(path: &Path) -> Result<(), String> {
-    backup_invalid_existing_config_with_detail(
-        path,
-        "existing app config root must be a JSON object",
-    )
-}
-
-fn backup_invalid_existing_config_with_detail(path: &Path, detail: &str) -> Result<(), String> {
-    let backup_path = invalid_config_backup_path(path);
-    fs::rename(path, &backup_path).map_err(|err| {
-        format!(
-            "{detail}; failed to back up `{}` to `{}`: {err}",
-            path.display(),
-            backup_path.display()
-        )
-    })?;
-    eprintln!(
-        "limux: {detail}; backed up `{}` to `{}` before rewriting settings",
-        path.display(),
-        backup_path.display()
-    );
-    Ok(())
 }
 
 fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), String> {
@@ -379,10 +337,6 @@ fn write_config_root_atomically(path: &Path, serialized: &str) -> Result<(), Str
 
 fn temp_config_path(path: &Path) -> std::path::PathBuf {
     timestamped_sibling_path(path, "tmp")
-}
-
-fn invalid_config_backup_path(path: &Path) -> std::path::PathBuf {
-    timestamped_sibling_path(path, "bak")
 }
 
 fn timestamped_sibling_path(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -714,48 +668,27 @@ mod tests {
     }
 
     #[test]
-    fn save_to_path_recovers_invalid_existing_json_by_backing_it_up() {
+    fn save_to_path_rejects_invalid_existing_json_without_rewriting() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, "not json").expect("write invalid config");
 
         let config = AppConfig::default();
-        save_to_path(&path, &config).expect("save should recover");
+        let error = save_to_path(&path, &config).expect_err("save should reject invalid config");
 
-        let raw = fs::read_to_string(&path).expect("read repaired config");
-        let parsed: Value = serde_json::from_str(&raw).expect("parse repaired config");
-        assert_eq!(
-            parsed["appearance"]["color_scheme"],
-            Value::String("system".to_string())
-        );
-
-        let backup = fs::read_dir(path.parent().expect("config dir"))
-            .expect("list config dir")
-            .find_map(|entry| {
-                let entry = entry.expect("dir entry");
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.contains(".settings.json.bak-").then_some(entry.path())
-            })
-            .expect("backup file");
-        assert_eq!(
-            fs::read_to_string(backup).expect("read backup config"),
-            "not json"
-        );
+        assert!(error.contains("existing app config is invalid JSON"));
+        assert_eq!(fs::read_to_string(&path).expect("read config"), "not json");
     }
 
     #[test]
-    fn load_from_path_falls_back_to_defaults_on_invalid_json() {
+    #[should_panic(expected = "failed to load app config")]
+    fn load_from_path_rejects_invalid_json() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, "not json").expect("write config");
 
-        let loaded = load_from_path(&path);
-
-        assert_eq!(loaded.config, AppConfig::default());
-        assert_eq!(loaded.warnings.len(), 1);
-        assert!(loaded.warnings[0].contains("failed to load app config"));
+        let _ = load_from_path(&path);
     }
 }

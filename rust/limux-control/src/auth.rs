@@ -1,3 +1,8 @@
+// summary: Authorize peers that connect to Limux Unix control sockets.
+// purpose: Enforce explicit socket access policy before terminal-control commands run.
+// inputs: Peer credentials from SO_PEERCRED plus LIMUX_SOCKET_MODE or CMUX_SOCKET_MODE.
+// returns/effects: Returns peer identity for authorized clients or explicit permission/config errors.
+
 use std::io;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
@@ -22,23 +27,29 @@ pub enum SocketControlMode {
 }
 
 impl SocketControlMode {
-    pub fn from_env() -> Self {
-        std::env::var("LIMUX_SOCKET_MODE")
+    pub fn from_env() -> io::Result<Self> {
+        match std::env::var("LIMUX_SOCKET_MODE")
             .ok()
             .or_else(|| std::env::var("CMUX_SOCKET_MODE").ok())
-            .as_deref()
-            .map(Self::parse)
-            .unwrap_or(Self::LocalUser)
+        {
+            Some(value) => Self::parse(&value),
+            None => Ok(Self::LimuxOnly),
+        }
     }
 
-    fn parse(value: &str) -> Self {
+    fn parse(value: &str) -> io::Result<Self> {
         match value.trim() {
-            "allowAll" | "allow-all" | "allow_all" => Self::AllowAll,
-            "localUser" | "local-user" | "local_user" => Self::LocalUser,
+            "allowAll" | "allow-all" | "allow_all" => Ok(Self::AllowAll),
+            "localUser" | "local-user" | "local_user" => Ok(Self::LocalUser),
             "cmuxOnly" | "limuxOnly" | "descendantOnly" | "descendant-only" | "descendant_only" => {
-                Self::LimuxOnly
+                Ok(Self::LimuxOnly)
             }
-            _ => Self::LocalUser,
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid LIMUX_SOCKET_MODE/CMUX_SOCKET_MODE value {value:?}; expected limuxOnly, localUser, or allowAll"
+                ),
+            )),
         }
     }
 
@@ -173,11 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn socket_mode_defaults_to_local_user() {
+    fn socket_mode_defaults_to_limux_only() {
         let _lock = ENV_TEST_LOCK.lock().expect("env lock");
         let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", None);
         let _cmux = EnvGuard::set("CMUX_SOCKET_MODE", None);
-        assert_eq!(SocketControlMode::from_env(), SocketControlMode::LocalUser);
+        assert_eq!(
+            SocketControlMode::from_env().unwrap(),
+            SocketControlMode::LimuxOnly
+        );
     }
 
     #[test]
@@ -185,7 +199,19 @@ mod tests {
         let _lock = ENV_TEST_LOCK.lock().expect("env lock");
         let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", Some("cmuxOnly"));
         let _cmux = EnvGuard::set("CMUX_SOCKET_MODE", None);
-        assert_eq!(SocketControlMode::from_env(), SocketControlMode::LimuxOnly);
+        assert_eq!(
+            SocketControlMode::from_env().unwrap(),
+            SocketControlMode::LimuxOnly
+        );
+    }
+
+    #[test]
+    fn invalid_socket_mode_is_rejected() {
+        let _lock = ENV_TEST_LOCK.lock().expect("env lock");
+        let _limux = EnvGuard::set("LIMUX_SOCKET_MODE", Some("public-ish"));
+        let _cmux = EnvGuard::set("CMUX_SOCKET_MODE", None);
+        let error = SocketControlMode::from_env().expect_err("invalid mode must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

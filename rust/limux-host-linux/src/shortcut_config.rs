@@ -1,3 +1,8 @@
+// summary: Define and resolve Limux host keyboard shortcut configuration.
+// purpose: Validate remappable shortcuts, migrate legacy bindings, and persist canonical bindings.
+// inputs: GTK display metadata, JSON shortcut files, and legacy settings.json shortcut sections.
+// returns/effects: Produces validated shortcut maps or explicit errors before writing config.
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1237,24 +1242,17 @@ pub fn load_shortcuts_or_default_with_display(
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) => {
-            let mut defaults = default_shortcuts();
-            defaults.warnings.push(format!(
-                "failed to read shortcut config `{}`: {err}",
-                path.display()
-            ));
-            return defaults;
+            panic!("failed to read shortcut config `{}`: {err}", path.display());
         }
     };
 
     match resolve_shortcuts_from_str_with_display(&raw, display) {
         Ok(config) => config,
         Err(err) => {
-            let mut defaults = default_shortcuts();
-            defaults.warnings.push(format!(
+            panic!(
                 "failed to load shortcut config `{}`: {err:?}",
                 path.display()
-            ));
-            defaults
+            );
         }
     }
 }
@@ -1891,17 +1889,14 @@ mod tests {
     }
 
     #[test]
-    fn load_shortcuts_or_default_falls_back_on_invalid_json() {
+    #[should_panic(expected = "failed to load shortcut config")]
+    fn load_shortcuts_or_default_rejects_invalid_json() {
         let dir = tempdir().unwrap();
         let path = shortcuts_path_in(dir.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{ this is not json").unwrap();
 
-        let resolved = load_shortcuts_or_default(&path);
-
-        assert_eq!(resolved.shortcuts.len(), definitions().len());
-        assert_eq!(resolved.warnings.len(), 1);
-        assert!(resolved.warnings[0].contains("failed to load shortcut config"));
+        let _ = load_shortcuts_or_default(&path);
     }
 
     #[test]

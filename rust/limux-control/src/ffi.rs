@@ -1,3 +1,8 @@
+// summary: Expose Limux control dispatch through a C-compatible FFI.
+// purpose: Let native hosts initialize, dispatch bounded control messages, and shut down safely.
+// inputs: Raw caller-provided message pointers plus protocol JSON bytes.
+// returns/effects: Dispatches valid bounded requests and returns integer status codes.
+
 use std::slice;
 use std::str;
 use std::sync::{Mutex, OnceLock};
@@ -5,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use limux_protocol::{parse_v1_command_envelope, V2Request};
 use tokio::runtime::{Builder, Runtime};
 
+use crate::request_io::MAX_REQUEST_LEN;
 use crate::Dispatcher;
 
 static DISPATCHER_CELL: OnceLock<Mutex<Option<Dispatcher>>> = OnceLock::new();
@@ -58,6 +64,9 @@ pub extern "C" fn limux_control_init() -> i32 {
 /// for the duration of this call.
 pub unsafe extern "C" fn limux_control_dispatch(message_ptr: *const u8, message_len: usize) -> i32 {
     if message_ptr.is_null() {
+        return 2;
+    }
+    if message_len == 0 || message_len > MAX_REQUEST_LEN {
         return 2;
     }
 
@@ -136,6 +145,18 @@ mod tests {
         let bad = b"not-json";
         assert_eq!(
             unsafe { limux_control_dispatch(bad.as_ptr(), bad.len()) },
+            2
+        );
+        limux_control_shutdown();
+    }
+
+    #[test]
+    fn ffi_dispatch_rejects_empty_and_oversized_lengths_before_reading() {
+        limux_control_shutdown();
+        let message = b"{\"id\":\"ffi-1\",\"method\":\"system.ping\",\"params\":{}}";
+        assert_eq!(unsafe { limux_control_dispatch(message.as_ptr(), 0) }, 2);
+        assert_eq!(
+            unsafe { limux_control_dispatch(message.as_ptr(), MAX_REQUEST_LEN + 1) },
             2
         );
         limux_control_shutdown();

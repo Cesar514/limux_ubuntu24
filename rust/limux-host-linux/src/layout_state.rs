@@ -328,11 +328,20 @@ pub fn load_session_from_dir(dir: &Path) -> LoadedSession {
 // inputs: Persistence directory plus the canonical session file path.
 // returns/effects: Returns canonical or legacy-loaded state without writing files.
 fn load_canonical_session(dir: &Path, canonical_path: &Path) -> LoadedSession {
-    let state = fs::read_to_string(canonical_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<AppSessionState>(&raw).ok())
+    let raw = fs::read_to_string(canonical_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read canonical session {}: {error}",
+            canonical_path.display()
+        )
+    });
+    let state = serde_json::from_str::<AppSessionState>(&raw)
         .map(normalize_session)
-        .unwrap_or_default();
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to parse canonical session {}: {error}",
+                canonical_path.display()
+            )
+        });
     if !state.workspaces.is_empty() {
         return LoadedSession {
             state,
@@ -360,11 +369,20 @@ fn load_legacy_session(dir: &Path) -> Option<AppSessionState> {
     if !legacy_path.exists() {
         return None;
     }
-    let state = fs::read_to_string(&legacy_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Vec<LegacySavedWorkspace>>(&raw).ok())
+    let raw = fs::read_to_string(&legacy_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read legacy workspaces {}: {error}",
+            legacy_path.display()
+        )
+    });
+    let state = serde_json::from_str::<Vec<LegacySavedWorkspace>>(&raw)
         .map(AppSessionState::from_legacy)
-        .unwrap_or_default();
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to parse legacy workspaces {}: {error}",
+                legacy_path.display()
+            )
+        });
     Some(state)
 }
 
@@ -1114,14 +1132,13 @@ mod tests {
     }
 
     #[test]
-    fn load_returns_empty_state_for_corrupt_canonical_file() {
+    #[should_panic(expected = "failed to parse canonical session")]
+    fn load_rejects_corrupt_canonical_file() {
         let dir = tempdir().expect("tempdir");
         let canonical_path = canonical_session_path_in(dir.path());
         fs::write(&canonical_path, "{not-json").expect("write corrupt canonical");
 
-        let loaded = load_session_from_dir(dir.path());
-        assert_eq!(loaded.source, SessionLoadSource::Canonical);
-        assert_eq!(loaded.state, AppSessionState::default());
+        let _ = load_session_from_dir(dir.path());
     }
 
     #[test]
