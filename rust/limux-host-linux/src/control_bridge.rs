@@ -130,6 +130,7 @@ const METHODS: &[&str] = &[
     "surface.list",
     "surface.focus",
     "surface.close",
+    "surface.move",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -534,6 +535,13 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    MoveSurface {
+        target: WorkspaceTarget,
+        surface_hint: String,
+        target_pane_id: String,
+        index: Option<usize>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -642,6 +650,7 @@ impl ControlCommand {
             | Self::ListSurfaces { reply, .. }
             | Self::FocusSurface { reply, .. }
             | Self::CloseSurface { reply, .. }
+            | Self::MoveSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2179,6 +2188,49 @@ fn handle_method(
                 ControlCommand::CloseSurface {
                     target,
                     surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.move" | "move-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("surface.move requires surface_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let target_pane_id =
+                match optional_ref_handle(params, &["target_pane_id", "pane_id"], "pane:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("surface.move requires target_pane_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let index = match optional_index(params, "index") {
+                Ok(index) => index,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::MoveSurface {
+                    target,
+                    surface_hint,
+                    target_pane_id,
+                    index,
                     reply,
                 },
                 rx,
@@ -4244,6 +4296,44 @@ mod tests {
             },
         );
         assert_eq!(contextual.error, None);
+    }
+
+    #[test]
+    fn surface_move_route_accepts_target_pane_and_index() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"move-surface","params":{"workspace_id":"codex","surface_id":"surface:4:tab","target_pane_id":"pane:9","index":2}}"#,
+            &|command| match command {
+                ControlCommand::MoveSurface {
+                    target,
+                    surface_hint,
+                    target_pane_id,
+                    index,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, "4:tab");
+                    assert_eq!(target_pane_id, "9");
+                    assert_eq!(index, Some(2));
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:9:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.move result")["surface_ref"],
+            "surface:9:tab"
+        );
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"surface.move","params":{"surface_id":"surface:4:tab"}}"#,
+            &|command| panic!("invalid surface.move should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]

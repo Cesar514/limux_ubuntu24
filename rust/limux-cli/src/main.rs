@@ -4279,6 +4279,7 @@ fn build_surface_alias_request(
     let method = match command {
         "focus-panel" => "surface.focus",
         "close-surface" => "surface.close",
+        "move-surface" => "surface.move",
         "new-split" => "surface.split",
         "refresh-surfaces" => "surface.refresh",
         _ => return Ok(None),
@@ -4298,6 +4299,19 @@ fn build_surface_alias_request(
     if command == "new-split" {
         let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
         params.insert("direction".to_string(), Value::String(direction));
+    }
+    if command == "move-surface" {
+        let target_pane = parse_opt(args, "--target-pane").or_else(|| parse_opt(args, "--pane"));
+        let Some(target_pane) = target_pane.filter(|value| !value.trim().is_empty()) else {
+            bail!("move-surface requires --target-pane or --pane");
+        };
+        params.insert("target_pane_id".to_string(), Value::String(target_pane));
+        if let Some(index) = parse_opt(args, "--index") {
+            let parsed = index
+                .parse::<u64>()
+                .with_context(|| format!("invalid move-surface --index: {}", index))?;
+            params.insert("index".to_string(), Value::Number(parsed.into()));
+        }
     }
     if command == "focus-panel" && !params.contains_key("surface_id") {
         bail!("focus-panel requires --panel, --surface, or a surface positional");
@@ -5673,7 +5687,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_list_text("list-panels", &payload))
             }
         }
-        "new-split" | "focus-panel" | "close-surface" | "refresh-surfaces" => {
+        "new-split" | "focus-panel" | "close-surface" | "move-surface" | "refresh-surfaces" => {
             let Some((method, params)) = build_surface_alias_request(command, args)? else {
                 bail!("unsupported surface alias: {}", command);
             };
@@ -6274,6 +6288,24 @@ mod cli_arg_tests {
         assert_eq!(split.0, "surface.split");
         assert_eq!(split.1["surface_id"], "surface:7:tab-a");
         assert_eq!(split.1["direction"], "down");
+
+        let moved = build_surface_alias_request(
+            "move-surface",
+            &args(&[
+                "--surface",
+                "surface:7:tab-a",
+                "--target-pane",
+                "pane:12",
+                "--index",
+                "2",
+            ]),
+        )
+        .expect("move-surface parses")
+        .expect("move-surface maps");
+        assert_eq!(moved.0, "surface.move");
+        assert_eq!(moved.1["surface_id"], "surface:7:tab-a");
+        assert_eq!(moved.1["target_pane_id"], "pane:12");
+        assert_eq!(moved.1["index"], 2);
     }
 
     #[test]

@@ -6520,6 +6520,52 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(result);
         }
+        ControlCommand::MoveSurface {
+            target,
+            surface_hint,
+            target_pane_id,
+            index,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(workspace_index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+            let Some(target_pane_id) =
+                parse_pane_handle(&target_pane_id).or_else(|| target_pane_id.parse::<u32>().ok())
+            else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "surface.move requires a valid target_pane_id",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[workspace_index];
+                pane::move_surface_for_root(&workspace.root, &surface_hint, target_pane_id, index)
+                    .map(|surface| {
+                        pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                    })
+            };
+
+            let Some(result) = result else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface or target pane not found",
+                )));
+                return;
+            };
+
+            request_session_save(state);
+            let _ = reply.send(Ok(result));
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,

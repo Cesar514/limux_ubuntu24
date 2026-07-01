@@ -2275,14 +2275,61 @@ pub fn move_tab_to_pane(
     tab_id: &str,
     target_pane: &gtk::Widget,
 ) -> bool {
+    move_tab_to_pane_at(source_pane, tab_id, target_pane, None)
+}
+
+// purpose: Move one tab between live panes with an optional destination index.
+// inputs: Source pane widget, tab id, target pane widget, and optional target insertion index.
+// returns/effects: Transfers the tab, activates it in the target pane, and updates pane state.
+pub fn move_tab_to_pane_at(
+    source_pane: &gtk::Widget,
+    tab_id: &str,
+    target_pane: &gtk::Widget,
+    index: Option<usize>,
+) -> bool {
     let Some(source) = find_pane_internals(source_pane) else {
         return false;
     };
     let Some(target) = find_pane_internals(target_pane) else {
         return false;
     };
-    let insert_idx = target.tab_state.borrow().tabs.len();
+    let insert_idx = index.unwrap_or_else(|| target.tab_state.borrow().tabs.len());
     transfer_tab_between_panes(&source, &target, tab_id, insert_idx)
+}
+
+// purpose: Move a surface to another pane within the same workspace root.
+// inputs: Workspace root, source surface handle, target pane id, and optional insertion index.
+// returns/effects: Moves and focuses the surface, returning its new summary.
+pub fn move_surface_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+    target_pane_id: u32,
+    index: Option<usize>,
+) -> Option<SurfaceSummary> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested).then(|| entry.id.clone())
+            })
+        };
+        let Some(tab_id) = tab_id else {
+            continue;
+        };
+        let source_pane: gtk::Widget = internals.pane_outer.clone().upcast();
+        let target_pane = pane_widget_for_root(root, target_pane_id)?;
+        if !move_tab_to_pane_at(&source_pane, &tab_id, &target_pane, index) {
+            return None;
+        }
+        return active_surface_summary(&target_pane);
+    }
+    None
 }
 
 pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarget {
