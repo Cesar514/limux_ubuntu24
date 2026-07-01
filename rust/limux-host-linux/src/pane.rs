@@ -1827,6 +1827,11 @@ pub enum BrowserTabCloseError {
     LastBrowserTab,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceCloseError {
+    NotFound,
+}
+
 // purpose: Build a public surface summary for one tab entry.
 // inputs: Live pane internals and the tab id to summarize.
 // returns/effects: Returns metadata for the matching tab without mutating GTK state.
@@ -2014,6 +2019,46 @@ pub fn focus_surface_for_root(root: &gtk::Widget, surface_hint: &str) -> Option<
         return active_surface_summary(&pane_widget);
     }
     None
+}
+
+// purpose: Close a surface by raw or `surface:` handle within a workspace root.
+// inputs: root is the workspace root widget and surface_hint identifies a live tab.
+// returns/effects: Removes the tab, invokes pane-empty callbacks when needed, and returns the closed surface.
+pub fn close_surface_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+) -> Result<SurfaceSummary, SurfaceCloseError> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return Err(SurfaceCloseError::NotFound);
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let target_tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested).then(|| entry.id.clone())
+            })
+        };
+        let Some(tab_id) = target_tab_id else {
+            continue;
+        };
+        let Some(summary) = surface_summary_for_tab(&internals, &tab_id) else {
+            return Err(SurfaceCloseError::NotFound);
+        };
+        remove_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            &tab_id,
+            &internals.callbacks,
+            &internals.pane_outer,
+            PaneEmptyReason::ClosedLastTab,
+        );
+        return Ok(summary);
+    }
+    Err(SurfaceCloseError::NotFound)
 }
 
 // purpose: List browser tabs in the same pane as an addressed browser surface.

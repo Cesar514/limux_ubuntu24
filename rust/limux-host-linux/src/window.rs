@@ -6471,6 +6471,55 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::CloseSurface {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let resolved_hint =
+                surface_hint.or_else(|| focused_ids_for_workspace(state, &workspace_id).1);
+            let Some(surface_hint) = resolved_hint else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            let result = pane::close_surface_for_root(&workspace_root, &surface_hint)
+                .map(|surface| {
+                    let mut payload =
+                        pane_create_response_payload(&workspace_id, &workspace_name, surface);
+                    payload["closed"] = serde_json::Value::Bool(true);
+                    payload
+                })
+                .map_err(|_| crate::control_bridge::BridgeError::not_found("surface not found"));
+
+            if result.is_ok() {
+                request_session_save(state);
+            }
+            let _ = reply.send(result);
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,

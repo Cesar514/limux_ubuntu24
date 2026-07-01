@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-01T23:38:20Z Implement and verify live bridge CMUX `surface.close` and `close-surface` parity for GTK surfaces. \
 [x] 2026-07-01T23:33:49Z Implement and verify live bridge and CLI CMUX browser visible, enabled, and checked state checks. \
 [x] 2026-07-01T23:30:01Z Implement and verify live bridge CMUX browser state save and load parity for WebKit browser surfaces. \
 [x] 2026-07-01T23:25:27Z Implement and verify live bridge CMUX browser tab list, new, switch, and close parity for WebKit browser surfaces. \

@@ -129,6 +129,7 @@ const METHODS: &[&str] = &[
     "surface.create_many",
     "surface.list",
     "surface.focus",
+    "surface.close",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -528,6 +529,11 @@ pub enum ControlCommand {
         surface_hint: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    CloseSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -635,6 +641,7 @@ impl ControlCommand {
             | Self::CreateSurfaces { reply, .. }
             | Self::ListSurfaces { reply, .. }
             | Self::FocusSurface { reply, .. }
+            | Self::CloseSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2150,6 +2157,26 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::FocusSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.close" | "close-surface" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CloseSurface {
                     target,
                     surface_hint,
                     reply,
@@ -4176,6 +4203,47 @@ mod tests {
             response.result.expect("surface.focus result")["surface_ref"],
             "surface:4:tab"
         );
+    }
+
+    #[test]
+    fn surface_close_route_accepts_surface_refs_and_context_defaults() {
+        let explicit = dispatch_request(
+            r#"{"id":1,"method":"close-surface","params":{"workspace_id":"codex","surface_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::CloseSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:4:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(explicit.error, None);
+        assert_eq!(
+            explicit.result.expect("surface.close result")["surface_ref"],
+            "surface:4:tab"
+        );
+
+        let contextual = dispatch_request(
+            r#"{"id":1,"method":"surface.close","params":{"workspace_id":"codex"}}"#,
+            &|command| match command {
+                ControlCommand::CloseSurface {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, None);
+                    let _ = reply.send(Ok(json!({ "closed": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(contextual.error, None);
     }
 
     #[test]
