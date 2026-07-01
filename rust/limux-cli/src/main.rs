@@ -4662,6 +4662,9 @@ async fn run_browser(
     }
     let sub = positional[pos_idx].clone();
     let rest = positional[(pos_idx + 1)..].to_vec();
+    if let Some(method) = unsupported_browser_cli_method(&sub, &rest) {
+        bail!("not_supported: {method}");
+    }
 
     let output = match sub.as_str() {
         "open" | "open-split" | "new" => {
@@ -5231,9 +5234,6 @@ async fn run_browser(
             .await?;
             CommandOutput::Json(payload)
         }
-        "viewport" => {
-            bail!("not_supported: browser viewport is not supported in linux mock");
-        }
         _ => {
             // Generic passthrough to browser.<sub>
             let sid = surface
@@ -5246,6 +5246,28 @@ async fn run_browser(
     };
 
     Ok(output)
+}
+
+// purpose: Map CMUX browser CLI forms that upstream documents as unsupported.
+// inputs: Parsed browser subcommand and its remaining positional arguments.
+// returns/effects: Returns the exact RPC method that should fail with not_supported.
+fn unsupported_browser_cli_method(sub: &str, rest: &[String]) -> Option<String> {
+    match (sub, rest.first().map(String::as_str)) {
+        ("viewport", Some("set")) => Some("browser.viewport.set".to_string()),
+        ("geolocation", Some("set")) => Some("browser.geolocation.set".to_string()),
+        ("offline", Some("set")) => Some("browser.offline.set".to_string()),
+        ("trace", Some("start")) => Some("browser.trace.start".to_string()),
+        ("trace", Some("stop")) => Some("browser.trace.stop".to_string()),
+        ("network", Some("route")) => Some("browser.network.route".to_string()),
+        ("network", Some("unroute")) => Some("browser.network.unroute".to_string()),
+        ("network", Some("requests")) => Some("browser.network.requests".to_string()),
+        ("screencast", Some("start")) => Some("browser.screencast.start".to_string()),
+        ("screencast", Some("stop")) => Some("browser.screencast.stop".to_string()),
+        ("input_mouse" | "input-mouse", _) => Some("browser.input_mouse".to_string()),
+        ("input_keyboard" | "input-keyboard", _) => Some("browser.input_keyboard".to_string()),
+        ("input_touch" | "input-touch", _) => Some("browser.input_touch".to_string()),
+        _ => None,
+    }
 }
 
 fn is_unsupported_tmux_cmd(cmd: &str) -> bool {
@@ -6294,6 +6316,40 @@ mod cli_arg_tests {
             .expect("clear parses")
             .expect("clear maps");
         assert_eq!(cleared.0, "notification.clear");
+    }
+
+    /// purpose: Verify CLI forms for CMUX documented browser gaps map to not_supported RPC names.
+    /// inputs: Browser subcommands and grouped positional verbs from the CMUX browser reference.
+    /// returns/effects: Asserts the CLI parser identifies each unsupported browser API.
+    #[test]
+    fn cmux_browser_unsupported_cli_forms_map_to_rpc_methods() {
+        let cases = [
+            ("viewport", &["set"][..], "browser.viewport.set"),
+            ("geolocation", &["set"], "browser.geolocation.set"),
+            ("offline", &["set"], "browser.offline.set"),
+            ("trace", &["start"], "browser.trace.start"),
+            ("trace", &["stop"], "browser.trace.stop"),
+            ("network", &["route"], "browser.network.route"),
+            ("network", &["unroute"], "browser.network.unroute"),
+            ("network", &["requests"], "browser.network.requests"),
+            ("screencast", &["start"], "browser.screencast.start"),
+            ("screencast", &["stop"], "browser.screencast.stop"),
+            ("input_mouse", &[], "browser.input_mouse"),
+            ("input-keyboard", &[], "browser.input_keyboard"),
+            ("input_touch", &[], "browser.input_touch"),
+        ];
+
+        for (sub, rest, expected) in cases {
+            let rest = rest
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                unsupported_browser_cli_method(sub, &rest).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(unsupported_browser_cli_method("viewport", &[]).is_none());
     }
 
     #[test]

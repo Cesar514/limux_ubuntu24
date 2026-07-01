@@ -112,6 +112,7 @@ const PARSE_ERROR_CODE: i64 = -32700;
 const INVALID_PARAMS_CODE: i64 = -32602;
 const UNKNOWN_METHOD_CODE: i64 = -32601;
 const INTERNAL_ERROR_CODE: i64 = -32603;
+const NOT_SUPPORTED_CODE: i64 = -32001;
 const NOT_FOUND_CODE: i64 = -32004;
 const CONFLICT_CODE: i64 = -32009;
 
@@ -570,6 +571,10 @@ impl BridgeError {
         Self::new(NOT_FOUND_CODE, message)
     }
 
+    fn not_supported(method: &str) -> Self {
+        Self::new(NOT_SUPPORTED_CODE, format!("not_supported: {method}"))
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(CONFLICT_CODE, message)
     }
@@ -622,6 +627,28 @@ fn required_browser_selector(
 fn required_browser_key(method: &str, params: &Map<String, Value>) -> Result<String, BridgeError> {
     optional_string(params, &["key"])
         .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires key")))
+}
+
+// purpose: Identify CMUX browser APIs documented as unsupported by WKWebView.
+// inputs: Fully-qualified browser RPC method.
+// returns/effects: Returns true for explicit not_supported responses, without dispatching.
+fn is_unsupported_browser_method(method: &str) -> bool {
+    matches!(
+        method,
+        "browser.viewport.set"
+            | "browser.geolocation.set"
+            | "browser.offline.set"
+            | "browser.trace.start"
+            | "browser.trace.stop"
+            | "browser.network.route"
+            | "browser.network.unroute"
+            | "browser.network.requests"
+            | "browser.screencast.start"
+            | "browser.screencast.stop"
+            | "browser.input_mouse"
+            | "browser.input_keyboard"
+            | "browser.input_touch"
+    )
 }
 
 fn optional_handle(
@@ -1066,6 +1093,9 @@ fn handle_method(
         Ok(params) => params,
         Err(error) => return error_response(id, error),
     };
+    if is_unsupported_browser_method(method) {
+        return error_response(id, BridgeError::not_supported(method));
+    }
 
     let queued = match method {
         "system.ping" | "ping" => return V2Response::success(id, json!({ "pong": true })),
@@ -3069,6 +3099,40 @@ mod tests {
             invalid.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn browser_unsupported_wkwebview_gap_methods_fail_before_dispatch() {
+        for method in [
+            "browser.viewport.set",
+            "browser.geolocation.set",
+            "browser.offline.set",
+            "browser.trace.start",
+            "browser.trace.stop",
+            "browser.network.route",
+            "browser.network.unroute",
+            "browser.network.requests",
+            "browser.screencast.start",
+            "browser.screencast.stop",
+            "browser.input_mouse",
+            "browser.input_keyboard",
+            "browser.input_touch",
+        ] {
+            let response = dispatch_request(
+                &json!({
+                    "id": 1,
+                    "method": method,
+                    "params": { "surface_id": "surface:9:browser" }
+                })
+                .to_string(),
+                &|command| panic!("unsupported browser method should not dispatch: {command:?}"),
+            );
+
+            let error = response.error.expect("unsupported error");
+            assert_eq!(error.code, NOT_SUPPORTED_CODE);
+            assert!(error.message.contains("not_supported"));
+            assert!(error.message.contains(method));
+        }
     }
 
     #[test]
