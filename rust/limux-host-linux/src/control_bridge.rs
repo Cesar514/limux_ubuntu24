@@ -24,6 +24,11 @@ const METHODS: &[&str] = &[
     "system.capabilities",
     "system.memory",
     "events.stream",
+    "feed.push",
+    "feed.list",
+    "feed.permission.reply",
+    "feed.question.reply",
+    "feed.exit_plan.reply",
     "workspace.current",
     "workspace.list",
     "workspace.create",
@@ -1066,6 +1071,36 @@ fn handle_method(
         "system.ping" | "ping" => return V2Response::success(id, json!({ "pong": true })),
         "system.capabilities" => {
             return V2Response::success(id, json!({ "commands": METHODS, "methods": METHODS }));
+        }
+        "feed.push" => {
+            return match crate::feed::coordinator().push(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
+        }
+        "feed.list" => {
+            return match crate::feed::coordinator().list(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
+        }
+        "feed.permission.reply" => {
+            return match crate::feed::coordinator().permission_reply(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
+        }
+        "feed.question.reply" => {
+            return match crate::feed::coordinator().question_reply(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
+        }
+        "feed.exit_plan.reply" => {
+            return match crate::feed::coordinator().exit_plan_reply(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
         }
         "system.identify" => {
             let (reply, rx) = mpsc::channel();
@@ -2183,6 +2218,15 @@ pub fn start(dispatch: fn(ControlCommand)) {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::{Mutex, OnceLock};
+
+    fn feed_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static FEED_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        FEED_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("feed test lock")
+    }
 
     #[test]
     fn parses_v2_request_directly() {
@@ -2206,8 +2250,145 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_feed_methods() {
+        assert!(METHODS.contains(&"feed.push"));
+        assert!(METHODS.contains(&"feed.permission.reply"));
+        assert!(METHODS.contains(&"feed.question.reply"));
+        assert!(METHODS.contains(&"feed.exit_plan.reply"));
+    }
+
+    #[test]
     fn capabilities_include_workspace_group_list() {
         assert!(METHODS.contains(&"workspace.group.list"));
+    }
+
+    #[test]
+    fn feed_push_acknowledges_and_lists_nonblocking_items() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let request = json!({
+            "id": 1,
+            "method": "feed.push",
+            "params": {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "PreToolUse",
+                    "_source": "claude",
+                    "tool_name": "Bash",
+                },
+                "wait_timeout_seconds": 0,
+            },
+        })
+        .to_string();
+        let response = dispatch_request(&request, &|command| {
+            panic!("feed.push should not queue command: {command:?}")
+        });
+        assert_eq!(response.error, None);
+        let result = response.result.expect("feed.push result");
+        assert_eq!(result["status"], "acknowledged");
+        assert_eq!(result["item_id"], "feed-1");
+
+        let listed = dispatch_request(r#"{"id":2,"method":"feed.list","params":{}}"#, &|command| {
+            panic!("feed.list should not queue command: {command:?}")
+        });
+        let items = listed.result.expect("feed.list result")["items"]
+            .as_array()
+            .expect("items array")
+            .clone();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "PreToolUse");
+        assert_eq!(items[0]["status"], "telemetry");
+    }
+
+    #[test]
+    fn feed_push_blocks_until_permission_reply_resolves() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let request = json!({
+            "id": 1,
+            "method": "feed.push",
+            "params": {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "PermissionRequest",
+                    "_source": "claude",
+                    "_opencode_request_id": "req-feed-perm",
+                    "tool_name": "Bash",
+                },
+                "wait_timeout_seconds": 1,
+            },
+        })
+        .to_string();
+        let handle = std::thread::spawn(move || {
+            dispatch_request(&request, &|command| {
+                panic!("feed.push should not queue command: {command:?}")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        let reply = dispatch_request(
+            r#"{"id":2,"method":"feed.permission.reply","params":{"request_id":"req-feed-perm","mode":"once"}}"#,
+            &|command| panic!("feed.permission.reply should not queue command: {command:?}"),
+        );
+        assert_eq!(reply.error, None);
+        assert_eq!(
+            reply.result.expect("permission reply result")["delivered"],
+            true
+        );
+
+        let pushed = handle.join().expect("feed push thread");
+        assert_eq!(pushed.error, None);
+        let result = pushed.result.expect("feed.push resolved result");
+        assert_eq!(result["status"], "resolved");
+        assert_eq!(
+            result["decision"],
+            json!({ "kind": "permission", "mode": "once" })
+        );
+    }
+
+    #[test]
+    fn feed_push_times_out_and_invalid_modes_fail_loudly() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let request = json!({
+            "id": 1,
+            "method": "feed.push",
+            "params": {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "PermissionRequest",
+                    "_source": "claude",
+                    "_opencode_request_id": "req-feed-timeout",
+                },
+                "wait_timeout_seconds": 0.01,
+            },
+        })
+        .to_string();
+        let timed_out = dispatch_request(&request, &|command| {
+            panic!("feed.push should not queue command: {command:?}")
+        });
+        assert_eq!(timed_out.error, None);
+        assert_eq!(
+            timed_out.result.expect("feed timeout result")["status"],
+            "timed_out"
+        );
+
+        let invalid = dispatch_request(
+            r#"{"id":2,"method":"feed.permission.reply","params":{"request_id":"req-feed-timeout","mode":"maybe"}}"#,
+            &|command| panic!("invalid feed reply should not queue command: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let missing = dispatch_request(
+            r#"{"id":3,"method":"feed.question.reply","params":{"request_id":"missing","selections":[]}}"#,
+            &|command| panic!("missing feed reply should not queue command: {command:?}"),
+        );
+        assert_eq!(
+            missing.error.as_ref().map(|error| error.code),
+            Some(NOT_FOUND_CODE)
+        );
     }
 
     #[test]
