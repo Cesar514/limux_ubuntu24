@@ -2392,6 +2392,47 @@ pub fn reorder_surface_for_root(
     None
 }
 
+// purpose: Refresh terminal surface rendering inside one workspace root.
+// inputs: Workspace root and an optional surface handle to narrow the refresh.
+// returns/effects: Calls Ghostty refresh on matching terminal surfaces and returns summaries.
+pub fn refresh_terminal_surfaces_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Vec<SurfaceSummary> {
+    let requested = surface_hint.map(normalize_surface_hint);
+    if requested.is_some_and(str::is_empty) {
+        return Vec::new();
+    }
+
+    let mut refreshed = Vec::new();
+    for internals in pane_internals_for_root(root) {
+        let matches = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state
+                .tabs
+                .iter()
+                .filter_map(|entry| {
+                    let TabKind::Terminal { state } = &entry.kind else {
+                        return None;
+                    };
+                    let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                    let requested_matches = requested
+                        .map(|hint| surface_hint_matches(&surface_id, &entry.id, hint))
+                        .unwrap_or(true);
+                    requested_matches.then(|| (entry.id.clone(), state.handle.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (tab_id, handle) in matches {
+            handle.refresh_display();
+            if let Some(summary) = surface_summary_for_tab(&internals, &tab_id) {
+                refreshed.push(summary);
+            }
+        }
+    }
+    refreshed
+}
+
 pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarget {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return FocusedShortcutTarget::None;

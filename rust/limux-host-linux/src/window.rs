@@ -6611,6 +6611,51 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             request_session_save(state);
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::RefreshSurfaces {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(workspace_index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, refreshed) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[workspace_index];
+                let refreshed = pane::refresh_terminal_surfaces_for_root(
+                    &workspace.root,
+                    surface_hint.as_deref(),
+                );
+                (workspace.id.clone(), workspace.name.clone(), refreshed)
+            };
+            if surface_hint.is_some() && refreshed.is_empty() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            }
+
+            let surfaces = refreshed
+                .into_iter()
+                .map(|surface| {
+                    pane_create_response_payload(&workspace_id, &workspace_name, surface)
+                })
+                .collect::<Vec<_>>();
+            let _ = reply.send(Ok(serde_json::json!({
+                "ok": true,
+                "refreshed": surfaces.len(),
+                "surfaces": surfaces,
+            })));
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,

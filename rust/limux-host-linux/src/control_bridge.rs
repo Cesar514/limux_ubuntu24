@@ -132,6 +132,7 @@ const METHODS: &[&str] = &[
     "surface.close",
     "surface.move",
     "surface.reorder",
+    "surface.refresh",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -551,6 +552,11 @@ pub enum ControlCommand {
         after_surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    RefreshSurfaces {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -661,6 +667,7 @@ impl ControlCommand {
             | Self::CloseSurface { reply, .. }
             | Self::MoveSurface { reply, .. }
             | Self::ReorderSurface { reply, .. }
+            | Self::RefreshSurfaces { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2295,6 +2302,26 @@ fn handle_method(
                     index,
                     before_surface_hint,
                     after_surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.refresh" | "refresh-surfaces" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::RefreshSurfaces {
+                    target,
+                    surface_hint,
                     reply,
                 },
                 rx,
@@ -4498,6 +4525,51 @@ mod tests {
             multiple.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn surface_refresh_route_accepts_surface_refs_and_context_defaults() {
+        let explicit = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"refresh-surfaces","params":{"workspace_id":"codex","#,
+                r#""panel_id":"surface:4:tab"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::RefreshSurfaces {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "refreshed": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(explicit.error, None);
+        assert_eq!(
+            explicit.result.expect("surface.refresh result")["refreshed"],
+            1
+        );
+
+        let all = dispatch_request(
+            r#"{"id":1,"method":"surface.refresh","params":{"workspace_id":"codex"}}"#,
+            &|command| match command {
+                ControlCommand::RefreshSurfaces {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, None);
+                    let _ = reply.send(Ok(json!({ "refreshed": 2 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(all.error, None);
+        assert_eq!(all.result.expect("surface.refresh result")["refreshed"], 2);
     }
 
     #[test]

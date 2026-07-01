@@ -6378,6 +6378,13 @@ mod cli_arg_tests {
             ]),
         );
         assert!(ambiguous.is_err());
+
+        let refreshed =
+            build_surface_alias_request("refresh-surfaces", &args(&["--panel", "surface:7:tab-a"]))
+                .expect("refresh-surfaces parses")
+                .expect("refresh-surfaces maps");
+        assert_eq!(refreshed.0, "surface.refresh");
+        assert_eq!(refreshed.1["surface_id"], "surface:7:tab-a");
     }
 
     #[test]
