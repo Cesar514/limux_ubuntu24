@@ -4992,6 +4992,16 @@ const BASE_CSS: &str = r#"
     color: alpha(@window_fg_color, 0.48);
     font-size: 12px;
 }
+.limux-ws-group-control {
+    min-height: 0;
+    min-width: 0;
+    padding: 0 2px;
+    border: none;
+}
+.limux-ws-group-control:hover .limux-ws-group-chevron,
+.limux-ws-group-control:hover .limux-ws-group-plus {
+    color: @window_fg_color;
+}
 .limux-ws-group-name {
     color: alpha(@window_fg_color, 0.78);
     font-size: 13px;
@@ -7125,6 +7135,49 @@ fn workspace_sidebar_render_items(
     items
 }
 
+// purpose: Build the CMUX workspace-group action for a header chevron click.
+// inputs: Current persisted group metadata.
+// returns/effects: Returns expand for collapsed groups and collapse for expanded groups.
+fn workspace_group_header_toggle_action(group: &WorkspaceGroupState) -> WorkspaceGroupAction {
+    if group.is_collapsed {
+        WorkspaceGroupAction::Expand {
+            group_id: group.id.clone(),
+        }
+    } else {
+        WorkspaceGroupAction::Collapse {
+            group_id: group.id.clone(),
+        }
+    }
+}
+
+// purpose: Build the CMUX workspace-group action for a header plus click.
+// inputs: Group id for the clicked header.
+// returns/effects: Returns a new-workspace action using host-configured placement.
+fn workspace_group_header_plus_action(group_id: &str) -> WorkspaceGroupAction {
+    WorkspaceGroupAction::NewWorkspace {
+        group_id: group_id.to_string(),
+        placement: None,
+    }
+}
+
+// purpose: Dispatch a workspace-group header action through the live host state.
+// inputs: A CMUX workspace-group action created by a GTK header control.
+// returns/effects: Applies the action or shows a loud runtime error dialog.
+fn dispatch_workspace_group_header_action(action: WorkspaceGroupAction) {
+    CONTROL_STATE.with(|slot| {
+        let Some(state) = slot.borrow().clone() else {
+            panic!("workspace group header action requires live control state");
+        };
+        if let Err(error) = apply_workspace_group_action(&state, action) {
+            show_runtime_error(
+                &state,
+                "Workspace group action failed",
+                &format!("{error:?}"),
+            );
+        }
+    });
+}
+
 // purpose: Build one CMUX-style workspace-group header row.
 // inputs: Group metadata and number of member workspaces.
 // returns/effects: Returns a GTK ListBoxRow for the sidebar.
@@ -7141,6 +7194,22 @@ fn build_workspace_group_sidebar_row(
         .xalign(0.5)
         .build();
     chevron.add_css_class("limux-ws-group-chevron");
+
+    let toggle_button = gtk::Button::builder().child(&chevron).build();
+    toggle_button.add_css_class("flat");
+    toggle_button.add_css_class("limux-ws-group-control");
+    toggle_button.set_focus_on_click(false);
+    toggle_button.set_tooltip_text(Some(if group.is_collapsed {
+        "Expand workspace group"
+    } else {
+        "Collapse workspace group"
+    }));
+    {
+        let action = workspace_group_header_toggle_action(group);
+        toggle_button.connect_clicked(move |_| {
+            dispatch_workspace_group_header_action(action.clone());
+        });
+    }
 
     let icon = gtk::Label::builder()
         .label(group.icon_symbol.as_deref().unwrap_or("\u{1F5C0}"))
@@ -7162,8 +7231,20 @@ fn build_workspace_group_sidebar_row(
         .build();
     count.add_css_class("limux-ws-group-count");
 
-    let plus = gtk::Label::builder().label("+").xalign(0.5).build();
-    plus.add_css_class("limux-ws-group-plus");
+    let plus_label = gtk::Label::builder().label("+").xalign(0.5).build();
+    plus_label.add_css_class("limux-ws-group-plus");
+
+    let plus_button = gtk::Button::builder().child(&plus_label).build();
+    plus_button.add_css_class("flat");
+    plus_button.add_css_class("limux-ws-group-control");
+    plus_button.set_focus_on_click(false);
+    plus_button.set_tooltip_text(Some("New workspace in group"));
+    {
+        let action = workspace_group_header_plus_action(&group.id);
+        plus_button.connect_clicked(move |_| {
+            dispatch_workspace_group_header_action(action.clone());
+        });
+    }
 
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -7178,7 +7259,7 @@ fn build_workspace_group_sidebar_row(
     } else {
         row_box.set_tooltip_text(Some(&group.name));
     }
-    row_box.append(&chevron);
+    row_box.append(&toggle_button);
     row_box.append(&icon);
     row_box.append(&name);
     if group.is_pinned {
@@ -7187,7 +7268,7 @@ fn build_workspace_group_sidebar_row(
         row_box.append(&pin);
     }
     row_box.append(&count);
-    row_box.append(&plus);
+    row_box.append(&plus_button);
 
     let row = gtk::ListBoxRow::new();
     row.add_css_class("limux-ws-group-list-row");
@@ -15276,9 +15357,10 @@ mod tests {
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
-        workspace_insert_index_for_placement, workspace_lifecycle_payload,
-        workspace_notification_message, workspace_reordered_payload,
+        workspace_drop_layout_path, workspace_folder_path_from_input,
+        workspace_group_header_plus_action, workspace_group_header_toggle_action,
+        workspace_group_insert_index, workspace_insert_index_for_placement,
+        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_sidebar_render_items, workspace_title_from_directory, BrowserEvent, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
@@ -15289,7 +15371,7 @@ mod tests {
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
-    use crate::control_bridge::{BrowserAction, RightSidebarMode};
+    use crate::control_bridge::{BrowserAction, RightSidebarMode, WorkspaceGroupAction};
     use crate::layout_state::{
         LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
     };
@@ -15595,6 +15677,36 @@ mod tests {
                     workspace_id: "ws-free".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn workspace_group_header_toggle_action_matches_collapsed_state() {
+        let mut group = test_workspace_group();
+        assert_eq!(
+            workspace_group_header_toggle_action(&group),
+            WorkspaceGroupAction::Collapse {
+                group_id: "group-1".to_string(),
+            }
+        );
+
+        group.is_collapsed = true;
+        assert_eq!(
+            workspace_group_header_toggle_action(&group),
+            WorkspaceGroupAction::Expand {
+                group_id: "group-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_group_header_plus_action_uses_configured_placement_path() {
+        assert_eq!(
+            workspace_group_header_plus_action("group-1"),
+            WorkspaceGroupAction::NewWorkspace {
+                group_id: "group-1".to_string(),
+                placement: None,
+            }
         );
     }
 
