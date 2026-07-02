@@ -4300,7 +4300,11 @@ const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
 const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
 const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
-const RIGHT_SIDEBAR_WIDTH: i32 = 280;
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: i32 = 280;
+const RIGHT_SIDEBAR_MIN_WIDTH: i32 = 276;
+const RIGHT_SIDEBAR_DEFAULT_MAX_WIDTH: i32 = 1200;
+const RIGHT_SIDEBAR_TERMINAL_RESERVE_WIDTH: i32 = 360;
+const RIGHT_SIDEBAR_AVAILABLE_WIDTH_FALLBACK: i32 = 1920;
 const RIGHT_SIDEBAR_LOG_PREVIEW_LIMIT: usize = 8;
 const RIGHT_SIDEBAR_FILE_PREVIEW_LIMIT: usize = 12;
 const RIGHT_SIDEBAR_FEED_PREVIEW_LIMIT: usize = 8;
@@ -4689,7 +4693,7 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&new_ws_btn);
 
     let (right_sidebar_shell, right_sidebar_title_label, right_sidebar_body) =
-        build_right_sidebar_panel();
+        build_right_sidebar_panel(&config.borrow().sidebar);
     let (main_split, sidebar_shell, sidebar_handle) =
         build_sidebar_split(&sidebar, &stack, &right_sidebar_shell);
 
@@ -4899,10 +4903,59 @@ fn build_window_css(background_opacity: f64) -> String {
     )
 }
 
+// purpose: Clamp the right sidebar width with CMUX rightMaxWidth semantics.
+// inputs: Requested width, optional available window width, and optional configured maximum.
+// returns/effects: Returns a bounded pixel width while reserving terminal content space.
+fn clamped_right_sidebar_width(
+    candidate: i32,
+    available_width: Option<i32>,
+    configured_max_width: Option<i32>,
+) -> i32 {
+    let candidate = if candidate > 0 {
+        candidate
+    } else {
+        RIGHT_SIDEBAR_DEFAULT_WIDTH
+    };
+    let available_width = available_width
+        .filter(|width| *width > 0)
+        .unwrap_or(RIGHT_SIDEBAR_AVAILABLE_WIDTH_FALLBACK);
+    let available_max =
+        (available_width - RIGHT_SIDEBAR_TERMINAL_RESERVE_WIDTH).max(RIGHT_SIDEBAR_MIN_WIDTH);
+    let configured_max = configured_max_width
+        .unwrap_or(RIGHT_SIDEBAR_DEFAULT_MAX_WIDTH)
+        .max(RIGHT_SIDEBAR_MIN_WIDTH);
+    let effective_max = configured_max
+        .min(available_max)
+        .max(RIGHT_SIDEBAR_MIN_WIDTH);
+    candidate.clamp(RIGHT_SIDEBAR_MIN_WIDTH, effective_max)
+}
+
+// purpose: Apply the configured CMUX rightMaxWidth policy to the GTK sidebar shell.
+// inputs: Sidebar shell, current sidebar config, and optional available window width.
+// returns/effects: Updates the shell width request.
+fn apply_right_sidebar_width(
+    shell: &gtk::Box,
+    sidebar: &app_config::SidebarConfig,
+    available_width: Option<i32>,
+) {
+    let candidate = if shell.width_request() > 0 {
+        shell.width_request()
+    } else {
+        RIGHT_SIDEBAR_DEFAULT_WIDTH
+    };
+    shell.set_width_request(clamped_right_sidebar_width(
+        candidate,
+        available_width,
+        sidebar.right_max_width,
+    ));
+}
+
 /// purpose: Build the CMUX-compatible right sidebar shell and retained-metadata body.
-/// inputs: None.
+/// inputs: Sidebar config used to clamp the initial shell width.
 /// returns/effects: Returns shell/title/body widgets for host state ownership.
-fn build_right_sidebar_panel() -> (gtk::Box, gtk::Label, gtk::Box) {
+fn build_right_sidebar_panel(
+    sidebar: &app_config::SidebarConfig,
+) -> (gtk::Box, gtk::Label, gtk::Box) {
     let title = gtk::Label::builder()
         .label("RIGHT SIDEBAR")
         .xalign(0.0)
@@ -4925,10 +4978,10 @@ fn build_right_sidebar_panel() -> (gtk::Box, gtk::Label, gtk::Box) {
 
     let shell = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .width_request(RIGHT_SIDEBAR_WIDTH)
         .hexpand(false)
         .vexpand(true)
         .build();
+    apply_right_sidebar_width(&shell, sidebar, None);
     shell.add_css_class("limux-right-sidebar");
     shell.append(&title);
     shell.append(&scroll);
@@ -6061,6 +6114,14 @@ fn apply_reloaded_app_config(
     let sidebar = config.sidebar.clone();
     state.borrow().config.borrow_mut().clone_from(&config);
     sync_sidebar_detail_rows(state, &sidebar);
+    let (right_sidebar_shell, available_width) = {
+        let app_state = state.borrow();
+        (
+            app_state.right_sidebar_shell.clone(),
+            Some(app_state.window.allocated_width()),
+        )
+    };
+    apply_right_sidebar_width(&right_sidebar_shell, &sidebar, available_width);
     if next_font_size == previous_font_size {
         return;
     }
@@ -13884,8 +13945,9 @@ mod tests {
         browser_count_script, browser_element_action_script, browser_find_script,
         browser_required_element_script, browser_scroll_script, browser_snapshot_script,
         browser_styles_script, build_window_css, clamp_workspace_insert_index_for_pinning,
-        desktop_notification_action_entries, desktop_notification_action_from_signal,
-        desktop_notification_actions, desktop_notification_activation_token_from_signal,
+        clamped_right_sidebar_width, desktop_notification_action_entries,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -14245,6 +14307,25 @@ mod tests {
             right_sidebar_metadata_sections(&custom),
             (false, true, false)
         );
+    }
+
+    // purpose: Verify Limux clamps right-sidebar widths using CMUX policy values.
+    // inputs: Candidate widths, available window widths, and configured maximums.
+    // returns/effects: Asserts min/default/configured/available caps match CMUX examples.
+    #[test]
+    fn right_sidebar_width_clamp_matches_cmux_policy() {
+        assert_eq!(clamped_right_sidebar_width(900, Some(1600), None), 900);
+        assert_eq!(clamped_right_sidebar_width(10000, Some(10000), None), 1200);
+        assert_eq!(clamped_right_sidebar_width(10000, Some(1000), None), 640);
+        assert_eq!(
+            clamped_right_sidebar_width(10000, Some(2400), Some(1500)),
+            1500
+        );
+        assert_eq!(
+            clamped_right_sidebar_width(10000, Some(1000), Some(1400)),
+            640
+        );
+        assert_eq!(clamped_right_sidebar_width(20, Some(1000), Some(120)), 276);
     }
 
     #[test]

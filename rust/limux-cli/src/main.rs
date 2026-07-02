@@ -1493,6 +1493,16 @@ struct BooleanSetting {
     default: bool,
 }
 
+#[derive(Clone, Copy)]
+struct NumericSetting {
+    key: &'static str,
+    section: &'static str,
+    json_key: &'static str,
+    default: i32,
+    min: i32,
+    max: i32,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -1661,6 +1671,15 @@ const SIDEBAR_SHOW_LOG_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_RIGHT_MAX_WIDTH_SETTING: NumericSetting = NumericSetting {
+    key: "sidebar.rightMaxWidth",
+    section: "sidebar",
+    json_key: "rightMaxWidth",
+    default: 1200,
+    min: 276,
+    max: 4096,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1682,7 +1701,8 @@ const CONFIG_GET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
-    "sidebar.showProgress|sidebar.showLog|workspaceGroups.newWorkspacePlacement>"
+    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
@@ -1699,7 +1719,8 @@ const CONFIG_SET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
-    "sidebar.showProgress|sidebar.showLog|workspaceGroups.newWorkspacePlacement> <value>"
+    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
 // purpose: Map CMUX config font-size keys to their supported ranges.
@@ -1776,6 +1797,16 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
         "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
         "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map supported CMUX numeric settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn numeric_setting(raw: &str) -> Option<NumericSetting> {
+    match raw {
+        "sidebar.rightMaxWidth" => Some(SIDEBAR_RIGHT_MAX_WIDTH_SETTING),
         _ => None,
     }
 }
@@ -1985,6 +2016,37 @@ fn set_config_boolean_setting_at(
     Ok(value.to_string())
 }
 
+// purpose: Read a nested numeric CMUX setting with strict validation.
+// inputs: Settings path and supported numeric setting descriptor.
+// returns/effects: Returns the effective clamped integer value and whether it was configured.
+fn get_config_numeric_setting_at(path: &Path, setting: NumericSetting) -> Result<(i32, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get(setting.section)
+        .and_then(Value::as_object)
+        .and_then(|section| section.get(setting.json_key))
+    else {
+        return Ok((setting.default, false));
+    };
+    Ok((parse_numeric_setting_value(setting, value)?, true))
+}
+
+// purpose: Write a nested numeric CMUX setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw numeric value.
+// returns/effects: Strictly parses, rounds, clamps, and atomically writes settings JSON.
+fn set_config_numeric_setting_at(path: &Path, setting: NumericSetting, raw: &str) -> Result<i32> {
+    let value = parse_numeric_setting_str(setting, raw)?;
+    let mut root = read_settings_root(path)?;
+    let section = root
+        .entry(setting.section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be a JSON object", setting.section))?;
+    section.insert(setting.json_key.to_string(), json!(value));
+    write_settings_root(path, &root)?;
+    Ok(value)
+}
+
 // purpose: Render CMUX-compatible config get output for one font-size setting.
 // inputs: Settings path and setting descriptor.
 // returns/effects: Returns text with effective value and backing path.
@@ -2119,6 +2181,32 @@ fn render_config_boolean_get(path: &Path, setting: BooleanSetting) -> Result<Str
 // returns/effects: Writes settings JSON and returns user-facing status text.
 fn render_config_boolean_set(path: &Path, setting: BooleanSetting, raw: &str) -> Result<String> {
     let value = set_config_boolean_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for one numeric setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_numeric_get(path: &Path, setting: NumericSetting) -> Result<String> {
+    let (value, _) = get_config_numeric_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one numeric setting.
+// inputs: Settings path, setting descriptor, and raw numeric argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_numeric_set(path: &Path, setting: NumericSetting, raw: &str) -> Result<String> {
+    let value = set_config_numeric_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -2292,6 +2380,36 @@ fn parse_boolean_str(key: &str, raw: &str) -> Result<bool> {
         "false" => Ok(false),
         _ => bail!("{key} requires true or false"),
     }
+}
+
+// purpose: Parse an existing JSON value for a supported numeric config key.
+// inputs: Numeric setting descriptor and raw JSON value.
+// returns/effects: Returns rounded/clamped integer pixels or errors on malformed settings JSON.
+fn parse_numeric_setting_value(setting: NumericSetting, value: &Value) -> Result<i32> {
+    let width = value
+        .as_f64()
+        .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
+    clamped_numeric_setting(setting, width)
+}
+
+// purpose: Validate a numeric config CLI value with CMUX clamping semantics.
+// inputs: Numeric setting descriptor and raw CLI value.
+// returns/effects: Returns rounded/clamped integer pixels or a loud config error.
+fn parse_numeric_setting_str(setting: NumericSetting, raw: &str) -> Result<i32> {
+    let width = raw
+        .parse::<f64>()
+        .with_context(|| format!("{} requires a positive number", setting.key))?;
+    clamped_numeric_setting(setting, width)
+}
+
+// purpose: Apply shared finite/positive validation and integer clamp.
+// inputs: Numeric setting descriptor and requested value.
+// returns/effects: Returns rounded and clamped integer value.
+fn clamped_numeric_setting(setting: NumericSetting, value: f64) -> Result<i32> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("{} must be a positive number", setting.key);
+    }
+    Ok((value.round() as i32).clamp(setting.min, setting.max))
 }
 
 /// purpose: Handle CMUX-compatible local commands without requiring a socket.
@@ -2838,6 +2956,9 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             if let Some(setting) = boolean_setting(key) {
                 return Ok(CommandOutput::Text(render_config_boolean_get(&path, setting)?));
             }
+            if let Some(setting) = numeric_setting(key) {
+                return Ok(CommandOutput::Text(render_config_numeric_get(&path, setting)?));
+            }
             let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
             Ok(CommandOutput::Text(render_config_placement_get(
                 &path, setting,
@@ -2871,6 +2992,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             }
             if let Some(setting) = boolean_setting(key) {
                 return Ok(CommandOutput::Text(render_config_boolean_set(
+                    &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = numeric_setting(key) {
+                return Ok(CommandOutput::Text(render_config_numeric_set(
                     &path, setting, value,
                 )?));
             }
@@ -16167,6 +16293,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_LOG_SETTING)
             .expect("get default sidebar log");
         assert!(text.contains("sidebar.showLog = true"));
+        let text = render_config_numeric_get(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING)
+            .expect("get default sidebar right max width");
+        assert!(text.contains("sidebar.rightMaxWidth = 1200"));
 
         fs::write(
             &path,
@@ -16199,6 +16328,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_LOG_SETTING, "false")
             .expect("set sidebar log");
         assert!(text.contains("sidebar.showLog = false"));
+        let text = render_config_numeric_set(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING, "10000")
+            .expect("set sidebar right max width");
+        assert!(text.contains("sidebar.rightMaxWidth = 4096"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
@@ -16211,6 +16343,7 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], false);
         assert_eq!(parsed["sidebar"]["showProgress"], false);
         assert_eq!(parsed["sidebar"]["showLog"], false);
+        assert_eq!(parsed["sidebar"]["rightMaxWidth"], 4096);
         assert_eq!(parsed["notifications"]["sound"], "Ping");
     }
 
@@ -16230,6 +16363,16 @@ mod cli_arg_tests {
         let err = render_config_boolean_get(&path, SIDEBAR_SHOW_LOG_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+
+        let err = render_config_numeric_set(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING, "0")
+            .expect_err("invalid width");
+        assert!(err.to_string().contains("must be a positive number"));
+
+        fs::write(&path, br#"{"sidebar":{"rightMaxWidth":"1200"}}"#)
+            .expect("write malformed width");
+        let err = render_config_numeric_get(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING)
+            .expect_err("invalid existing width");
+        assert!(err.to_string().contains("must be a positive number"));
     }
 
     #[test]

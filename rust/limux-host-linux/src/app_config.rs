@@ -133,6 +133,7 @@ pub struct SidebarConfig {
     pub show_custom_metadata: bool,
     pub show_progress: bool,
     pub show_log: bool,
+    pub right_max_width: Option<i32>,
 }
 
 impl Default for SidebarConfig {
@@ -146,6 +147,7 @@ impl Default for SidebarConfig {
             show_custom_metadata: true,
             show_progress: true,
             show_log: true,
+            right_max_width: None,
         }
     }
 }
@@ -670,6 +672,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showLog"))
         .map(|value| parse_bool_setting(value, "sidebar.showLog"))
         .unwrap_or(sidebar_defaults.show_log);
+    let right_max_width = sidebar
+        .and_then(|sidebar| sidebar.get("rightMaxWidth"))
+        .map(|value| parse_sidebar_right_max_width(value, "sidebar.rightMaxWidth"));
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -765,6 +770,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_custom_metadata,
             show_progress,
             show_log,
+            right_max_width,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -795,6 +801,22 @@ fn parse_bool_setting(value: &Value, path: &str) -> bool {
     value
         .as_bool()
         .unwrap_or_else(|| panic!("{path} must be a boolean"))
+}
+
+// purpose: Parse CMUX sidebar rightMaxWidth while preserving its settings-editor clamp.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns rounded pixels clamped to CMUX's supported 276..4096 range.
+fn parse_sidebar_right_max_width(value: &Value, path: &str) -> i32 {
+    const MIN_WIDTH: f64 = 276.0;
+    const SETTINGS_MAX_WIDTH: f64 = 4096.0;
+
+    let width = value
+        .as_f64()
+        .unwrap_or_else(|| panic!("{path} must be a positive number"));
+    if !width.is_finite() || width <= 0.0 {
+        panic!("{path} must be a positive number");
+    }
+    width.round().clamp(MIN_WIDTH, SETTINGS_MAX_WIDTH) as i32
 }
 
 // purpose: Parse a required string setting value without silent coercion.
@@ -1165,19 +1187,41 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "autoResumeAgentSessions".to_string(),
         json!(config.terminal.auto_resume_agent_sessions),
     );
-    root.insert(
-        "sidebar".to_string(),
-        json!({
-            "hideAllDetails": config.sidebar.hide_all_details,
-            "wrapWorkspaceTitles": config.sidebar.wrap_workspace_titles,
-            "showWorkspaceDescription": config.sidebar.show_workspace_description,
-            "showNotificationMessage": config.sidebar.show_notification_message,
-            "showBranchDirectory": config.sidebar.show_branch_directory,
-            "showCustomMetadata": config.sidebar.show_custom_metadata,
-            "showProgress": config.sidebar.show_progress,
-            "showLog": config.sidebar.show_log,
-        }),
-    );
+    let mut sidebar = serde_json::Map::from_iter([
+        (
+            "hideAllDetails".to_string(),
+            json!(config.sidebar.hide_all_details),
+        ),
+        (
+            "wrapWorkspaceTitles".to_string(),
+            json!(config.sidebar.wrap_workspace_titles),
+        ),
+        (
+            "showWorkspaceDescription".to_string(),
+            json!(config.sidebar.show_workspace_description),
+        ),
+        (
+            "showNotificationMessage".to_string(),
+            json!(config.sidebar.show_notification_message),
+        ),
+        (
+            "showBranchDirectory".to_string(),
+            json!(config.sidebar.show_branch_directory),
+        ),
+        (
+            "showCustomMetadata".to_string(),
+            json!(config.sidebar.show_custom_metadata),
+        ),
+        (
+            "showProgress".to_string(),
+            json!(config.sidebar.show_progress),
+        ),
+        ("showLog".to_string(), json!(config.sidebar.show_log)),
+    ]);
+    if let Some(width) = config.sidebar.right_max_width {
+        sidebar.insert("rightMaxWidth".to_string(), json!(width));
+    }
+    root.insert("sidebar".to_string(), Value::Object(sidebar));
     root.insert(
         "notifications".to_string(),
         json!({
@@ -1840,7 +1884,8 @@ mod tests {
     "showBranchDirectory": false,
     "showCustomMetadata": false,
     "showProgress": false,
-    "showLog": false
+    "showLog": false,
+    "rightMaxWidth": 10000
   }
 }
 "#,
@@ -1858,6 +1903,7 @@ mod tests {
         assert!(!loaded.config.sidebar.show_custom_metadata);
         assert!(!loaded.config.sidebar.show_progress);
         assert!(!loaded.config.sidebar.show_log);
+        assert_eq!(loaded.config.sidebar.right_max_width, Some(4096));
     }
 
     #[test]
@@ -1867,6 +1913,20 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"showProgress":"false"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX right sidebar width settings fail loudly.
+    // inputs: Settings JSON with a non-positive sidebar.rightMaxWidth value.
+    // returns/effects: Panics instead of accepting a silent fallback.
+    #[test]
+    #[should_panic(expected = "sidebar.rightMaxWidth must be a positive number")]
+    fn load_from_path_rejects_invalid_sidebar_right_max_width() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"rightMaxWidth":0}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2332,6 +2392,28 @@ mod tests {
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));
+    }
+
+    // purpose: Verify saving writes optional CMUX right sidebar maximum width.
+    // inputs: AppConfig with sidebar.right_max_width configured.
+    // returns/effects: Persists sidebar.rightMaxWidth while preserving sibling config.
+    #[test]
+    fn save_to_path_writes_sidebar_right_max_width() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, br#"{"app":{"appearance":"dark"}}"#).expect("write config");
+
+        let mut config = AppConfig::default();
+        config.sidebar.right_max_width = Some(1500);
+        save_to_path(&path, &config).expect("save sidebar width");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["sidebar"]["rightMaxWidth"],
+            Value::Number(1500.into())
+        );
     }
 
     // purpose: Verify saving writes the CMUX terminal auto-resume setting without dropping siblings.
