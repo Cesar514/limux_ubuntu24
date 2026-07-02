@@ -553,6 +553,16 @@ pub enum WorkspaceAction {
     ClearName,
     SetDescription { description: String },
     ClearDescription,
+    MoveUp,
+    MoveDown,
+    MoveTop,
+    CloseOthers,
+    CloseAbove,
+    CloseBelow,
+    MarkRead,
+    MarkUnread,
+    SetColor { color: String },
+    ClearColor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2689,6 +2699,29 @@ fn parse_workspace_action(params: &Map<String, Value>) -> Result<WorkspaceAction
             Ok(WorkspaceAction::SetDescription { description })
         }
         "clear_description" => Ok(WorkspaceAction::ClearDescription),
+        "move_up" => Ok(WorkspaceAction::MoveUp),
+        "move_down" => Ok(WorkspaceAction::MoveDown),
+        "move_top" => Ok(WorkspaceAction::MoveTop),
+        "close_others" | "close_other_tabs" => Ok(WorkspaceAction::CloseOthers),
+        "close_above" => Ok(WorkspaceAction::CloseAbove),
+        "close_below" => Ok(WorkspaceAction::CloseBelow),
+        "mark_read" => Ok(WorkspaceAction::MarkRead),
+        "mark_unread" | "mark_as_unread" => Ok(WorkspaceAction::MarkUnread),
+        "set_color" => {
+            let Some(color) = optional_string(params, &["color"]) else {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action set-color requires color",
+                ));
+            };
+            let color = color.trim().to_string();
+            if color.is_empty() {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action set-color requires color",
+                ));
+            }
+            Ok(WorkspaceAction::SetColor { color })
+        }
+        "clear_color" => Ok(WorkspaceAction::ClearColor),
         _ => Err(BridgeError::invalid_params(format!(
             "workspace.action unsupported action: {raw_action}"
         ))),
@@ -6201,8 +6234,37 @@ mod tests {
         );
         assert_eq!(pin.error, None);
 
-        let invalid = dispatch_request(
+        let move_up = dispatch_request(
             r#"{"id":4,"method":"workspace.action","params":{"action":"move-up"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceAction { action, reply, .. } => {
+                    assert_eq!(action, WorkspaceAction::MoveUp);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(move_up.error, None);
+
+        let set_color = dispatch_request(
+            r##"{"id":5,"method":"workspace.action","params":{"action":"set-color","color":"#C0392B"}}"##,
+            &|command| match command {
+                ControlCommand::WorkspaceAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceAction::SetColor {
+                            color: "#C0392B".to_string(),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(set_color.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":6,"method":"workspace.action","params":{"action":"launch-rockets"}}"#,
             &|command| panic!("unsupported workspace.action dispatched: {command:?}"),
         );
         assert_eq!(

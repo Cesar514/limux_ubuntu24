@@ -63,6 +63,8 @@ pub struct WorkspaceState {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, rename = "customColor")]
+    pub custom_color: Option<String>,
     #[serde(default)]
     pub favorite: bool,
     #[serde(default)]
@@ -573,6 +575,7 @@ impl AppSessionState {
                     id: None,
                     name: workspace.name,
                     description: None,
+                    custom_color: None,
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
@@ -1146,6 +1149,7 @@ mod tests {
                 id: Some("11111111-1111-4111-8111-111111111111".to_string()),
                 name: "canonical".to_string(),
                 description: Some("primary session".to_string()),
+                custom_color: Some("#3366ff".to_string()),
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
@@ -1175,6 +1179,10 @@ mod tests {
         let loaded = load_session_from_dir(dir.path());
         assert_eq!(loaded.source, SessionLoadSource::Canonical);
         assert_eq!(loaded.state.workspaces[0].name, "canonical");
+        assert_eq!(
+            loaded.state.workspaces[0].custom_color.as_deref(),
+            Some("#3366ff")
+        );
     }
 
     #[test]
@@ -1277,6 +1285,7 @@ mod tests {
                 id: Some("22222222-2222-4222-8222-222222222222".to_string()),
                 name: "workspace".to_string(),
                 description: None,
+                custom_color: None,
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
@@ -1843,6 +1852,7 @@ mod tests {
                 id: Some("33333333-3333-4333-8333-333333333333".to_string()),
                 name: "workspace".to_string(),
                 description: None,
+                custom_color: Some("#3366ff".to_string()),
                 favorite: false,
                 cwd: None,
                 folder_path: None,
@@ -1889,6 +1899,7 @@ mod tests {
                 id: Some("44444444-4444-4444-8444-444444444444".to_string()),
                 name: "workspace".to_string(),
                 description: Some("Agent surfaces".to_string()),
+                custom_color: None,
                 favorite: false,
                 cwd: None,
                 folder_path: None,
@@ -1923,6 +1934,7 @@ mod tests {
                 id: Some("66666666-6666-4666-8666-666666666666".to_string()),
                 name: "workspace".to_string(),
                 description: None,
+                custom_color: Some("#3366ff".to_string()),
                 favorite: false,
                 cwd: None,
                 folder_path: None,
@@ -1960,6 +1972,10 @@ mod tests {
             &pane.tabs[0].content,
             TabContentState::CustomSidebar { name } if name == "build-board"
         ));
+        assert_eq!(
+            decoded.workspaces[0].custom_color.as_deref(),
+            Some("#3366ff")
+        );
     }
 
     #[test]
@@ -1989,6 +2005,7 @@ mod tests {
                 id: Some("55555555-5555-4555-8555-555555555555".to_string()),
                 name: "workspace".to_string(),
                 description: None,
+                custom_color: None,
                 favorite: false,
                 cwd: None,
                 folder_path: None,

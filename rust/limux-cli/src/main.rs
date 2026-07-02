@@ -13487,7 +13487,9 @@ async fn run_workspace_action(client: &mut Client, args: &[String]) -> Result<Va
         return Ok(json!({
             "help": concat!(
                 "Usage: limux workspace-action --action <name> [flags]\n",
-                "Actions: pin, unpin, rename, clear-name, set-description, clear-description\n",
+                "Actions: pin, unpin, rename, clear-name, set-description, clear-description, ",
+                "move-up, move-down, move-top, close-others, close-above, close-below, ",
+                "mark-read, mark-unread, set-color, clear-color\n",
                 "Flags: --workspace <id|ref|name>, --window <id|ref>, --title <text>, ",
                 "--description <text>, --color <name|#hex>",
             )

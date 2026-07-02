@@ -53,6 +53,7 @@ struct Workspace {
     id: String,
     name: String,
     description: Option<String>,
+    custom_color: Option<String>,
     /// The root widget in the content stack for this workspace.
     root: gtk::Widget,
     /// Manages the split tree data model and async widget rebuild.
@@ -180,6 +181,7 @@ struct WorkspaceEventSnapshot {
     workspace_ref: String,
     title: String,
     description: Option<String>,
+    custom_color: Option<String>,
     index: usize,
     selected: bool,
     favorite: bool,
@@ -1495,6 +1497,8 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
         "description": workspace.description.as_deref(),
+        "customColor": workspace.custom_color.as_deref(),
+        "color": workspace.custom_color.as_deref(),
         "selected": index == selected_idx,
         "focused": index == selected_idx,
         "cwd": cwd,
@@ -1583,6 +1587,8 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "workspace": workspace_row(index, state.active_idx, workspace),
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
+        "customColor": workspace.custom_color.as_deref(),
+        "color": workspace.custom_color.as_deref(),
     }))
 }
 
@@ -1597,6 +1603,7 @@ fn workspace_event_snapshot(state: &AppState, index: usize) -> Option<WorkspaceE
         workspace_ref: workspace_ref(&workspace.id),
         title: workspace.name.clone(),
         description: workspace.description.clone(),
+        custom_color: workspace.custom_color.clone(),
         index,
         selected: index == state.active_idx,
         favorite: workspace.favorite,
@@ -1618,6 +1625,8 @@ fn workspace_lifecycle_payload(
         "workspace_ref": snapshot.workspace_ref,
         "title": snapshot.title,
         "description": snapshot.description,
+        "customColor": snapshot.custom_color.clone(),
+        "color": snapshot.custom_color.clone(),
         "index": snapshot.index,
         "selected": snapshot.selected,
         "favorite": snapshot.favorite,
@@ -1967,6 +1976,16 @@ fn workspace_action_name(action: &WorkspaceAction) -> &'static str {
         WorkspaceAction::ClearName => "clear_name",
         WorkspaceAction::SetDescription { .. } => "set_description",
         WorkspaceAction::ClearDescription => "clear_description",
+        WorkspaceAction::MoveUp => "move_up",
+        WorkspaceAction::MoveDown => "move_down",
+        WorkspaceAction::MoveTop => "move_top",
+        WorkspaceAction::CloseOthers => "close_others",
+        WorkspaceAction::CloseAbove => "close_above",
+        WorkspaceAction::CloseBelow => "close_below",
+        WorkspaceAction::MarkRead => "mark_read",
+        WorkspaceAction::MarkUnread => "mark_unread",
+        WorkspaceAction::SetColor { .. } => "set_color",
+        WorkspaceAction::ClearColor => "clear_color",
     }
 }
 
@@ -2017,6 +2036,16 @@ fn apply_workspace_action_to_workspace(
             workspace.description_label.set_label("");
             extras.insert("description".to_string(), serde_json::Value::Null);
         }
+        WorkspaceAction::SetColor { color } => set_workspace_color(workspace, Some(color), extras),
+        WorkspaceAction::ClearColor => set_workspace_color(workspace, None, extras),
+        WorkspaceAction::MoveUp
+        | WorkspaceAction::MoveDown
+        | WorkspaceAction::MoveTop
+        | WorkspaceAction::CloseOthers
+        | WorkspaceAction::CloseAbove
+        | WorkspaceAction::CloseBelow
+        | WorkspaceAction::MarkRead
+        | WorkspaceAction::MarkUnread => {}
     }
 }
 
@@ -2042,8 +2071,50 @@ fn set_workspace_title(
     extras: &mut serde_json::Map<String, serde_json::Value>,
 ) {
     workspace.name = title.clone();
-    workspace.name_label.set_label(&title);
+    apply_workspace_title_visual(workspace);
     extras.insert("title".to_string(), serde_json::json!(title));
+}
+
+// purpose: Set or clear a CMUX workspace color.
+// inputs: Target workspace, optional raw color token, and output extras map.
+// returns/effects: Updates persisted color state and visible sidebar title color.
+fn set_workspace_color(
+    workspace: &mut Workspace,
+    color: Option<String>,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    workspace.custom_color = color;
+    apply_workspace_title_visual(workspace);
+    extras.insert(
+        "color".to_string(),
+        workspace
+            .custom_color
+            .as_deref()
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    extras.insert(
+        "customColor".to_string(),
+        workspace
+            .custom_color
+            .as_deref()
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+}
+
+// purpose: Render the workspace title with an optional CMUX workspace color.
+// inputs: Live workspace label state.
+// returns/effects: Sets safe text or escaped Pango markup on the sidebar title label.
+fn apply_workspace_title_visual(workspace: &Workspace) {
+    if let Some(color) = workspace.custom_color.as_deref() {
+        let escaped = glib::markup_escape_text(&workspace.name);
+        workspace
+            .name_label
+            .set_markup(&format!("<span foreground=\"{color}\">{escaped}</span>"));
+    } else {
+        workspace.name_label.set_label(&workspace.name);
+    }
 }
 
 // purpose: Add CMUX workspace.action response metadata to a workspace payload.
@@ -2065,19 +2136,111 @@ fn workspace_action_response_payload(
     payload
 }
 
-// purpose: Apply CMUX workspace.action metadata mutations to the live host.
+// purpose: Resolve and validate a CMUX workspace color token.
+// inputs: Raw color from workspace.action set-color.
+// returns/effects: Returns a normalized hex string or a loud validation error.
+fn normalize_workspace_color(raw: &str) -> Result<String, BridgeError> {
+    let color = raw.trim();
+    let lower = color.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "red" => "#ff3b30",
+        "crimson" => "#dc143c",
+        "orange" => "#ff9500",
+        "amber" => "#ffbf00",
+        "olive" => "#808000",
+        "green" => "#34c759",
+        "teal" => "#30b0c7",
+        "aqua" => "#00ffff",
+        "blue" => "#0a84ff",
+        "navy" => "#000080",
+        "indigo" => "#5856d6",
+        "purple" => "#af52de",
+        "magenta" => "#ff00ff",
+        "rose" => "#ff2d55",
+        "brown" => "#a2845e",
+        "charcoal" => "#36454f",
+        _ => color,
+    };
+    if !custom_sidebar_is_hex_color(mapped) {
+        return Err(BridgeError::invalid_params(
+            "workspace.action set-color requires #RRGGBB/#RRGGBBAA or a named CMUX color",
+        ));
+    }
+    Ok(format!(
+        "#{}",
+        mapped.trim_start_matches('#').to_ascii_uppercase()
+    ))
+}
+
+// purpose: Return whether a workspace.action can mutate one workspace in place.
+// inputs: Parsed workspace.action.
+// returns/effects: Returns true for metadata actions handled by mutate_workspace_action.
+fn workspace_action_is_metadata(action: &WorkspaceAction) -> bool {
+    matches!(
+        action,
+        WorkspaceAction::Pin
+            | WorkspaceAction::Unpin
+            | WorkspaceAction::Rename { .. }
+            | WorkspaceAction::ClearName
+            | WorkspaceAction::SetDescription { .. }
+            | WorkspaceAction::ClearDescription
+            | WorkspaceAction::SetColor { .. }
+            | WorkspaceAction::ClearColor
+    )
+}
+
+// purpose: Resolve a workspace.action target to a live workspace index.
+// inputs: Shared GTK state and CMUX workspace target.
+// returns/effects: Returns a valid index or a not_found error.
+fn workspace_action_target_index(
+    state: &State,
+    target: &WorkspaceTarget,
+) -> Result<usize, BridgeError> {
+    let app_state = state.borrow();
+    workspace_index_for_target(&app_state, target)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))
+}
+
+// purpose: Apply CMUX workspace.action mutations to the live host.
 // inputs: Shared GTK state, workspace target, and parsed action.
-// returns/effects: Mutates workspace metadata, emits lifecycle events, and persists state.
+// returns/effects: Mutates workspace state, emits lifecycle events, and persists state.
 fn apply_workspace_action(
     state: &State,
     target: WorkspaceTarget,
     action: WorkspaceAction,
 ) -> Result<serde_json::Value, BridgeError> {
-    let index = {
-        let app_state = state.borrow();
-        workspace_index_for_target(&app_state, &target)
+    let index = workspace_action_target_index(state, &target)?;
+    match action {
+        WorkspaceAction::MoveUp | WorkspaceAction::MoveDown | WorkspaceAction::MoveTop => {
+            apply_workspace_reorder_action(state, index, action)
+        }
+        WorkspaceAction::CloseOthers
+        | WorkspaceAction::CloseAbove
+        | WorkspaceAction::CloseBelow => apply_workspace_close_action(state, index, action),
+        WorkspaceAction::MarkRead | WorkspaceAction::MarkUnread => {
+            apply_workspace_read_action(state, index, action)
+        }
+        _ => apply_workspace_metadata_action(state, index, action),
     }
-    .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+}
+
+// purpose: Apply a CMUX workspace.action metadata mutation.
+// inputs: Shared GTK state, target index, and metadata action.
+// returns/effects: Mutates one workspace, emits action event, persists, and returns payload.
+fn apply_workspace_metadata_action(
+    state: &State,
+    index: usize,
+    action: WorkspaceAction,
+) -> Result<serde_json::Value, BridgeError> {
+    if !workspace_action_is_metadata(&action) {
+        return Err(BridgeError::invalid_params("unsupported workspace action"));
+    }
+    let action = match action {
+        WorkspaceAction::SetColor { color } => WorkspaceAction::SetColor {
+            color: normalize_workspace_color(&color)?,
+        },
+        other => other,
+    };
     let mutation = {
         let mut app_state = state.borrow_mut();
         mutate_workspace_action(&mut app_state, index, action)
@@ -2103,6 +2266,194 @@ fn apply_workspace_action(
         mutation.action_name,
         mutation.extras,
     ))
+}
+
+// purpose: Apply CMUX workspace.action move actions through the existing reorder model.
+// inputs: Shared GTK state, source index, and move action.
+// returns/effects: Reorders workspaces, emits reorder events, persists, and returns payload.
+fn apply_workspace_reorder_action(
+    state: &State,
+    index: usize,
+    action: WorkspaceAction,
+) -> Result<serde_json::Value, BridgeError> {
+    let action_name = workspace_action_name(&action);
+    let result = {
+        let mut app_state = state.borrow_mut();
+        let target_index = workspace_action_move_target_index(&app_state, index, &action);
+        reorder_workspace_to_index_in_state(&mut app_state, index, target_index)
+    };
+    if let Some(row) = result.row_to_select.clone() {
+        result.sidebar_list.select_row(Some(&row));
+    }
+    if result.changed {
+        publish_workspace_reordered_event(
+            result.ordered_workspace_ids.clone(),
+            vec![result.workspace_id.clone()],
+            result.pinned_workspace_ids.clone(),
+            result.selected_workspace_id.clone(),
+            result.selected_index,
+        );
+        request_session_save(state);
+    }
+    Ok(workspace_action_response_payload(
+        result.payload(),
+        action_name,
+        serde_json::Map::new(),
+    ))
+}
+
+// purpose: Compute target index for a CMUX workspace.action move.
+// inputs: Current app state, source index, and move action.
+// returns/effects: Returns a clamped target index without mutating state.
+fn workspace_action_move_target_index(
+    state: &AppState,
+    index: usize,
+    action: &WorkspaceAction,
+) -> usize {
+    match action {
+        WorkspaceAction::MoveUp => index.saturating_sub(1),
+        WorkspaceAction::MoveDown => (index + 1).min(state.workspaces.len().saturating_sub(1)),
+        WorkspaceAction::MoveTop => 0,
+        _ => index,
+    }
+}
+
+// purpose: Apply CMUX workspace.action close scope actions.
+// inputs: Shared GTK state, target index, and close action.
+// returns/effects: Closes matching unpinned workspaces, emits close events, and persists once.
+fn apply_workspace_close_action(
+    state: &State,
+    index: usize,
+    action: WorkspaceAction,
+) -> Result<serde_json::Value, BridgeError> {
+    let action_name = workspace_action_name(&action);
+    let (target_id, ids_to_close) = workspace_action_close_targets(state, index, &action);
+    for workspace_id in &ids_to_close {
+        close_workspace_by_id_internal(state, workspace_id, false, Some(&target_id));
+    }
+    if !ids_to_close.is_empty() {
+        request_session_save(state);
+    }
+    let payload = workspace_action_payload_for_id(state, &target_id)?;
+    let mut extras = serde_json::Map::new();
+    extras.insert("closed".to_string(), serde_json::json!(ids_to_close.len()));
+    Ok(workspace_action_response_payload(
+        payload,
+        action_name,
+        extras,
+    ))
+}
+
+// purpose: Resolve workspace ids affected by a CMUX close scope action.
+// inputs: Shared GTK state, target index, and close action.
+// returns/effects: Returns target id and close candidate ids without mutating state.
+fn workspace_action_close_targets(
+    state: &State,
+    index: usize,
+    action: &WorkspaceAction,
+) -> (String, Vec<String>) {
+    let app_state = state.borrow();
+    let target_id = app_state.workspaces[index].id.clone();
+    let ids = app_state
+        .workspaces
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, workspace)| {
+            workspace_action_close_matches(action, index, *candidate_index) && !workspace.favorite
+        })
+        .map(|(_, workspace)| workspace.id.clone())
+        .collect();
+    (target_id, ids)
+}
+
+// purpose: Check whether a candidate index is in a CMUX close scope.
+// inputs: Close action, target index, and candidate index.
+// returns/effects: Returns true when the candidate should close.
+fn workspace_action_close_matches(
+    action: &WorkspaceAction,
+    index: usize,
+    candidate_index: usize,
+) -> bool {
+    match action {
+        WorkspaceAction::CloseOthers => candidate_index != index,
+        WorkspaceAction::CloseAbove => candidate_index < index,
+        WorkspaceAction::CloseBelow => candidate_index > index,
+        _ => false,
+    }
+}
+
+// purpose: Apply CMUX workspace.action read-state actions.
+// inputs: Shared GTK state, target index, and read action.
+// returns/effects: Updates unread visuals/notifications and returns workspace payload.
+fn apply_workspace_read_action(
+    state: &State,
+    index: usize,
+    action: WorkspaceAction,
+) -> Result<serde_json::Value, BridgeError> {
+    let action_name = workspace_action_name(&action);
+    let workspace_id = state.borrow().workspaces[index].id.clone();
+    let mut extras = serde_json::Map::new();
+    match action {
+        WorkspaceAction::MarkRead => {
+            let _ = mark_workspace_notifications_read(
+                state,
+                &WorkspaceTarget::Handle(workspace_id.clone()),
+            )?;
+            extras.insert("unread".to_string(), serde_json::json!(false));
+        }
+        WorkspaceAction::MarkUnread => {
+            mark_workspace_unread_for_action(state, index)?;
+            extras.insert("unread".to_string(), serde_json::json!(true));
+        }
+        _ => {}
+    }
+    let payload = workspace_action_payload_for_id(state, &workspace_id)?;
+    Ok(workspace_action_response_payload(
+        payload,
+        action_name,
+        extras,
+    ))
+}
+
+// purpose: Set unread sidebar styling for a workspace without creating a notification row.
+// inputs: Shared GTK state and target workspace index.
+// returns/effects: Mutates the workspace unread visuals and returns not_found if stale.
+fn mark_workspace_unread_for_action(state: &State, index: usize) -> Result<(), BridgeError> {
+    let mut app_state = state.borrow_mut();
+    let Some(workspace) = app_state.workspaces.get_mut(index) else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    workspace.unread = true;
+    workspace
+        .notify_dot
+        .remove_css_class("limux-notify-dot-hidden");
+    workspace.notify_dot.add_css_class("limux-notify-dot");
+    workspace.notify_label.set_label("Unread");
+    workspace
+        .notify_label
+        .add_css_class("limux-notify-msg-unread");
+    workspace.notify_label.set_visible(true);
+    if let Some(row_box) = workspace.sidebar_row.child() {
+        row_box.add_css_class("limux-sidebar-row-unread");
+    }
+    Ok(())
+}
+
+// purpose: Build the current payload for a workspace id after an action.
+// inputs: Shared GTK state and workspace id.
+// returns/effects: Returns workspace payload or a not_found error.
+fn workspace_action_payload_for_id(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let app_state = state.borrow();
+    let index = app_state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    workspace_payload(&app_state, index)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))
 }
 
 // purpose: Preserve tmux-compatible last-pane history after a successful focus change.
@@ -3524,6 +3875,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
                 description: workspace.description.clone(),
+                custom_color: workspace.custom_color.clone(),
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
@@ -5241,6 +5593,7 @@ fn create_workspace_for_custom_sidebar(
         id: None,
         name: title,
         description: None,
+        custom_color: None,
         favorite: false,
         cwd: working_directory.clone(),
         folder_path: working_directory.clone(),
@@ -11728,6 +12081,7 @@ fn create_workspace_for_tab_payload(
             id: new_workspace_id.clone(),
             name: seed.name.clone(),
             description: None,
+            custom_color: None,
             root: root.clone().upcast(),
             split_container,
             sidebar_row: row,
@@ -12352,6 +12706,7 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         id: None,
         name: name.to_string(),
         description: None,
+        custom_color: None,
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
@@ -12428,6 +12783,7 @@ fn add_group_anchor_workspace(
         id: Some(workspace_id.clone()),
         name: name.to_string(),
         description: None,
+        custom_color: None,
         favorite: false,
         cwd: cwd.map(ToOwned::to_owned),
         folder_path: cwd.map(ToOwned::to_owned),
@@ -15634,6 +15990,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 id: None,
                 name: title,
                 description,
+                custom_color: None,
                 favorite: false,
                 cwd: working_directory.clone(),
                 folder_path: working_directory.clone(),
@@ -15733,6 +16090,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     id: None,
                     name: format!("{name_prefix}-{index}"),
                     description: None,
+                    custom_color: None,
                     favorite: false,
                     cwd: working_directory.clone(),
                     folder_path: working_directory.clone(),
@@ -16414,6 +16772,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         id,
         name: workspace.name.clone(),
         description: workspace.description.clone(),
+        custom_color: workspace.custom_color.clone(),
         root,
         split_container,
         sidebar_row: row.clone(),
@@ -18769,7 +19128,7 @@ mod tests {
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
         limit_text_to_last_lines, load_custom_sidebar_selection_from_dir,
         load_custom_sidebar_selection_with_beta, next_active_workspace_index,
-        notification_command_env, notification_hook_policy_payload,
+        normalize_workspace_color, notification_command_env, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
         pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
         publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
@@ -18790,14 +19149,14 @@ mod tests {
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input,
-        workspace_group_delete_confirmation_detail, workspace_group_header_plus_action,
-        workspace_group_header_toggle_action, workspace_group_insert_index,
-        workspace_insert_index_for_placement, workspace_lifecycle_payload,
-        workspace_notification_message, workspace_reorder_uses_top_level_rows,
-        workspace_reordered_payload, workspace_sidebar_render_items,
-        workspace_title_from_directory, workspace_top_level_ids, BrowserEvent,
-        CustomSidebarDispatcherAction, CustomSidebarNodeAction,
+        workspace_action_close_matches, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_group_delete_confirmation_detail,
+        workspace_group_header_plus_action, workspace_group_header_toggle_action,
+        workspace_group_insert_index, workspace_insert_index_for_placement,
+        workspace_lifecycle_payload, workspace_notification_message,
+        workspace_reorder_uses_top_level_rows, workspace_reordered_payload,
+        workspace_sidebar_render_items, workspace_title_from_directory, workspace_top_level_ids,
+        BrowserEvent, CustomSidebarDispatcherAction, CustomSidebarNodeAction,
         CustomSidebarWorkspaceReorderTarget, CustomSidebarWorkspaceSortMode, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
@@ -18808,6 +19167,7 @@ mod tests {
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
+    use crate::control_bridge::WorkspaceAction;
     use crate::control_bridge::{BrowserAction, RightSidebarMode, WorkspaceGroupAction};
     use crate::layout_state::{
         LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
@@ -21098,6 +21458,7 @@ mod tests {
             workspace_ref: "workspace:workspace-a".to_string(),
             title: "Agents".to_string(),
             description: Some("Agent group".to_string()),
+            custom_color: Some("#3366ff".to_string()),
             index: 2,
             selected: true,
             favorite: false,
@@ -21115,6 +21476,8 @@ mod tests {
         assert_eq!(payload["workspace_ref"], "workspace:workspace-a");
         assert_eq!(payload["title"], "Agents");
         assert_eq!(payload["description"], "Agent group");
+        assert_eq!(payload["customColor"], "#3366ff");
+        assert_eq!(payload["color"], "#3366ff");
         assert_eq!(payload["index"], 2);
         assert_eq!(payload["selected"], true);
         assert_eq!(payload["favorite"], false);
@@ -21123,6 +21486,48 @@ mod tests {
         assert_eq!(payload["previous_workspace_id"], "workspace-old");
         assert_eq!(payload["previous_workspace_ref"], "workspace:workspace-old");
         assert_eq!(payload["origin"], "test");
+    }
+
+    #[test]
+    fn workspace_action_color_accepts_cmux_names_and_hex() {
+        assert_eq!(
+            normalize_workspace_color("Amber").expect("named color"),
+            "#FFBF00"
+        );
+        assert_eq!(
+            normalize_workspace_color("#c0392b").expect("hex color"),
+            "#C0392B"
+        );
+        assert!(normalize_workspace_color("not-a-color").is_err());
+    }
+
+    #[test]
+    fn workspace_action_close_scopes_match_cmux_indices() {
+        assert!(workspace_action_close_matches(
+            &WorkspaceAction::CloseOthers,
+            2,
+            0
+        ));
+        assert!(!workspace_action_close_matches(
+            &WorkspaceAction::CloseOthers,
+            2,
+            2
+        ));
+        assert!(workspace_action_close_matches(
+            &WorkspaceAction::CloseAbove,
+            2,
+            1
+        ));
+        assert!(!workspace_action_close_matches(
+            &WorkspaceAction::CloseAbove,
+            2,
+            3
+        ));
+        assert!(workspace_action_close_matches(
+            &WorkspaceAction::CloseBelow,
+            2,
+            3
+        ));
     }
 
     #[test]
@@ -21201,6 +21606,7 @@ mod tests {
             workspace_ref: "workspace:workspace-stream-test".to_string(),
             title: "Stream Test".to_string(),
             description: None,
+            custom_color: None,
             index: 1,
             selected: true,
             favorite: false,
