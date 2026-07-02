@@ -61,6 +61,7 @@ struct GlobalOptions {
 
 #[derive(Debug)]
 enum CommandOutput {
+    Silent,
     Text(String),
     Json(Value),
 }
@@ -4910,6 +4911,202 @@ async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value
     }))
 }
 
+/// purpose: Build and run a CMUX-compatible right-sidebar control command.
+/// inputs: Right-sidebar CLI args plus optional global window selector.
+/// returns/effects: Sends one live bridge request and returns whether output is expected.
+async fn run_right_sidebar(
+    client: &mut Client,
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<(Value, bool)> {
+    let request = build_right_sidebar_request(args, global_window)?;
+    let prints_state = request
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action == "mode")
+        .unwrap_or(false);
+    let payload = client.call("right_sidebar", Value::Object(request)).await?;
+    Ok((payload, prints_state))
+}
+
+/// purpose: Parse CMUX right-sidebar CLI forms into live bridge params.
+/// inputs: Raw command args and optional global `--window`.
+/// returns/effects: Returns normalized params or fails loudly on malformed commands.
+fn build_right_sidebar_request(
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<Map<String, Value>> {
+    let parsed = parse_right_sidebar_args(args)?;
+    let mut params = right_sidebar_target_params(&parsed, global_window);
+    params.extend(right_sidebar_action_params(&parsed)?);
+    Ok(params)
+}
+
+/// purpose: Convert parsed CMUX right-sidebar targets into bridge params.
+/// inputs: Parsed args and optional inherited global `--window`.
+/// returns/effects: Returns only target fields with empty values omitted.
+fn right_sidebar_target_params(
+    parsed: &RightSidebarArgs,
+    global_window: Option<&str>,
+) -> Map<String, Value> {
+    let mut params = Map::new();
+    if let Some(workspace) = parsed.workspace.as_ref() {
+        params.insert("workspace_id".to_string(), Value::String(workspace.clone()));
+    }
+    let window = parsed
+        .window
+        .clone()
+        .or_else(|| global_window.map(ToOwned::to_owned))
+        .filter(|value| !value.trim().is_empty());
+    if let Some(window) = window {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    params
+}
+
+/// purpose: Convert parsed CMUX right-sidebar action syntax into bridge params.
+/// inputs: Parsed right-sidebar args.
+/// returns/effects: Returns action/mode/focus params or a usage error.
+fn right_sidebar_action_params(parsed: &RightSidebarArgs) -> Result<Map<String, Value>> {
+    let action = parsed
+        .positional
+        .first()
+        .ok_or_else(|| anyhow!("right-sidebar requires a subcommand"))?
+        .to_ascii_lowercase();
+    let mut params = Map::new();
+    match action.as_str() {
+        "toggle" | "show" | "hide" | "focus" | "mode" => {
+            if parsed.positional.len() != 1 {
+                bail!("right-sidebar {action} received unexpected arguments");
+            }
+            if parsed.no_focus {
+                bail!("right-sidebar: --no-focus is only valid with set");
+            }
+            params.insert("action".to_string(), Value::String(action));
+        }
+        "set" => {
+            if parsed.positional.len() != 2 {
+                bail!("right-sidebar set requires a mode: files, find, vault, sessions, feed, or dock");
+            }
+            let mode = normalize_right_sidebar_mode(&parsed.positional[1])?;
+            params.insert("action".to_string(), Value::String("set".to_string()));
+            params.insert("mode".to_string(), Value::String(mode));
+            params.insert("focus".to_string(), Value::Bool(!parsed.no_focus));
+        }
+        "files" | "find" | "vault" | "sessions" | "feed" | "dock" => {
+            if parsed.positional.len() != 1 {
+                bail!("right-sidebar {action} received unexpected arguments");
+            }
+            if parsed.no_focus {
+                bail!("right-sidebar: --no-focus is only valid with set");
+            }
+            params.insert("action".to_string(), Value::String("set".to_string()));
+            params.insert("mode".to_string(), Value::String(action));
+            params.insert("focus".to_string(), Value::Bool(true));
+        }
+        _ => {
+            if parsed.positional.len() == 1 && !parsed.no_focus {
+                let mode = normalize_right_sidebar_mode(&action)?;
+                params.insert("action".to_string(), Value::String("set".to_string()));
+                params.insert("mode".to_string(), Value::String(mode));
+                params.insert("focus".to_string(), Value::Bool(true));
+            } else {
+                bail!("Unknown right-sidebar command '{}'", parsed.positional[0]);
+            }
+        }
+    }
+    Ok(params)
+}
+
+#[derive(Debug, Default)]
+struct RightSidebarArgs {
+    positional: Vec<String>,
+    workspace: Option<String>,
+    window: Option<String>,
+    no_focus: bool,
+}
+
+/// purpose: Parse CMUX right-sidebar flags without consuming positional modes.
+/// inputs: Raw CLI tokens after `right-sidebar`.
+/// returns/effects: Returns split positional/target flags or a usage error.
+fn parse_right_sidebar_args(args: &[String]) -> Result<RightSidebarArgs> {
+    let mut parsed = RightSidebarArgs::default();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        if consume_right_sidebar_option(args, &mut idx, &mut parsed)? {
+            continue;
+        }
+        parsed.positional.push(args[idx].clone());
+        idx += 1;
+    }
+    Ok(parsed)
+}
+
+/// purpose: Consume one CMUX right-sidebar flag if the current token is a flag.
+/// inputs: Full token list, mutable index, and parsed-args accumulator.
+/// returns/effects: Advances the index when a flag is consumed; errors on unknown flags.
+fn consume_right_sidebar_option(
+    args: &[String],
+    idx: &mut usize,
+    parsed: &mut RightSidebarArgs,
+) -> Result<bool> {
+    let value = args[*idx].as_str();
+    match value {
+        "--workspace" | "--tab" => {
+            parsed.workspace = Some(right_sidebar_required_value(args, *idx, "--workspace")?);
+            *idx += 2;
+            Ok(true)
+        }
+        "--window" => {
+            parsed.window = Some(right_sidebar_required_value(args, *idx, "--window")?);
+            *idx += 2;
+            Ok(true)
+        }
+        "--no-focus" => {
+            parsed.no_focus = true;
+            *idx += 1;
+            Ok(true)
+        }
+        value if value.starts_with("--workspace=") => {
+            parsed.workspace = Some(value["--workspace=".len()..].to_string());
+            *idx += 1;
+            Ok(true)
+        }
+        value if value.starts_with("--tab=") => {
+            parsed.workspace = Some(value["--tab=".len()..].to_string());
+            *idx += 1;
+            Ok(true)
+        }
+        value if value.starts_with("--window=") => {
+            parsed.window = Some(value["--window=".len()..].to_string());
+            *idx += 1;
+            Ok(true)
+        }
+        value if value.starts_with("--") => bail!("right-sidebar: unknown flag '{value}'"),
+        _ => Ok(false),
+    }
+}
+
+/// purpose: Read a required value after a CMUX right-sidebar flag.
+/// inputs: Full token list, flag index, and user-facing flag name.
+/// returns/effects: Returns the next token or a flag-specific missing-value error.
+fn right_sidebar_required_value(args: &[String], idx: usize, flag: &str) -> Result<String> {
+    args.get(idx + 1)
+        .cloned()
+        .ok_or_else(|| anyhow!("right-sidebar: {flag} requires an id"))
+}
+
+/// purpose: Validate and normalize the CMUX right-sidebar mode vocabulary.
+/// inputs: Raw CLI mode.
+/// returns/effects: Returns the lower-case mode or a hard invalid-mode error.
+fn normalize_right_sidebar_mode(raw: &str) -> Result<String> {
+    let mode = raw.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "files" | "find" | "vault" | "sessions" | "feed" | "dock" => Ok(mode),
+        _ => bail!("Unknown right-sidebar mode '{raw}'"),
+    }
+}
+
 async fn run_new_surface(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace");
     let command = parse_opt(args, "--command");
@@ -7090,6 +7287,15 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 ))
             }
         }
+        "right-sidebar" => {
+            let (payload, prints_state) =
+                run_right_sidebar(client, args, opts.window.as_deref()).await?;
+            if opts.json_output || prints_state {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Silent
+            }
+        }
         "new-surface" => {
             let payload = run_new_surface(client, args).await?;
             if opts.json_output {
@@ -7242,6 +7448,7 @@ async fn main() -> Result<()> {
 /// returns/effects: Writes to stdout or returns JSON encoding errors.
 fn print_command_output(output: CommandOutput, pretty: bool) -> Result<()> {
     match output {
+        CommandOutput::Silent => Ok(()),
         CommandOutput::Text(text) => {
             println!("{}", text);
             Ok(())
@@ -7359,6 +7566,41 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn cmux_right_sidebar_cli_forms_map_to_bridge_params() {
+        let set = build_right_sidebar_request(
+            &args(&["set", "find", "--no-focus", "--workspace=workspace:2"]),
+            Some("window:7"),
+        )
+        .expect("right-sidebar set parses");
+        assert_eq!(set["action"], "set");
+        assert_eq!(set["mode"], "find");
+        assert_eq!(set["focus"], false);
+        assert_eq!(set["workspace_id"], "workspace:2");
+        assert_eq!(set["window_id"], "window:7");
+
+        let alias = build_right_sidebar_request(&args(&["dock", "--window", "window:3"]), None)
+            .expect("right-sidebar mode alias parses");
+        assert_eq!(alias["action"], "set");
+        assert_eq!(alias["mode"], "dock");
+        assert_eq!(alias["focus"], true);
+        assert_eq!(alias["window_id"], "window:3");
+
+        let mode = build_right_sidebar_request(&args(&["mode"]), None).expect("mode parses");
+        assert_eq!(mode["action"], "mode");
+    }
+
+    #[test]
+    fn cmux_right_sidebar_rejects_invalid_no_focus_and_modes() {
+        let no_focus = build_right_sidebar_request(&args(&["toggle", "--no-focus"]), None)
+            .expect_err("no-focus outside set fails");
+        assert!(no_focus.to_string().contains("--no-focus"));
+
+        let bad_mode = build_right_sidebar_request(&args(&["set", "unknown"]), None)
+            .expect_err("unknown mode fails");
+        assert!(bad_mode.to_string().contains("Unknown right-sidebar mode"));
+    }
+
+    #[test]
     fn cmux_global_version_parses_without_command_socket() {
         let opts = parse_global_args_from(args(&["--version"])).expect("version parses");
 
@@ -7381,6 +7623,7 @@ mod cli_arg_tests {
                 assert!(text.contains("Agent docs"));
                 assert!(text.contains("limux hooks setup"));
             }
+            CommandOutput::Silent => panic!("docs should render text"),
             CommandOutput::Json(_) => panic!("docs should render text"),
         }
     }

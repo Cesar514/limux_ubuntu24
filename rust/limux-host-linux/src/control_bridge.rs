@@ -167,6 +167,7 @@ const METHODS: &[&str] = &[
     "notification.open",
     "notification.jump_to_unread",
     "notification.clear",
+    "right_sidebar",
 ];
 
 const PARSE_ERROR_CODE: i64 = -32700;
@@ -494,6 +495,45 @@ pub enum WorkspaceNavigation {
     Last,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RightSidebarMode {
+    Files,
+    Find,
+    Vault,
+    Sessions,
+    Feed,
+    Dock,
+}
+
+impl RightSidebarMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Find => "find",
+            Self::Vault => "vault",
+            Self::Sessions => "sessions",
+            Self::Feed => "feed",
+            Self::Dock => "dock",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RightSidebarAction {
+    Toggle,
+    Show,
+    Hide,
+    Focus,
+    SetMode { mode: RightSidebarMode, focus: bool },
+    GetState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RightSidebarTarget {
+    pub workspace_id: Option<String>,
+    pub window_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum ControlCommand {
     Identify {
@@ -746,6 +786,11 @@ pub enum ControlCommand {
         notification_id: Option<u64>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    RightSidebar {
+        action: RightSidebarAction,
+        target: RightSidebarTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
 }
 
 impl ControlCommand {
@@ -798,7 +843,8 @@ impl ControlCommand {
             | Self::MarkNotificationRead { reply, .. }
             | Self::OpenNotification { reply, .. }
             | Self::JumpToUnreadNotification { reply }
-            | Self::ClearNotifications { reply, .. } => {
+            | Self::ClearNotifications { reply, .. }
+            | Self::RightSidebar { reply, .. } => {
                 let _ = reply.send(result);
             }
         }
@@ -1041,6 +1087,65 @@ fn is_unsupported_remote_workspace_method(method: &str) -> bool {
         method,
         "workspace.remote.reconnect" | "workspace.remote.disconnect"
     )
+}
+
+/// purpose: Parse a CMUX right-sidebar mode from socket params.
+/// inputs: Raw mode string from CLI or API.
+/// returns/effects: Returns a mode enum or invalid_params for unknown modes.
+fn parse_right_sidebar_mode(raw: &str) -> Result<RightSidebarMode, BridgeError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "files" => Ok(RightSidebarMode::Files),
+        "find" => Ok(RightSidebarMode::Find),
+        "vault" => Ok(RightSidebarMode::Vault),
+        "sessions" => Ok(RightSidebarMode::Sessions),
+        "feed" => Ok(RightSidebarMode::Feed),
+        "dock" => Ok(RightSidebarMode::Dock),
+        _ => Err(BridgeError::invalid_params(format!(
+            "Unknown right-sidebar mode '{raw}'"
+        ))),
+    }
+}
+
+/// purpose: Parse one CMUX right-sidebar command request.
+/// inputs: JSON parameter map with action, optional mode, targets, and focus.
+/// returns/effects: Returns a live host command action/target or invalid_params.
+fn parse_right_sidebar_request(
+    params: &Map<String, Value>,
+) -> Result<(RightSidebarAction, RightSidebarTarget), BridgeError> {
+    let action = optional_string(params, &["action", "command"])
+        .ok_or_else(|| BridgeError::invalid_params("right_sidebar requires action"))?;
+    let target = RightSidebarTarget {
+        workspace_id: optional_ref_handle(
+            params,
+            &["workspace_id", "workspace", "tab_id", "tab"],
+            "workspace:",
+        )?,
+        window_id: optional_ref_handle(params, &["window_id", "window"], "window:")?,
+    };
+    let action = match action.as_str() {
+        "toggle" => RightSidebarAction::Toggle,
+        "show" => RightSidebarAction::Show,
+        "hide" => RightSidebarAction::Hide,
+        "focus" => RightSidebarAction::Focus,
+        "mode" | "state" => RightSidebarAction::GetState,
+        "set" => {
+            let mode = optional_string(params, &["mode"]).ok_or_else(|| {
+                BridgeError::invalid_params(
+                    "right_sidebar set requires mode files|find|vault|sessions|feed|dock",
+                )
+            })?;
+            let focus = optional_bool(params, "focus")?.unwrap_or(true);
+            RightSidebarAction::SetMode {
+                mode: parse_right_sidebar_mode(&mode)?,
+                focus,
+            }
+        }
+        _ => {
+            let mode = parse_right_sidebar_mode(&action)?;
+            RightSidebarAction::SetMode { mode, focus: true }
+        }
+    };
+    Ok((action, target))
 }
 
 fn optional_handle(
@@ -1624,6 +1729,21 @@ fn handle_method(
             (
                 ControlCommand::Memory {
                     top_group_limit,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "right_sidebar" => {
+            let (action, target) = match parse_right_sidebar_request(params) {
+                Ok(parsed) => parsed,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::RightSidebar {
+                    action,
+                    target,
                     reply,
                 },
                 rx,
@@ -3474,6 +3594,56 @@ mod tests {
     fn capabilities_include_remote_workspace_methods() {
         assert!(METHODS.contains(&"workspace.remote.reconnect"));
         assert!(METHODS.contains(&"workspace.remote.disconnect"));
+    }
+
+    #[test]
+    fn capabilities_include_right_sidebar_method() {
+        assert!(METHODS.contains(&"right_sidebar"));
+    }
+
+    #[test]
+    fn right_sidebar_route_accepts_cmux_modes_and_targets() {
+        let request = r#"{"id":1,"method":"right_sidebar","params":{"action":"set","mode":"dock","focus":false,"workspace_id":"workspace:2","window_id":"window:7"}}"#;
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::RightSidebar {
+                action,
+                target,
+                reply,
+            } => {
+                assert_eq!(
+                    action,
+                    RightSidebarAction::SetMode {
+                        mode: RightSidebarMode::Dock,
+                        focus: false
+                    }
+                );
+                assert_eq!(target.workspace_id.as_deref(), Some("2"));
+                assert_eq!(target.window_id.as_deref(), Some("7"));
+                reply
+                    .send(Ok(
+                        json!({"visible": true, "mode": "dock", "focused": false}),
+                    ))
+                    .expect("reply sends");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("result")["mode"], "dock");
+    }
+
+    #[test]
+    fn right_sidebar_route_rejects_unknown_modes() {
+        let request =
+            r#"{"id":1,"method":"right_sidebar","params":{"action":"set","mode":"bogus"}}"#;
+        let response = dispatch_request(request, &|command| {
+            panic!("invalid mode should not dispatch: {command:?}");
+        });
+
+        assert_eq!(response.result, None);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
+        assert!(error.message.contains("Unknown right-sidebar mode"));
     }
 
     #[test]

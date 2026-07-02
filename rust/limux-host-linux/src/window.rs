@@ -22,8 +22,9 @@ use libadwaita as adw;
 use crate::app_config;
 use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
-    PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, WorkspaceGroupAction,
-    WorkspaceNavigation, WorkspaceTarget,
+    PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
+    RightSidebarMode, RightSidebarTarget, WorkspaceGroupAction, WorkspaceNavigation,
+    WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -128,6 +129,9 @@ pub(crate) struct AppState {
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
+    right_sidebar_visible: bool,
+    right_sidebar_mode: RightSidebarMode,
+    right_sidebar_focused: bool,
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
@@ -2630,6 +2634,83 @@ fn sidebar_is_visible(state: &AppState) -> bool {
     state.sidebar_shell.is_visible() && sidebar_width(&state.sidebar_shell) > 10
 }
 
+/// purpose: Resolve a right-sidebar workspace target against live host workspaces.
+/// inputs: Host state and optional CMUX right-sidebar workspace/window selectors.
+/// returns/effects: Confirms the target exists or returns not_found for explicit misses.
+fn validate_right_sidebar_target(
+    state: &AppState,
+    target: &RightSidebarTarget,
+) -> Result<Option<String>, BridgeError> {
+    if target.window_id.is_some() {
+        // Limux currently has one GTK host window; full multi-window routing remains separate.
+    }
+    let Some(workspace_id) = target.workspace_id.as_deref() else {
+        return Ok(state
+            .active_workspace()
+            .map(|workspace| workspace.id.clone()));
+    };
+    let matched = state.workspaces.iter().find(|workspace| {
+        workspace.id == workspace_id || workspace_ref(&workspace.id) == workspace_id
+    });
+    matched
+        .map(|workspace| Some(workspace.id.clone()))
+        .ok_or_else(|| BridgeError::not_found("right sidebar workspace target not found"))
+}
+
+/// purpose: Render the current CMUX right-sidebar state as JSON.
+/// inputs: Host state and resolved workspace id, if known.
+/// returns/effects: Returns visible/mode/focused metadata for CLI/API reads.
+fn right_sidebar_state_payload(
+    state: &AppState,
+    workspace_id: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "visible": state.right_sidebar_visible,
+        "mode": state.right_sidebar_mode.as_str(),
+        "focused": state.right_sidebar_focused,
+        "workspace_id": workspace_id,
+        "supported_modes": ["files", "find", "vault", "sessions", "feed", "dock"],
+    })
+}
+
+/// purpose: Apply one CMUX right-sidebar visibility, focus, or mode action.
+/// inputs: Live host state plus parsed CMUX right-sidebar action and target.
+/// returns/effects: Mutates host-owned state and returns a CMUX-shaped payload.
+fn apply_right_sidebar_action(
+    state: &State,
+    action: RightSidebarAction,
+    target: RightSidebarTarget,
+) -> Result<serde_json::Value, BridgeError> {
+    let mut app_state = state.borrow_mut();
+    let workspace_id = validate_right_sidebar_target(&app_state, &target)?;
+    match action {
+        RightSidebarAction::Toggle => {
+            app_state.right_sidebar_visible = !app_state.right_sidebar_visible;
+            if !app_state.right_sidebar_visible {
+                app_state.right_sidebar_focused = false;
+            }
+        }
+        RightSidebarAction::Show => {
+            app_state.right_sidebar_visible = true;
+        }
+        RightSidebarAction::Hide => {
+            app_state.right_sidebar_visible = false;
+            app_state.right_sidebar_focused = false;
+        }
+        RightSidebarAction::Focus => {
+            app_state.right_sidebar_visible = true;
+            app_state.right_sidebar_focused = true;
+        }
+        RightSidebarAction::SetMode { mode, focus } => {
+            app_state.right_sidebar_visible = true;
+            app_state.right_sidebar_mode = mode;
+            app_state.right_sidebar_focused = focus;
+        }
+        RightSidebarAction::GetState => {}
+    }
+    Ok(right_sidebar_state_payload(&app_state, workspace_id))
+}
+
 fn begin_window_move_from_widget(
     widget: &impl IsA<gtk::Widget>,
     window: &adw::ApplicationWindow,
@@ -3158,6 +3239,9 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
+        right_sidebar_visible: false,
+        right_sidebar_mode: RightSidebarMode::Files,
+        right_sidebar_focused: false,
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
@@ -8927,6 +9011,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             reply,
         } => {
             let _ = reply.send(clear_host_notifications(state, notification_id));
+        }
+        ControlCommand::RightSidebar {
+            action,
+            target,
+            reply,
+        } => {
+            let _ = reply.send(apply_right_sidebar_action(state, action, target));
         }
     }
 }
