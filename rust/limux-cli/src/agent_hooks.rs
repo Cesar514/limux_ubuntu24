@@ -14,6 +14,7 @@ pub(crate) enum AgentKind {
     Grok,
     OpenCode,
     Cursor,
+    Kiro,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -22,13 +23,14 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 10] {
+    pub(crate) fn all() -> [Self; 11] {
         [
             Self::Claude,
             Self::Codex,
             Self::Grok,
             Self::OpenCode,
             Self::Cursor,
+            Self::Kiro,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -44,6 +46,7 @@ impl AgentKind {
             "grok" => Some(Self::Grok),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
+            "kiro" | "kiro-cli" => Some(Self::Kiro),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -60,6 +63,7 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor",
+            Self::Kiro => "kiro",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -75,6 +79,7 @@ impl AgentKind {
             Self::Grok => "Grok",
             Self::OpenCode => "OpenCode",
             Self::Cursor => "Cursor",
+            Self::Kiro => "Kiro",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -90,6 +95,7 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor-agent",
+            Self::Kiro => "kiro-cli",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -270,6 +276,10 @@ pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -
             }
             continue;
         }
+        if kind == AgentKind::Kiro && arg == "chat" {
+            index += 1;
+            continue;
+        }
         if option_takes_secret_value(arg) {
             index += 1;
             if index < arguments.len() && !arguments[index].starts_with('-') {
@@ -347,6 +357,12 @@ pub(crate) fn build_resume_command(
         }
         AgentKind::Grok => {
             parts.push("-r".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Kiro => {
+            parts.push("chat".to_string());
+            parts.push("--resume-id".to_string());
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
@@ -456,6 +472,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Codex => arg == "resume" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
+        AgentKind::Kiro => arg == "--resume-id" || arg.starts_with("--resume-id="),
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -507,6 +524,7 @@ fn option_takes_safe_value(arg: &str) -> bool {
             | "--working-directory"
             | "--config-dir"
             | "--home"
+            | "--agent"
     )
 }
 
@@ -704,5 +722,31 @@ mod tests {
 
             assert_eq!(command, format!("'{executable}' '--resume' 'new'"));
         }
+    }
+
+    #[test]
+    fn kiro_resume_command_uses_chat_resume_id() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "kiro-cli".to_string(),
+            arguments: vec![
+                "kiro-cli".to_string(),
+                "chat".to_string(),
+                "--resume-id".to_string(),
+                "old".to_string(),
+                "--agent".to_string(),
+                "cmux".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 50.0,
+        };
+
+        let command =
+            build_resume_command(AgentKind::Kiro, "new", Some(&launch), None).expect("resume");
+
+        assert_eq!(
+            command,
+            "'kiro-cli' 'chat' '--resume-id' 'new' '--agent' 'cmux'"
+        );
     }
 }

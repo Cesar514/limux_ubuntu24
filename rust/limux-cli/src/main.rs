@@ -4529,6 +4529,16 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             cursor_feed_hook_events(),
         ),
+        agent_hooks::AgentKind::Kiro => install_kiro_agent_hooks_with_feed(
+            &kiro_agent_path(),
+            agent,
+            &[
+                ("agentSpawn", "session-start"),
+                ("userPromptSubmit", "prompt-submit"),
+                ("stop", "stop"),
+            ],
+            kiro_feed_hook_events(),
+        ),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4600,6 +4610,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             opencode_config_unregister_plugin()
         }
         agent_hooks::AgentKind::Cursor => uninstall_json_hooks(&cursor_hooks_path(), agent),
+        agent_hooks::AgentKind::Kiro => uninstall_json_hooks(&kiro_agent_path(), agent),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -4751,6 +4762,96 @@ fn append_flat_hook_entry(
     Ok(())
 }
 
+// purpose: Install Kiro's CMUX agent JSON with lifecycle and Feed bridge hooks.
+// inputs: Kiro agent JSON path, agent kind, lifecycle event mappings, and Feed event names.
+// returns/effects: Rewrites owned hook entries and preserves user-provided agent metadata/tools.
+fn install_kiro_agent_hooks_with_feed(
+    path: &Path,
+    agent: agent_hooks::AgentKind,
+    events: &[(&str, &str)],
+    feed_events: &[&str],
+) -> Result<()> {
+    let mut root = read_json_object(path)?;
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} has non-object hooks field", path.display()))?;
+    let marker = hook_marker(agent);
+    remove_owned_hook_entries(hooks, agent, marker);
+
+    for (agent_event, limux_event) in events {
+        append_kiro_hook_entry(
+            path,
+            hooks,
+            agent_event,
+            hook_command(agent, limux_event)?,
+            hook_timeout(agent),
+        )?;
+    }
+    for agent_event in feed_events {
+        append_kiro_hook_entry(
+            path,
+            hooks,
+            agent_event,
+            feed_hook_command(agent, agent_event)?,
+            feed_hook_timeout(agent),
+        )?;
+    }
+
+    root.entry("name".to_string())
+        .or_insert_with(|| Value::String("cmux".to_string()));
+    root.entry("description".to_string()).or_insert_with(|| {
+        Value::String("CMUX notification and Feed bridge hooks for Kiro CLI.".to_string())
+    });
+    root.entry("tools".to_string())
+        .or_insert_with(|| json!(["*"]));
+
+    write_json_object(path, &root)
+}
+
+// purpose: Append one Kiro flat command hook entry with millisecond timeout.
+// inputs: Config path for diagnostics, hooks map, event name, command, and timeout_ms.
+// returns/effects: Mutates the hook list or fails if the existing event value is not an array.
+fn append_kiro_hook_entry(
+    path: &Path,
+    hooks: &mut Map<String, Value>,
+    agent_event: &str,
+    command: String,
+    timeout_ms: u64,
+) -> Result<()> {
+    let entries = hooks
+        .entry(agent_event.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let entries = entries
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("{} hook {agent_event} is not an array", path.display()))?;
+    entries.push(json!({ "command": command, "timeout_ms": timeout_ms.max(1) }));
+    Ok(())
+}
+
+// purpose: Remove all hook entries owned by a Limux agent from a hook map.
+// inputs: Hook map, agent kind, and lifecycle marker string.
+// returns/effects: Mutates hook arrays and drops empty hook event arrays.
+fn remove_owned_hook_entries(
+    hooks: &mut Map<String, Value>,
+    agent: agent_hooks::AgentKind,
+    marker: &str,
+) {
+    for value in hooks.values_mut() {
+        if let Some(entries) = value.as_array_mut() {
+            entries.retain(|entry| !hook_entry_matches_agent(agent, entry, marker));
+        }
+    }
+    hooks.retain(|_, value| {
+        value
+            .as_array()
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(true)
+    });
+}
+
 // purpose: List the Claude hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Claude hook event names without side effects.
@@ -4787,6 +4888,13 @@ fn cursor_feed_hook_events() -> &'static [&'static str] {
     &["beforeShellExecution"]
 }
 
+// purpose: List the Kiro hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Kiro hook event names without side effects.
+fn kiro_feed_hook_events() -> &'static [&'static str] {
+    &["preToolUse", "postToolUse"]
+}
+
 // purpose: List the Gemini hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Gemini hook event names without side effects.
@@ -4806,6 +4914,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Grok => 5,
         agent_hooks::AgentKind::Codex
         | agent_hooks::AgentKind::Cursor
+        | agent_hooks::AgentKind::Kiro
         | agent_hooks::AgentKind::Gemini
         | agent_hooks::AgentKind::Copilot
         | agent_hooks::AgentKind::CodeBuddy
@@ -4823,6 +4932,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::Codex => 5,
         agent_hooks::AgentKind::Grok => 120,
         agent_hooks::AgentKind::Cursor => 0,
+        agent_hooks::AgentKind::Kiro => 120_000,
         agent_hooks::AgentKind::Claude
         | agent_hooks::AgentKind::Gemini
         | agent_hooks::AgentKind::Copilot
@@ -4968,6 +5078,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Grok => "hooks grok",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Cursor => "hooks cursor",
+        agent_hooks::AgentKind::Kiro => "hooks kiro",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5050,6 +5161,15 @@ fn cursor_hooks_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cursor/hooks.json")
+}
+
+fn kiro_agent_path() -> PathBuf {
+    if let Some(home) = env::var_os("KIRO_HOME") {
+        return PathBuf::from(home).join("agents/cmux.json");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".kiro/agents/cmux.json")
 }
 
 fn gemini_settings_path() -> PathBuf {
@@ -9981,6 +10101,22 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn feed_hook_escalates_kiro_side_effecting_tool() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "preToolUse",
+            "tool_name": "fs_write"
+        });
+
+        let (params, actionable, event_name, _, _) =
+            build_feed_hook_push(&args(&["--source", "kiro"]), &payload).expect("feed push");
+
+        assert!(actionable);
+        assert_eq!(event_name, "PermissionRequest");
+        assert_eq!(params["wait_timeout_seconds"], json!(120.0));
+    }
+
+    #[test]
     fn feed_permission_decision_renders_claude_deny_output() {
         let output = render_feed_decision(
             &args(&["--source", "claude"]),
@@ -10065,6 +10201,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Cursor)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("kiro-cli"),
+            Some(agent_hooks::AgentKind::Kiro)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -10079,6 +10219,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Cursor));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -10307,6 +10448,55 @@ mod cli_arg_tests {
             .contains("hooks cursor shell-done"));
         assert!(feed.get("timeout").is_none());
         assert!(feed.get("hooks").is_none());
+    }
+
+    /// purpose: Verify Kiro setup writes CMUX agent JSON lifecycle and Feed hooks.
+    /// inputs: Temporary Kiro agent JSON file and the Kiro hook installer.
+    /// returns/effects: Asserts Kiro-specific timeout_ms shape, metadata defaults, and command markers.
+    #[test]
+    fn kiro_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux.json");
+
+        install_kiro_agent_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Kiro,
+            &[
+                ("agentSpawn", "session-start"),
+                ("userPromptSubmit", "prompt-submit"),
+                ("stop", "stop"),
+            ],
+            kiro_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        let pre_tool = &root["hooks"]["preToolUse"][0];
+        let post_tool = &root["hooks"]["postToolUse"][0];
+
+        assert_eq!(root["name"], "cmux");
+        assert_eq!(root["tools"], json!(["*"]));
+        assert!(root["description"]
+            .as_str()
+            .expect("description")
+            .contains("Kiro CLI"));
+        assert_eq!(root["hooks"]["agentSpawn"][0]["timeout_ms"], 5000);
+        assert!(root["hooks"]["agentSpawn"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks kiro session-start"));
+        assert_eq!(pre_tool["timeout_ms"], 120_000);
+        assert!(pre_tool["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source kiro --event 'preToolUse'"));
+        assert!(post_tool["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source kiro --event 'postToolUse'"));
+        assert!(pre_tool.get("hooks").is_none());
+        assert!(pre_tool.get("timeout").is_none());
     }
 
     /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.
