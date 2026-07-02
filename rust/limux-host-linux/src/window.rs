@@ -26,7 +26,7 @@ use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand, CustomSidebarAction,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
     RightSidebarMode, RightSidebarTarget, SidebarAction, SurfacePullRequestCommand,
-    WorkspaceGroupAction, WorkspaceNavigation, WorkspaceTarget,
+    WorkspaceAction, WorkspaceGroupAction, WorkspaceNavigation, WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -1948,6 +1948,161 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
         return (None, None);
     };
     (Some(surface.pane_id), Some(surface.surface_id))
+}
+
+struct WorkspaceActionMutation {
+    action_name: &'static str,
+    snapshot: Option<WorkspaceEventSnapshot>,
+    extras: serde_json::Map<String, serde_json::Value>,
+}
+
+// purpose: Return the CMUX action name for a parsed workspace.action.
+// inputs: Parsed workspace action.
+// returns/effects: Returns the payload/event action token.
+fn workspace_action_name(action: &WorkspaceAction) -> &'static str {
+    match action {
+        WorkspaceAction::Pin => "pin",
+        WorkspaceAction::Unpin => "unpin",
+        WorkspaceAction::Rename { .. } => "rename",
+        WorkspaceAction::ClearName => "clear_name",
+        WorkspaceAction::SetDescription { .. } => "set_description",
+        WorkspaceAction::ClearDescription => "clear_description",
+    }
+}
+
+// purpose: Apply one workspace.action mutation inside a borrowed AppState.
+// inputs: Mutable app state, target workspace index, and parsed action.
+// returns/effects: Updates workspace widgets/state and returns event metadata.
+fn mutate_workspace_action(
+    app_state: &mut AppState,
+    index: usize,
+    action: WorkspaceAction,
+) -> WorkspaceActionMutation {
+    let action_name = workspace_action_name(&action);
+    let mut extras = serde_json::Map::new();
+    {
+        let workspace = &mut app_state.workspaces[index];
+        apply_workspace_action_to_workspace(workspace, action, &mut extras);
+    }
+    WorkspaceActionMutation {
+        action_name,
+        snapshot: workspace_event_snapshot(app_state, index),
+        extras,
+    }
+}
+
+// purpose: Mutate one workspace for a CMUX workspace.action.
+// inputs: Target workspace, parsed action, and output extras map.
+// returns/effects: Updates GTK labels/buttons and records response fields.
+fn apply_workspace_action_to_workspace(
+    workspace: &mut Workspace,
+    action: WorkspaceAction,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match action {
+        WorkspaceAction::Pin => set_workspace_pin(workspace, true, extras),
+        WorkspaceAction::Unpin => set_workspace_pin(workspace, false, extras),
+        WorkspaceAction::Rename { title } => set_workspace_title(workspace, title, extras),
+        WorkspaceAction::ClearName => {
+            let title = workspace_title_from_directory(workspace.folder_path.as_deref());
+            set_workspace_title(workspace, title, extras);
+        }
+        WorkspaceAction::SetDescription { description } => {
+            workspace.description = Some(description.clone());
+            workspace.description_label.set_label(&description);
+            extras.insert("description".to_string(), serde_json::json!(description));
+        }
+        WorkspaceAction::ClearDescription => {
+            workspace.description = None;
+            workspace.description_label.set_label("");
+            extras.insert("description".to_string(), serde_json::Value::Null);
+        }
+    }
+}
+
+// purpose: Set explicit CMUX workspace pin state.
+// inputs: Target workspace, desired pin state, and output extras map.
+// returns/effects: Updates favorite UI state and response extras.
+fn set_workspace_pin(
+    workspace: &mut Workspace,
+    pinned: bool,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    workspace.favorite = pinned;
+    set_workspace_favorite_visual(workspace);
+    extras.insert("pinned".to_string(), serde_json::json!(pinned));
+}
+
+// purpose: Set explicit CMUX workspace title state.
+// inputs: Target workspace, title, and output extras map.
+// returns/effects: Updates name state/sidebar label and response extras.
+fn set_workspace_title(
+    workspace: &mut Workspace,
+    title: String,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    workspace.name = title.clone();
+    workspace.name_label.set_label(&title);
+    extras.insert("title".to_string(), serde_json::json!(title));
+}
+
+// purpose: Add CMUX workspace.action response metadata to a workspace payload.
+// inputs: Base workspace payload, action token, and action-specific extras.
+// returns/effects: Returns enriched payload without mutating state.
+fn workspace_action_response_payload(
+    mut payload: serde_json::Value,
+    action_name: &str,
+    extras: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("action".to_string(), serde_json::json!(action_name));
+        object.insert("window_id".to_string(), serde_json::json!("window:1"));
+        object.insert("window_ref".to_string(), serde_json::json!("window:1"));
+        for (key, value) in extras {
+            object.insert(key, value);
+        }
+    }
+    payload
+}
+
+// purpose: Apply CMUX workspace.action metadata mutations to the live host.
+// inputs: Shared GTK state, workspace target, and parsed action.
+// returns/effects: Mutates workspace metadata, emits lifecycle events, and persists state.
+fn apply_workspace_action(
+    state: &State,
+    target: WorkspaceTarget,
+    action: WorkspaceAction,
+) -> Result<serde_json::Value, BridgeError> {
+    let index = {
+        let app_state = state.borrow();
+        workspace_index_for_target(&app_state, &target)
+    }
+    .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    let mutation = {
+        let mut app_state = state.borrow_mut();
+        mutate_workspace_action(&mut app_state, index, action)
+    };
+
+    if let Some(snapshot) = mutation.snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.action",
+            &snapshot,
+            None,
+            serde_json::json!({ "origin": "socket", "action": mutation.action_name }),
+        );
+    }
+    request_session_save(state);
+
+    let payload = {
+        let app_state = state.borrow();
+        workspace_payload(&app_state, index)
+    }
+    .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    Ok(workspace_action_response_payload(
+        payload,
+        mutation.action_name,
+        mutation.extras,
+    ))
 }
 
 // purpose: Preserve tmux-compatible last-pane history after a successful focus change.
@@ -15725,6 +15880,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let _ = reply.send(result.ok_or_else(|| {
                 crate::control_bridge::BridgeError::not_found("workspace not found")
             }));
+        }
+        ControlCommand::WorkspaceAction {
+            target,
+            action,
+            reply,
+        } => {
+            let _ = reply.send(apply_workspace_action(state, target, action));
         }
         ControlCommand::CloseWorkspace { target, reply } => {
             let resolved = {

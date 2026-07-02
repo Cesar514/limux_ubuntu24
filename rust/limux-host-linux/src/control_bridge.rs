@@ -54,6 +54,7 @@ const METHODS: &[&str] = &[
     "workspace.previous",
     "workspace.last",
     "workspace.rename",
+    "workspace.action",
     "workspace.close",
     "workspace.remote.reconnect",
     "workspace.remote.disconnect",
@@ -545,6 +546,16 @@ pub enum WorkspaceGroupAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceAction {
+    Pin,
+    Unpin,
+    Rename { title: String },
+    ClearName,
+    SetDescription { description: String },
+    ClearDescription,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceNavigation {
     Next,
     Previous,
@@ -931,6 +942,11 @@ pub enum ControlCommand {
         title: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    WorkspaceAction {
+        target: WorkspaceTarget,
+        action: WorkspaceAction,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CloseWorkspace {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
@@ -1059,6 +1075,7 @@ impl ControlCommand {
             | Self::SelectWorkspace { reply, .. }
             | Self::NavigateWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
+            | Self::WorkspaceAction { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
             | Self::SendKey { reply, .. }
@@ -2110,7 +2127,7 @@ fn parse_optional_workspace_target(
     params: &Map<String, Value>,
     allow_name: bool,
 ) -> Result<WorkspaceTarget, BridgeError> {
-    if let Some(handle) = optional_handle(params, &["workspace_id", "id"])? {
+    if let Some(handle) = optional_handle(params, &["workspace_id", "workspace", "id"])? {
         if allow_name && !looks_like_workspace_handle(&handle) {
             return Ok(WorkspaceTarget::Name(handle));
         }
@@ -2628,6 +2645,54 @@ fn parse_workspace_group_action(
         }
     };
     Ok(action)
+}
+
+/// purpose: Parse CMUX `workspace.action` sub-actions for live GTK mutation.
+/// inputs: Socket params containing action plus optional title/description.
+/// returns/effects: Returns a strict action or a loud validation error.
+fn parse_workspace_action(params: &Map<String, Value>) -> Result<WorkspaceAction, BridgeError> {
+    let Some(raw_action) = optional_string(params, &["action"]) else {
+        return Err(BridgeError::invalid_params(
+            "workspace.action requires action",
+        ));
+    };
+    let action = raw_action.trim().to_ascii_lowercase().replace('-', "_");
+    match action.as_str() {
+        "pin" => Ok(WorkspaceAction::Pin),
+        "unpin" => Ok(WorkspaceAction::Unpin),
+        "rename" => {
+            let Some(title) = optional_string(params, &["title", "name"]) else {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action rename requires title",
+                ));
+            };
+            let title = title.trim().to_string();
+            if title.is_empty() {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action rename requires title",
+                ));
+            }
+            Ok(WorkspaceAction::Rename { title })
+        }
+        "clear_name" => Ok(WorkspaceAction::ClearName),
+        "set_description" => {
+            let Some(description) = optional_string(params, &["description"]) else {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action set-description requires description",
+                ));
+            };
+            if description.trim().is_empty() {
+                return Err(BridgeError::invalid_params(
+                    "workspace.action set-description requires description",
+                ));
+            }
+            Ok(WorkspaceAction::SetDescription { description })
+        }
+        "clear_description" => Ok(WorkspaceAction::ClearDescription),
+        _ => Err(BridgeError::invalid_params(format!(
+            "workspace.action unsupported action: {raw_action}"
+        ))),
+    }
 }
 
 fn handle_method(
@@ -4684,6 +4749,25 @@ fn handle_method(
                 rx,
             )
         }
+        "workspace.action" | "workspace-action" => {
+            let action = match parse_workspace_action(params) {
+                Ok(action) => action,
+                Err(error) => return error_response(id, error),
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::WorkspaceAction {
+                    target,
+                    action,
+                    reply,
+                },
+                rx,
+            )
+        }
         "workspace.close" | "close-workspace" => {
             let target = match parse_optional_workspace_target(params, false) {
                 Ok(target) => target,
@@ -6057,6 +6141,74 @@ mod tests {
         );
 
         assert_eq!(response.error, None);
+    }
+
+    #[test]
+    fn workspace_action_routes_parse_cmux_metadata_actions() {
+        let rename = dispatch_request(
+            r#"{"id":1,"method":"workspace.action","params":{"workspace_id":"workspace:abc","action":"rename","title":"Infra"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceAction {
+                    target,
+                    action,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Handle("workspace:abc".to_string()));
+                    assert_eq!(
+                        action,
+                        WorkspaceAction::Rename {
+                            title: "Infra".to_string(),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(rename.error, None);
+
+        let description = dispatch_request(
+            r#"{"id":2,"method":"workspace.action","params":{"workspace_id":"workspace:abc","action":"set-description","description":"Ship checklist"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceAction::SetDescription {
+                            description: "Ship checklist".to_string(),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(description.error, None);
+
+        let pin = dispatch_request(
+            r#"{"id":3,"method":"workspace-action","params":{"workspace":"codex","action":"pin"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceAction {
+                    target,
+                    action,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(action, WorkspaceAction::Pin);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(pin.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":4,"method":"workspace.action","params":{"action":"move-up"}}"#,
+            &|command| panic!("unsupported workspace.action dispatched: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]

@@ -13280,6 +13280,224 @@ async fn run_rename_workspace_like(
     client.call("workspace.rename", Value::Object(params)).await
 }
 
+// purpose: Normalize CMUX workspace-action names for the live workspace.action RPC.
+// inputs: Raw action token from --action or the first positional argument.
+// returns/effects: Returns lower-case underscore action text without mutating state.
+fn normalize_workspace_action(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+#[derive(Default)]
+struct WorkspaceActionCliArgs {
+    workspace: Option<String>,
+    window: Option<String>,
+    action: Option<String>,
+    title: Option<String>,
+    color: Option<String>,
+    description: Option<String>,
+    positionals: Vec<String>,
+}
+
+// purpose: Parse CMUX workspace-action options without silently accepting typos.
+// inputs: `workspace-action` arguments after the command name.
+// returns/effects: Returns parsed flags and positionals or a hard parser error.
+fn parse_workspace_action_cli_args(args: &[String]) -> Result<WorkspaceActionCliArgs> {
+    let mut parsed = WorkspaceActionCliArgs::default();
+    let mut idx = 0;
+    while idx < args.len() {
+        if consume_workspace_action_option(args, &mut idx, &mut parsed)? {
+            continue;
+        }
+        parsed.positionals.push(args[idx].to_string());
+        idx += 1;
+    }
+    Ok(parsed)
+}
+
+// purpose: Consume one recognized CMUX workspace-action option.
+// inputs: Full arg list, current index, and mutable parser state.
+// returns/effects: Advances index when an option is consumed, rejects unknown flags.
+fn consume_workspace_action_option(
+    args: &[String],
+    idx: &mut usize,
+    parsed: &mut WorkspaceActionCliArgs,
+) -> Result<bool> {
+    let arg = &args[*idx];
+    match arg.as_str() {
+        "--workspace" | "--window" | "--action" | "--title" | "--color" | "--description" => {
+            let value = args
+                .get(*idx + 1)
+                .cloned()
+                .ok_or_else(|| anyhow!("workspace-action: {arg} requires a value"))?;
+            set_workspace_action_field(parsed, arg, value);
+            *idx += 2;
+            Ok(true)
+        }
+        value if value.starts_with("--workspace=") => {
+            set_workspace_action_inline(parsed, idx, value, "--workspace=")
+        }
+        value if value.starts_with("--window=") => {
+            set_workspace_action_inline(parsed, idx, value, "--window=")
+        }
+        value if value.starts_with("--action=") => {
+            set_workspace_action_inline(parsed, idx, value, "--action=")
+        }
+        value if value.starts_with("--title=") => {
+            set_workspace_action_inline(parsed, idx, value, "--title=")
+        }
+        value if value.starts_with("--color=") => {
+            set_workspace_action_inline(parsed, idx, value, "--color=")
+        }
+        value if value.starts_with("--description=") => {
+            set_workspace_action_inline(parsed, idx, value, "--description=")
+        }
+        value if value.starts_with("--") => bail!("workspace-action: unknown flag '{value}'"),
+        _ => Ok(false),
+    }
+}
+
+// purpose: Store a parsed workspace-action option value by flag name.
+// inputs: Mutable parser state, flag name, and flag value.
+// returns/effects: Updates one field in the parser state.
+fn set_workspace_action_field(parsed: &mut WorkspaceActionCliArgs, flag: &str, value: String) {
+    match flag {
+        "--workspace" | "--workspace=" => parsed.workspace = Some(value),
+        "--window" | "--window=" => parsed.window = Some(value),
+        "--action" | "--action=" => parsed.action = Some(value),
+        "--title" | "--title=" => parsed.title = Some(value),
+        "--color" | "--color=" => parsed.color = Some(value),
+        "--description" | "--description=" => parsed.description = Some(value),
+        _ => unreachable!(),
+    }
+}
+
+// purpose: Store an inline --flag=value workspace-action option.
+// inputs: Mutable parser state, arg index, complete token, and inline flag prefix.
+// returns/effects: Updates parser state and advances the index.
+fn set_workspace_action_inline(
+    parsed: &mut WorkspaceActionCliArgs,
+    idx: &mut usize,
+    value: &str,
+    prefix: &str,
+) -> Result<bool> {
+    let flag = prefix.trim_end_matches('=');
+    set_workspace_action_field(parsed, flag, value[prefix.len()..].to_string());
+    *idx += 1;
+    Ok(true)
+}
+
+// purpose: Infer CMUX workspace-action value fields from trailing positionals.
+// inputs: Mutable parsed CLI args.
+// returns/effects: Normalizes action spelling and fills title/color/description aliases.
+fn finalize_workspace_action_args(parsed: &mut WorkspaceActionCliArgs) -> Result<String> {
+    let raw_action = if let Some(action) = parsed.action.take() {
+        action
+    } else if !parsed.positionals.is_empty() {
+        parsed.positionals.remove(0)
+    } else {
+        bail!("workspace-action requires --action <name>");
+    };
+    let action = normalize_workspace_action(&raw_action);
+    let trailing = parsed.positionals.join(" ");
+    if action == "rename" && parsed.title.is_none() && !trailing.trim().is_empty() {
+        parsed.title = Some(trailing.trim().to_string());
+    }
+    if action == "set_color" && parsed.color.is_none() && !trailing.trim().is_empty() {
+        parsed.color = Some(trailing.trim().to_string());
+    }
+    if action == "set_description" && parsed.description.is_none() && !trailing.trim().is_empty() {
+        parsed.description = Some(trailing.trim().to_string());
+    }
+    validate_workspace_action_required_fields(&action, parsed)?;
+    Ok(action)
+}
+
+// purpose: Enforce CMUX workspace-action required value rules.
+// inputs: Normalized action and parsed CLI fields.
+// returns/effects: Returns Ok or a CMUX-shaped loud validation error.
+fn validate_workspace_action_required_fields(
+    action: &str,
+    parsed: &WorkspaceActionCliArgs,
+) -> Result<()> {
+    if action == "rename"
+        && parsed
+            .title
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!("workspace-action rename requires --title <text> (or a trailing title)");
+    }
+    if action == "set_color"
+        && parsed
+            .color
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!("workspace-action set-color requires --color <name|#hex> (or a trailing color)");
+    }
+    if action == "set_description"
+        && parsed
+            .description
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        bail!("workspace-action set-description requires --description <text> (or trailing text)");
+    }
+
+    Ok(())
+}
+
+// purpose: Convert parsed workspace-action state to socket params.
+// inputs: Parsed CLI fields plus normalized action.
+// returns/effects: Produces a JSON object for `workspace.action`.
+fn workspace_action_params_from_args(mut parsed: WorkspaceActionCliArgs) -> Result<Value> {
+    let action = finalize_workspace_action_args(&mut parsed)?;
+    let mut params = Map::new();
+    params.insert("action".to_string(), Value::String(action));
+    if let Some(workspace) = parsed
+        .workspace
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(window) = parsed.window {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    if let Some(title) = parsed.title.filter(|value| !value.trim().is_empty()) {
+        params.insert("title".to_string(), Value::String(title));
+    }
+    if let Some(color) = parsed.color.filter(|value| !value.trim().is_empty()) {
+        params.insert("color".to_string(), Value::String(color));
+    }
+    if let Some(description) = parsed.description.filter(|value| !value.trim().is_empty()) {
+        params.insert("description".to_string(), Value::String(description));
+    }
+    Ok(Value::Object(params))
+}
+
+// purpose: Build CMUX workspace-action RPC params from CLI flags and positionals.
+// inputs: `workspace-action` arguments after the command name.
+// returns/effects: Returns strict `workspace.action` params or a loud parser error.
+fn build_workspace_action_params(args: &[String]) -> Result<Value> {
+    workspace_action_params_from_args(parse_workspace_action_cli_args(args)?)
+}
+
+async fn run_workspace_action(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_flag(args, "--help") {
+        return Ok(json!({
+            "help": concat!(
+                "Usage: limux workspace-action --action <name> [flags]\n",
+                "Actions: pin, unpin, rename, clear-name, set-description, clear-description\n",
+                "Flags: --workspace <id|ref|name>, --window <id|ref>, --title <text>, ",
+                "--description <text>, --color <name|#hex>",
+            )
+        }));
+    }
+    client
+        .call("workspace.action", build_workspace_action_params(args)?)
+        .await
+}
+
 async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
@@ -16466,6 +16684,16 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
+        "workspace-action" => {
+            let payload = run_workspace_action(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if let Some(help) = get_string(&payload, &["help"]) {
+                CommandOutput::Text(help)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "move-tab-to-new-workspace" | "detach-tab" => {
             let payload = run_move_tab_to_new_workspace(client, command, args).await?;
             if opts.json_output {
@@ -19381,6 +19609,53 @@ mod cli_arg_tests {
 
         let bad_focus = build_tab_action_request(&args(&["--action", "pin", "--focus", "later"]));
         assert!(bad_focus.is_err());
+    }
+
+    #[test]
+    fn cmux_workspace_action_builds_workspace_action_params() {
+        let rename = build_workspace_action_params(&args(&[
+            "--workspace",
+            "workspace:2",
+            "--action",
+            "rename",
+            "--title",
+            "infra",
+        ]))
+        .expect("workspace-action rename parses");
+        assert_eq!(
+            rename,
+            json!({
+                "action": "rename",
+                "workspace_id": "workspace:2",
+                "title": "infra",
+            })
+        );
+
+        let description = build_workspace_action_params(&args(&[
+            "--action",
+            "set-description",
+            "Ship",
+            "checklist",
+        ]))
+        .expect("workspace-action set-description parses");
+        assert_eq!(
+            description,
+            json!({
+                "action": "set_description",
+                "description": "Ship checklist",
+            })
+        );
+
+        let color = build_workspace_action_params(&args(&["set-color", "Amber"]))
+            .expect("workspace-action set-color parses");
+        assert_eq!(color["action"], "set_color");
+        assert_eq!(color["color"], "Amber");
+
+        let missing_title = build_workspace_action_params(&args(&["--action", "rename"]));
+        assert!(missing_title
+            .expect_err("missing title rejected")
+            .to_string()
+            .contains("rename requires"));
     }
 
     #[test]
