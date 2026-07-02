@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::ErrorKind;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -33,6 +35,13 @@ struct ProcessGroup {
     process_count: usize,
     rss_bytes: u64,
     cpu_ticks: u64,
+    cpu_percent_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SystemCpuSample {
+    total_ticks: u64,
+    cpu_count: u64,
 }
 
 /// purpose: Build the CMUX-style memory diagnostic payload for the current host.
@@ -42,14 +51,38 @@ pub fn memory_diagnostic_payload(top_group_limit: usize) -> Result<Value, String
     diagnostic_payload(top_group_limit, None, "memory_diagnostic")
 }
 
-/// purpose: Build the CMUX-style top diagnostic payload for the current host.
-/// inputs: top_group_limit controls rows and workspace_filter optionally scopes by workspace.
-/// returns/effects: Returns JSON with app RSS and descendant process groups.
-pub fn top_diagnostic_payload(
+/// purpose: Build top diagnostics with a bounded CPU sample window.
+/// inputs: Row limit, optional workspace scope, and sample duration in milliseconds.
+/// returns/effects: Returns current process groups with sampled cpu_percent values.
+pub fn sampled_top_diagnostic_payload(
     top_group_limit: usize,
     workspace_filter: Option<&str>,
+    sample_ms: u64,
 ) -> Result<Value, String> {
-    diagnostic_payload(top_group_limit, workspace_filter, "top_diagnostic")
+    let root_pid = std::process::id();
+    let before_root = read_process_stats(root_pid)?;
+    let before_groups = collect_matching_groups(root_pid, workspace_filter)?;
+    let before_system = read_system_cpu_sample()?;
+
+    thread::sleep(Duration::from_millis(sample_ms));
+
+    let root = read_process_stats(root_pid)?;
+    let after_system = read_system_cpu_sample()?;
+    let groups = collect_matching_groups(root_pid, workspace_filter)?;
+    let mut groups = apply_cpu_sample(groups, &before_groups, before_system, after_system);
+    groups.sort_by(|left, right| right.rss_bytes.cmp(&left.rss_bytes));
+
+    let app_cpu_percent_millis = cpu_percent_millis(
+        before_root.cpu_ticks,
+        root.cpu_ticks,
+        before_system,
+        after_system,
+    );
+    let mut diagnostic = diagnostic_from_groups(root, groups, top_group_limit, workspace_filter);
+    diagnostic["app"]["cpu_percent"] = json!(millis_to_percent(app_cpu_percent_millis));
+    diagnostic["sample_ms"] = json!(sample_ms);
+    diagnostic["cpu_sample_source"] = json!("procfs_delta");
+    Ok(json!({ "top_diagnostic": diagnostic }))
 }
 
 /// purpose: Build a process diagnostic payload from one /proc scan.
@@ -62,13 +95,22 @@ fn diagnostic_payload(
 ) -> Result<Value, String> {
     let root_pid = std::process::id();
     let root = read_process_stats(root_pid)?;
-    let groups = collect_child_groups(root_pid)?;
-    let mut groups = group_processes_by_direct_child(groups)
-        .into_iter()
-        .filter(|group| group_matches_workspace(group, workspace_filter))
-        .collect::<Vec<_>>();
+    let mut groups = collect_matching_groups(root_pid, workspace_filter)?;
     groups.sort_by(|left, right| right.rss_bytes.cmp(&left.rss_bytes));
+    Ok(
+        json!({ payload_key: diagnostic_from_groups(root, groups, top_group_limit, workspace_filter) }),
+    )
+}
 
+/// purpose: Build the shared top/memory diagnostic JSON from collected process groups.
+/// inputs: Root process stats, group rows, row limit, and optional workspace filter.
+/// returns/effects: Returns diagnostic payload without wrapping top-level key.
+fn diagnostic_from_groups(
+    root: ProcStats,
+    groups: Vec<ProcessGroup>,
+    top_group_limit: usize,
+    workspace_filter: Option<&str>,
+) -> Value {
     let total_child_rss = groups.iter().map(|group| group.rss_bytes).sum::<u64>();
     let total_child_count = groups
         .iter()
@@ -100,7 +142,128 @@ fn diagnostic_payload(
             "workspace_ref": format!("workspace:{}", normalize_workspace_filter(workspace_id)),
         });
     }
-    Ok(json!({ payload_key: diagnostic }))
+    diagnostic
+}
+
+/// purpose: Collect child process groups after optional workspace attribution filtering.
+/// inputs: Root process id and optional workspace scope.
+/// returns/effects: Returns grouped process stats, ignoring descendants that exit mid-scan.
+fn collect_matching_groups(
+    root_pid: u32,
+    workspace_filter: Option<&str>,
+) -> Result<Vec<ProcessGroup>, String> {
+    let groups = collect_child_groups(root_pid)?;
+    Ok(group_processes_by_direct_child(groups)
+        .into_iter()
+        .filter(|group| group_matches_workspace(group, workspace_filter))
+        .collect::<Vec<_>>())
+}
+
+/// purpose: Attach sampled CPU percentages to the second process-group snapshot.
+/// inputs: Current groups, previous groups, and before/after system CPU samples.
+/// returns/effects: Returns current groups with cpu_percent_millis populated.
+fn apply_cpu_sample(
+    mut groups: Vec<ProcessGroup>,
+    before_groups: &[ProcessGroup],
+    before_system: SystemCpuSample,
+    after_system: SystemCpuSample,
+) -> Vec<ProcessGroup> {
+    let before_by_pid = before_groups
+        .iter()
+        .map(|group| (group.root.pid, group.cpu_ticks))
+        .collect::<BTreeMap<_, _>>();
+    for group in &mut groups {
+        if let Some(before_ticks) = before_by_pid.get(&group.root.pid) {
+            group.cpu_percent_millis =
+                cpu_percent_millis(*before_ticks, group.cpu_ticks, before_system, after_system);
+        }
+    }
+    groups
+}
+
+/// purpose: Calculate CPU percent using Linux process jiffy deltas over total CPU jiffy deltas.
+/// inputs: Before/after process ticks and before/after aggregate CPU samples.
+/// returns/effects: Returns percent scaled by 1000, or zero for invalid/restarted samples.
+fn cpu_percent_millis(
+    before_ticks: u64,
+    after_ticks: u64,
+    before_system: SystemCpuSample,
+    after_system: SystemCpuSample,
+) -> u64 {
+    let Some(process_delta) = after_ticks.checked_sub(before_ticks) else {
+        return 0;
+    };
+    let Some(system_delta) = after_system
+        .total_ticks
+        .checked_sub(before_system.total_ticks)
+    else {
+        return 0;
+    };
+    if system_delta == 0 || after_system.cpu_count == 0 {
+        return 0;
+    }
+    process_delta
+        .saturating_mul(after_system.cpu_count)
+        .saturating_mul(100_000)
+        / system_delta
+}
+
+/// purpose: Convert milli-percent values to a JSON-friendly decimal percent.
+/// inputs: Percent scaled by 1000.
+/// returns/effects: Returns a finite floating-point percent.
+fn millis_to_percent(value: u64) -> f64 {
+    value as f64 / 1000.0
+}
+
+/// purpose: Read aggregate CPU jiffies and logical CPU count from /proc/stat.
+/// inputs: Linux procfs CPU summary.
+/// returns/effects: Returns a sample or explicit parse/read error.
+fn read_system_cpu_sample() -> Result<SystemCpuSample, String> {
+    parse_system_cpu_sample(&fs::read_to_string("/proc/stat").map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            "/proc/stat not found".to_string()
+        } else {
+            format!("failed to read /proc/stat: {error}")
+        }
+    })?)
+}
+
+/// purpose: Parse aggregate CPU ticks and logical CPU count from /proc/stat text.
+/// inputs: Raw /proc/stat contents.
+/// returns/effects: Returns system CPU sample or malformed-stat error.
+fn parse_system_cpu_sample(raw: &str) -> Result<SystemCpuSample, String> {
+    let total_line = raw
+        .lines()
+        .find(|line| line.starts_with("cpu "))
+        .ok_or("/proc/stat missing aggregate cpu line")?;
+    let total_ticks = total_line
+        .split_whitespace()
+        .skip(1)
+        .map(|part| {
+            part.parse::<u64>()
+                .map_err(|error| format!("/proc/stat cpu tick malformed: {error}"))
+        })
+        .try_fold(0_u64, |total, value| value.map(|ticks| total + ticks))?;
+    let cpu_count = raw
+        .lines()
+        .filter(|line| cpu_detail_line_prefix(line).is_some())
+        .count() as u64;
+    Ok(SystemCpuSample {
+        total_ticks,
+        cpu_count,
+    })
+}
+
+/// purpose: Identify per-CPU lines without treating the aggregate `cpu ` line as a processor.
+/// inputs: One /proc/stat line.
+/// returns/effects: Returns the cpuN prefix when the line is a logical processor row.
+fn cpu_detail_line_prefix(line: &str) -> Option<&str> {
+    let prefix = line.split_whitespace().next()?;
+    let suffix = prefix.strip_prefix("cpu")?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(prefix)
 }
 
 /// purpose: Check whether a process group belongs to an optional workspace scope.
@@ -160,6 +323,7 @@ fn group_processes_by_direct_child(pairs: Vec<(u32, ProcStats)>) -> Vec<ProcessG
             process_count: 0,
             rss_bytes: 0,
             cpu_ticks: 0,
+            cpu_percent_millis: 0,
         });
         group.process_count += 1;
         group.rss_bytes += stats.resident_bytes;
@@ -355,6 +519,7 @@ fn group_to_json(group: ProcessGroup) -> Value {
         "command": group.root.command,
         "rss_bytes": group.rss_bytes,
         "cpu_ticks": group.cpu_ticks,
+        "cpu_percent": millis_to_percent(group.cpu_percent_millis),
         "process_count": group.process_count,
         "top_attribution": attribution_to_json(&group.root.attribution),
     })
@@ -370,6 +535,7 @@ fn process_to_json(stats: &ProcStats) -> Value {
         "command": stats.command,
         "resident_bytes": stats.resident_bytes,
         "cpu_ticks": stats.cpu_ticks,
+        "cpu_percent": 0.0,
     })
 }
 
@@ -462,5 +628,33 @@ mod tests {
             Some("workspace:workspace-a")
         ));
         assert!(!group_matches_workspace(&group, Some("workspace-b")));
+    }
+
+    #[test]
+    fn parse_system_cpu_sample_counts_logical_cpus() {
+        let raw = concat!(
+            "cpu  10 20 30 40 0 0 0 0 0 0\n",
+            "cpu0 5 10 15 20 0 0 0 0 0 0\n",
+            "cpu1 5 10 15 20 0 0 0 0 0 0\n",
+            "intr 1\n"
+        );
+        let sample = parse_system_cpu_sample(raw).expect("system cpu sample parses");
+        assert_eq!(sample.total_ticks, 100);
+        assert_eq!(sample.cpu_count, 2);
+    }
+
+    #[test]
+    fn cpu_percent_millis_uses_system_delta_and_cpu_count() {
+        let before = SystemCpuSample {
+            total_ticks: 1_000,
+            cpu_count: 4,
+        };
+        let after = SystemCpuSample {
+            total_ticks: 1_400,
+            cpu_count: 4,
+        };
+
+        assert_eq!(cpu_percent_millis(10, 30, before, after), 20_000);
+        assert_eq!(millis_to_percent(20_000), 20.0);
     }
 }

@@ -615,6 +615,7 @@ pub enum ControlCommand {
     },
     SystemTop {
         top_group_limit: usize,
+        sample_ms: u64,
         workspace_target: Option<WorkspaceTarget>,
         window_id: Option<String>,
         include_all: bool,
@@ -1927,6 +1928,20 @@ fn parse_top_group_limit(params: &Map<String, Value>, method: &str) -> Result<us
     }
 }
 
+// purpose: Parse bounded CPU sample windows for system.top.
+// inputs: JSON params from system.top.
+// returns/effects: Returns 50..=2000 milliseconds or the default 250 ms window.
+fn parse_top_sample_ms(params: &Map<String, Value>) -> Result<u64, BridgeError> {
+    match optional_index(params, "sample_ms") {
+        Ok(Some(sample_ms)) if (50..=2000).contains(&sample_ms) => Ok(sample_ms as u64),
+        Ok(Some(_)) => Err(BridgeError::invalid_params(
+            "system.top sample_ms must be 50..=2000",
+        )),
+        Ok(None) => Ok(250),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_pane_create_direction(raw: &str) -> Result<PaneCreateDirection, BridgeError> {
     match raw {
@@ -2445,6 +2460,10 @@ fn handle_method(
                 Ok(limit) => limit,
                 Err(error) => return error_response(id, error),
             };
+            let sample_ms = match parse_top_sample_ms(params) {
+                Ok(sample_ms) => sample_ms,
+                Err(error) => return error_response(id, error),
+            };
             let (workspace_target, window_id, include_all) = match parse_system_top_scope(params) {
                 Ok(scope) => scope,
                 Err(error) => return error_response(id, error),
@@ -2453,6 +2472,7 @@ fn handle_method(
             (
                 ControlCommand::SystemTop {
                     top_group_limit,
+                    sample_ms,
                     workspace_target,
                     window_id,
                     include_all,
@@ -7877,17 +7897,19 @@ mod tests {
     fn system_top_route_preserves_scope_and_limit() {
         let request = concat!(
             r#"{"id":1,"method":"system.top","params":{"#,
-            r#""top_group_limit":6,"workspace_id":"workspace:abc","window_id":"window:1"}}"#
+            r#""top_group_limit":6,"sample_ms":75,"workspace_id":"workspace:abc","window_id":"window:1"}}"#
         );
         let response = dispatch_request(request, &|command| match command {
             ControlCommand::SystemTop {
                 top_group_limit,
+                sample_ms,
                 workspace_target,
                 window_id,
                 include_all,
                 reply,
             } => {
                 assert_eq!(top_group_limit, 6);
+                assert_eq!(sample_ms, 75);
                 assert_eq!(window_id.as_deref(), Some("window:1"));
                 assert!(!include_all);
                 assert!(matches!(
@@ -7914,6 +7936,15 @@ mod tests {
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_sample = dispatch_request(
+            r#"{"id":1,"method":"system.top","params":{"sample_ms":20}}"#,
+            &|command| panic!("invalid system.top sample should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_sample.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }

@@ -2311,18 +2311,23 @@ fn system_tree_payload(
     }))
 }
 
+struct SystemTopPayloadRequest<'a> {
+    top_group_limit: usize,
+    sample_ms: u64,
+    workspace_target: Option<&'a WorkspaceTarget>,
+    window_id: Option<&'a str>,
+    include_all: bool,
+}
+
 // purpose: Build native CMUX system.top output from live process diagnostics.
-// inputs: Optional workspace and window scopes plus all-window flag.
+// inputs: State and scoped top request fields.
 // returns/effects: Returns scoped process diagnostics or a loud scope error.
 fn system_top_payload(
     state: &State,
-    top_group_limit: usize,
-    workspace_target: Option<&WorkspaceTarget>,
-    window_id: Option<&str>,
-    _include_all: bool,
+    request: SystemTopPayloadRequest<'_>,
 ) -> Result<serde_json::Value, BridgeError> {
-    validate_system_tree_window(window_id)?;
-    let workspace_id = if let Some(target) = workspace_target {
+    validate_system_tree_window(request.window_id)?;
+    let workspace_id = if let Some(target) = request.workspace_target {
         let app_state = state.borrow();
         let index = workspace_index_for_target(&app_state, target)
             .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
@@ -2330,12 +2335,16 @@ fn system_top_payload(
     } else {
         None
     };
-    let mut payload =
-        crate::memory_diagnostics::top_diagnostic_payload(top_group_limit, workspace_id.as_deref())
-            .map_err(BridgeError::internal)?;
+    let mut payload = crate::memory_diagnostics::sampled_top_diagnostic_payload(
+        request.top_group_limit,
+        workspace_id.as_deref(),
+        request.sample_ms,
+    )
+    .map_err(BridgeError::internal)?;
     if let Some(top) = payload.get("top_diagnostic").cloned() {
         payload["memory_diagnostic"] = top;
     }
+    payload["all"] = serde_json::json!(request.include_all);
     payload["source"] = serde_json::Value::String("limux_system_top".to_string());
     Ok(payload)
 }
@@ -8352,6 +8361,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::SystemTop {
             top_group_limit,
+            sample_ms,
             workspace_target,
             window_id,
             include_all,
@@ -8359,10 +8369,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             let result = system_top_payload(
                 state,
-                top_group_limit,
-                workspace_target.as_ref(),
-                window_id.as_deref(),
-                include_all,
+                SystemTopPayloadRequest {
+                    top_group_limit,
+                    sample_ms,
+                    workspace_target: workspace_target.as_ref(),
+                    window_id: window_id.as_deref(),
+                    include_all,
+                },
             );
             let _ = reply.send(result);
         }

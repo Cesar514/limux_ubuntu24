@@ -4873,6 +4873,7 @@ enum TopTextFormat {
 struct TopOptions {
     sort_key: Option<TopSortKey>,
     text_format: TopTextFormat,
+    sample_ms: u64,
     all: bool,
     workspace: Option<String>,
     window: Option<String>,
@@ -4898,6 +4899,7 @@ async fn run_top(client: &mut Client, options: &TopOptions) -> Result<Value> {
 fn top_request_params(options: &TopOptions) -> Value {
     let mut params = Map::new();
     params.insert("top_group_limit".to_string(), json!(12));
+    params.insert("sample_ms".to_string(), json!(options.sample_ms));
     if options.all {
         params.insert("all".to_string(), json!(true));
     }
@@ -4916,6 +4918,7 @@ fn top_request_params(options: &TopOptions) -> Value {
 fn parse_top_options(args: &[String]) -> Result<TopOptions> {
     let mut sort_key = None;
     let mut text_format = TopTextFormat::Tree;
+    let mut sample_ms = 250;
     let mut all = false;
     let mut workspace = None;
     let mut window = None;
@@ -4932,6 +4935,10 @@ fn parse_top_options(args: &[String]) -> Result<TopOptions> {
                 let (parsed, next) = parse_top_format_arg(args, index)?;
                 text_format = parsed;
                 index = next;
+            }
+            "--sample-ms" | "--sample" => {
+                sample_ms = parse_top_sample_ms(args, index)?;
+                index += 2;
             }
             "--flat" => {
                 text_format = TopTextFormat::Tsv;
@@ -4952,7 +4959,8 @@ fn parse_top_options(args: &[String]) -> Result<TopOptions> {
             unknown if unknown.starts_with("--") => {
                 let known = concat!(
                     "--all --workspace <id|ref|index> --window <id|ref|index> ",
-                    "--processes --sort <cpu|mem|proc> --format <tree|tsv> --json"
+                    "--processes --sort <cpu|mem|proc> --sample-ms <50..2000> ",
+                    "--format <tree|tsv> --json"
                 );
                 bail!("top: unknown flag '{unknown}'. Known flags: {known}");
             }
@@ -4962,6 +4970,7 @@ fn parse_top_options(args: &[String]) -> Result<TopOptions> {
     Ok(TopOptions {
         sort_key,
         text_format,
+        sample_ms,
         all,
         workspace,
         window,
@@ -4995,6 +5004,21 @@ fn parse_top_sort_arg(args: &[String], index: usize) -> Result<(Option<TopSortKe
         _ => bail!("top: invalid --sort value '{value}'. Use cpu, mem, or proc"),
     };
     Ok((Some(key), index + 2))
+}
+
+// purpose: Parse CMUX-compatible top CPU sample duration.
+// inputs: Raw args and current sample flag index.
+// returns/effects: Returns a bounded millisecond duration or usage error.
+fn parse_top_sample_ms(args: &[String], index: usize) -> Result<u64> {
+    let flag = args[index].as_str();
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| anyhow!("top requires {flag} <milliseconds>"))?;
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|sample_ms| (50..=2000).contains(sample_ms))
+        .ok_or_else(|| anyhow!("top {flag} must be an integer from 50 to 2000"))
 }
 
 // purpose: Parse the CMUX top text format flag.
@@ -5036,7 +5060,9 @@ fn sort_top_payload(payload: &mut Value, sort_key: Option<TopSortKey>) {
 // returns/effects: Returns zero when the metric is absent.
 fn top_sort_value(group: &Value, sort_key: TopSortKey) -> u64 {
     match sort_key {
-        TopSortKey::Cpu => group.get("cpu_ticks").and_then(Value::as_u64).unwrap_or(0),
+        TopSortKey::Cpu => top_cpu_percent_millis(group)
+            .or_else(|| group.get("cpu_ticks").and_then(Value::as_u64))
+            .unwrap_or(0),
         TopSortKey::Memory => group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0),
         TopSortKey::ProcessCount => group
             .get("process_count")
@@ -5174,7 +5200,7 @@ fn top_group_rows(payload: &Value) -> Vec<Value> {
 // inputs: Process group row and requested id format.
 // returns/effects: Returns escaped TSV fields without a trailing newline.
 fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
-    let cpu_ticks = group.get("cpu_ticks").and_then(Value::as_u64).unwrap_or(0);
+    let cpu = top_cpu_display(group);
     let rss = group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0);
     let process_count = group
         .get("process_count")
@@ -5187,7 +5213,7 @@ fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
         .unwrap_or("process");
     let parent = memory_attribution_text(group.get("top_attribution"), id_format);
     [
-        cpu_ticks.to_string(),
+        cpu,
         rss.to_string(),
         process_count.to_string(),
         "process_group".to_string(),
@@ -5199,6 +5225,31 @@ fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
     .map(|field| top_tsv_field(&field))
     .collect::<Vec<_>>()
     .join("\t")
+}
+
+// purpose: Format sampled CPU percent for `top --flat` rows.
+// inputs: Process group JSON with cpu_percent or legacy cpu_ticks.
+// returns/effects: Returns a concise numeric field for TSV output.
+fn top_cpu_display(group: &Value) -> String {
+    if let Some(percent) = group.get("cpu_percent").and_then(Value::as_f64) {
+        return format!("{percent:.1}");
+    }
+    group
+        .get("cpu_ticks")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .to_string()
+}
+
+// purpose: Convert sampled CPU percent to milli-percent for stable integer sorting.
+// inputs: Process group JSON with optional cpu_percent number.
+// returns/effects: Returns None when only legacy cumulative ticks are available.
+fn top_cpu_percent_millis(group: &Value) -> Option<u64> {
+    let percent = group.get("cpu_percent").and_then(Value::as_f64)?;
+    if !percent.is_finite() || percent < 0.0 {
+        return None;
+    }
+    Some((percent * 1000.0).round() as u64)
 }
 
 // purpose: Build a stable ref for a local process group row.
@@ -16808,6 +16859,11 @@ mod cli_arg_tests {
 
         let cpu_sort = parse_top_options(&args(&["--sort", "cpu"])).expect("cpu sort parses");
         assert_eq!(cpu_sort.sort_key, Some(TopSortKey::Cpu));
+        assert_eq!(cpu_sort.sample_ms, 250);
+
+        let sampled = parse_top_options(&args(&["--sample-ms", "500"])).expect("sample parses");
+        assert_eq!(sampled.sample_ms, 500);
+        assert!(parse_top_options(&args(&["--sample-ms", "20"])).is_err());
 
         let scoped = parse_top_options(&args(&[
             "--workspace",
@@ -16822,6 +16878,7 @@ mod cli_arg_tests {
         let params = top_request_params(&scoped);
         assert_eq!(params["workspace_id"], "workspace:7");
         assert_eq!(params["window_id"], "window:1");
+        assert_eq!(params["sample_ms"], 250);
     }
 
     #[test]
@@ -16830,8 +16887,8 @@ mod cli_arg_tests {
             "memory_diagnostic": {
                 "children": {
                     "groups": [
-                        {"pid": 10, "name": "small", "rss_bytes": 50, "cpu_ticks": 900, "process_count": 9},
-                        {"pid": 11, "name": "large", "rss_bytes": 500, "cpu_ticks": 10, "process_count": 1}
+                        {"pid": 10, "name": "small", "rss_bytes": 50, "cpu_ticks": 900, "cpu_percent": 7.5, "process_count": 9},
+                        {"pid": 11, "name": "large", "rss_bytes": 500, "cpu_ticks": 10, "cpu_percent": 1.0, "process_count": 1}
                     ]
                 }
             }
@@ -16848,7 +16905,7 @@ mod cli_arg_tests {
         sort_top_payload(&mut payload, Some(TopSortKey::Cpu));
         let cpu_groups = top_group_rows(&payload);
         assert_eq!(cpu_groups[0]["name"], "small");
-        assert!(render_top_tsv(&payload, IdFormat::Refs).contains("900\t50\t9"));
+        assert!(render_top_tsv(&payload, IdFormat::Refs).contains("7.5\t50\t9"));
     }
 
     #[test]
