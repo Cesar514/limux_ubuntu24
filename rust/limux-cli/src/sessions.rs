@@ -65,6 +65,11 @@ struct CodexDebugIndex {
     transcript_path_by_session_id: BTreeMap<String, String>,
 }
 
+struct CodexPidTranscript {
+    session_id: String,
+    path: String,
+}
+
 impl From<SessionCommandInput> for SessionCommandResult {
     fn from(input: SessionCommandInput) -> Self {
         session_command_result_from_input(input)
@@ -318,7 +323,7 @@ fn collect_session_entries(
         if snapshot.agent == AgentKind::Codex {
             let index =
                 codex_index.get_or_insert_with(|| build_codex_debug_index(&options.codex_home));
-            add_codex_payload(&mut payload, &options.codex_home, &record.session_id, index);
+            add_codex_payload(&mut payload, &options.codex_home, record, index);
         }
         entries.push(SessionEntry {
             updated_at: record.updated_at,
@@ -424,19 +429,73 @@ fn render_store_payload(snapshot: &AgentHookSessionSnapshot) -> Value {
 fn add_codex_payload(
     payload: &mut Value,
     codex_home: &Path,
-    session_id: &str,
+    record: &AgentHookSessionRecord,
     index: &CodexDebugIndex,
 ) {
+    let session_id = &record.session_id;
+    let pid_transcript = record
+        .pid
+        .and_then(|pid| codex_transcript_for_pid(pid, codex_home));
+    let indexed_id = codex_indexed_session_id(session_id, pid_transcript.as_ref());
+    let indexed_path = codex_indexed_transcript_path(session_id, pid_transcript.as_ref(), index);
     let session_dir = codex_home.join("sessions");
     payload["session_home"] = json!(codex_home);
     payload["session_dir"] = json!(session_dir);
-    payload["codex_indexed"] = json!(index.indexed_session_ids.contains(session_id));
-    payload["codex_transcript_found"] =
-        json!(index.transcript_path_by_session_id.contains_key(session_id));
-    payload["codex_transcript_path"] = index
+    payload["codex_indexed"] = json!(index.indexed_session_ids.contains(indexed_id));
+    set_codex_pid_payload_fields(payload, pid_transcript.as_ref());
+    payload["codex_transcript_found"] = json!(indexed_path.is_some());
+    payload["codex_transcript_path"] = indexed_path.map(Value::String).unwrap_or(Value::Null);
+    if payload["transcript_path"].is_null() {
+        payload["transcript_path"] = payload["codex_transcript_path"].clone();
+    }
+}
+
+// purpose: Choose the Codex session id used for index membership checks.
+// inputs: Saved wrapper session id and optional pid-resolved native Codex transcript.
+// returns/effects: Returns the native Codex id when available, otherwise the saved id.
+fn codex_indexed_session_id<'a>(
+    saved_session_id: &'a str,
+    pid_transcript: Option<&'a CodexPidTranscript>,
+) -> &'a str {
+    pid_transcript
+        .map(|transcript| transcript.session_id.as_str())
+        .unwrap_or(saved_session_id)
+}
+
+// purpose: Resolve the best Codex transcript path for one saved session.
+// inputs: Saved session id, optional pid-resolved transcript, and Codex debug index.
+// returns/effects: Prefers indexed saved id, then indexed native id, then live pid fd path.
+fn codex_indexed_transcript_path(
+    saved_session_id: &str,
+    pid_transcript: Option<&CodexPidTranscript>,
+    index: &CodexDebugIndex,
+) -> Option<String> {
+    index
         .transcript_path_by_session_id
-        .get(session_id)
-        .map(|path| json!(path))
+        .get(saved_session_id)
+        .cloned()
+        .or_else(|| {
+            pid_transcript
+                .and_then(|transcript| {
+                    index
+                        .transcript_path_by_session_id
+                        .get(&transcript.session_id)
+                })
+                .cloned()
+        })
+        .or_else(|| pid_transcript.map(|transcript| transcript.path.clone()))
+}
+
+// purpose: Add pid-anchored Codex transcript diagnostics to a JSON payload.
+// inputs: Mutable session payload and optional pid-resolved native Codex transcript.
+// returns/effects: Mutates payload with native Codex id/path presence fields.
+fn set_codex_pid_payload_fields(payload: &mut Value, pid_transcript: Option<&CodexPidTranscript>) {
+    payload["codex_native_session_id"] = pid_transcript
+        .map(|transcript| json!(transcript.session_id))
+        .unwrap_or(Value::Null);
+    payload["codex_pid_transcript_found"] = json!(pid_transcript.is_some());
+    payload["codex_pid_transcript_path"] = pid_transcript
+        .map(|transcript| json!(transcript.path))
         .unwrap_or(Value::Null);
 }
 
@@ -499,15 +558,96 @@ fn collect_codex_transcripts(root: &Path, output: &mut BTreeMap<String, String>)
     }
 }
 
+// purpose: Resolve a live Codex transcript from a saved Linux process id.
+// inputs: Process id and configured Codex home directory.
+// returns/effects: Reads /proc/<pid>/fd symlinks on Linux; returns None elsewhere.
+fn codex_transcript_for_pid(pid: u32, codex_home: &Path) -> Option<CodexPidTranscript> {
+    if cfg!(target_os = "linux") {
+        codex_transcript_from_fd_dir(
+            &Path::new("/proc").join(pid.to_string()).join("fd"),
+            codex_home,
+        )
+    } else {
+        None
+    }
+}
+
+// purpose: Resolve a Codex transcript from a directory of process fd symlinks.
+// inputs: fd directory and configured Codex home.
+// returns/effects: Returns the first JSONL fd target under Codex sessions roots with UUID token.
+fn codex_transcript_from_fd_dir(fd_dir: &Path, codex_home: &Path) -> Option<CodexPidTranscript> {
+    let mut candidates = fs::read_dir(fd_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .filter_map(|target| codex_transcript_from_path(&target, codex_home))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    candidates.into_iter().next()
+}
+
+// purpose: Validate and decode a Codex transcript path.
+// inputs: Candidate fd target and configured Codex home.
+// returns/effects: Returns session id/path only for Codex JSONL transcript files.
+fn codex_transcript_from_path(path: &Path, codex_home: &Path) -> Option<CodexPidTranscript> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return None;
+    }
+    if path.is_absolute() && !path.starts_with(codex_home) {
+        return None;
+    }
+    if !path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("sessions" | "archived_sessions")
+        )
+    }) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let session_id = uuid_like_tokens(name).into_iter().next()?;
+    Some(CodexPidTranscript {
+        session_id,
+        path: path.display().to_string(),
+    })
+}
+
 // purpose: Extract UUID-shaped tokens from transcript file names.
 // inputs: A file name or path component.
 // returns/effects: Returns lowercased UUID-shaped strings.
 fn uuid_like_tokens(value: &str) -> Vec<String> {
-    value
-        .split(|ch: char| !(ch.is_ascii_hexdigit() || ch == '-'))
-        .filter(|part| part.len() == 36 && part.chars().filter(|ch| *ch == '-').count() == 4)
-        .map(str::to_ascii_lowercase)
-        .collect()
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() < 36 {
+        return Vec::new();
+    }
+    let mut tokens = Vec::new();
+    for start in 0..=(chars.len() - 36) {
+        let token = chars[start..start + 36].iter().collect::<String>();
+        if is_uuid_like_token(&token) && !tokens.contains(&token) {
+            tokens.push(token.to_ascii_lowercase());
+        }
+    }
+    tokens
+}
+
+// purpose: Validate UUID-shaped transcript ids embedded in filenames.
+// inputs: Candidate 36-character string.
+// returns/effects: Returns true only for 8-4-4-4-12 hexadecimal UUID shape.
+fn is_uuid_like_token(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(index, ch)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            ch == '-'
+        } else {
+            ch.is_ascii_hexdigit()
+        }
+    })
 }
 
 // purpose: Render CMUX-like text output for session rows.
@@ -589,6 +729,13 @@ fn base_session_line_parts(payload: &Value) -> Vec<String> {
 // returns/effects: Appends Codex index/transcript diagnostics.
 fn push_codex_line_parts(payload: &Value, parts: &mut Vec<String>) {
     if payload.get("agent").and_then(Value::as_str) == Some("codex") {
+        if let Some(native) = payload
+            .get("codex_native_session_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("codex_native_session={native}"));
+        }
         parts.push(format!(
             "codex_indexed={}",
             yes_no(payload_bool(payload, "codex_indexed"))
@@ -596,6 +743,10 @@ fn push_codex_line_parts(payload: &Value, parts: &mut Vec<String>) {
         parts.push(format!(
             "codex_transcript={}",
             yes_no(payload_bool(payload, "codex_transcript_found"))
+        ));
+        parts.push(format!(
+            "codex_pid_transcript={}",
+            yes_no(payload_bool(payload, "codex_pid_transcript_found"))
         ));
     }
 }
@@ -680,6 +831,7 @@ fn sessions_usage() -> &'static str {
 mod tests {
     use super::*;
     use crate::agent_hooks::{AgentHookSessionStore, AgentLaunchCommandRecord};
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     // purpose: Seed one Codex hook-store record with a stale PID.
@@ -770,5 +922,77 @@ mod tests {
     #[test]
     fn sessions_list_json_includes_store_metadata() {
         assert_sessions_list_json_includes_store_metadata();
+    }
+
+    // purpose: Verify fd-based Codex transcript resolution rejects unrelated open files.
+    // inputs: Synthetic fd directory with Codex-home and outside-home JSONL symlinks.
+    // returns/effects: Asserts only the Codex sessions transcript path and UUID are returned.
+    fn assert_codex_fd_resolver_accepts_only_codex_home_jsonl_transcripts() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join(".codex");
+        let session_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("02");
+        fs::create_dir_all(&session_dir).expect("create sessions dir");
+        let transcript = session_dir.join("rollout-11111111-2222-3333-4444-555555555555.jsonl");
+        fs::write(&transcript, "{}\n").expect("write transcript");
+        let outside = dir
+            .path()
+            .join("other")
+            .join("99999999-2222-3333-4444-555555555555.jsonl");
+        fs::create_dir_all(outside.parent().expect("outside parent")).expect("outside dir");
+        fs::write(&outside, "{}\n").expect("write outside transcript");
+
+        let fd_dir = dir.path().join("fd");
+        fs::create_dir_all(&fd_dir).expect("create fd dir");
+        symlink(&outside, fd_dir.join("3")).expect("outside symlink");
+        symlink(&transcript, fd_dir.join("4")).expect("transcript symlink");
+
+        let resolved =
+            codex_transcript_from_fd_dir(&fd_dir, &codex_home).expect("resolve transcript");
+
+        assert_eq!(resolved.session_id, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(resolved.path, transcript.display().to_string());
+    }
+
+    #[test]
+    fn codex_fd_resolver_accepts_only_codex_home_jsonl_transcripts() {
+        assert_codex_fd_resolver_accepts_only_codex_home_jsonl_transcripts();
+    }
+
+    // purpose: Verify static Codex transcript path validation is strict.
+    // inputs: Candidate transcript paths with valid and invalid homes, roots, and extensions.
+    // returns/effects: Asserts only Codex-home sessions JSONL files with UUID tokens are accepted.
+    fn assert_codex_transcript_path_requires_codex_sessions_jsonl_with_uuid() {
+        let codex_home = PathBuf::from("/home/user/.codex");
+        assert!(codex_transcript_from_path(
+            Path::new(
+                "/home/user/.codex/sessions/rollout-11111111-2222-3333-4444-555555555555.jsonl"
+            ),
+            &codex_home,
+        )
+        .is_some());
+        assert!(codex_transcript_from_path(
+            Path::new("/home/user/.codex/not-sessions/11111111-2222-3333-4444-555555555555.jsonl"),
+            &codex_home,
+        )
+        .is_none());
+        assert!(codex_transcript_from_path(
+            Path::new("/tmp/sessions/11111111-2222-3333-4444-555555555555.jsonl"),
+            &codex_home,
+        )
+        .is_none());
+        assert!(codex_transcript_from_path(
+            Path::new("/home/user/.codex/sessions/not-a-session.txt"),
+            &codex_home,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_transcript_path_requires_codex_sessions_jsonl_with_uuid() {
+        assert_codex_transcript_path_requires_codex_sessions_jsonl_with_uuid();
     }
 }
