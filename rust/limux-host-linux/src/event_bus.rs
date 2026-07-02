@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 const MAX_EVENTS: usize = 4_096;
 const MAX_EVENT_FRAME_BYTES: usize = 16 * 1024;
 const MAX_EVENT_LOG_BYTES: u64 = 16 * 1024 * 1024;
+const LIVE_SUBSCRIBER_QUEUE_LIMIT: usize = 1_024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
@@ -170,6 +171,14 @@ impl EventBus {
             if events.is_empty() {
                 continue;
             }
+            if events.len() > LIVE_SUBSCRIBER_QUEUE_LIMIT {
+                let frame = slow_consumer_frame(cursor, events.len(), latest_seq);
+                write_frame(writer, &frame)?;
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "event stream slow_consumer pending queue exceeded",
+                ));
+            }
             for event in &events {
                 cursor = event.seq;
                 write_frame(writer, &event.frame)?;
@@ -323,6 +332,28 @@ fn heartbeat_frame(latest_seq: u64) -> Value {
         "boot_id": boot_id(),
         "subscription_id": subscription_id(),
         "latest_seq": latest_seq,
+        "occurred_at": occurred_at(),
+    })
+}
+
+// purpose: Build the terminal error frame for a live subscriber that fell too far behind.
+// inputs: Last delivered cursor, pending matching event count, and latest retained sequence.
+// returns/effects: Returns JSON without mutating event state.
+fn slow_consumer_frame(cursor: u64, pending_count: usize, latest_seq: u64) -> Value {
+    json!({
+        "type": "error",
+        "protocol": "cmux-events",
+        "version": 1,
+        "boot_id": boot_id(),
+        "subscription_id": subscription_id(),
+        "error": {
+            "code": "slow_consumer",
+            "message": "subscriber pending event queue exceeded 1024 events",
+            "cursor": cursor,
+            "pending_count": pending_count,
+            "limit": LIVE_SUBSCRIBER_QUEUE_LIMIT,
+            "latest_seq": latest_seq
+        },
         "occurred_at": occurred_at(),
     })
 }
@@ -521,5 +552,70 @@ mod tests {
         }));
 
         assert_eq!(frame["payload"]["payload_truncated"], true);
+    }
+
+    // purpose: Seed a precise live backlog without depending on thread scheduling.
+    // inputs: Test event bus and a category to match the active stream filters.
+    // returns/effects: Pushes one more pending event than the CMUX live queue limit.
+    fn seed_slow_consumer_pending_events(bus: &EventBus, category: &str) {
+        let mut state = bus.state.lock().expect("event bus lock");
+        for idx in 0..=LIVE_SUBSCRIBER_QUEUE_LIMIT {
+            let seq = idx as u64 + 1;
+            state.events.push_back(EventRecord {
+                frame: json!({
+                    "type": "event",
+                    "seq": seq,
+                    "name": "workspace.selected",
+                    "category": category,
+                    "payload": {}
+                }),
+                seq,
+                name: "workspace.selected".to_string(),
+                category: category.to_string(),
+            });
+            state.next_seq = seq + 1;
+        }
+    }
+
+    #[test]
+    /// purpose: Verify live subscribers are closed when pending events exceed CMUX's queue cap.
+    /// inputs: Test event stream with no replay followed by more than 1,024 matching events.
+    /// returns/effects: Asserts a slow_consumer error frame is emitted and the stream exits.
+    fn live_stream_closes_slow_consumers_after_pending_queue_limit() {
+        let bus = std::sync::Arc::new(EventBus::with_durable_log_path(None));
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let stream_bus = bus.clone();
+        let handle = std::thread::spawn(move || {
+            stream_bus.stream(
+                &json!({ "category": "slow-consumer-test", "include_heartbeats": false }),
+                &mut writer,
+            )
+        });
+
+        let mut reader = std::io::BufReader::new(reader);
+        let mut ack = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut ack).expect("read ack");
+        let frame: Value = serde_json::from_str(ack.trim()).expect("ack json");
+        assert_eq!(frame["type"], "ack");
+
+        seed_slow_consumer_pending_events(&bus, "slow-consumer-test");
+        bus.changed.notify_all();
+
+        let mut error = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut error).expect("read error");
+        let frame: Value = serde_json::from_str(error.trim()).expect("error json");
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["error"]["code"], "slow_consumer");
+        assert_eq!(
+            frame["error"]["pending_count"],
+            LIVE_SUBSCRIBER_QUEUE_LIMIT + 1
+        );
+        assert_eq!(frame["error"]["limit"], LIVE_SUBSCRIBER_QUEUE_LIMIT);
+
+        let result = handle.join().expect("event stream thread");
+        assert!(result
+            .expect_err("slow consumer error")
+            .to_string()
+            .contains("slow_consumer"));
     }
 }
