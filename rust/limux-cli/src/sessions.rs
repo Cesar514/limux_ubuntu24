@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub(super) enum SessionCommandOutput {
     Text(String),
@@ -74,6 +77,7 @@ struct SessionForkDiagnostics {
     transcript_path: Option<String>,
     hook_record_restorable: bool,
     fork_command: Option<String>,
+    fork_supported: bool,
     fork_unavailable_reason: &'static str,
     pid_exists: Option<bool>,
 }
@@ -116,11 +120,18 @@ fn load_session_entries(options: &SessionListOptions) -> Result<(Vec<Value>, Vec
     let mut stores = Vec::new();
     let mut entries = Vec::new();
     let mut codex_index = None;
+    let mut opencode_probe_cache = BTreeMap::new();
     for agent in selected_agents(options.agent) {
         let snapshot =
             agent_hooks::AgentHookSessionStore::snapshot_for_dir(agent, &options.state_dir)?;
         stores.push(render_store_payload(&snapshot));
-        collect_session_entries(options, &snapshot, &mut codex_index, &mut entries)?;
+        collect_session_entries(
+            options,
+            &snapshot,
+            &mut codex_index,
+            &mut opencode_probe_cache,
+            &mut entries,
+        )?;
     }
     entries.sort_by(|left, right| {
         right
@@ -321,6 +332,7 @@ fn collect_session_entries(
     options: &SessionListOptions,
     snapshot: &AgentHookSessionSnapshot,
     codex_index: &mut Option<CodexDebugIndex>,
+    opencode_probe_cache: &mut BTreeMap<String, bool>,
     entries: &mut Vec<SessionEntry>,
 ) -> Result<()> {
     for record in &snapshot.records {
@@ -328,7 +340,7 @@ fn collect_session_entries(
             continue;
         }
         let resolved_record = resolved_session_record(snapshot.agent, record);
-        let mut payload = base_session_payload(snapshot, &resolved_record);
+        let mut payload = base_session_payload(snapshot, &resolved_record, opencode_probe_cache);
         if snapshot.agent == AgentKind::Codex {
             let index =
                 codex_index.get_or_insert_with(|| build_codex_debug_index(&options.codex_home));
@@ -400,9 +412,10 @@ fn resolved_session_record(
 fn base_session_payload(
     snapshot: &AgentHookSessionSnapshot,
     record: &AgentHookSessionRecord,
+    opencode_probe_cache: &mut BTreeMap<String, bool>,
 ) -> Value {
     let launch = record.launch_command.as_ref();
-    let fork = session_fork_diagnostics(snapshot.agent, record);
+    let fork = session_fork_diagnostics(snapshot.agent, record, opencode_probe_cache);
     json!({
         "agent": snapshot.agent.store_name(),
         "agent_display_name": snapshot.agent.label(),
@@ -425,14 +438,13 @@ fn base_session_payload(
         "launch_arguments": launch.map(|launch| launch.arguments.clone()).unwrap_or_default(),
         "fork_command": fork.fork_command,
         "fork_command_available": fork.fork_command.is_some(),
-        "fork_supported": fork.fork_command.is_some(),
+        "fork_supported": fork.fork_supported,
         "fork_unavailable_reason": fork.fork_unavailable_reason,
         "fork_startup_input_available": false,
         "hook_record_restorable": fork.hook_record_restorable,
         "stale_pid_blocks_restore_in_0_64_17": fork.pid_exists == Some(false) && fork.hook_record_restorable,
         "fork_risk": fork.pid_exists == Some(false),
-        "active_for_workspace": false,
-        "active_for_surface": false,
+        "active_for_workspace": false, "active_for_surface": false,
         "active_workspace_session_id": Value::Null,
         "active_surface_session_id": Value::Null,
     })
@@ -444,6 +456,7 @@ fn base_session_payload(
 fn session_fork_diagnostics(
     agent: AgentKind,
     record: &AgentHookSessionRecord,
+    opencode_probe_cache: &mut BTreeMap<String, bool>,
 ) -> SessionForkDiagnostics {
     let transcript_path = session_transcript_path(agent, record);
     let hook_record_restorable = hook_record_restorable(agent, record, transcript_path.as_deref());
@@ -451,13 +464,35 @@ fn session_fork_diagnostics(
     let fork_command = hook_record_restorable
         .then(|| agent_hooks::build_fork_command(agent, &record.session_id, launch, None))
         .flatten();
+    let fork_support = fork_support(agent, record, &fork_command, opencode_probe_cache);
+    let fork_unavailable_reason =
+        fork_unavailable_reason(hook_record_restorable, &fork_command, fork_support);
     SessionForkDiagnostics {
         transcript_path,
         hook_record_restorable,
-        fork_unavailable_reason: fork_unavailable_reason(hook_record_restorable, &fork_command),
         fork_command,
+        fork_supported: fork_support.0,
+        fork_unavailable_reason,
         pid_exists: record.pid.map(stored_pid_exists),
     }
+}
+
+// purpose: Compute CMUX-compatible fork support separate from command rendering.
+// inputs: Agent kind, saved record, optional rendered fork command, and OpenCode probe cache.
+// returns/effects: Returns supported flag and diagnostic reason without mutating session state.
+fn fork_support(
+    agent: AgentKind,
+    record: &AgentHookSessionRecord,
+    fork_command: &Option<String>,
+    opencode_probe_cache: &mut BTreeMap<String, bool>,
+) -> (bool, &'static str) {
+    if fork_command.is_none() {
+        return (false, "agent_has_no_fork_command");
+    }
+    if agent != AgentKind::OpenCode {
+        return (true, "available");
+    }
+    opencode_fork_support(record, opencode_probe_cache)
 }
 
 // purpose: Resolve the transcript path used by session diagnostics.
@@ -501,14 +536,253 @@ fn hook_record_restorable(
 fn fork_unavailable_reason(
     hook_record_restorable: bool,
     fork_command: &Option<String>,
+    fork_support: (bool, &'static str),
 ) -> &'static str {
-    if !hook_record_restorable {
-        "record_marked_non_restorable"
-    } else if fork_command.is_none() {
-        "agent_has_no_fork_command"
-    } else {
-        "available"
+    if fork_support.0 {
+        return "available";
     }
+    if !hook_record_restorable {
+        return "record_marked_non_restorable";
+    }
+    if fork_command.is_none() {
+        return "agent_has_no_fork_command";
+    }
+    fork_support.1
+}
+
+// purpose: Gate local OpenCode fork support on CMUX's minimum fixed version.
+// inputs: Saved OpenCode record and per-command probe cache.
+// returns/effects: Runs at most one bounded local `--version` probe per cache key.
+fn opencode_fork_support(
+    record: &AgentHookSessionRecord,
+    cache: &mut BTreeMap<String, bool>,
+) -> (bool, &'static str) {
+    let Some(launch) = record.launch_command.as_ref() else {
+        return (false, "opencode_version_unverified");
+    };
+    if opencode_launcher_is_omo(launch) {
+        return (true, "available");
+    }
+    let working_directory = launch
+        .cwd
+        .as_deref()
+        .and_then(normalized)
+        .or_else(|| record.cwd.as_deref().and_then(normalized));
+    if working_directory
+        .as_deref()
+        .is_some_and(|cwd| !Path::new(cwd).is_dir())
+    {
+        return (true, "available");
+    }
+    let Some(executable) = opencode_probe_executable(launch) else {
+        return (false, "opencode_version_unverified");
+    };
+    if executable.starts_with('/') && !Path::new(&executable).is_file() {
+        return (false, "opencode_executable_missing");
+    }
+    opencode_local_probe_support(&executable, launch, working_directory.as_deref(), cache)
+}
+
+// purpose: Run or reuse a local OpenCode version probe decision.
+// inputs: Probe executable, launch metadata, optional cwd, and cache.
+// returns/effects: Returns CMUX fork support and reason for local OpenCode records.
+fn opencode_local_probe_support(
+    executable: &str,
+    launch: &agent_hooks::AgentLaunchCommandRecord,
+    working_directory: Option<&str>,
+    cache: &mut BTreeMap<String, bool>,
+) -> (bool, &'static str) {
+    let key = opencode_probe_cache_key(executable, launch, working_directory);
+    let supported = match cache.get(&key) {
+        Some(supported) => *supported,
+        None => {
+            let supported = opencode_version_output(executable, launch, working_directory)
+                .is_some_and(|output| opencode_version_supports_fork(&output));
+            cache.insert(key, supported);
+            supported
+        }
+    };
+    if supported {
+        (true, "available")
+    } else {
+        (false, "opencode_version_unsupported")
+    }
+}
+
+// purpose: Detect OpenCode wrapper launchers that CMUX treats as fork-capable.
+// inputs: Saved launch metadata.
+// returns/effects: Returns true for `omo` launch forms without filesystem probing.
+fn opencode_launcher_is_omo(launch: &agent_hooks::AgentLaunchCommandRecord) -> bool {
+    opencode_probe_executable(launch)
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "omo")
+}
+
+// purpose: Resolve the executable used for OpenCode `--version` probing.
+// inputs: Saved launch metadata.
+// returns/effects: Returns normalized executable or first launch arg.
+fn opencode_probe_executable(launch: &agent_hooks::AgentLaunchCommandRecord) -> Option<String> {
+    normalized(&launch.executable)
+        .or_else(|| launch.arguments.first().and_then(|arg| normalized(arg)))
+}
+
+// purpose: Build a stable OpenCode probe cache key.
+// inputs: Probe executable, saved launch metadata, and working directory.
+// returns/effects: Returns a key covering command, cwd, and relevant safe environment.
+fn opencode_probe_cache_key(
+    executable: &str,
+    launch: &agent_hooks::AgentLaunchCommandRecord,
+    working_directory: Option<&str>,
+) -> String {
+    let environment = opencode_probe_environment(&launch.environment);
+    [
+        executable.to_string(),
+        "--version".to_string(),
+        format!(
+            "PATH={}",
+            environment.get("PATH").cloned().unwrap_or_default()
+        ),
+        format!(
+            "OPENCODE_CONFIG_DIR={}",
+            environment
+                .get("OPENCODE_CONFIG_DIR")
+                .cloned()
+                .unwrap_or_default()
+        ),
+        format!("cwd={}", working_directory.unwrap_or_default()),
+    ]
+    .join("\u{1f}")
+}
+
+// purpose: Run a bounded OpenCode `--version` command.
+// inputs: Executable, saved launch metadata, and optional local cwd.
+// returns/effects: Captures stdout/stderr or kills the process on timeout.
+fn opencode_version_output(
+    executable: &str,
+    launch: &agent_hooks::AgentLaunchCommandRecord,
+    working_directory: Option<&str>,
+) -> Option<String> {
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .env_clear()
+        .envs(opencode_probe_environment(&launch.environment))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = working_directory {
+        command.current_dir(cwd);
+    }
+    command_output_with_timeout(command, Duration::from_secs(3))
+}
+
+// purpose: Capture command output without allowing a diagnostics probe to hang.
+// inputs: Configured command and timeout duration.
+// returns/effects: Returns combined output, terminating the child on timeout.
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<String> {
+    let mut child = command.spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        let Some(status) = child.try_wait().ok()? else {
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        let output = child.wait_with_output().ok()?;
+        if !status.success() {
+            return None;
+        }
+        let mut combined = output.stdout;
+        combined.extend(output.stderr);
+        return String::from_utf8(combined).ok();
+    }
+}
+
+// purpose: Return a nonempty process environment value.
+// inputs: Environment key name.
+// returns/effects: Reads the current process environment without mutation.
+fn nonempty_process_env(key: &str) -> Option<(String, String)> {
+    let value = std::env::var(key).ok()?;
+    (!value.trim().is_empty()).then(|| (key.to_string(), value))
+}
+
+// purpose: Return a nonempty launch environment value.
+// inputs: Launch environment and key name.
+// returns/effects: Clones a safe value when present.
+fn nonempty_launch_env(
+    launch_environment: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<(String, String)> {
+    launch_environment
+        .get(key)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (key.to_string(), value.clone()))
+}
+
+// purpose: Insert a default PATH when the probe environment lacks one.
+// inputs: Mutable environment map.
+// returns/effects: Mutates only when PATH is absent.
+fn ensure_probe_path(environment: &mut BTreeMap<String, String>) {
+    if environment.contains_key("PATH") {
+        return;
+    }
+    environment.insert(
+        "PATH".to_string(),
+        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+    );
+}
+
+// purpose: Build a sanitized environment for OpenCode version probing.
+// inputs: Saved launch environment.
+// returns/effects: Preserves safe process keys plus CMUX-selected launch keys.
+fn opencode_probe_environment(
+    launch_environment: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::new();
+    for key in [
+        "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "TMPDIR", "USER",
+    ] {
+        if let Some((key, value)) = nonempty_process_env(key) {
+            environment.insert(key, value);
+        }
+    }
+    for key in ["OPENCODE_CONFIG_DIR", "PATH"] {
+        if let Some((key, value)) = nonempty_launch_env(launch_environment, key) {
+            environment.insert(key, value);
+        }
+    }
+    ensure_probe_path(&mut environment);
+    environment
+}
+
+// purpose: Parse OpenCode version output using CMUX's minimum fork-fixed version.
+// inputs: Raw `opencode --version` output.
+// returns/effects: Returns true for versions >= 1.14.50.
+fn opencode_version_supports_fork(output: &str) -> bool {
+    let Some((major, minor, patch)) = first_semver(output) else {
+        return false;
+    };
+    (major, minor, patch) >= (1, 14, 50)
+}
+
+// purpose: Find the first semantic version triple in command output.
+// inputs: Arbitrary process output.
+// returns/effects: Returns the first major/minor/patch tuple when parseable.
+fn first_semver(output: &str) -> Option<(u64, u64, u64)> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        let mut parts = token.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    })
 }
 
 // purpose: Find a Claude transcript in known Claude config roots.
@@ -1221,6 +1495,7 @@ mod tests {
     use super::*;
     use crate::agent_hooks::{AgentHookSessionStore, AgentLaunchCommandRecord};
     use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     struct ClaudeSeed {
@@ -1338,6 +1613,128 @@ mod tests {
     #[test]
     fn sessions_list_json_includes_fork_command() {
         assert_sessions_list_json_includes_fork_command();
+    }
+
+    // purpose: Exercise CMUX OpenCode minimum version parsing for fork support.
+    // inputs: Representative OpenCode version command outputs.
+    // returns/effects: Asserts only versions at or above 1.14.50 are accepted.
+    fn assert_opencode_version_supports_fork_threshold() {
+        assert!(!opencode_version_supports_fork("opencode 1.14.48"));
+        assert!(opencode_version_supports_fork("opencode 1.14.50"));
+        assert!(opencode_version_supports_fork("opencode version 1.15.0"));
+        assert!(!opencode_version_supports_fork("not a version"));
+    }
+
+    #[test]
+    fn opencode_version_supports_fork_threshold() {
+        assert_opencode_version_supports_fork_threshold();
+    }
+
+    // purpose: Exercise local OpenCode version probe support diagnostics.
+    // inputs: Temporary executable reporting a fork-capable OpenCode version.
+    // returns/effects: Asserts fork command remains available and fork is supported.
+    fn assert_opencode_supported_version_enables_fork() {
+        let dir =
+            seed_versioned_opencode_record("opencode-session-supported", "opencode 1.14.50\n");
+        let value = sessions_json_for(dir.path(), "opencode", "opencode-session-supported");
+        assert_opencode_session_fork_state(&value, true, true, "available");
+    }
+
+    #[test]
+    fn opencode_supported_version_enables_fork() {
+        assert_opencode_supported_version_enables_fork();
+    }
+
+    // purpose: Exercise local OpenCode version probe rejection diagnostics.
+    // inputs: Temporary executable reporting an OpenCode version before the fork fix.
+    // returns/effects: Asserts command is renderable but fork support is false.
+    fn assert_opencode_unsupported_version_disables_fork_support() {
+        let dir =
+            seed_versioned_opencode_record("opencode-session-unsupported", "opencode 1.14.48\n");
+        let value = sessions_json_for(dir.path(), "opencode", "opencode-session-unsupported");
+        assert_opencode_session_fork_state(&value, true, false, "opencode_version_unsupported");
+    }
+
+    #[test]
+    fn opencode_unsupported_version_disables_fork_support() {
+        assert_opencode_unsupported_version_disables_fork_support();
+    }
+
+    // purpose: Exercise CMUX remote-like OpenCode bypass behavior.
+    // inputs: Missing local working directory with an otherwise normal launch record.
+    // returns/effects: Asserts fork support is trusted without a local version probe.
+    fn assert_opencode_remote_like_context_bypasses_local_probe() {
+        let dir = tempdir().expect("tempdir");
+        let remote_cwd = dir.path().join("remote-project-does-not-exist");
+        seed_opencode_record(
+            dir.path(),
+            "opencode-session-remote",
+            &remote_cwd,
+            "/remote/bin/opencode",
+            BTreeMap::from([("PATH".to_string(), "/remote/bin:/usr/bin".to_string())]),
+        );
+
+        let value = sessions_json_for(dir.path(), "opencode", "opencode-session-remote");
+        assert_opencode_session_fork_state(&value, true, true, "available");
+    }
+
+    #[test]
+    fn opencode_remote_like_context_bypasses_local_probe() {
+        assert_opencode_remote_like_context_bypasses_local_probe();
+    }
+
+    // purpose: Exercise CMUX missing absolute OpenCode executable rejection.
+    // inputs: Local cwd and absent absolute executable path.
+    // returns/effects: Asserts fork command is renderable but marked unsupported.
+    fn assert_opencode_missing_absolute_executable_disables_fork_support() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-opencode");
+        seed_opencode_record(
+            dir.path(),
+            "opencode-session-missing",
+            dir.path(),
+            &missing,
+            BTreeMap::new(),
+        );
+
+        let value = sessions_json_for(dir.path(), "opencode", "opencode-session-missing");
+        assert_opencode_session_fork_state(&value, true, false, "opencode_executable_missing");
+    }
+
+    // purpose: Seed an OpenCode record backed by a local version-printing executable.
+    // inputs: Session id and version probe output.
+    // returns/effects: Returns a tempdir containing the hook store and probe executable.
+    fn seed_versioned_opencode_record(session_id: &str, version_output: &str) -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        let executable = write_opencode_probe(dir.path(), version_output);
+        seed_opencode_record(
+            dir.path(),
+            session_id,
+            dir.path(),
+            &executable,
+            BTreeMap::from([("PATH".to_string(), dir.path().display().to_string())]),
+        );
+        dir
+    }
+
+    // purpose: Assert OpenCode fork support diagnostics for the first session row.
+    // inputs: Rendered sessions JSON and expected diagnostic values.
+    // returns/effects: Panics if any fork diagnostic diverges.
+    fn assert_opencode_session_fork_state(
+        value: &Value,
+        command_available: bool,
+        supported: bool,
+        reason: &str,
+    ) {
+        let session = &value["sessions"][0];
+        assert_eq!(session["fork_command_available"], command_available);
+        assert_eq!(session["fork_supported"], supported);
+        assert_eq!(session["fork_unavailable_reason"], reason);
+    }
+
+    #[test]
+    fn opencode_missing_absolute_executable_disables_fork_support() {
+        assert_opencode_missing_absolute_executable_disables_fork_support();
     }
 
     // purpose: Exercise CMUX Claude transcript trust behavior for session diagnostics.
@@ -1492,6 +1889,58 @@ mod tests {
     #[test]
     fn claude_workflow_container_resolves_single_sibling_transcript() {
         assert_claude_workflow_container_resolves_single_sibling_transcript();
+    }
+
+    // purpose: Create a temporary OpenCode probe executable for session diagnostics tests.
+    // inputs: Directory where the executable should live and output to print.
+    // returns/effects: Writes an executable shell script and returns its path.
+    fn write_opencode_probe(dir: &Path, output: &str) -> PathBuf {
+        let executable = dir.join("opencode");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                output.replace('\'', "'\\''")
+            ),
+        )
+        .expect("probe executable");
+        let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("permissions");
+        executable
+    }
+
+    // purpose: Seed one OpenCode session record for fork-support diagnostics tests.
+    // inputs: Hook state dir, session id, cwd, executable, and preserved environment.
+    // returns/effects: Writes one OpenCode hook store record.
+    fn seed_opencode_record(
+        dir: &Path,
+        session_id: &str,
+        cwd: &Path,
+        executable: impl AsRef<Path>,
+        environment: BTreeMap<String, String>,
+    ) {
+        let executable = executable.as_ref().display().to_string();
+        let store = AgentHookSessionStore::new_for_dir("opencode", dir);
+        store
+            .upsert(AgentHookSessionRecord {
+                session_id: session_id.to_string(),
+                workspace_id: "workspace-opencode".to_string(),
+                surface_id: "surface-opencode".to_string(),
+                cwd: Some(cwd.display().to_string()),
+                pid: None,
+                is_restorable: Some(true),
+                transcript_path: None,
+                launch_command: Some(AgentLaunchCommandRecord {
+                    executable: executable.clone(),
+                    arguments: vec![executable],
+                    cwd: Some(cwd.display().to_string()),
+                    environment,
+                    captured_at: 1.0,
+                }),
+                updated_at: 10.0,
+            })
+            .expect("seed opencode record");
     }
 
     // purpose: Seed one Claude session record for diagnostics tests.
