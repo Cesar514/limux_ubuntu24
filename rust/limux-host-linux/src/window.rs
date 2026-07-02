@@ -17537,7 +17537,7 @@ fn split_pane(
     orientation: gtk::Orientation,
     options: SplitPaneOptions,
 ) -> Option<gtk::Widget> {
-    let (shortcuts, wd, container) = {
+    let (shortcuts, workspace_wd, container) = {
         let s = state.borrow();
         (
             s.shortcuts.clone(),
@@ -17555,6 +17555,7 @@ fn split_pane(
     if !container.can_split(pane_widget, orientation) {
         return None;
     }
+    let wd = pane::inherited_working_directory_for_pane(pane_widget).or(workspace_wd);
 
     let new_pane = create_pane_for_workspace(
         state,

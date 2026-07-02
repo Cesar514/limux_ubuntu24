@@ -888,7 +888,10 @@ pub fn create_pane(
         let internals = internals.clone();
         let wd = ws_wd.clone();
         new_term_btn.connect_clicked(move |_| {
-            let dir = wd.borrow().clone();
+            let active_dir = active_terminal_working_directory(&internals);
+            let pane_dir = wd.borrow().clone();
+            let dir =
+                inherited_terminal_working_directory(active_dir.as_deref(), pane_dir.as_deref());
             add_terminal_tab_inner(&internals, dir.as_deref(), None);
         });
     }
@@ -1209,6 +1212,19 @@ impl TabState {
     fn find_tab_mut(&mut self, id: &str) -> Option<&mut TabEntry> {
         self.tabs.iter_mut().find(|e| e.id == id)
     }
+}
+
+// purpose: Pick the startup cwd for new terminal tabs created from an existing pane.
+// inputs: Active terminal cwd and pane/workspace fallback cwd.
+// returns/effects: Returns active terminal cwd first so resumed agents preserve split/new-tab cwd.
+fn inherited_terminal_working_directory(
+    active_terminal_cwd: Option<&str>,
+    pane_working_directory: Option<&str>,
+) -> Option<String> {
+    active_terminal_cwd
+        .filter(|cwd| !cwd.trim().is_empty())
+        .or_else(|| pane_working_directory.filter(|cwd| !cwd.trim().is_empty()))
+        .map(ToOwned::to_owned)
 }
 
 fn next_tab_id() -> String {
@@ -2023,7 +2039,7 @@ fn activate_custom_sidebar_tab_if_requested(
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
     if let Some(internals) = find_pane_internals(pane_widget) {
-        let dir = internals.working_directory.borrow().clone();
+        let dir = inherited_working_directory_for_pane(pane_widget);
         add_terminal_tab_inner(&internals, dir.as_deref(), None);
     }
 }
@@ -2035,13 +2051,13 @@ pub fn add_terminal_tab_to_pane_with_command(
     activate: bool,
 ) -> Option<SurfaceSummary> {
     let internals = find_pane_internals(pane_widget)?;
-    let dir = internals.working_directory.borrow().clone();
+    let dir = inherited_working_directory_for_pane(pane_widget);
     let options = if command.is_some() || !activate {
         Some(TerminalTabOptions {
             id: None,
             custom_name: None,
             pinned: false,
-            cwd: None,
+            cwd: dir.as_deref(),
             agent: None,
             startup_command: command,
             extra_env: Vec::new(),
@@ -2079,19 +2095,19 @@ pub fn add_terminal_tab_to_pane_with_launch_options(
     launch: TerminalLaunchOptions,
 ) -> Option<SurfaceSummary> {
     let internals = find_pane_internals(pane_widget)?;
-    let fallback_dir = internals.working_directory.borrow().clone();
     let cwd = launch
         .working_directory
         .as_deref()
-        .or(fallback_dir.as_deref());
+        .map(ToOwned::to_owned)
+        .or_else(|| inherited_working_directory_for_pane(pane_widget));
     let tab_id = add_terminal_tab_inner(
         &internals,
-        cwd,
+        cwd.as_deref(),
         Some(TerminalTabOptions {
             id: None,
             custom_name: None,
             pinned: false,
-            cwd,
+            cwd: cwd.as_deref(),
             agent: None,
             startup_command: launch.command,
             extra_env: launch.extra_env,
@@ -2393,6 +2409,34 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
         TabKind::Browser { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => None,
     }
+}
+
+// purpose: Read the active terminal surface cwd from a pane.
+// inputs: Pane internals containing active tab and tab metadata.
+// returns/effects: Returns None for non-terminal active tabs or empty cwd values.
+fn active_terminal_working_directory(internals: &Rc<PaneInternals>) -> Option<String> {
+    let tab_state = internals.tab_state.borrow();
+    let active_tab = tab_state.active_tab.as_deref()?;
+    let entry = tab_state.tabs.iter().find(|entry| entry.id == active_tab)?;
+    match &entry.kind {
+        TabKind::Terminal { state } => state
+            .cwd
+            .borrow()
+            .as_ref()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .cloned(),
+        TabKind::Browser { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => None,
+    }
+}
+
+// purpose: Resolve the default cwd for new tabs or splits derived from a pane.
+// inputs: Pane widget containing terminal-tab cwd state and pane fallback cwd.
+// returns/effects: Returns active terminal cwd first, then pane/workspace cwd.
+pub fn inherited_working_directory_for_pane(pane_widget: &gtk::Widget) -> Option<String> {
+    let internals = find_pane_internals(pane_widget)?;
+    let active_dir = active_terminal_working_directory(&internals);
+    let pane_dir = internals.working_directory.borrow().clone();
+    inherited_terminal_working_directory(active_dir.as_deref(), pane_dir.as_deref())
 }
 
 /// purpose: Update the tracked working directory for a terminal surface.
@@ -5682,13 +5726,14 @@ mod tests {
     use super::{
         append_git_watch_env, browser_diagnostics_snapshot, classify_content_drop_zone,
         codex_wrapper_root, content_drop_preview_rect, effective_drop_target_dimensions,
-        install_codex_wrapper_env, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        push_browser_diagnostic, surface_hint_matches, write_executable_file,
-        BrowserDiagnosticsBuffer, ContentDropZone, TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT,
-        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
-        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, CODEX_WRAPPER_SCRIPT,
-        HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
+        inherited_terminal_working_directory, install_codex_wrapper_env, is_localhost_input,
+        next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, push_browser_diagnostic,
+        surface_hint_matches, write_executable_file, BrowserDiagnosticsBuffer, ContentDropZone,
+        TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
+        BROWSER_URL_ENTRY_CSS_CLASSES, CODEX_WRAPPER_SCRIPT, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -5846,6 +5891,26 @@ mod tests {
         append_git_watch_env(&config, &mut env);
         assert_eq!(env_value(&env, "CMUX_NO_GIT_WATCH"), "1");
         assert_eq!(env_value(&env, "CMUX_NO_PR_WATCH"), "1");
+    }
+
+    // purpose: Verify CMUX split/new-tab cwd inheritance prefers the active terminal cwd.
+    // inputs: Active terminal cwd and pane/workspace fallback cwd combinations.
+    // returns/effects: Asserts active cwd wins while empty values fall back.
+    #[test]
+    fn inherited_terminal_working_directory_prefers_active_terminal_cwd() {
+        assert_eq!(
+            inherited_terminal_working_directory(Some("/tmp/agent"), Some("/tmp/workspace")),
+            Some("/tmp/agent".to_string())
+        );
+        assert_eq!(
+            inherited_terminal_working_directory(Some("  "), Some("/tmp/workspace")),
+            Some("/tmp/workspace".to_string())
+        );
+        assert_eq!(
+            inherited_terminal_working_directory(None, Some("/tmp/workspace")),
+            Some("/tmp/workspace".to_string())
+        );
+        assert_eq!(inherited_terminal_working_directory(None, Some(" ")), None);
     }
 
     #[test]
