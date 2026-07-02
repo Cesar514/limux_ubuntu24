@@ -149,6 +149,21 @@ pub enum NotificationSound {
     Bell,
     Complete,
     Alert,
+    Basso,
+    Blow,
+    Bottle,
+    Frog,
+    Funk,
+    Glass,
+    Hero,
+    Morse,
+    Ping,
+    Pop,
+    Purr,
+    Sosumi,
+    Submarine,
+    Tink,
+    CustomFile,
     None,
 }
 
@@ -160,12 +175,49 @@ impl NotificationSound {
             Self::Bell => "bell",
             Self::Complete => "complete",
             Self::Alert => "alert",
+            Self::Basso => "Basso",
+            Self::Blow => "Blow",
+            Self::Bottle => "Bottle",
+            Self::Frog => "Frog",
+            Self::Funk => "Funk",
+            Self::Glass => "Glass",
+            Self::Hero => "Hero",
+            Self::Morse => "Morse",
+            Self::Ping => "Ping",
+            Self::Pop => "Pop",
+            Self::Purr => "Purr",
+            Self::Sosumi => "Sosumi",
+            Self::Submarine => "Submarine",
+            Self::Tink => "Tink",
+            Self::CustomFile => "custom_file",
             Self::None => "none",
         }
     }
 
     pub fn labels() -> &'static [&'static str] {
-        &["Default", "Message", "Bell", "Complete", "Alert", "None"]
+        &[
+            "Default",
+            "Message",
+            "Bell",
+            "Complete",
+            "Alert",
+            "Basso",
+            "Blow",
+            "Bottle",
+            "Frog",
+            "Funk",
+            "Glass",
+            "Hero",
+            "Morse",
+            "Ping",
+            "Pop",
+            "Purr",
+            "Sosumi",
+            "Submarine",
+            "Tink",
+            "Custom file",
+            "None",
+        ]
     }
 
     pub fn dropdown_index(self) -> u32 {
@@ -175,7 +227,22 @@ impl NotificationSound {
             Self::Bell => 2,
             Self::Complete => 3,
             Self::Alert => 4,
-            Self::None => 5,
+            Self::Basso => 5,
+            Self::Blow => 6,
+            Self::Bottle => 7,
+            Self::Frog => 8,
+            Self::Funk => 9,
+            Self::Glass => 10,
+            Self::Hero => 11,
+            Self::Morse => 12,
+            Self::Ping => 13,
+            Self::Pop => 14,
+            Self::Purr => 15,
+            Self::Sosumi => 16,
+            Self::Submarine => 17,
+            Self::Tink => 18,
+            Self::CustomFile => 19,
+            Self::None => 20,
         }
     }
 
@@ -185,7 +252,22 @@ impl NotificationSound {
             2 => Self::Bell,
             3 => Self::Complete,
             4 => Self::Alert,
-            5 => Self::None,
+            5 => Self::Basso,
+            6 => Self::Blow,
+            7 => Self::Bottle,
+            8 => Self::Frog,
+            9 => Self::Funk,
+            10 => Self::Glass,
+            11 => Self::Hero,
+            12 => Self::Morse,
+            13 => Self::Ping,
+            14 => Self::Pop,
+            15 => Self::Purr,
+            16 => Self::Sosumi,
+            17 => Self::Submarine,
+            18 => Self::Tink,
+            19 => Self::CustomFile,
+            20 => Self::None,
             _ => Self::Default,
         }
     }
@@ -197,6 +279,21 @@ impl NotificationSound {
             Self::Bell => Some("bell-terminal"),
             Self::Complete => Some("complete"),
             Self::Alert => Some("dialog-warning"),
+            Self::Basso => Some("Basso"),
+            Self::Blow => Some("Blow"),
+            Self::Bottle => Some("Bottle"),
+            Self::Frog => Some("Frog"),
+            Self::Funk => Some("Funk"),
+            Self::Glass => Some("Glass"),
+            Self::Hero => Some("Hero"),
+            Self::Morse => Some("Morse"),
+            Self::Ping => Some("Ping"),
+            Self::Pop => Some("Pop"),
+            Self::Purr => Some("Purr"),
+            Self::Sosumi => Some("Sosumi"),
+            Self::Submarine => Some("Submarine"),
+            Self::Tink => Some("Tink"),
+            Self::CustomFile => None,
         }
     }
 
@@ -207,6 +304,21 @@ impl NotificationSound {
             "bell" => Some(Self::Bell),
             "complete" => Some(Self::Complete),
             "alert" => Some(Self::Alert),
+            "Basso" => Some(Self::Basso),
+            "Blow" => Some(Self::Blow),
+            "Bottle" => Some(Self::Bottle),
+            "Frog" => Some(Self::Frog),
+            "Funk" => Some(Self::Funk),
+            "Glass" => Some(Self::Glass),
+            "Hero" => Some(Self::Hero),
+            "Morse" => Some(Self::Morse),
+            "Ping" => Some(Self::Ping),
+            "Pop" => Some(Self::Pop),
+            "Purr" => Some(Self::Purr),
+            "Sosumi" => Some(Self::Sosumi),
+            "Submarine" => Some(Self::Submarine),
+            "Tink" => Some(Self::Tink),
+            "custom_file" => Some(Self::CustomFile),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -217,6 +329,7 @@ impl NotificationSound {
 pub struct NotificationConfig {
     pub enabled: bool,
     pub sound: NotificationSound,
+    pub custom_sound_file_path: String,
     pub hooks: Vec<NotificationHookConfig>,
     pub agent_permission_prompt: bool,
     pub agent_turn_complete: AgentTurnCompleteMode,
@@ -283,6 +396,7 @@ impl Default for NotificationConfig {
         Self {
             enabled: true,
             sound: NotificationSound::Default,
+            custom_sound_file_path: String::new(),
             hooks: Vec::new(),
             agent_permission_prompt: true,
             agent_turn_complete: AgentTurnCompleteMode::WhenIdle,
@@ -383,9 +497,12 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .unwrap_or(notification_defaults.enabled);
     let notification_sound = notifications
         .and_then(|notifications| notifications.get("sound"))
-        .and_then(Value::as_str)
-        .and_then(NotificationSound::from_str)
+        .map(|value| parse_notification_sound(value, "notifications.sound"))
         .unwrap_or(notification_defaults.sound);
+    let custom_sound_file_path = notifications
+        .and_then(|notifications| notifications.get("customSoundFilePath"))
+        .map(|value| parse_string_setting(value, "notifications.customSoundFilePath"))
+        .unwrap_or_default();
     let notification_hooks = notifications
         .and_then(|notifications| notifications.get("hooks"))
         .map(parse_notification_hooks)
@@ -424,6 +541,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         notifications: NotificationConfig {
             enabled: notifications_enabled,
             sound: notification_sound,
+            custom_sound_file_path,
             hooks: notification_hooks,
             agent_permission_prompt,
             agent_turn_complete,
@@ -442,6 +560,31 @@ fn parse_bool_setting(value: &Value, path: &str) -> bool {
     value
         .as_bool()
         .unwrap_or_else(|| panic!("{path} must be a boolean"))
+}
+
+// purpose: Parse a required string setting value without silent coercion.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the owned string or panics for malformed existing config.
+fn parse_string_setting(value: &Value, path: &str) -> String {
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"))
+        .to_string()
+}
+
+// purpose: Parse CMUX-compatible notification sound names.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the selected sound or panics for malformed existing config.
+fn parse_notification_sound(value: &Value, path: &str) -> NotificationSound {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    NotificationSound::from_str(raw).unwrap_or_else(|| {
+        panic!(
+            "{path} must be one of default, message, bell, complete, alert, \
+             CMUX presets, custom_file, or none"
+        )
+    })
 }
 
 // purpose: Parse CMUX's agent turn-complete notification mode.
@@ -745,6 +888,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!({
             "enabled": config.notifications.enabled,
             "sound": config.notifications.sound.as_str(),
+            "customSoundFilePath": config.notifications.custom_sound_file_path.clone(),
             "agentPermissionPrompt": config.notifications.agent_permission_prompt,
             "agentTurnComplete": config.notifications.agent_turn_complete.as_str(),
             "agentIdleReminder": config.notifications.agent_idle_reminder,
@@ -1010,6 +1154,7 @@ mod tests {
   "notifications": {
     "enabled": false,
     "sound": "bell",
+    "customSoundFilePath": "/tmp/notify.wav",
     "agentPermissionPrompt": false,
     "agentTurnComplete": "always",
     "agentIdleReminder": false
@@ -1024,12 +1169,53 @@ mod tests {
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.config.notifications.enabled);
         assert_eq!(loaded.config.notifications.sound, NotificationSound::Bell);
+        assert_eq!(
+            loaded.config.notifications.custom_sound_file_path,
+            "/tmp/notify.wav"
+        );
         assert!(!loaded.config.notifications.agent_permission_prompt);
         assert_eq!(
             loaded.config.notifications.agent_turn_complete,
             AgentTurnCompleteMode::Always
         );
         assert!(!loaded.config.notifications.agent_idle_reminder);
+    }
+
+    #[test]
+    fn load_from_path_reads_cmux_notification_sound_presets() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "notifications": {
+    "sound": "Ping",
+    "customSoundFilePath": "/tmp/notify.wav"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.config.notifications.sound, NotificationSound::Ping);
+        assert_eq!(
+            loaded.config.notifications.custom_sound_file_path,
+            "/tmp/notify.wav"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "notifications.sound must be one of")]
+    fn load_from_path_rejects_invalid_notification_sound() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"notifications":{"sound":"Loud"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
     }
 
     #[test]
@@ -1382,6 +1568,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.notifications.enabled = false;
         config.notifications.sound = NotificationSound::Alert;
+        config.notifications.custom_sound_file_path = "/tmp/notify.wav".to_string();
         config.notifications.agent_permission_prompt = false;
         config.notifications.agent_turn_complete = AgentTurnCompleteMode::Never;
         config.notifications.agent_idle_reminder = false;
@@ -1393,6 +1580,10 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("alert".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["customSoundFilePath"],
+            Value::String("/tmp/notify.wav".to_string())
         );
         assert_eq!(
             parsed["notifications"]["agentPermissionPrompt"],
@@ -1467,6 +1658,11 @@ mod tests {
             NotificationSound::Alert.freedesktop_sound_name(),
             Some("dialog-warning")
         );
+        assert_eq!(
+            NotificationSound::Ping.freedesktop_sound_name(),
+            Some("Ping")
+        );
+        assert_eq!(NotificationSound::CustomFile.freedesktop_sound_name(), None);
         assert_eq!(NotificationSound::Default.freedesktop_sound_name(), None);
         assert_eq!(NotificationSound::None.freedesktop_sound_name(), None);
     }

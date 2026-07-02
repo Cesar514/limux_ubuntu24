@@ -1459,6 +1459,8 @@ const SURFACE_TAB_BAR_FONT_SIZE: FontSizeSetting = FontSizeSetting {
 enum NotificationSettingKind {
     Bool { default: bool },
     TurnComplete,
+    Sound,
+    String { default: &'static str },
 }
 
 #[derive(Clone, Copy)]
@@ -1479,6 +1481,18 @@ const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
     kind: NotificationSettingKind::Bool { default: true },
+};
+
+const NOTIFICATION_SOUND_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.sound",
+    json_key: "sound",
+    kind: NotificationSettingKind::Sound,
+};
+
+const NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.customSoundFilePath",
+    json_key: "customSoundFilePath",
+    kind: NotificationSettingKind::String { default: "" },
 };
 
 const AGENT_TURN_COMPLETE_SETTING: NotificationSetting = NotificationSetting {
@@ -1507,12 +1521,14 @@ const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = Placem
 
 const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement> <value>"
@@ -1534,6 +1550,8 @@ fn font_size_setting(raw: &str) -> Option<FontSizeSetting> {
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn notification_setting(raw: &str) -> Option<NotificationSetting> {
     match raw {
+        "notifications.sound" => Some(NOTIFICATION_SOUND_SETTING),
+        "notifications.customSoundFilePath" => Some(NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING),
         "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
         "notifications.agentTurnComplete" => Some(AGENT_TURN_COMPLETE_SETTING),
         "notifications.agentIdleReminder" => Some(AGENT_IDLE_REMINDER_SETTING),
@@ -1777,6 +1795,8 @@ fn default_notification_setting_value(setting: NotificationSetting) -> &'static 
         NotificationSettingKind::Bool { default: true } => "true",
         NotificationSettingKind::Bool { default: false } => "false",
         NotificationSettingKind::TurnComplete => "whenIdle",
+        NotificationSettingKind::Sound => "default",
+        NotificationSettingKind::String { default } => default,
     }
 }
 
@@ -1795,6 +1815,16 @@ fn parse_notification_setting_value(setting: NotificationSetting, value: &Value)
                 .ok_or_else(|| anyhow!("{} must be whenIdle, always, or never", setting.key))?;
             parse_agent_turn_complete_value(raw, setting.key).map(str::to_string)
         }
+        NotificationSettingKind::Sound => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be a string", setting.key))?;
+            parse_notification_sound_value(raw, setting.key).map(str::to_string)
+        }
+        NotificationSettingKind::String { .. } => value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{} must be a string", setting.key)),
     }
 }
 
@@ -1811,6 +1841,10 @@ fn notification_setting_json_value(setting: NotificationSetting, raw: &str) -> R
         NotificationSettingKind::TurnComplete => Ok(Value::String(
             parse_agent_turn_complete_value(raw, setting.key)?.to_string(),
         )),
+        NotificationSettingKind::Sound => Ok(Value::String(
+            parse_notification_sound_value(raw, setting.key)?.to_string(),
+        )),
+        NotificationSettingKind::String { .. } => Ok(Value::String(raw.to_string())),
     }
 }
 
@@ -1821,6 +1855,21 @@ fn parse_agent_turn_complete_value<'a>(raw: &'a str, key: &str) -> Result<&'a st
     match raw {
         "whenIdle" | "always" | "never" => Ok(raw),
         _ => bail!("{key} must be whenIdle, always, or never"),
+    }
+}
+
+// purpose: Validate CMUX notification sound preset strings.
+// inputs: Raw setting value and key for error context.
+// returns/effects: Returns the canonical value or a loud config error.
+fn parse_notification_sound_value<'a>(raw: &'a str, key: &str) -> Result<&'a str> {
+    match raw {
+        "default" | "message" | "bell" | "complete" | "alert" | "Basso" | "Blow" | "Bottle"
+        | "Frog" | "Funk" | "Glass" | "Hero" | "Morse" | "Ping" | "Pop" | "Purr" | "Sosumi"
+        | "Submarine" | "Tink" | "custom_file" | "none" => Ok(raw),
+        _ => bail!(
+            "{key} must be default, message, bell, complete, alert, a CMUX preset, \
+             custom_file, or none"
+        ),
     }
 }
 
@@ -15066,16 +15115,34 @@ mod cli_arg_tests {
         let text = render_config_notification_get(&path, AGENT_PERMISSION_PROMPT_SETTING)
             .expect("get default permission prompt");
         assert!(text.contains("notifications.agentPermissionPrompt = true"));
+        let text = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
+            .expect("get default notification sound");
+        assert!(text.contains("notifications.sound = default"));
 
         fs::write(&path, br#"{"app":{"newWorkspacePlacement":"end"}}"#).expect("write settings");
         let text = render_config_notification_set(&path, AGENT_TURN_COMPLETE_SETTING, "always")
             .expect("set turn complete");
         assert!(text.contains("notifications.agentTurnComplete = always"));
+        let text = render_config_notification_set(&path, NOTIFICATION_SOUND_SETTING, "Ping")
+            .expect("set sound");
+        assert!(text.contains("notifications.sound = Ping"));
+        let text = render_config_notification_set(
+            &path,
+            NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING,
+            "/tmp/notify.wav",
+        )
+        .expect("set custom sound path");
+        assert!(text.contains("notifications.customSoundFilePath = /tmp/notify.wav"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
         assert_eq!(parsed["app"]["newWorkspacePlacement"], "end");
         assert_eq!(parsed["notifications"]["agentTurnComplete"], "always");
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+        assert_eq!(
+            parsed["notifications"]["customSoundFilePath"],
+            "/tmp/notify.wav"
+        );
     }
 
     #[test]
@@ -15093,11 +15160,20 @@ mod cli_arg_tests {
             .to_string()
             .contains("must be whenIdle, always, or never"));
 
+        let err = render_config_notification_set(&path, NOTIFICATION_SOUND_SETTING, "Loud")
+            .expect_err("invalid sound");
+        assert!(err.to_string().contains("must be default"));
+
         fs::write(&path, br#"{"notifications":{"agentIdleReminder":"true"}}"#)
             .expect("write malformed settings");
         let err = render_config_notification_get(&path, AGENT_IDLE_REMINDER_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+
+        fs::write(&path, br#"{"notifications":{"sound":false}}"#).expect("write malformed sound");
+        let err = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
+            .expect_err("invalid existing sound");
+        assert!(err.to_string().contains("must be a string"));
     }
 
     #[test]

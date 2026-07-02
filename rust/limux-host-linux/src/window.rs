@@ -2610,6 +2610,7 @@ struct DesktopNotificationRequest {
     summary: String,
     body: String,
     sound: app_config::NotificationSound,
+    custom_sound_file_path: String,
     target: DesktopNotificationTarget,
     feed_actions: Vec<crate::feed::FeedNotificationAction>,
 }
@@ -10986,6 +10987,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                         } else {
                             app_config::NotificationSound::None
                         },
+                        custom_sound_file_path: notification_config.custom_sound_file_path.clone(),
                         target: desktop_target,
                         feed_actions: feed_actions.clone(),
                     },
@@ -13160,6 +13162,7 @@ fn mark_workspace_unread_with_message(
             summary: ws.name.clone(),
             body: message.to_string(),
             sound: notifications.sound,
+            custom_sound_file_path: notifications.custom_sound_file_path.clone(),
             target: target.clone(),
             feed_actions,
         });
@@ -13186,11 +13189,20 @@ fn mark_workspace_unread_with_message(
 
 fn desktop_notification_hints(
     sound: app_config::NotificationSound,
+    custom_sound_file_path: &str,
 ) -> HashMap<String, glib::Variant> {
     let mut hints = HashMap::from([("desktop-entry".to_string(), crate::APP_ID.to_variant())]);
 
     match sound {
         app_config::NotificationSound::Default => {}
+        app_config::NotificationSound::CustomFile => {
+            if !custom_sound_file_path.trim().is_empty() {
+                hints.insert(
+                    "sound-file".to_string(),
+                    custom_sound_file_path.to_variant(),
+                );
+            }
+        }
         app_config::NotificationSound::None => {
             hints.insert("suppress-sound".to_string(), true.to_variant());
         }
@@ -13259,7 +13271,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
                 request.summary.as_str(),
                 request.body.as_str(),
                 actions,
-                desktop_notification_hints(request.sound),
+                desktop_notification_hints(request.sound, &request.custom_sound_file_path),
                 DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
             )
                 .to_variant();
@@ -13307,11 +13319,11 @@ mod tests {
         browser_styles_script, build_window_css, clamp_workspace_insert_index_for_pinning,
         desktop_notification_action_entries, desktop_notification_action_from_signal,
         desktop_notification_actions, desktop_notification_activation_token_from_signal,
-        desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, feed_exit_plan_action_specs,
-        feed_question_action_specs, font_size_after_delta, ghostty_prefers_dark,
-        gtk_system_prefers_dark_from_raw, host_notification_row, limit_text_to_last_lines,
-        next_active_workspace_index, notification_hook_policy_payload,
+        desktop_notification_closed_id_from_signal, desktop_notification_hints,
+        desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
+        feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
+        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
         pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
         publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
@@ -13337,7 +13349,7 @@ mod tests {
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
-    use crate::app_config::WorkspaceGroupNewPlacement;
+    use crate::app_config::{NotificationSound, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{
         LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
@@ -13840,6 +13852,25 @@ mod tests {
             desktop_notification_actions(),
             vec!["default".to_string(), "Open".to_string()]
         );
+    }
+
+    #[test]
+    fn desktop_notification_hints_include_cmux_sound_and_custom_file() {
+        let ping_hints = desktop_notification_hints(NotificationSound::Ping, "");
+        assert_eq!(
+            ping_hints.get("sound-name").and_then(|value| value.str()),
+            Some("Ping")
+        );
+
+        let custom_hints =
+            desktop_notification_hints(NotificationSound::CustomFile, "/tmp/notify.wav");
+        assert_eq!(
+            custom_hints.get("sound-file").and_then(|value| value.str()),
+            Some("/tmp/notify.wav")
+        );
+
+        let silent_hints = desktop_notification_hints(NotificationSound::None, "");
+        assert!(silent_hints.contains_key("suppress-sound"));
     }
 
     #[test]
