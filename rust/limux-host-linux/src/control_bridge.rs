@@ -4379,6 +4379,56 @@ mod tests {
     }
 
     #[test]
+    fn feed_sidebar_exit_plan_action_resolves_pending_request() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let push = dispatch_request(
+            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"ExitPlanMode","_source":"claude","_opencode_request_id":"req-plan","tool_name":"ExitPlanMode"},"wait_timeout_seconds":0}}"#,
+            &|command| panic!("feed.push should not queue command: {command:?}"),
+        );
+        assert_eq!(push.error, None);
+
+        crate::window::reply_to_feed_exit_plan_request("req-plan", "autoAccept")
+            .expect("sidebar exit-plan action resolves");
+
+        let listed = dispatch_request(r#"{"id":2,"method":"feed.list","params":{}}"#, &|command| {
+            panic!("feed.list should not queue command: {command:?}")
+        });
+        let result = listed.result.expect("feed.list result");
+        let items = result["items"].as_array().expect("items");
+        assert_eq!(items[0]["status"], "resolved");
+        assert_eq!(
+            items[0]["decision"],
+            json!({ "kind": "exit_plan", "mode": "autoAccept" })
+        );
+    }
+
+    #[test]
+    fn feed_sidebar_question_action_resolves_pending_request() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let push = dispatch_request(
+            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"AskUserQuestion","_source":"claude","_opencode_request_id":"req-question","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Deploy?","options":["Yes","No"]}]}},"wait_timeout_seconds":0}}"#,
+            &|command| panic!("feed.push should not queue command: {command:?}"),
+        );
+        assert_eq!(push.error, None);
+
+        crate::window::reply_to_feed_question_request("req-question", vec!["Yes".to_string()])
+            .expect("sidebar question action resolves");
+
+        let listed = dispatch_request(r#"{"id":2,"method":"feed.list","params":{}}"#, &|command| {
+            panic!("feed.list should not queue command: {command:?}")
+        });
+        let result = listed.result.expect("feed.list result");
+        let items = result["items"].as_array().expect("items");
+        assert_eq!(items[0]["status"], "resolved");
+        assert_eq!(
+            items[0]["decision"],
+            json!({ "kind": "question", "selections": ["Yes"] })
+        );
+    }
+
+    #[test]
     fn feed_push_blocks_until_permission_reply_resolves() {
         let _guard = feed_test_guard();
         crate::feed::coordinator().reset_for_tests();

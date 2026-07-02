@@ -2972,29 +2972,67 @@ fn append_right_sidebar_feed_items(body: &gtk::Box, payload: &serde_json::Value)
     }
     for item in items {
         append_right_sidebar_row(body, &sidebar_feed_preview_line(item));
-        append_feed_permission_actions(body, item);
+        append_feed_decision_actions(body, item);
     }
 }
 
-/// purpose: Add permission decision buttons for pending Feed rows.
+/// purpose: Add direct decision controls for pending Feed rows.
 /// inputs: Body widget and one Feed item row.
-/// returns/effects: Appends buttons that call feed.permission.reply for the row request id.
-fn append_feed_permission_actions(body: &gtk::Box, item: &serde_json::Value) {
-    let Some(request_id) = pending_permission_request_id(item) else {
+/// returns/effects: Appends buttons that call the matching feed.*.reply method.
+fn append_feed_decision_actions(body: &gtk::Box, item: &serde_json::Value) {
+    if let Some(request_id) = pending_permission_request_id(item) {
+        append_feed_permission_actions(body, request_id);
+    } else if let Some(request_id) = pending_exit_plan_request_id(item) {
+        append_feed_exit_plan_actions(body, request_id);
+    } else if let Some(request_id) = pending_question_request_id(item) {
+        append_feed_question_actions(body, request_id, item);
+    }
+}
+
+/// purpose: Add permission decision buttons for a pending Feed row.
+/// inputs: Body widget and request id.
+/// returns/effects: Appends buttons that call feed.permission.reply for the request id.
+fn append_feed_permission_actions(body: &gtk::Box, request_id: String) {
+    append_feed_action_buttons(
+        body,
+        &request_id,
+        feed_permission_action_specs(),
+        reply_to_feed_permission_request,
+    );
+}
+
+/// purpose: Add exit-plan decision buttons for a pending Feed row.
+/// inputs: Body widget and request id.
+/// returns/effects: Appends buttons that call feed.exit_plan.reply for the request id.
+fn append_feed_exit_plan_actions(body: &gtk::Box, request_id: String) {
+    append_feed_action_buttons(
+        body,
+        &request_id,
+        feed_exit_plan_action_specs(),
+        reply_to_feed_exit_plan_request,
+    );
+}
+
+/// purpose: Add question decision buttons for a pending Feed row.
+/// inputs: Body widget, request id, and question payload.
+/// returns/effects: Appends buttons that call feed.question.reply for the request id.
+fn append_feed_question_actions(body: &gtk::Box, request_id: String, item: &serde_json::Value) {
+    let options = feed_question_action_specs(item);
+    if options.is_empty() {
         return;
-    };
+    }
     let action_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
     action_row.add_css_class("limux-right-sidebar-actions");
-    for (label, mode) in feed_permission_action_specs() {
-        let button = gtk::Button::with_label(label);
+    for (label, selections) in options {
+        let button = gtk::Button::with_label(&label);
         button.add_css_class("flat");
-        button.set_tooltip_text(Some(&format!("Reply {mode} to {request_id}")));
+        button.set_tooltip_text(Some(&format!("Answer {request_id}: {label}")));
         let request_id = request_id.clone();
         button.connect_clicked(move |clicked| {
-            match reply_to_feed_permission_request(&request_id, mode) {
+            match reply_to_feed_question_request(&request_id, selections.clone()) {
                 Ok(()) => {
                     clicked.set_label("Sent");
                     clicked.set_sensitive(false);
@@ -3009,6 +3047,42 @@ fn append_feed_permission_actions(body: &gtk::Box, item: &serde_json::Value) {
     body.append(&action_row);
 }
 
+/// purpose: Add a row of one-click Feed decision buttons.
+/// inputs: Body widget, request id, action specs, and reply function.
+/// returns/effects: Appends GTK buttons that call the supplied reply function.
+fn append_feed_action_buttons<F>(
+    body: &gtk::Box,
+    request_id: &str,
+    specs: &'static [(&'static str, &'static str)],
+    reply: F,
+) where
+    F: Fn(&str, &str) -> Result<(), BridgeError> + Copy + 'static,
+{
+    let action_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    action_row.add_css_class("limux-right-sidebar-actions");
+    for (label, mode) in specs {
+        let button = gtk::Button::with_label(label);
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(&format!("Reply {mode} to {request_id}")));
+        let request_id = request_id.to_string();
+        let mode = *mode;
+        button.connect_clicked(move |clicked| match reply(&request_id, mode) {
+            Ok(()) => {
+                clicked.set_label("Sent");
+                clicked.set_sensitive(false);
+            }
+            Err(error) => {
+                clicked.set_tooltip_text(Some(&format!("Feed reply failed: {error:?}")));
+            }
+        });
+        action_row.append(&button);
+    }
+    body.append(&action_row);
+}
+
 /// purpose: Resolve one Feed permission request through the shared coordinator.
 /// inputs: Request id and CMUX permission mode.
 /// returns/effects: Mutates Feed state and wakes any blocked feed.push caller.
@@ -3016,18 +3090,70 @@ pub(crate) fn reply_to_feed_permission_request(
     request_id: &str,
     mode: &str,
 ) -> Result<(), BridgeError> {
+    let params = feed_reply_params(request_id, &[("mode", mode)]);
+    crate::feed::coordinator()
+        .permission_reply(&params)
+        .map(|_| ())
+}
+
+/// purpose: Resolve one Feed exit-plan request through the shared coordinator.
+/// inputs: Request id and CMUX exit-plan mode.
+/// returns/effects: Mutates Feed state and wakes any blocked feed.push caller.
+pub(crate) fn reply_to_feed_exit_plan_request(
+    request_id: &str,
+    mode: &str,
+) -> Result<(), BridgeError> {
+    let params = feed_reply_params(request_id, &[("mode", mode)]);
+    crate::feed::coordinator()
+        .exit_plan_reply(&params)
+        .map(|_| ())
+}
+
+/// purpose: Resolve one Feed question request through the shared coordinator.
+/// inputs: Request id and selected answers.
+/// returns/effects: Mutates Feed state and wakes any blocked feed.push caller.
+pub(crate) fn reply_to_feed_question_request(
+    request_id: &str,
+    selections: Vec<String>,
+) -> Result<(), BridgeError> {
     let mut params = serde_json::Map::new();
     params.insert(
         "request_id".to_string(),
         serde_json::Value::String(request_id.to_string()),
     );
     params.insert(
-        "mode".to_string(),
-        serde_json::Value::String(mode.to_string()),
+        "selections".to_string(),
+        serde_json::Value::Array(
+            selections
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
     );
     crate::feed::coordinator()
-        .permission_reply(&params)
+        .question_reply(&params)
         .map(|_| ())
+}
+
+/// purpose: Build common Feed reply params with a request id and string fields.
+/// inputs: Request id plus additional key/value fields.
+/// returns/effects: Returns JSON params without mutating state.
+fn feed_reply_params(
+    request_id: &str,
+    fields: &[(&str, &str)],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    for (key, value) in fields {
+        params.insert(
+            (*key).to_string(),
+            serde_json::Value::String((*value).to_string()),
+        );
+    }
+    params
 }
 
 /// purpose: Define direct CMUX permission decisions exposed in the Feed sidebar.
@@ -3038,6 +3164,19 @@ fn feed_permission_action_specs() -> &'static [(&'static str, &'static str)] {
         ("Once", "once"),
         ("Always", "always"),
         ("Bypass", "bypass"),
+        ("Deny", "deny"),
+    ]
+}
+
+/// purpose: Define direct CMUX exit-plan decisions exposed in the Feed sidebar.
+/// inputs: None.
+/// returns/effects: Returns stable button label and mode pairs.
+fn feed_exit_plan_action_specs() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Manual", "manual"),
+        ("Auto", "autoAccept"),
+        ("Bypass", "bypassPermissions"),
+        ("Ultraplan", "ultraplan"),
         ("Deny", "deny"),
     ]
 }
@@ -3304,15 +3443,109 @@ fn sidebar_feed_preview_line(item: &serde_json::Value) -> String {
 /// inputs: One Feed item row.
 /// returns/effects: Returns request_id only for pending permission requests.
 fn pending_permission_request_id(item: &serde_json::Value) -> Option<String> {
+    pending_request_id_for_kind(item, &["permissionRequest", "PermissionRequest"])
+}
+
+/// purpose: Extract action-eligible pending exit-plan request ids from Feed rows.
+/// inputs: One Feed item row.
+/// returns/effects: Returns request_id only for pending exit-plan requests.
+fn pending_exit_plan_request_id(item: &serde_json::Value) -> Option<String> {
+    pending_request_id_for_kind(item, &["exitPlan", "ExitPlanMode"])
+}
+
+/// purpose: Extract action-eligible pending question request ids from Feed rows.
+/// inputs: One Feed item row.
+/// returns/effects: Returns request_id only for pending question requests.
+fn pending_question_request_id(item: &serde_json::Value) -> Option<String> {
+    pending_request_id_for_kind(item, &["question", "AskUserQuestion"])
+}
+
+/// purpose: Extract pending request ids for a set of CMUX Feed kinds.
+/// inputs: One Feed item row and accepted kind values.
+/// returns/effects: Returns request_id only for matching pending rows.
+fn pending_request_id_for_kind(item: &serde_json::Value, kinds: &[&str]) -> Option<String> {
     let status = json_string_field(item, "status")?;
     if status != "pending" {
         return None;
     }
     let kind = json_string_field(item, "kind")?;
-    if !matches!(kind, "permissionRequest" | "PermissionRequest") {
+    if !kinds.contains(&kind) {
         return None;
     }
     json_string_field(item, "request_id").map(ToOwned::to_owned)
+}
+
+/// purpose: Build direct question reply options from a Feed question payload.
+/// inputs: One Feed item row with optional `tool_input` question data.
+/// returns/effects: Returns visible button labels plus selection payloads.
+fn feed_question_action_specs(item: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    let questions = feed_question_prompts(item);
+    if questions.len() > 1 {
+        let defaults = questions
+            .iter()
+            .map(|question| question.first().cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        return vec![("Default".to_string(), defaults)];
+    }
+    questions
+        .first()
+        .into_iter()
+        .flat_map(|options| options.iter())
+        .take(6)
+        .filter(|option| !option.trim().is_empty())
+        .map(|option| (option.clone(), vec![option.clone()]))
+        .collect()
+}
+
+/// purpose: Parse CMUX/Claude question prompt option labels from Feed rows.
+/// inputs: One Feed item row.
+/// returns/effects: Returns each prompt's available option labels in order.
+fn feed_question_prompts(item: &serde_json::Value) -> Vec<Vec<String>> {
+    let Some(input) = item.get("tool_input") else {
+        return feed_question_options(item);
+    };
+    if let Some(questions) = input.get("questions").and_then(serde_json::Value::as_array) {
+        return questions
+            .iter()
+            .map(|question| {
+                question
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|options| feed_option_labels(options))
+                    .unwrap_or_default()
+            })
+            .collect();
+    }
+    feed_question_options(input)
+}
+
+/// purpose: Parse flat question option labels from a Feed row or tool input.
+/// inputs: JSON object that may contain question option arrays.
+/// returns/effects: Returns one prompt worth of option labels or an empty set.
+fn feed_question_options(value: &serde_json::Value) -> Vec<Vec<String>> {
+    for key in ["question_options", "options"] {
+        if let Some(options) = value.get(key).and_then(serde_json::Value::as_array) {
+            return vec![feed_option_labels(options)];
+        }
+    }
+    Vec::new()
+}
+
+/// purpose: Convert CMUX question option values to labels.
+/// inputs: JSON option values, either strings or objects with label/title/id fields.
+/// returns/effects: Returns non-empty labels in input order.
+fn feed_option_labels(options: &[serde_json::Value]) -> Vec<String> {
+    options
+        .iter()
+        .filter_map(|option| {
+            option.as_str().map(ToOwned::to_owned).or_else(|| {
+                ["label", "title", "id"]
+                    .iter()
+                    .find_map(|key| json_string_field(option, key).map(ToOwned::to_owned))
+            })
+        })
+        .filter(|label| !label.trim().is_empty())
+        .collect()
 }
 
 /// purpose: Extract one non-empty string field from a JSON object.
@@ -12362,12 +12595,13 @@ mod tests {
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, feed_permission_action_specs,
-        font_size_after_delta, ghostty_prefers_dark, gtk_system_prefers_dark_from_raw,
-        host_notification_row, limit_text_to_last_lines, next_active_workspace_index,
-        notification_hook_policy_payload, notification_policy_effects_from_value,
-        pane_create_split_placement, pending_permission_request_id, publish_browser_event,
-        publish_surface_input_sent_event, publish_surface_key_sent_event,
+        directional_neighbor_score, favorites_prefix_len, feed_exit_plan_action_specs,
+        feed_permission_action_specs, feed_question_action_specs, font_size_after_delta,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
+        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
+        notification_policy_effects_from_value, pane_create_split_placement,
+        pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
+        publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
         queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
         right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
@@ -12776,6 +13010,25 @@ mod tests {
             "items": [
                 { "source": "codex", "kind": "PostToolUse", "status": "telemetry", "tool_name": "read" },
                 {
+                    "source": "claude",
+                    "kind": "exitPlan",
+                    "status": "pending",
+                    "tool_name": "ExitPlanMode",
+                    "request_id": "req-plan"
+                },
+                {
+                    "source": "claude",
+                    "kind": "question",
+                    "status": "pending",
+                    "tool_name": "AskUserQuestion",
+                    "request_id": "req-question",
+                    "tool_input": {
+                        "questions": [
+                            { "question": "Deploy?", "options": ["Yes", "No"] }
+                        ]
+                    }
+                },
+                {
                     "source": "codex",
                     "kind": "PermissionRequest",
                     "status": "pending",
@@ -12789,13 +13042,38 @@ mod tests {
             sidebar_feed_preview_lines_from_value(&payload, 2),
             vec![
                 "[pending] codex PermissionRequest: shell".to_string(),
-                "[telemetry] codex PostToolUse: read".to_string()
+                "[pending] claude question: AskUserQuestion".to_string()
             ]
         );
-        let visible = sidebar_feed_visible_items(&payload, 2);
+        let visible = sidebar_feed_visible_items(&payload, 4);
         assert_eq!(
             pending_permission_request_id(visible[0]).as_deref(),
             Some("req-1")
+        );
+        assert_eq!(
+            pending_question_request_id(visible[1]).as_deref(),
+            Some("req-question")
+        );
+        assert_eq!(
+            feed_question_action_specs(visible[1]),
+            vec![
+                ("Yes".to_string(), vec!["Yes".to_string()]),
+                ("No".to_string(), vec!["No".to_string()])
+            ]
+        );
+        assert_eq!(
+            pending_exit_plan_request_id(visible[2]).as_deref(),
+            Some("req-plan")
+        );
+        assert_eq!(
+            feed_exit_plan_action_specs(),
+            &[
+                ("Manual", "manual"),
+                ("Auto", "autoAccept"),
+                ("Bypass", "bypassPermissions"),
+                ("Ultraplan", "ultraplan"),
+                ("Deny", "deny")
+            ]
         );
         assert_eq!(
             feed_permission_action_specs(),
@@ -12806,7 +13084,7 @@ mod tests {
                 ("Deny", "deny")
             ]
         );
-        assert_eq!(pending_permission_request_id(visible[1]), None);
+        assert_eq!(pending_permission_request_id(visible[3]), None);
     }
 
     #[test]
