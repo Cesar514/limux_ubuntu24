@@ -3921,7 +3921,9 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("clear-history", "Usage: limux clear-history"),
     ("set-hook", "Usage: limux set-hook"),
     ("popup", "Usage: limux popup"),
+    ("bind", "Usage: limux bind"),
     ("bind-key", "Usage: limux bind-key"),
+    ("unbind", "Usage: limux unbind"),
     ("unbind-key", "Usage: limux unbind-key"),
     ("copy-mode", "Usage: limux copy-mode"),
     ("set-buffer", "Usage: limux set-buffer"),
@@ -14495,6 +14497,8 @@ fn canonical_tmux_command(command: &str) -> &str {
         "selectp" => "select-pane",
         "selectw" => "select-window",
         "splitw" => "split-window",
+        "bind" => "bind-key",
+        "unbind" => "unbind-key",
         "setb" => "set-buffer",
         "pasteb" => "paste-buffer",
         "showb" => "show-buffer",
@@ -16774,8 +16778,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         | "clear-history" | "split-window" | "splitw" | "select-layout" | "set-hook"
         | "resize-pane" | "resizep" | "set-buffer" | "setb" | "list-buffers" | "show-buffer"
         | "showb" | "paste-buffer" | "pasteb" | "respawn-pane" | "respawnp" | "display-message"
-        | "display" | "displayp" | "capturep" | "popup" | "bind-key" | "unbind-key"
-        | "copy-mode" => {
+        | "display" | "displayp" | "capturep" | "popup" | "bind" | "bind-key" | "unbind"
+        | "unbind-key" | "copy-mode" => {
             let payload = run_tmux_compat(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -19130,6 +19134,8 @@ mod cli_arg_tests {
         assert_eq!(canonical_tmux_command("selectp"), "select-pane");
         assert_eq!(canonical_tmux_command("selectw"), "select-window");
         assert_eq!(canonical_tmux_command("splitw"), "split-window");
+        assert_eq!(canonical_tmux_command("bind"), "bind-key");
+        assert_eq!(canonical_tmux_command("unbind"), "unbind-key");
         assert_eq!(canonical_tmux_command("setb"), "set-buffer");
         assert_eq!(canonical_tmux_command("pasteb"), "paste-buffer");
         assert_eq!(canonical_tmux_command("showb"), "show-buffer");
@@ -19269,8 +19275,15 @@ mod cli_arg_tests {
 
     #[test]
     fn unsupported_tmux_placeholders_are_explicit() {
-        for command in ["popup", "bind-key", "unbind-key", "copy-mode"] {
-            assert!(is_unsupported_tmux_cmd(command));
+        for command in [
+            "popup",
+            "bind",
+            "bind-key",
+            "unbind",
+            "unbind-key",
+            "copy-mode",
+        ] {
+            assert!(is_unsupported_tmux_cmd(canonical_tmux_command(command)));
         }
         assert!(!is_unsupported_tmux_cmd("display-message"));
         assert_eq!(canonical_tmux_command("displayp"), "display-message");
