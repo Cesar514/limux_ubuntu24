@@ -1486,6 +1486,13 @@ struct AppearanceSetting {
 }
 
 #[derive(Clone, Copy)]
+struct BranchLayoutSetting {
+    key: &'static str,
+    section: &'static str,
+    json_key: &'static str,
+}
+
+#[derive(Clone, Copy)]
 struct BooleanSetting {
     key: &'static str,
     section: &'static str,
@@ -1664,6 +1671,12 @@ const SIDEBAR_WATCH_GIT_STATUS_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_BRANCH_LAYOUT_SETTING: BranchLayoutSetting = BranchLayoutSetting {
+    key: "sidebar.branchLayout",
+    section: "sidebar",
+    json_key: "branchLayout",
+};
+
 const SIDEBAR_SHOW_PORTS_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showPorts",
     section: "sidebar",
@@ -1749,7 +1762,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|sidebar.showPullRequests|",
+    "sidebar.showBranchDirectory|sidebar.branchLayout|sidebar.showPullRequests|",
     "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showSSH|",
     "sidebar.makePullRequestsClickable|",
     "sidebar.openPullRequestLinksInCmuxBrowser|",
@@ -1771,7 +1784,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|sidebar.showPullRequests|",
+    "sidebar.showBranchDirectory|sidebar.branchLayout|sidebar.showPullRequests|",
     "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showSSH|",
     "sidebar.makePullRequestsClickable|",
     "sidebar.openPullRequestLinksInCmuxBrowser|",
@@ -1831,6 +1844,16 @@ fn placement_setting(raw: &str) -> Option<PlacementSetting> {
 fn appearance_setting(raw: &str) -> Option<AppearanceSetting> {
     match raw {
         "app.appearance" => Some(APP_APPEARANCE_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map supported CMUX sidebar branch layout setting to its descriptor.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn branch_layout_setting(raw: &str) -> Option<BranchLayoutSetting> {
+    match raw {
+        "sidebar.branchLayout" => Some(SIDEBAR_BRANCH_LAYOUT_SETTING),
         _ => None,
     }
 }
@@ -2049,6 +2072,47 @@ fn set_config_appearance_setting_at(
     Ok(appearance.to_string())
 }
 
+// purpose: Read the CMUX sidebar branch layout setting with its default.
+// inputs: Settings path and supported branch layout setting descriptor.
+// returns/effects: Returns the effective value and whether it was configured.
+fn get_config_branch_layout_setting_at(
+    path: &Path,
+    setting: BranchLayoutSetting,
+) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get(setting.section)
+        .and_then(Value::as_object)
+        .and_then(|section| section.get(setting.json_key))
+    else {
+        return Ok(("vertical".to_string(), false));
+    };
+    Ok((parse_branch_layout_value(setting.key, value)?, true))
+}
+
+// purpose: Write the CMUX sidebar branch layout setting while preserving siblings.
+// inputs: Settings path, supported descriptor, and raw layout value.
+// returns/effects: Strictly parses vertical/inline and atomically writes settings JSON.
+fn set_config_branch_layout_setting_at(
+    path: &Path,
+    setting: BranchLayoutSetting,
+    raw: &str,
+) -> Result<String> {
+    let layout = parse_branch_layout_str(setting.key, raw)?;
+    let mut root = read_settings_root(path)?;
+    let section = root
+        .entry(setting.section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be a JSON object", setting.section))?;
+    section.insert(
+        setting.json_key.to_string(),
+        Value::String(layout.to_string()),
+    );
+    write_settings_root(path, &root)?;
+    Ok(layout.to_string())
+}
+
 // purpose: Read a nested boolean setting with CMUX defaults.
 // inputs: Settings path and supported boolean setting descriptor.
 // returns/effects: Returns the effective value and whether it was configured.
@@ -2223,6 +2287,36 @@ fn render_config_appearance_set(
     raw: &str,
 ) -> Result<String> {
     let value = set_config_appearance_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for sidebar.branchLayout.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_branch_layout_get(path: &Path, setting: BranchLayoutSetting) -> Result<String> {
+    let (value, _) = get_config_branch_layout_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for sidebar.branchLayout.
+// inputs: Settings path, setting descriptor, and raw layout argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_branch_layout_set(
+    path: &Path,
+    setting: BranchLayoutSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = set_config_branch_layout_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -2426,6 +2520,26 @@ fn parse_appearance_str<'a>(key: &str, raw: &'a str) -> Result<&'a str> {
     match raw {
         "system" | "light" | "dark" => Ok(raw),
         _ => bail!("{key} must be system, light, or dark"),
+    }
+}
+
+// purpose: Parse an existing JSON value for sidebar.branchLayout.
+// inputs: User-facing key and raw JSON value.
+// returns/effects: Returns canonical layout or errors on malformed settings JSON.
+fn parse_branch_layout_value(key: &str, value: &Value) -> Result<String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{key} must be vertical or inline"))?;
+    parse_branch_layout_str(key, raw).map(str::to_string)
+}
+
+// purpose: Validate CMUX sidebar branch layout strings.
+// inputs: User-facing key and raw branch layout.
+// returns/effects: Returns canonical layout or a loud config error.
+fn parse_branch_layout_str<'a>(key: &str, raw: &'a str) -> Result<&'a str> {
+    match raw {
+        "vertical" | "inline" => Ok(raw),
+        _ => bail!("{key} must be vertical or inline"),
     }
 }
 
@@ -3021,6 +3135,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
                     &path, setting,
                 )?));
             }
+            if let Some(setting) = branch_layout_setting(key) {
+                return Ok(CommandOutput::Text(render_config_branch_layout_get(
+                    &path, setting,
+                )?));
+            }
             if let Some(setting) = boolean_setting(key) {
                 return Ok(CommandOutput::Text(render_config_boolean_get(&path, setting)?));
             }
@@ -3055,6 +3174,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             }
             if let Some(setting) = appearance_setting(key) {
                 return Ok(CommandOutput::Text(render_config_appearance_set(
+                    &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = branch_layout_setting(key) {
+                return Ok(CommandOutput::Text(render_config_branch_layout_set(
                     &path, setting, value,
                 )?));
             }
@@ -16358,6 +16482,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING)
             .expect("get default sidebar git watch");
         assert!(text.contains("sidebar.watchGitStatus = true"));
+        let text = render_config_branch_layout_get(&path, SIDEBAR_BRANCH_LAYOUT_SETTING)
+            .expect("get default sidebar branch layout");
+        assert!(text.contains("sidebar.branchLayout = vertical"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_PORTS_SETTING)
             .expect("get default sidebar ports");
         assert!(text.contains("sidebar.showPorts = true"));
@@ -16418,6 +16545,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING, "false")
             .expect("set sidebar git watch");
         assert!(text.contains("sidebar.watchGitStatus = false"));
+        let text = render_config_branch_layout_set(&path, SIDEBAR_BRANCH_LAYOUT_SETTING, "inline")
+            .expect("set sidebar branch layout");
+        assert!(text.contains("sidebar.branchLayout = inline"));
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_PORTS_SETTING, "false")
             .expect("set sidebar ports");
         assert!(text.contains("sidebar.showPorts = false"));
@@ -16465,6 +16595,7 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
         assert_eq!(parsed["sidebar"]["showPullRequests"], false);
         assert_eq!(parsed["sidebar"]["watchGitStatus"], false);
+        assert_eq!(parsed["sidebar"]["branchLayout"], "inline");
         assert_eq!(parsed["sidebar"]["showPorts"], false);
         assert_eq!(parsed["sidebar"]["showSSH"], false);
         assert_eq!(parsed["sidebar"]["makePullRequestsClickable"], false);
@@ -16492,10 +16623,20 @@ mod cli_arg_tests {
             .expect_err("invalid bool");
         assert!(err.to_string().contains("requires true or false"));
 
+        let err = render_config_branch_layout_set(&path, SIDEBAR_BRANCH_LAYOUT_SETTING, "stacked")
+            .expect_err("invalid branch layout");
+        assert!(err.to_string().contains("must be vertical or inline"));
+
         fs::write(&path, br#"{"sidebar":{"showPorts":"false"}}"#).expect("write malformed bool");
         let err = render_config_boolean_get(&path, SIDEBAR_SHOW_PORTS_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+
+        fs::write(&path, br#"{"sidebar":{"branchLayout":false}}"#)
+            .expect("write malformed branch layout");
+        let err = render_config_branch_layout_get(&path, SIDEBAR_BRANCH_LAYOUT_SETTING)
+            .expect_err("invalid existing branch layout");
+        assert!(err.to_string().contains("must be vertical or inline"));
 
         let err = render_config_numeric_set(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING, "0")
             .expect_err("invalid width");

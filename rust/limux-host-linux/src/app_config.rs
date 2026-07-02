@@ -130,6 +130,7 @@ pub struct SidebarConfig {
     pub show_workspace_description: bool,
     pub show_notification_message: bool,
     pub show_branch_directory: bool,
+    pub branch_layout: SidebarBranchLayout,
     pub show_pull_requests: bool,
     pub watch_git_status: bool,
     pub show_ports: bool,
@@ -151,6 +152,7 @@ impl Default for SidebarConfig {
             show_workspace_description: true,
             show_notification_message: true,
             show_branch_directory: true,
+            branch_layout: SidebarBranchLayout::default(),
             show_pull_requests: true,
             watch_git_status: true,
             show_ports: true,
@@ -162,6 +164,36 @@ impl Default for SidebarConfig {
             show_progress: true,
             show_log: true,
             right_max_width: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarBranchLayout {
+    #[default]
+    Vertical,
+    Inline,
+}
+
+impl SidebarBranchLayout {
+    // purpose: Serialize the sidebar branch layout using CMUX's config spelling.
+    // inputs: Branch layout selected from parsed settings or defaults.
+    // returns/effects: Returns a stable config/API string without allocation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vertical => "vertical",
+            Self::Inline => "inline",
+        }
+    }
+
+    // purpose: Parse CMUX sidebar branch layout strings.
+    // inputs: Raw string from settings.
+    // returns/effects: Returns None for unsupported layout names.
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "vertical" => Some(Self::Vertical),
+            "inline" => Some(Self::Inline),
+            _ => None,
         }
     }
 }
@@ -674,6 +706,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showBranchDirectory"))
         .map(|value| parse_bool_setting(value, "sidebar.showBranchDirectory"))
         .unwrap_or(sidebar_defaults.show_branch_directory);
+    let branch_layout = sidebar
+        .and_then(|sidebar| sidebar.get("branchLayout"))
+        .map(|value| parse_sidebar_branch_layout(value, "sidebar.branchLayout"))
+        .unwrap_or(sidebar_defaults.branch_layout);
     let show_pull_requests = sidebar
         .and_then(|sidebar| sidebar.get("showPullRequests"))
         .map(|value| parse_bool_setting(value, "sidebar.showPullRequests"))
@@ -809,6 +845,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_workspace_description,
             show_notification_message,
             show_branch_directory,
+            branch_layout,
             show_pull_requests,
             watch_git_status,
             show_ports,
@@ -1014,6 +1051,17 @@ fn parse_workspace_new_placement(value: &Value, label: &str) -> WorkspaceGroupNe
         .unwrap_or_else(|| panic!("{label} must be a string"));
     WorkspaceGroupNewPlacement::from_str(raw)
         .unwrap_or_else(|| panic!("{label} must be afterCurrent, top, or end"))
+}
+
+// purpose: Parse one CMUX sidebar branch layout setting.
+// inputs: JSON string value plus a diagnostic label.
+// returns/effects: Returns a valid layout or panics loudly.
+fn parse_sidebar_branch_layout(value: &Value, label: &str) -> SidebarBranchLayout {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} must be a string"));
+    SidebarBranchLayout::from_str(raw)
+        .unwrap_or_else(|| panic!("{label} must be vertical or inline"))
 }
 
 // purpose: Parse CMUX-style notification hook definitions from settings JSON.
@@ -1258,6 +1306,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.sidebar.show_branch_directory),
         ),
         (
+            "branchLayout".to_string(),
+            json!(config.sidebar.branch_layout.as_str()),
+        ),
+        (
             "showPullRequests".to_string(),
             json!(config.sidebar.show_pull_requests),
         ),
@@ -1426,6 +1478,7 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "showWorkspaceDescription": true,
             "showNotificationMessage": true,
             "showBranchDirectory": true,
+            "branchLayout": "vertical",
             "showPullRequests": true,
             "watchGitStatus": true,
             "showPorts": true,
@@ -1960,6 +2013,7 @@ mod tests {
     "showWorkspaceDescription": false,
     "showNotificationMessage": false,
     "showBranchDirectory": false,
+    "branchLayout": "inline",
     "showPullRequests": false,
     "watchGitStatus": false,
     "showPorts": false,
@@ -1985,6 +2039,10 @@ mod tests {
         assert!(!loaded.config.sidebar.show_workspace_description);
         assert!(!loaded.config.sidebar.show_notification_message);
         assert!(!loaded.config.sidebar.show_branch_directory);
+        assert_eq!(
+            loaded.config.sidebar.branch_layout,
+            SidebarBranchLayout::Inline
+        );
         assert!(!loaded.config.sidebar.show_pull_requests);
         assert!(!loaded.config.sidebar.watch_git_status);
         assert!(!loaded.config.sidebar.show_ports);
@@ -2024,6 +2082,20 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"watchGitStatus":"false"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX sidebar branch layout settings fail loudly.
+    // inputs: Settings JSON with unsupported sidebar.branchLayout.
+    // returns/effects: Panics instead of accepting a silent fallback.
+    #[test]
+    #[should_panic(expected = "sidebar.branchLayout must be vertical or inline")]
+    fn load_from_path_rejects_invalid_sidebar_branch_layout() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"branchLayout":"stacked"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2510,6 +2582,7 @@ mod tests {
         config.sidebar.show_workspace_description = false;
         config.sidebar.show_notification_message = false;
         config.sidebar.show_branch_directory = false;
+        config.sidebar.branch_layout = SidebarBranchLayout::Inline;
         config.sidebar.show_pull_requests = false;
         config.sidebar.watch_git_status = false;
         config.sidebar.show_ports = false;
@@ -2539,6 +2612,10 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
+        assert_eq!(
+            parsed["sidebar"]["branchLayout"],
+            Value::String("inline".to_string())
+        );
         assert_eq!(parsed["sidebar"]["showPullRequests"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["watchGitStatus"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showPorts"], Value::Bool(false));
