@@ -4444,11 +4444,14 @@ fn custom_sidebar_dispatcher_action(
             ensure_custom_sidebar_no_params(action)?;
             Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
         }
-        "workspace.select" | "workspace.focus" | "select-workspace" => {
+        "workspace.select" | "workspace.focus" | "selectWorkspace" | "select-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
                 custom_sidebar_action_workspace_id(action)?,
             )))
         }
+        "tab.focus" | "focus-tab" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
+            custom_sidebar_action_tab_id(action)?,
+        ))),
         "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
             custom_sidebar_action_surface_id(action)?,
         ))),
@@ -4459,6 +4462,9 @@ fn custom_sidebar_dispatcher_action(
         }
         "surface.close" | "close-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
             custom_sidebar_action_surface_id(action)?,
+        ))),
+        "tab.close" | "close-tab" => Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
+            custom_sidebar_action_tab_id(action)?,
         ))),
         "workspace.pin" | "workspace.togglePin" | "toggle-workspace-pin" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceTogglePin(
@@ -18553,6 +18559,11 @@ mod tests {
             message: None,
             params: workspace_param_alias.clone(),
         };
+        let select_workspace_camel = CustomSidebarNodeAction {
+            action_type: "selectWorkspace".to_string(),
+            message: None,
+            params: workspace_param_alias.clone(),
+        };
         let workspace_toggle_pin = CustomSidebarNodeAction {
             action_type: "workspace.togglePin".to_string(),
             message: None,
@@ -18572,6 +18583,16 @@ mod tests {
         tab_param_alias.insert("param".to_string(), json!("tab-a"));
         let tab_toggle_pin = CustomSidebarNodeAction {
             action_type: "tab.togglePin".to_string(),
+            message: None,
+            params: tab_param_alias.clone(),
+        };
+        let tab_focus = CustomSidebarNodeAction {
+            action_type: "tab.focus".to_string(),
+            message: None,
+            params: tab_param_alias.clone(),
+        };
+        let tab_close = CustomSidebarNodeAction {
+            action_type: "tab.close".to_string(),
             message: None,
             params: tab_param_alias,
         };
@@ -18656,6 +18677,12 @@ mod tests {
             )))
         );
         assert_eq!(
+            custom_sidebar_dispatcher_action(&select_workspace_camel),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
             custom_sidebar_dispatcher_action(&surface_focus),
             Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
                 "surface:7:tab-a".to_string()
@@ -18728,6 +18755,26 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&tab_toggle_pin),
             "cmux dispatcher: tab.togglePin"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&tab_focus),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
+                "tab-a".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&tab_focus),
+            "cmux dispatcher: tab.focus"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&tab_close),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
+                "tab-a".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&tab_close),
+            "cmux dispatcher: tab.close"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_reorder),
