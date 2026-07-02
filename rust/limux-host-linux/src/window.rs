@@ -5713,6 +5713,95 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::SwapPane {
+            target,
+            pane_id,
+            target_pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+            let pane_id = parse_pane_handle(&pane_id).or_else(|| pane_id.parse::<u32>().ok());
+            let target_pane_id =
+                parse_pane_handle(&target_pane_id).or_else(|| target_pane_id.parse::<u32>().ok());
+            let (Some(pane_id), Some(target_pane_id)) = (pane_id, target_pane_id) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.swap requires valid pane ids",
+                )));
+                return;
+            };
+            if pane_id == target_pane_id {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "cannot swap pane with itself",
+                )));
+                return;
+            }
+
+            let result = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let Some(first_surface) =
+                    pane::selected_surface_for_pane_in_root(&workspace.root, pane_id)
+                else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "pane not found",
+                    )));
+                    return;
+                };
+                let Some(second_surface) =
+                    pane::selected_surface_for_pane_in_root(&workspace.root, target_pane_id)
+                else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "target pane not found",
+                    )));
+                    return;
+                };
+                let Some(first_moved) = pane::move_surface_for_root(
+                    &workspace.root,
+                    &first_surface.surface_id,
+                    target_pane_id,
+                    Some(0),
+                ) else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "surface or target pane not found",
+                    )));
+                    return;
+                };
+                let Some(second_moved) = pane::move_surface_for_root(
+                    &workspace.root,
+                    &second_surface.surface_id,
+                    pane_id,
+                    Some(0),
+                ) else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "surface or pane not found",
+                    )));
+                    return;
+                };
+                let first_payload =
+                    pane_create_response_payload(&workspace.id, &workspace.name, first_moved);
+                let second_payload =
+                    pane_create_response_payload(&workspace.id, &workspace.name, second_moved);
+                serde_json::json!({
+                    "ok": true,
+                    "workspace_id": workspace.id.as_str(),
+                    "workspace_ref": workspace_ref(&workspace.id),
+                    "panes": [first_payload, second_payload],
+                })
+            };
+
+            request_session_save(state);
+            let _ = reply.send(Ok(result));
+        }
         ControlCommand::JoinPane {
             target,
             source_pane_id,

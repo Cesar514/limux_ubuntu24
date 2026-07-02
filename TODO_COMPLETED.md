@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T00:44:15Z Implement and verify live bridge CMUX tmux `pane.swap` and `swap-pane` parity for exchanging selected surfaces between panes. \
 [x] 2026-07-02T00:38:55Z Implement and verify live bridge CMUX tmux `pane.break` and `break-pane` parity for moving surfaces into new workspaces. \
 [x] 2026-07-02T00:33:35Z Implement and verify live bridge CMUX tmux `pane.join` and `join-pane` parity for moving surfaces into target panes. \
 [x] 2026-07-02T00:28:44Z Implement and verify live bridge CMUX tmux `pane.resize` and `resize-pane` parity by mutating persisted GTK split ratios. \

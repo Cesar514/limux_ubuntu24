@@ -1900,6 +1900,26 @@ pub(crate) fn pane_widget_for_root(root: &gtk::Widget, pane_id: u32) -> Option<g
         .map(|internals| internals.pane_outer.clone().upcast())
 }
 
+// purpose: Resolve the selected surface for a pane in a workspace root.
+// inputs: Workspace root widget and a live pane id.
+// returns/effects: Returns the active surface summary or the first tab summary without mutating state.
+pub fn selected_surface_for_pane_in_root(
+    root: &gtk::Widget,
+    pane_id: u32,
+) -> Option<SurfaceSummary> {
+    let internals = pane_internals_for_root(root)
+        .into_iter()
+        .find(|internals| internals.pane_id == pane_id)?;
+    let selected_tab_id = {
+        let tab_state = internals.tab_state.borrow();
+        tab_state
+            .active_tab
+            .clone()
+            .or_else(|| tab_state.tabs.first().map(|entry| entry.id.clone()))?
+    };
+    surface_summary_for_tab(&internals, &selected_tab_id)
+}
+
 pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
     let mut surfaces = Vec::new();
 

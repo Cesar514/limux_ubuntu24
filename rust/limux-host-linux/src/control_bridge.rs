@@ -63,6 +63,7 @@ const METHODS: &[&str] = &[
     "pane.focus",
     "pane.last",
     "pane.resize",
+    "pane.swap",
     "pane.join",
     "pane.break",
     "browser.open_split",
@@ -527,6 +528,12 @@ pub enum ControlCommand {
         amount: u64,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SwapPane {
+        target: WorkspaceTarget,
+        pane_id: String,
+        target_pane_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     JoinPane {
         target: WorkspaceTarget,
         source_pane_id: Option<String>,
@@ -716,6 +723,7 @@ impl ControlCommand {
             | Self::FocusPane { reply, .. }
             | Self::LastPane { reply, .. }
             | Self::ResizePane { reply, .. }
+            | Self::SwapPane { reply, .. }
             | Self::JoinPane { reply, .. }
             | Self::BreakPane { reply, .. }
             | Self::BrowserAction { reply, .. }
@@ -2226,6 +2234,47 @@ fn handle_method(
                     pane_id,
                     direction,
                     amount,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.swap" | "swap-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_id =
+                match optional_ref_handle(params, &["pane_id", "first_pane_id", "id"], "pane:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("pane.swap requires pane_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let target_pane_id = match optional_ref_handle(
+                params,
+                &["target_pane_id", "second_pane_id", "target_pane"],
+                "pane:",
+            ) {
+                Ok(Some(value)) if !value.trim().is_empty() => value,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("pane.swap requires target_pane_id"),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SwapPane {
+                    target,
+                    pane_id,
+                    target_pane_id,
                     reply,
                 },
                 rx,
@@ -4698,6 +4747,45 @@ mod tests {
         );
         assert_eq!(
             invalid_direction.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn pane_swap_route_accepts_cmux_alias_and_refs() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"swap-pane","params":{"workspace_id":"codex","#,
+                r#""pane_id":"pane:11","target_pane_id":"pane:12"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SwapPane {
+                    target,
+                    pane_id,
+                    target_pane_id,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(pane_id, "11");
+                    assert_eq!(target_pane_id, "12");
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("pane.swap result")["ok"], true);
+    }
+
+    #[test]
+    fn pane_swap_route_rejects_missing_targets() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"pane.swap","params":{"pane_id":"pane:11"}}"#,
+            &|command| panic!("invalid pane.swap should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }
