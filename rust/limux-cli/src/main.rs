@@ -10419,6 +10419,32 @@ fn tmux_split_direction(args: &[String]) -> &'static str {
     }
 }
 
+// purpose: Convert CMUX/tmux split-window -l cells into an initial divider ratio.
+// inputs: Raw args and normalized split direction.
+// returns/effects: Returns a bounded ratio or fails loudly for invalid cell counts.
+fn tmux_split_initial_divider_position(args: &[String], direction: &str) -> Result<Option<f64>> {
+    let Some(raw) = parse_opt(args, "-l") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('%') {
+        bail!("split-window -l requires a positive integer cell count");
+    }
+    let cells = trimmed
+        .parse::<u64>()
+        .with_context(|| "split-window -l requires a positive integer cell count")?;
+    if cells == 0 {
+        bail!("split-window -l requires a positive integer cell count");
+    }
+    let requested = cells.min(99) as f64 / 100.0;
+    let ratio = match direction {
+        "left" | "up" => requested,
+        "right" | "down" => 1.0 - requested,
+        _ => 0.5,
+    };
+    Ok(Some(ratio.clamp(0.1, 0.9)))
+}
+
 // purpose: Insert optional split-window workspace and surface targets into params.
 // inputs: Mutable params and raw split-window args.
 // returns/effects: Adds non-empty workspace_id and surface_id when present.
@@ -10447,14 +10473,18 @@ fn insert_tmux_split_targets(params: &mut Map<String, Value>, args: &[String]) {
 fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
     let mut params = Map::new();
     insert_tmux_split_targets(&mut params, args);
+    let direction = tmux_split_direction(args);
     params.insert(
         "direction".to_string(),
-        Value::String(tmux_split_direction(args).to_string()),
+        Value::String(direction.to_string()),
     );
     params.insert(
         "focus".to_string(),
         Value::Bool(!tmux_has_short_flag(args, "-d")),
     );
+    if let Some(position) = tmux_split_initial_divider_position(args, direction)? {
+        params.insert("initial_divider_position".to_string(), json!(position));
+    }
     if let Some(cwd) = parse_opt(args, "-c").filter(|value| !value.trim().is_empty()) {
         params.insert("working_directory".to_string(), Value::String(cwd));
     }
@@ -13600,6 +13630,7 @@ mod cli_arg_tests {
         assert_eq!(params["surface_id"], "surface:7:tab-a");
         assert_eq!(params["direction"], "right");
         assert_eq!(params["focus"], true);
+        assert!(params.get("initial_divider_position").is_none());
         assert_eq!(params["working_directory"], "/tmp/project");
         assert_eq!(params["command"], "echo ready");
 
@@ -13610,6 +13641,21 @@ mod cli_arg_tests {
         let (up, _) = build_tmux_split_window_request(&args(&["-b", "-t", "surface:7:tab-a"]))
             .expect("up split parses");
         assert_eq!(up["direction"], "up");
+    }
+
+    #[test]
+    fn tmux_split_window_serializes_size_cells_as_initial_divider() {
+        let (right, _) =
+            build_tmux_split_window_request(&args(&["-h", "-l", "30"])).expect("right split");
+        assert_eq!(right["initial_divider_position"], 0.7);
+
+        let (left, _) =
+            build_tmux_split_window_request(&args(&["-hb", "-l", "30"])).expect("left split");
+        assert_eq!(left["initial_divider_position"], 0.3);
+
+        let err = build_tmux_split_window_request(&args(&["-l", "0"]))
+            .expect_err("zero cells should fail");
+        assert!(err.to_string().contains("positive integer cell count"));
     }
 
     #[test]

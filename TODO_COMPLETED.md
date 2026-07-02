@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T11:31:24Z Implement and verify CMUX/tmux split sizing request parity: `split-window -l <cells>` now serializes a bounded `initial_divider_position`, `surface.split` preserves that divider request, and the live host applies it as the initial split ratio while exact terminal-cell geometry remains tracked separately. \
 [x] 2026-07-02T11:24:17Z Implement and verify CMUX/tmux detached split focus parity: `split-window -d` serializes `focus:false`, `surface.split` preserves detached focus requests, and host terminal launch activation honors the requested focus setting. \
 [x] 2026-07-02T11:17:05Z Implement and verify CMUX/tmux local split/layout parity in `limux-cli`: `split-window`/`splitw` route to `surface.split` with tmux direction, cwd, target, command, and `-P` output handling, and `select-layout` routes to `workspace.equalize_splits` with main-layout orientation mapping. \
 [x] 2026-07-02T11:10:36Z Implement and verify CMUX/tmux lifecycle alias parity in `limux-cli` for `neww`, `select-window`/`selectw`, `select-pane`/`selectp`, `kill-window`/`killw`, `kill-pane`/`killp`, and `renamew`, including no-socket help probes, `-t`/`--target` parsing, pane focus, workspace select/close, surface close, and rename title parsing. \

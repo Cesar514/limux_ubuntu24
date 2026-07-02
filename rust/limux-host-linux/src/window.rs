@@ -9402,6 +9402,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     },
                     skip_default_tab: startup_requested,
                     new_pane_first: resolved.placement.new_pane_first,
+                    initial_ratio: request.initial_divider_position,
                     persist: true,
                 },
             );
@@ -9920,6 +9921,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     initial_state: None,
                     skip_default_tab: true,
                     new_pane_first: placement.new_pane_first,
+                    initial_ratio: None,
                     persist: false,
                 },
             );
@@ -10971,6 +10973,7 @@ pub(crate) fn create_pane_for_workspace(
                     initial_state: None,
                     skip_default_tab: false,
                     new_pane_first: false,
+                    initial_ratio: None,
                     persist: true,
                 },
             );
@@ -11476,6 +11479,7 @@ struct SplitPaneOptions {
     initial_state: Option<PaneState>,
     skip_default_tab: bool,
     new_pane_first: bool,
+    initial_ratio: Option<f64>,
     persist: bool,
 }
 
@@ -11528,6 +11532,7 @@ fn schedule_pane_batch_step(batch: Rc<RefCell<PendingPaneBatch>>) {
                 initial_state: None,
                 skip_default_tab: false,
                 new_pane_first: placement.new_pane_first,
+                initial_ratio: None,
                 persist: false,
             },
         );
@@ -11623,7 +11628,9 @@ fn split_pane(
         new_pane.clone().upcast(),
         orientation,
         options.new_pane_first,
-        layout_state::DEFAULT_SPLIT_RATIO,
+        options
+            .initial_ratio
+            .unwrap_or(layout_state::DEFAULT_SPLIT_RATIO),
     ) {
         return None;
     }
@@ -11683,6 +11690,7 @@ fn handle_split_with_tab(
             initial_state: None,
             skip_default_tab: true,
             new_pane_first,
+            initial_ratio: None,
             persist: false,
         },
     );
@@ -11888,6 +11896,7 @@ fn dispatch_browser_command(state: &State, command: ShortcutCommand) -> bool {
                     initial_state: Some(PaneState::browser_only(uri.as_deref())),
                     skip_default_tab: false,
                     new_pane_first: false,
+                    initial_ratio: None,
                     persist: true,
                 },
             )
@@ -11908,6 +11917,7 @@ fn split_focused_pane(state: &State, orientation: gtk::Orientation) {
                 initial_state: None,
                 skip_default_tab: false,
                 new_pane_first: false,
+                initial_ratio: None,
                 persist: true,
             },
         );

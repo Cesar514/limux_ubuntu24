@@ -436,7 +436,7 @@ pub enum BrowserTabAction {
 /// Browser pane support uses the existing WebKit pane state path. Responses
 /// must keep the existing core/CLI field names: `pane_id`, `pane_ref`,
 /// `surface_id`, and `surface_ref`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePaneRequest {
     pub target: WorkspaceTarget,
     pub source_pane_id: Option<String>,
@@ -448,6 +448,7 @@ pub struct CreatePaneRequest {
     pub working_directory: Option<String>,
     pub startup_environment: BTreeMap<String, String>,
     pub focus: bool,
+    pub initial_divider_position: Option<f64>,
     pub url: Option<String>,
 }
 
@@ -1341,6 +1342,29 @@ fn required_f64(params: &Map<String, Value>, key: &str, method: &str) -> Result<
     }
 }
 
+// purpose: Read an optional finite floating-point parameter.
+// inputs: Parameter map plus accepted field aliases.
+// returns/effects: Returns None when absent or invalid_params when present but non-numeric.
+fn optional_f64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<f64>, BridgeError> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        let parsed = value.as_f64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        });
+        return match parsed {
+            Some(number) if number.is_finite() => Ok(Some(number)),
+            _ => Err(BridgeError::invalid_params(format!(
+                "{key} must be a number"
+            ))),
+        };
+    }
+    Ok(None)
+}
+
 fn optional_handle(
     params: &Map<String, Value>,
     keys: &[&str],
@@ -1886,6 +1910,10 @@ fn parse_create_pane_request(
         working_directory,
         startup_environment,
         focus: optional_bool(params, "focus")?.unwrap_or(true),
+        initial_divider_position: optional_f64(
+            params,
+            &["initial_divider_position", "initialDividerPosition"],
+        )?,
         url,
     })
 }
@@ -3318,6 +3346,13 @@ fn handle_method(
                         startup_environment,
                         focus: match optional_bool(params, "focus") {
                             Ok(focus) => focus.unwrap_or(true),
+                            Err(error) => return error_response(id, error),
+                        },
+                        initial_divider_position: match optional_f64(
+                            params,
+                            &["initial_divider_position", "initialDividerPosition"],
+                        ) {
+                            Ok(position) => position,
                             Err(error) => return error_response(id, error),
                         },
                         url: None,
@@ -5429,6 +5464,7 @@ mod tests {
         assert_eq!(request.pane_type, PaneCreateType::Terminal);
         assert_eq!(request.command, Some("claude".to_string()));
         assert!(request.focus);
+        assert_eq!(request.initial_divider_position, None);
     }
 
     // purpose: Verify CMUX watcher startup fields parse for terminal pane creation.
@@ -5555,6 +5591,7 @@ mod tests {
                     "workspace_id":"codex",
                     "surface_id":"surface:4:tab",
                     "direction":"right",
+                    "initial_divider_position":0.7,
                     "initial_command":"/tmp/cmux-codex-teams.sh",
                     "working_directory":"/tmp/project",
                     "startup_environment":{
@@ -5569,6 +5606,7 @@ mod tests {
                     assert_eq!(request.source_surface_id, Some("4:tab".to_string()));
                     assert_eq!(request.direction, PaneCreateDirection::Right);
                     assert!(request.focus);
+                    assert_eq!(request.initial_divider_position, Some(0.7));
                     assert_eq!(
                         request.initial_command.as_deref(),
                         Some("/tmp/cmux-codex-teams.sh")
@@ -6866,6 +6904,7 @@ mod tests {
                     assert_eq!(request.pane_type, PaneCreateType::Terminal);
                     assert_eq!(request.command, Some("top".to_string()));
                     assert!(request.focus);
+                    assert_eq!(request.initial_divider_position, None);
                     assert_eq!(request.url, None);
                     let _ = reply.send(Ok(json!({
                         "pane_ref": "pane:12",
