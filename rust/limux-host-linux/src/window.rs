@@ -3923,26 +3923,79 @@ fn publish_sidebar_event(name: &str, workspace_id: &str, payload: serde_json::Va
     });
 }
 
-/// purpose: Read the current git branch for sidebar-state metadata.
+/// purpose: Render CMUX-compatible branch/directory text for the workspace sidebar row.
+/// inputs: Workspace path, current branch, and configured branch layout.
+/// returns/effects: Returns display text without mutating state.
+fn sidebar_branch_directory_label(
+    path: &str,
+    branch: &str,
+    layout: app_config::SidebarBranchLayout,
+) -> String {
+    let display_path = abbreviate_path(path);
+    if branch == "none" || branch.is_empty() {
+        return display_path;
+    }
+    match layout {
+        app_config::SidebarBranchLayout::Vertical => format!("branch: {branch}\n{display_path}"),
+        app_config::SidebarBranchLayout::Inline => format!("{branch} - {display_path}"),
+    }
+}
+
+/// purpose: Render the full tooltip for a sidebar branch/directory row.
+/// inputs: Full workspace path and current branch string.
+/// returns/effects: Returns tooltip text without mutating state.
+fn sidebar_branch_directory_tooltip(path: &str, branch: &str) -> String {
+    if branch == "none" || branch.is_empty() {
+        path.to_string()
+    } else {
+        format!("branch: {branch}\n{path}")
+    }
+}
+
+/// purpose: Read the current git branch for sidebar metadata without spawning git.
 /// inputs: Optional workspace cwd/folder path.
-/// returns/effects: Runs `git rev-parse` when a cwd exists; returns "none" on non-git dirs.
+/// returns/effects: Reads `.git/HEAD` from cwd or ancestors; returns "none" outside branches.
 fn sidebar_git_branch(cwd: Option<&str>) -> String {
     let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
         return "none".to_string();
     };
-    match Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+    sidebar_git_branch_from_path(Path::new(cwd)).unwrap_or_else(|| "none".to_string())
+}
+
+/// purpose: Resolve branch name by walking upward to a `.git` metadata entry.
+/// inputs: Candidate workspace path.
+/// returns/effects: Returns branch name from HEAD, or None for detached/non-git paths.
+fn sidebar_git_branch_from_path(path: &Path) -> Option<String> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    for ancestor in start.ancestors() {
+        if let Some(branch) = sidebar_git_branch_from_dotgit(&ancestor.join(".git")) {
+            return Some(branch);
         }
-        _ => "none".to_string(),
     }
+    None
+}
+
+/// purpose: Parse branch name from a Git metadata directory or gitdir pointer file.
+/// inputs: Path to a `.git` directory or file.
+/// returns/effects: Reads HEAD and returns the short branch name for normal branches.
+fn sidebar_git_branch_from_dotgit(dotgit: &Path) -> Option<String> {
+    let git_dir = if dotgit.is_dir() {
+        dotgit.to_path_buf()
+    } else {
+        let raw = fs::read_to_string(dotgit).ok()?;
+        let target = raw.trim().strip_prefix("gitdir:")?.trim();
+        let target_path = Path::new(target);
+        if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            dotgit.parent()?.join(target_path)
+        }
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
 }
 
 /// purpose: Render CMUX sidebar port rows according to visibility settings.
@@ -6429,8 +6482,15 @@ fn apply_sidebar_detail_labels(
         description_label.set_visible(false);
     }
     if let Some(path) = folder_path.filter(|_| show_details) {
-        path_label.set_label(&abbreviate_path(path));
-        path_label.set_tooltip_text(Some(path));
+        let branch = sidebar_git_branch(Some(path));
+        let label = sidebar_branch_directory_label(path, &branch, sidebar.branch_layout);
+        let tooltip = sidebar_branch_directory_tooltip(path, &branch);
+        path_label.set_label(&label);
+        path_label.set_tooltip_text(Some(&tooltip));
+        path_label.set_wrap(matches!(
+            sidebar.branch_layout,
+            app_config::SidebarBranchLayout::Vertical
+        ));
         path_label.set_visible(sidebar.show_branch_directory);
     } else {
         path_label.set_visible(false);
@@ -13951,6 +14011,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
@@ -13984,8 +14045,9 @@ mod tests {
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
         should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
-        should_show_unread_visual, sidebar_feed_preview_lines_from_value,
-        sidebar_feed_visible_items, sidebar_file_preview_lines,
+        should_show_unread_visual, sidebar_branch_directory_label,
+        sidebar_branch_directory_tooltip, sidebar_feed_preview_lines_from_value,
+        sidebar_feed_visible_items, sidebar_file_preview_lines, sidebar_git_branch,
         sidebar_log_preview_lines_from_entries, sidebar_ports_rows, sidebar_progress_preview_line,
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
@@ -14000,7 +14062,7 @@ mod tests {
         SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
         HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
-    use crate::app_config::{NotificationSound, WorkspaceGroupNewPlacement};
+    use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{
         LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
@@ -14325,6 +14387,65 @@ mod tests {
         assert_eq!(
             right_sidebar_metadata_sections(&custom),
             (false, true, false)
+        );
+    }
+
+    // purpose: Verify CMUX branchLayout formats branch and directory detail rows.
+    // inputs: Workspace paths, branch names, and vertical/inline branch layout values.
+    // returns/effects: Asserts labels and tooltips use configured layout without mutation.
+    #[test]
+    fn sidebar_branch_directory_label_follows_branch_layout() {
+        assert_eq!(
+            sidebar_branch_directory_label(
+                "/tmp/project",
+                "feature/demo",
+                SidebarBranchLayout::Vertical
+            ),
+            "branch: feature/demo\n/tmp/project"
+        );
+        assert_eq!(
+            sidebar_branch_directory_label("/tmp/project", "main", SidebarBranchLayout::Inline),
+            "main - /tmp/project"
+        );
+        assert_eq!(
+            sidebar_branch_directory_label("/tmp/project", "none", SidebarBranchLayout::Inline),
+            "/tmp/project"
+        );
+        assert_eq!(
+            sidebar_branch_directory_tooltip("/tmp/project", "main"),
+            "branch: main\n/tmp/project"
+        );
+    }
+
+    // purpose: Verify sidebar git branch discovery avoids spawning git and reads HEAD metadata.
+    // inputs: Temporary normal .git directory plus worktree-style gitdir pointer.
+    // returns/effects: Asserts branch names resolve from nested workspace directories.
+    #[test]
+    fn sidebar_git_branch_reads_git_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let nested = repo.join("src");
+        fs::create_dir_all(repo.join(".git")).expect("create git dir");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write head");
+        assert_eq!(
+            sidebar_git_branch(Some(nested.to_str().expect("nested path"))),
+            "main"
+        );
+
+        let worktree = dir.path().join("worktree");
+        let gitdir = dir.path().join("actual-git");
+        fs::create_dir_all(&worktree).expect("create worktree");
+        fs::create_dir_all(&gitdir).expect("create actual git dir");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("write gitdir pointer");
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/sidebar\n").expect("write head");
+        assert_eq!(
+            sidebar_git_branch(Some(worktree.to_str().expect("worktree path"))),
+            "feature/sidebar"
         );
     }
 
