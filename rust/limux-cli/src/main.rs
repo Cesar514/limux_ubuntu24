@@ -849,15 +849,48 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "right-sidebar",
         "Usage: limux right-sidebar <command> [flags]",
     ),
-    ("set-status", "Usage: limux set-status"),
-    ("clear-status", "Usage: limux clear-status"),
-    ("list-status", "Usage: limux list-status"),
-    ("set-progress", "Usage: limux set-progress"),
-    ("clear-progress", "Usage: limux clear-progress"),
-    ("log", "Usage: limux log"),
-    ("clear-log", "Usage: limux clear-log"),
-    ("list-log", "Usage: limux list-log"),
-    ("sidebar-state", "Usage: limux sidebar-state"),
+    (
+        "set-status",
+        concat!(
+            "Usage: limux set-status <key> <value> [--icon <name>] ",
+            "[--color <#hex>] [--priority <n>] [--workspace <id|ref>]"
+        ),
+    ),
+    (
+        "clear-status",
+        "Usage: limux clear-status <key> [--workspace <id|ref>]",
+    ),
+    (
+        "list-status",
+        "Usage: limux list-status [--workspace <id|ref>]",
+    ),
+    (
+        "set-progress",
+        concat!(
+            "Usage: limux set-progress <0.0-1.0> [--label <text>] ",
+            "[--workspace <id|ref>]"
+        ),
+    ),
+    (
+        "clear-progress",
+        "Usage: limux clear-progress [--workspace <id|ref>]",
+    ),
+    (
+        "log",
+        concat!(
+            "Usage: limux log [--level info|progress|success|warning|error] ",
+            "[--source <name>] [--] <message>"
+        ),
+    ),
+    ("clear-log", "Usage: limux clear-log [--workspace <id|ref>]"),
+    (
+        "list-log",
+        "Usage: limux list-log [--limit <n>] [--workspace <id|ref>]",
+    ),
+    (
+        "sidebar-state",
+        "Usage: limux sidebar-state [--workspace <id|ref>]",
+    ),
     ("set-app-focus", "Usage: limux set-app-focus"),
     ("simulate-app-active", "Usage: limux simulate-app-active"),
     ("claude-hook", "Usage: limux claude-hook"),
@@ -5175,6 +5208,61 @@ fn render_sidebar_list_text(command: &str, payload: &Value) -> String {
     }
 }
 
+/// purpose: Render aggregate sidebar-state payloads for non-JSON CLI output.
+/// inputs: JSON payload from the live bridge.
+/// returns/effects: Returns workspace metadata plus retained status/progress/log rows.
+fn render_sidebar_state_text(payload: &Value) -> String {
+    let workspace =
+        get_string(payload, &["workspace", "workspace_id"]).unwrap_or_else(|| "none".to_string());
+    let cwd = get_string(payload, &["cwd"]).unwrap_or_else(|| "none".to_string());
+    let git_branch = get_string(payload, &["git_branch"]).unwrap_or_else(|| "none".to_string());
+    let status = render_sidebar_state_section(payload, "status", render_sidebar_status_row);
+    let log = render_sidebar_state_section(payload, "log", render_sidebar_log_row);
+    let progress = payload
+        .get("progress")
+        .filter(|value| !value.is_null())
+        .map(render_sidebar_progress_row)
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "workspace={workspace}\ncwd={cwd}\ngit_branch={git_branch}\nprogress={progress}\nstatus:\n{status}\nlog:\n{log}"
+    )
+}
+
+/// purpose: Render one array section from sidebar-state.
+/// inputs: Payload, section key, and row renderer.
+/// returns/effects: Returns "none" for empty or missing sections.
+fn render_sidebar_state_section(
+    payload: &Value,
+    key: &str,
+    render: fn(&Value) -> String,
+) -> String {
+    let rows = payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().map(render).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        "none".to_string()
+    } else {
+        rows.join("\n")
+    }
+}
+
+/// purpose: Render one sidebar progress row for non-JSON CLI output.
+/// inputs: JSON progress object from the live bridge.
+/// returns/effects: Returns value plus label when present.
+fn render_sidebar_progress_row(row: &Value) -> String {
+    let value = row
+        .get("value")
+        .and_then(Value::as_f64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let label = get_string(row, &["label"])
+        .map(|value| format!(" label={value}"))
+        .unwrap_or_default();
+    format!("{value}{label}")
+}
+
 /// purpose: Render one sidebar status row for non-JSON CLI output.
 /// inputs: JSON status row from the live bridge.
 /// returns/effects: Returns key=value plus priority when present.
@@ -7567,15 +7655,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
-                let workspace =
-                    get_string(&payload, &["workspace"]).unwrap_or_else(|| "none".to_string());
-                let cwd = get_string(&payload, &["cwd"]).unwrap_or_else(|| "none".to_string());
-                let git_branch =
-                    get_string(&payload, &["git_branch"]).unwrap_or_else(|| "none".to_string());
-                CommandOutput::Text(format!(
-                    "workspace={}\ncwd={}\ngit_branch={}",
-                    workspace, cwd, git_branch
-                ))
+                CommandOutput::Text(render_sidebar_state_text(&payload))
             }
         }
         "set-status" | "clear-status" | "set-progress" | "clear-progress" | "log" | "clear-log" => {
@@ -7973,6 +8053,27 @@ mod cli_arg_tests {
             build_sidebar_command_request("log", &args(&["--level", "debug", "message"]), None)
                 .expect_err("bad log level fails");
         assert!(bad_level.to_string().contains("--level must be"));
+    }
+
+    #[test]
+    fn cmux_sidebar_state_text_includes_metadata_sections() {
+        let rendered = render_sidebar_state_text(&json!({
+            "workspace": "ws-1",
+            "cwd": "/repo",
+            "git_branch": "main",
+            "progress": {"value": 0.5, "label": "Building"},
+            "status": [{"key": "build", "value": "running", "priority": 80}],
+            "log": [{
+                "created_at": "2026-07-02T04:37:18Z",
+                "level": "info",
+                "source": "build",
+                "message": "Started"
+            }]
+        }));
+
+        assert!(rendered.contains("progress=0.5 label=Building"));
+        assert!(rendered.contains("build=running priority=80"));
+        assert!(rendered.contains("2026-07-02T04:37:18Z info build: Started"));
     }
 
     #[test]
