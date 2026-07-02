@@ -8,6 +8,8 @@ mod keybind_editor;
 mod layout_state;
 mod memory_diagnostics;
 mod pane;
+mod port_discovery;
+mod port_discovery_procfs;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;
