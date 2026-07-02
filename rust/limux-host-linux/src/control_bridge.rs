@@ -144,6 +144,7 @@ const METHODS: &[&str] = &[
     "surface.drag_to_split",
     "surface.refresh",
     "surface.clear_history",
+    "surface.respawn",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -616,6 +617,13 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    RespawnSurface {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        command: String,
+        tmux_start_command: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -738,6 +746,7 @@ impl ControlCommand {
             | Self::DragSurfaceToSplit { reply, .. }
             | Self::RefreshSurfaces { reply, .. }
             | Self::ClearSurfaceHistory { reply, .. }
+            | Self::RespawnSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2650,6 +2659,43 @@ fn handle_method(
                 ControlCommand::ClearSurfaceHistory {
                     target,
                     surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.respawn" | "respawn-pane" => {
+            let Some(command) = optional_string(params, &["command"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.respawn requires command"),
+                );
+            };
+            let command = command.trim().to_string();
+            if command.is_empty() {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.respawn requires non-empty command"),
+                );
+            }
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::RespawnSurface {
+                    target,
+                    surface_hint: match optional_ref_handle(
+                        params,
+                        &["surface_id", "panel_id", "id"],
+                        "surface:",
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return error_response(id, error),
+                    },
+                    command,
+                    tmux_start_command: optional_string(params, &["tmux_start_command"]),
                     reply,
                 },
                 rx,
@@ -5218,6 +5264,48 @@ mod tests {
         assert_eq!(
             active.result.expect("surface.clear_history result")["cleared"],
             true
+        );
+    }
+
+    #[test]
+    fn surface_respawn_route_requires_command_and_preserves_metadata() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"respawn-pane","params":{"workspace_id":"codex","#,
+                r#""surface_id":"surface:4:tab","command":"echo ready","#,
+                r#""tmux_start_command":"echo ready"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::RespawnSurface {
+                    target,
+                    surface_hint,
+                    command,
+                    tmux_start_command,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(command, "echo ready");
+                    assert_eq!(tmux_start_command.as_deref(), Some("echo ready"));
+                    let _ = reply.send(Ok(json!({ "respawned": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.respawn result")["respawned"],
+            true
+        );
+
+        let missing = dispatch_request(
+            r#"{"id":1,"method":"surface.respawn","params":{"surface_id":"surface:4:tab"}}"#,
+            &|command| panic!("unexpected command: {command:?}"),
+        );
+        assert_eq!(
+            missing.error.expect("missing command error").code,
+            INVALID_PARAMS_CODE
         );
     }
 

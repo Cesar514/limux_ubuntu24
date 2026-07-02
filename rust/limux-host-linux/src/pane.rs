@@ -1633,6 +1633,83 @@ pub fn add_terminal_tab_to_pane_with_command(
     })
 }
 
+// purpose: Replace a terminal tab with a new process while preserving its surface ID.
+// inputs: Pane widget, optional surface hint, and command to run in the new terminal.
+// returns/effects: Recreates the terminal tab in place and returns its updated surface summary.
+pub fn respawn_terminal_surface(
+    pane_widget: &gtk::Widget,
+    surface_hint: Option<&str>,
+    command: String,
+) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+    let (tab_id, custom_name, pinned, cwd, was_active) = {
+        let tab_state = internals.tab_state.borrow();
+        let active_tab = tab_state.active_tab.as_deref();
+        let entry = tab_state.tabs.iter().find(|entry| {
+            let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+            matches!(entry.kind, TabKind::Terminal { .. })
+                && requested
+                    .map(|hint| hint == entry.id || hint == surface_id)
+                    .unwrap_or(active_tab == Some(entry.id.as_str()))
+        })?;
+        let cwd = match &entry.kind {
+            TabKind::Terminal { state } => state.cwd.borrow().clone(),
+            TabKind::Browser { .. } | TabKind::Keybinds => None,
+        };
+        (
+            entry.id.clone(),
+            entry.custom_name.clone(),
+            entry.pinned,
+            cwd,
+            active_tab == Some(entry.id.as_str()),
+        )
+    };
+
+    {
+        let mut tab_state = internals.tab_state.borrow_mut();
+        let index = tab_state.tabs.iter().position(|entry| entry.id == tab_id)?;
+        let entry = tab_state.tabs.remove(index);
+        internals.tab_strip.remove(&entry.tab_button);
+        internals.content_stack.remove(&entry.content);
+        if tab_state.active_tab.as_deref() == Some(tab_id.as_str()) {
+            tab_state.active_tab = None;
+        }
+    }
+    let options = TerminalTabOptions {
+        id: Some(&tab_id),
+        custom_name: custom_name.as_deref(),
+        pinned,
+        cwd: cwd.as_deref(),
+        agent: None,
+        startup_command: Some(command),
+        activate: was_active,
+    };
+    let working_directory = internals.working_directory.borrow().clone();
+    let new_tab_id =
+        add_terminal_tab_inner(&internals, working_directory.as_deref(), Some(options));
+    (internals.callbacks.on_state_changed)();
+    surface_summary_for_tab(&internals, &new_tab_id)
+}
+
+// purpose: Respawn a terminal surface found anywhere under a workspace root.
+// inputs: Workspace root, optional surface hint, and command to run.
+// returns/effects: Replaces the matching terminal tab process and preserves the surface ID.
+pub fn respawn_terminal_surface_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+    command: String,
+) -> Option<SurfaceSummary> {
+    pane_internals_for_root(root)
+        .into_iter()
+        .find_map(|internals| {
+            let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+            respawn_terminal_surface(&pane_widget, surface_hint, command.clone())
+        })
+}
+
 #[allow(dead_code)]
 pub fn add_browser_tab_to_pane(pane_widget: &gtk::Widget) {
     add_browser_tab_to_pane_with_uri(pane_widget, None);

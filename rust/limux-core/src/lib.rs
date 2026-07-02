@@ -50,6 +50,7 @@ const COMMANDS: &[&str] = &[
     "surface.health",
     "surface.read_text",
     "surface.send_text",
+    "surface.respawn",
     "surface.send_key",
     "surface.trigger_flash",
     "surface.clear_history",
@@ -5584,6 +5585,35 @@ fn handle_command(
                 "surface": surface
             }))
         }
+        "surface.respawn" => {
+            let params = params_object(params)?;
+            let workspace_id = optional_u64_param_any(params, &["workspace_id"])?;
+            let surface_hint = optional_u64_param_any(params, &["surface_id", "id"])?;
+            let command = required_string_param(params, "command")?.trim().to_string();
+            if command.is_empty() {
+                return Err(CommandError::invalid_params(
+                    "surface.respawn requires non-empty command",
+                ));
+            }
+            let (workspace_id, surface_id) =
+                resolve_surface_target(state, workspace_id, surface_hint)?;
+            let surface = update_surface_metadata(state, workspace_id, surface_id, |surface| {
+                surface.text.clear();
+                surface.shell_input.clear();
+                surface.terminal_mode = TerminalMode::Idle;
+                surface.title = command.clone();
+                surface.unread = false;
+            })
+            .ok_or_else(|| CommandError::not_found("surface not found"))?;
+            Ok(json!({
+                "workspace_id": encode_handle_id(workspace_id),
+                "workspace_ref": workspace_ref(workspace_id),
+                "surface_id": encode_handle_id(surface.id),
+                "surface_ref": surface_ref(surface.id),
+                "respawned": true,
+                "surface": surface
+            }))
+        }
         "surface.send_key" => {
             let params = params_object(params)?;
             let workspace_id = optional_u64_param_any(params, &["workspace_id"])?;
@@ -6232,13 +6262,24 @@ mod tests {
             "hello"
         );
 
+        let respawned = dispatcher
+            .dispatch(request(
+                "surface.respawn",
+                json!({ "surface_id": surface_id, "command": "echo ready" }),
+            ))
+            .await;
+        let respawned = respawned.result.expect("surface respawn");
+        assert_eq!(respawned["respawned"], true);
+        assert_eq!(respawned["surface"]["title"], "echo ready");
+        assert_eq!(respawned["surface"]["text"], "");
+
         let read = dispatcher
             .dispatch(request(
                 "surface.read_text",
                 json!({ "surface_id": surface_id }),
             ))
             .await;
-        assert_eq!(read.result.expect("read text")["text"], "hello");
+        assert_eq!(read.result.expect("read text")["text"], "");
 
         let split = dispatcher
             .dispatch(request("surface.split", json!({ "title": "split" })))

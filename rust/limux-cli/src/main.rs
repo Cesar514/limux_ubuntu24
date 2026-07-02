@@ -994,6 +994,39 @@ where
     update(&mut map, &path)
 }
 
+// purpose: Resolve named tmux-compat buffer content without silent empty paste.
+// inputs: Buffer map and requested buffer name.
+// returns/effects: Returns cloned text or fails when the buffer is absent.
+fn tmux_buffer_text(buffers: &BTreeMap<String, String>, name: &str) -> Result<String> {
+    buffers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow!("Buffer not found: {name}"))
+}
+
+// purpose: Build the CMUX-compatible respawn payload for a terminal surface.
+// inputs: Raw CLI args after `respawn-pane`.
+// returns/effects: Returns optional workspace scope plus surface.respawn params.
+fn build_respawn_pane_request(args: &[String]) -> Result<(Option<String>, Value)> {
+    let workspace = parse_opt(args, "--workspace");
+    let surface = parse_opt(args, "--surface");
+    let command = parse_opt(args, "--command")
+        .or_else(|| trailing_title(args))
+        .unwrap_or_else(|| "exec ${SHELL:-/bin/sh} -l".to_string());
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        bail!("respawn-pane requires non-empty command text");
+    }
+
+    let mut p = Map::new();
+    if let Some(surface) = surface {
+        p.insert("surface_id".to_string(), Value::String(surface));
+    }
+    p.insert("command".to_string(), Value::String(command.clone()));
+    p.insert("tmux_start_command".to_string(), Value::String(command));
+    Ok((workspace, Value::Object(p)))
+}
+
 async fn resolve_current_workspace(client: &mut Client) -> Result<String> {
     let current = client.call("workspace.current", json!({})).await?;
     get_string(&current, &["workspace_id", "workspace_ref"])
@@ -5524,18 +5557,22 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
         }
         "set-hook" => {
             let list_mode = parse_flag(args, "--list");
+            let unset_flag = parse_flag(args, "--unset");
             let unset = parse_opt(args, "--unset");
             with_locked_json_map(&client.socket, "hooks", |hooks, path| {
                 if list_mode {
                     let text = hooks
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
+                        .map(|(k, v)| format!("{} -> {}", k, v))
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Ok(json!({
                         "text": text,
                         "path": path.display().to_string(),
                     }));
+                }
+                if unset_flag && unset.is_none() {
+                    bail!("set-hook --unset requires an event name");
                 }
                 if let Some(name) = unset {
                     hooks.remove(&name);
@@ -5583,9 +5620,8 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             .await
         }
         "set-buffer" => {
-            let name =
-                parse_opt(args, "--name").ok_or_else(|| anyhow!("set-buffer requires --name"))?;
-            let body = trailing_title(args).unwrap_or_default();
+            let name = parse_opt(args, "--name").unwrap_or_else(|| "default".to_string());
+            let body = trailing_title(args).ok_or_else(|| anyhow!("set-buffer requires text"))?;
             with_locked_json_map(&client.socket, "buffers", |buffers, path| {
                 buffers.insert(name, body);
                 write_json_map(path, buffers)?;
@@ -5593,16 +5629,19 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             })
         }
         "list-buffers" => with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
-            let text = buffers.keys().cloned().collect::<Vec<_>>().join("\n");
+            let text = buffers
+                .iter()
+                .map(|(name, value)| format!("{}\t{}", name, value.len()))
+                .collect::<Vec<_>>()
+                .join("\n");
             Ok(json!({"text": text}))
         }),
         "paste-buffer" => {
-            let name =
-                parse_opt(args, "--name").ok_or_else(|| anyhow!("paste-buffer requires --name"))?;
+            let name = parse_opt(args, "--name").unwrap_or_else(|| "default".to_string());
             let workspace = parse_opt(args, "--workspace");
             let surface = parse_opt(args, "--surface");
             let text = with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
-                Ok(buffers.get(&name).cloned().unwrap_or_default())
+                tmux_buffer_text(buffers, &name)
             })?;
             let mut p = Map::new();
             if let Some(surface) = surface {
@@ -5612,18 +5651,12 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             call_in_workspace_scope(client, workspace, "surface.send_text", Value::Object(p)).await
         }
         "respawn-pane" => {
-            let workspace = parse_opt(args, "--workspace");
-            let surface = parse_opt(args, "--surface");
-            let command = parse_opt(args, "--command").unwrap_or_default();
-            let mut p = Map::new();
-            if let Some(surface) = surface {
-                p.insert("surface_id".to_string(), Value::String(surface));
-            }
-            p.insert("text".to_string(), Value::String(format!("{}\n", command)));
-            call_in_workspace_scope(client, workspace, "surface.send_text", Value::Object(p)).await
+            let (workspace, params) = build_respawn_pane_request(args)?;
+            call_in_workspace_scope(client, workspace, "surface.respawn", params).await
         }
         "display-message" => {
-            let msg = trailing_title(args).unwrap_or_default();
+            let msg =
+                trailing_title(args).ok_or_else(|| anyhow!("display-message requires text"))?;
             Ok(json!({"text": msg}))
         }
         _ => bail!("unknown tmux command"),
@@ -6310,6 +6343,59 @@ mod cli_arg_tests {
             fs::read(&marker).expect("existing marker remains"),
             b"existing"
         );
+    }
+
+    // purpose: Verify missing tmux buffers fail instead of pasting empty text.
+    // inputs: A buffer map with one named entry.
+    // returns/effects: Asserts successful lookup and explicit not-found error.
+    #[test]
+    fn tmux_buffer_lookup_fails_for_missing_named_buffer() {
+        let mut buffers = BTreeMap::new();
+        buffers.insert("build".to_string(), "cargo test".to_string());
+
+        assert_eq!(
+            tmux_buffer_text(&buffers, "build").expect("buffer text"),
+            "cargo test"
+        );
+        let error = tmux_buffer_text(&buffers, "missing").expect_err("missing buffer should fail");
+        assert!(error.to_string().contains("Buffer not found: missing"));
+    }
+
+    // purpose: Verify respawn-pane builds CMUX-compatible surface.respawn params.
+    // inputs: Workspace, surface, command flag, and positional command forms.
+    // returns/effects: Asserts command metadata and target fields are present.
+    #[test]
+    fn respawn_pane_request_targets_surface_respawn_payload() {
+        let (workspace, params) = build_respawn_pane_request(&args(&[
+            "--workspace",
+            "workspace:7",
+            "--surface",
+            "surface:9:tab",
+            "--command",
+            "echo ready",
+        ]))
+        .expect("respawn params");
+
+        assert_eq!(workspace.as_deref(), Some("workspace:7"));
+        assert_eq!(params["surface_id"], "surface:9:tab");
+        assert_eq!(params["command"], "echo ready");
+        assert_eq!(params["tmux_start_command"], "echo ready");
+
+        let (_, positional) = build_respawn_pane_request(&args(&["--", "cargo", "test"]))
+            .expect("positional respawn params");
+        assert_eq!(positional["command"], "cargo test");
+
+        let (_, default_shell) =
+            build_respawn_pane_request(&args(&[])).expect("default shell respawn params");
+        assert_eq!(default_shell["command"], "exec ${SHELL:-/bin/sh} -l");
+    }
+
+    #[test]
+    fn unsupported_tmux_placeholders_are_explicit() {
+        for command in ["popup", "bind-key", "unbind-key", "copy-mode"] {
+            assert!(is_unsupported_tmux_cmd(command));
+        }
+        assert!(!is_unsupported_tmux_cmd("display-message"));
     }
 
     #[test]

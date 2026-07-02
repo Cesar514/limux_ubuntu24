@@ -7191,6 +7191,61 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::RespawnSurface {
+            target,
+            surface_hint,
+            command,
+            tmux_start_command,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let respawned = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let (_focused_pane_id, focused_surface_id) =
+                    focused_ids_for_workspace(state, &workspace.id);
+                let resolved_surface_hint =
+                    surface_hint.as_deref().or(focused_surface_id.as_deref());
+                pane::respawn_terminal_surface_for_root(
+                    &workspace.root,
+                    resolved_surface_hint,
+                    command.clone(),
+                )
+                .map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(mut payload) = respawned else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("ok".to_string(), serde_json::Value::Bool(true));
+                map.insert("respawned".to_string(), serde_json::Value::Bool(true));
+                if let Some(start_command) = tmux_start_command {
+                    map.insert(
+                        "tmux_start_command".to_string(),
+                        serde_json::Value::String(start_command),
+                    );
+                }
+            }
+            request_session_save(state);
+            let _ = reply.send(Ok(payload));
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,
