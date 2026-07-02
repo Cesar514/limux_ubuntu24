@@ -2563,6 +2563,68 @@ fn surface_health_payload(
     Ok(serde_json::json!({ "surfaces": surfaces }))
 }
 
+/// purpose: Resolve a CMUX surface ports-kick request and return current discovered ports.
+/// inputs: Workspace, sidebar config, optional surface target, and optional reason.
+/// returns/effects: Scans current workspace ports once or returns explicit target errors.
+fn surface_ports_kick_payload(
+    state: &State,
+    workspace: &Workspace,
+    sidebar: &app_config::SidebarConfig,
+    surface_hint: Option<&str>,
+    reason: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_ports_kick_surface(state, workspace, surface_hint)?;
+    let ports = crate::port_discovery::workspace_port_rows(
+        &workspace.id,
+        20,
+        sidebar.open_port_links_in_cmux_browser,
+    )
+    .map_err(BridgeError::internal)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_ref": workspace_ref(&workspace.id),
+        "surface_id": surface.surface_id,
+        "surface_ref": surface_ref(&surface.surface_id),
+        "surface_type": surface.kind,
+        "reason": reason.unwrap_or("command"),
+        "ports": ports,
+    }))
+}
+
+/// purpose: Resolve the surface targeted by `surface.ports_kick`.
+/// inputs: Workspace surface summaries plus optional explicit surface/tab hint.
+/// returns/effects: Returns explicit not_found for unknown requested surfaces.
+fn resolve_ports_kick_surface(
+    state: &State,
+    workspace: &Workspace,
+    surface_hint: Option<&str>,
+) -> Result<pane::SurfaceSummary, BridgeError> {
+    let surfaces = pane::surface_summaries_for_root(&workspace.root);
+    if let Some(hint) = surface_hint {
+        return surfaces
+            .into_iter()
+            .find(|surface| surface_hint_matches(&surface.surface_id, hint))
+            .ok_or_else(|| BridgeError::not_found("surface not found"));
+    }
+    let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+    if let Some(surface_id) = focused_surface_id {
+        if let Some(surface) = surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .cloned()
+        {
+            return Ok(surface);
+        }
+    }
+    surfaces
+        .iter()
+        .find(|surface| surface.selected)
+        .or_else(|| surfaces.first())
+        .cloned()
+        .ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
 #[derive(Clone)]
 struct WorkspaceSeedSource {
     workspace_cwd: Option<String>,
@@ -10918,6 +10980,37 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let result = {
                 let app_state = state.borrow();
                 surface_health_payload(state, &app_state.workspaces[index], surface_hint.as_deref())
+            };
+            let _ = reply.send(result);
+        }
+        ControlCommand::SurfacePortsKick {
+            target,
+            surface_hint,
+            reason,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let result = {
+                let app_state = state.borrow();
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                surface_ports_kick_payload(
+                    state,
+                    &app_state.workspaces[index],
+                    &sidebar,
+                    surface_hint.as_deref(),
+                    reason.as_deref(),
+                )
             };
             let _ = reply.send(result);
         }

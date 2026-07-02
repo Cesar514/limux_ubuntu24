@@ -169,6 +169,7 @@ const METHODS: &[&str] = &[
     "surface.clear_history",
     "surface.respawn",
     "surface.health",
+    "surface.ports_kick",
     "surface.read_text",
     "surface.send_text",
     "surface.send_key",
@@ -798,6 +799,12 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfacePortsKick {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reason: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -952,6 +959,7 @@ impl ControlCommand {
             | Self::ClearSurfaceHistory { reply, .. }
             | Self::RespawnSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
+            | Self::SurfacePortsKick { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::WorkspaceEnv { reply, .. }
@@ -3944,6 +3952,30 @@ fn handle_method(
                 rx,
             )
         }
+        "surface.ports_kick" | "surface.ports-kick" | "ports_kick" | "ports-kick" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfacePortsKick {
+                    target,
+                    surface_hint,
+                    reason: optional_string(params, &["reason"]),
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.read_text" | "read-screen" | "capture-pane" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -4818,6 +4850,11 @@ mod tests {
         assert!(METHODS.contains(&"sidebar.log.append"));
         assert!(METHODS.contains(&"sidebar.state"));
         assert!(METHODS.contains(&"set_status"));
+    }
+
+    #[test]
+    fn capabilities_include_surface_ports_kick_method() {
+        assert!(METHODS.contains(&"surface.ports_kick"));
     }
 
     #[test]
@@ -8182,6 +8219,30 @@ mod tests {
                     assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
                     assert_eq!(surface_hint, Some("4:tab".to_string()));
                     let _ = reply.send(Ok(json!({ "surfaces": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn surface_ports_kick_route_accepts_surface_refs_and_reason() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.ports_kick","params":{"workspace_id":"codex","surface_id":"surface:4:tab","reason":"refresh"}}"#,
+            &|command| match command {
+                ControlCommand::SurfacePortsKick {
+                    target,
+                    surface_hint,
+                    reason,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(reason, Some("refresh".to_string()));
+                    let _ = reply.send(Ok(json!({ "surface_id": "4:tab" })));
                 }
                 other => panic!("unexpected command: {other:?}"),
             },

@@ -356,6 +356,7 @@ fn full_help_text() -> &'static str {
         "  current-workspace\n",
         "  memory [--groups <count>]\n",
         "  surface-health [--workspace <id|ref>]\n",
+        "  ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
         "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--layout <json>]\n",
@@ -2878,6 +2879,14 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("refresh-surfaces", "Usage: limux refresh-surfaces"),
     ("reload-config", "Usage: limux reload-config"),
     ("surface-health", "Usage: limux surface-health"),
+    (
+        "ports-kick",
+        "Usage: limux ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]",
+    ),
+    (
+        "ports_kick",
+        "Usage: limux ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]",
+    ),
     ("debug-terminals", "Usage: limux debug-terminals"),
     ("trigger-flash", "Usage: limux trigger-flash"),
     ("list-panels", "Usage: limux list-panels"),
@@ -4757,6 +4766,57 @@ async fn run_list(client: &mut Client, command: &str, args: &[String]) -> Result
         }
     }
     Ok(payload)
+}
+
+/// purpose: Run CMUX-compatible surface port scan kick through the live host.
+/// inputs: CLI args with optional workspace, surface/panel, and reason.
+/// returns/effects: Sends one `surface.ports_kick` request or fails on malformed flags.
+async fn run_ports_kick(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = build_ports_kick_params(args)?;
+    client
+        .call("surface.ports_kick", Value::Object(params))
+        .await
+}
+
+/// purpose: Build params for `ports-kick`/`ports_kick` CLI aliases.
+/// inputs: Raw CLI args.
+/// returns/effects: Returns normalized JSON params and rejects unknown options.
+fn build_ports_kick_params(args: &[String]) -> Result<Map<String, Value>> {
+    let mut params = Map::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let raw = args[index].as_str();
+        let Some(flag) = raw.strip_prefix("--") else {
+            bail!("ports-kick accepts only --workspace, --surface, --panel, and --reason");
+        };
+        let (name, inline) = flag
+            .split_once('=')
+            .map(|(name, value)| (format!("--{name}"), Some(value.to_string())))
+            .unwrap_or_else(|| (raw.to_string(), None));
+        let value = sidebar_option_value(args, &mut index, &name, inline)?;
+        match name.as_str() {
+            "--workspace" => params.insert("workspace_id".to_string(), Value::String(value)),
+            "--surface" => params.insert("surface_id".to_string(), Value::String(value)),
+            "--panel" => params.insert("panel_id".to_string(), Value::String(value)),
+            "--reason" => params.insert("reason".to_string(), Value::String(value)),
+            _ => bail!("Unknown ports-kick option {name}"),
+        };
+    }
+    if !params.contains_key("workspace_id") {
+        if let Some(workspace) = context_env_value("LIMUX_WORKSPACE_ID")
+            .or_else(|| context_env_value("CMUX_WORKSPACE_ID"))
+        {
+            params.insert("workspace_id".to_string(), Value::String(workspace));
+        }
+    }
+    if !params.contains_key("surface_id") && !params.contains_key("panel_id") {
+        if let Some(surface) =
+            context_env_value("LIMUX_SURFACE_ID").or_else(|| context_env_value("CMUX_SURFACE_ID"))
+        {
+            params.insert("surface_id".to_string(), Value::String(surface));
+        }
+    }
+    Ok(params)
 }
 
 // purpose: Run CMUX-compatible workspace-group subcommands through the host socket.
@@ -14595,6 +14655,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "identify" => CommandOutput::Json(run_identify(client, args).await?),
+        "ports-kick" | "ports_kick" => {
+            let payload = run_ports_kick(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "list-panels"
         | "list-panes"
         | "list-workspaces"
@@ -15494,6 +15562,25 @@ mod cli_arg_tests {
         assert!(rendered.contains("progress=0.5 label=Building"));
         assert!(rendered.contains("build=running priority=80"));
         assert!(rendered.contains("2026-07-02T04:37:18Z info build: Started"));
+    }
+
+    #[test]
+    fn ports_kick_params_accept_surface_panel_and_reason() {
+        let params = build_ports_kick_params(&args(&[
+            "--workspace",
+            "workspace:abc",
+            "--surface",
+            "surface:1:tab",
+            "--reason=refresh",
+        ]))
+        .expect("ports-kick parses");
+        assert_eq!(params["workspace_id"], json!("workspace:abc"));
+        assert_eq!(params["surface_id"], json!("surface:1:tab"));
+        assert_eq!(params["reason"], json!("refresh"));
+
+        let panel_params =
+            build_ports_kick_params(&args(&["--panel", "panel-1"])).expect("panel alias parses");
+        assert_eq!(panel_params["panel_id"], json!("panel-1"));
     }
 
     #[test]
