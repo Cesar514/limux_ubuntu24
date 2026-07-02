@@ -64,6 +64,11 @@ struct GlobalOptions {
 enum CommandOutput {
     Silent,
     Text(String),
+    Exit {
+        stdout: String,
+        stderr: String,
+        status: i32,
+    },
     Json(Value),
 }
 
@@ -3560,6 +3565,16 @@ async fn run_feed_hook(
         return Ok(CommandOutput::Json(result));
     }
     let decision = result.get("decision").cloned();
+    let source = parse_opt(args, "--source")
+        .ok_or_else(|| anyhow!("limux hooks feed requires --source <agent-name>"))?;
+    if source == "kiro" {
+        if let Some(output) = decision
+            .as_ref()
+            .and_then(render_kiro_permission_decision_output)
+        {
+            return Ok(output);
+        }
+    }
     let output = decision
         .as_ref()
         .map(|value| render_feed_decision(args, tool_input.as_ref(), &payload, value))
@@ -3568,6 +3583,31 @@ async fn run_feed_hook(
     let _ = hook_event_name;
     let _ = tool_name;
     Ok(CommandOutput::Text(output))
+}
+
+// purpose: Enforce Kiro's preToolUse permission contract from resolved Feed decisions.
+// inputs: Feed decision JSON returned by feed.push.
+// returns/effects: Returns stdout/exit behavior; deny and malformed modes fail closed with exit 2.
+fn render_kiro_permission_decision_output(decision: &Value) -> Option<CommandOutput> {
+    if hook_str(decision, &["kind"]) != Some("permission") {
+        return None;
+    }
+    let mode = hook_str(decision, &["mode"])
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(mode.as_str(), "once" | "always" | "all" | "bypass") {
+        return Some(CommandOutput::Text("{}".to_string()));
+    }
+    let stderr = if mode == "deny" {
+        "User denied permission via Limux Feed."
+    } else {
+        "Limux Feed returned an unrecognized Kiro permission decision; denying for safety."
+    };
+    Some(CommandOutput::Exit {
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+        status: 2,
+    })
 }
 
 // purpose: Convert resolved Feed decisions into the source agent's hook stdout JSON.
@@ -5727,6 +5767,22 @@ fn feed_hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<Strin
     let limux_disable_var = hook_disable_var("LIMUX", agent);
     let cmux_disable_var = hook_disable_var("CMUX", agent);
     let limux_command = hook_cli_command()?;
+    if agent == agent_hooks::AgentKind::Kiro {
+        return Ok(format!(
+            concat!(
+                "if [ \"${{{limux_disable_var}:-}}\" != \"1\" ] && ",
+                "[ \"${{{cmux_disable_var}:-}}\" != \"1\" ]; then ",
+                "{{ {limux_command} hooks feed --source {source} --event {event}; ",
+                "status=$?; [ \"$status\" -eq 2 ] && exit 2; ",
+                "if [ \"$status\" -ne 0 ]; then echo '{{}}'; fi; }}; else echo '{{}}'; fi"
+            ),
+            limux_disable_var = limux_disable_var,
+            cmux_disable_var = cmux_disable_var,
+            limux_command = limux_command,
+            source = agent.store_name(),
+            event = shell_single_quote(event)
+        ));
+    }
     Ok(format!(
         "[ \"${{{limux_disable_var}:-}}\" != \"1\" ] && [ \"${{{cmux_disable_var}:-}}\" != \"1\" ] && {limux_command} hooks feed --source {} --event {} || echo '{{}}'",
         agent.store_name(),
@@ -10493,13 +10549,27 @@ async fn main() -> Result<()> {
 
     match output {
         Ok(output) => {
+            let status = command_output_status(&output);
             print_command_output(output, opts.pretty)?;
+            if let Some(status) = status {
+                std::process::exit(status);
+            }
             Ok(())
         }
         Err(err) => {
             eprintln!("{}", err);
             std::process::exit(1);
         }
+    }
+}
+
+// purpose: Report an explicit process exit status requested by a command output.
+// inputs: Completed CLI command output.
+// returns/effects: Returns the desired status when the caller must terminate nonzero.
+fn command_output_status(output: &CommandOutput) -> Option<i32> {
+    match output {
+        CommandOutput::Exit { status, .. } => Some(*status),
+        _ => None,
     }
 }
 
@@ -10511,6 +10581,15 @@ fn print_command_output(output: CommandOutput, pretty: bool) -> Result<()> {
         CommandOutput::Silent => Ok(()),
         CommandOutput::Text(text) => {
             println!("{}", text);
+            Ok(())
+        }
+        CommandOutput::Exit { stdout, stderr, .. } => {
+            if !stdout.is_empty() {
+                println!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprintln!("{}", stderr);
+            }
             Ok(())
         }
         CommandOutput::Json(value) => {
@@ -10850,6 +10929,7 @@ mod cli_arg_tests {
             }
             CommandOutput::Silent => panic!("docs should render text"),
             CommandOutput::Json(_) => panic!("docs should render text"),
+            CommandOutput::Exit { .. } => panic!("docs should render text"),
         }
     }
 
@@ -11883,6 +11963,38 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn kiro_permission_decision_preserves_exit_code_two_for_denies() {
+        let allow = render_kiro_permission_decision_output(
+            &json!({ "kind": "permission", "mode": "always" }),
+        )
+        .expect("allow output");
+        let CommandOutput::Text(stdout) = allow else {
+            panic!("allow should print normal hook output");
+        };
+        assert_eq!(stdout, "{}");
+
+        let deny = render_kiro_permission_decision_output(
+            &json!({ "kind": "permission", "mode": "deny" }),
+        )
+        .expect("deny output");
+        let CommandOutput::Exit { stderr, status, .. } = deny else {
+            panic!("deny should exit with Kiro denial status");
+        };
+        assert_eq!(status, 2);
+        assert!(stderr.contains("denied permission"));
+
+        let unknown = render_kiro_permission_decision_output(
+            &json!({ "kind": "permission", "mode": "totally-bogus-mode" }),
+        )
+        .expect("unknown output");
+        let CommandOutput::Exit { stderr, status, .. } = unknown else {
+            panic!("unknown modes should fail closed");
+        };
+        assert_eq!(status, 2);
+        assert!(stderr.contains("unrecognized Kiro permission decision"));
+    }
+
+    #[test]
     fn feed_question_decision_renders_claude_answers() {
         let output = render_feed_decision(
             &args(&["--source", "claude"]),
@@ -12496,6 +12608,18 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks feed --source kiro --event 'preToolUse'"));
+        assert!(!pre_tool["command"]
+            .as_str()
+            .expect("command")
+            .contains("|| echo '{}'"));
+        assert!(pre_tool["command"]
+            .as_str()
+            .expect("command")
+            .contains("status=$?"));
+        assert!(pre_tool["command"]
+            .as_str()
+            .expect("command")
+            .contains("exit 2"));
         assert!(post_tool["command"]
             .as_str()
             .expect("command")
