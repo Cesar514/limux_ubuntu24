@@ -4321,6 +4321,12 @@ fn custom_sidebar_dispatcher_action(
         "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
             custom_sidebar_action_param_string(action, "surface_id")?,
         ))),
+        "workspace.reorder" | "reorder-workspace" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
+                workspace_id: custom_sidebar_action_param_string(action, "workspace_id")?,
+                index: custom_sidebar_action_param_usize(action, "index")?,
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -4352,6 +4358,23 @@ fn custom_sidebar_action_param_string(
         .ok_or_else(|| format!("{} requires string `{key}`", action.action_type))
 }
 
+/// purpose: Read a required non-negative integer parameter from a CMUX sidebar action.
+/// inputs: Parsed action metadata and parameter key.
+/// returns/effects: Returns a usize or a loud validation error.
+fn custom_sidebar_action_param_usize(
+    action: &CustomSidebarNodeAction,
+    key: &str,
+) -> Result<usize, String> {
+    let Some(value) = action.params.get(key) else {
+        return Err(format!("{} requires integer `{key}`", action.action_type));
+    };
+    let Some(index) = value.as_u64() else {
+        return Err(format!("{} requires integer `{key}`", action.action_type));
+    };
+    usize::try_from(index)
+        .map_err(|_| format!("{} integer `{key}` is out of range", action.action_type))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CustomSidebarDispatcherAction {
     WorkspaceNext,
@@ -4360,6 +4383,7 @@ enum CustomSidebarDispatcherAction {
     JumpToUnread,
     WorkspaceSelect(String),
     SurfaceFocus(String),
+    WorkspaceReorder { workspace_id: String, index: usize },
 }
 
 /// purpose: Execute a supported CMUX dispatcher action from a JSON custom-sidebar button.
@@ -4407,6 +4431,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
+            CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
     }
 }
@@ -4435,6 +4460,10 @@ fn apply_custom_sidebar_dispatcher_action(
         CustomSidebarDispatcherAction::SurfaceFocus(surface_id) => {
             focus_surface_for_custom_sidebar(state, &surface_id)
         }
+        CustomSidebarDispatcherAction::WorkspaceReorder {
+            workspace_id,
+            index,
+        } => reorder_workspace_for_custom_sidebar(state, &workspace_id, index),
     }
 }
 
@@ -4552,6 +4581,156 @@ fn focus_surface_in_workspace_for_custom_sidebar(
         })
     };
     result.ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
+/// purpose: Reorder a workspace from a JSON custom-sidebar dispatcher action.
+/// inputs: Live host state, workspace id/ref, and absolute CMUX target index.
+/// returns/effects: Mutates workspace order, updates sidebar rows, publishes reorder events, and persists.
+fn reorder_workspace_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+    target_index: usize,
+) -> Result<serde_json::Value, BridgeError> {
+    let result = {
+        let mut app_state = state.borrow_mut();
+        let Some(from_index) = workspace_index_for_raw_id(&app_state, workspace_id) else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        reorder_workspace_to_index_in_state(&mut app_state, from_index, target_index)
+    };
+    if let Some(row) = result.row_to_select.clone() {
+        result.sidebar_list.select_row(Some(&row));
+    }
+    if result.changed {
+        publish_workspace_reordered_event(
+            result.ordered_workspace_ids.clone(),
+            vec![result.workspace_id.clone()],
+            result.pinned_workspace_ids.clone(),
+            result.selected_workspace_id.clone(),
+            result.selected_index,
+        );
+        request_session_save(state);
+    }
+    Ok(result.payload())
+}
+
+/// purpose: Move one workspace inside AppState using CMUX absolute index semantics.
+/// inputs: Mutable host state, source index, and requested target index.
+/// returns/effects: Reorders state, syncs sidebar rows, and returns publishable metadata.
+fn reorder_workspace_to_index_in_state(
+    state: &mut AppState,
+    from_index: usize,
+    target_index: usize,
+) -> CustomSidebarWorkspaceReorderResult {
+    let workspace_count = state.workspaces.len();
+    let to_index =
+        custom_sidebar_workspace_reorder_to_index(from_index, target_index, workspace_count);
+    let workspace_id = state.workspaces[from_index].id.clone();
+    if from_index != to_index {
+        let workspace = state.workspaces.remove(from_index);
+        state.workspaces.insert(to_index, workspace);
+        if state.active_idx == from_index {
+            state.active_idx = to_index;
+        } else if from_index < state.active_idx && state.active_idx <= to_index {
+            state.active_idx -= 1;
+        } else if to_index <= state.active_idx && state.active_idx < from_index {
+            state.active_idx += 1;
+        }
+        sync_sidebar_row_order(state);
+    }
+    let row_to_select = sidebar_row_for_workspace_index(state, state.active_idx);
+    CustomSidebarWorkspaceReorderResult::from_state(
+        state,
+        workspace_id,
+        from_index,
+        to_index,
+        row_to_select,
+    )
+}
+
+/// purpose: Clamp a CMUX workspace.reorder target index to the current workspace order.
+/// inputs: Source index, requested index, and workspace count.
+/// returns/effects: Returns the final index without mutating state.
+fn custom_sidebar_workspace_reorder_to_index(
+    from_index: usize,
+    target_index: usize,
+    workspace_count: usize,
+) -> usize {
+    if workspace_count <= 1 {
+        return from_index.min(workspace_count.saturating_sub(1));
+    }
+    target_index.min(workspace_count - 1)
+}
+
+struct CustomSidebarWorkspaceReorderResult {
+    workspace_id: String,
+    from_index: usize,
+    to_index: usize,
+    changed: bool,
+    ordered_workspace_ids: Vec<String>,
+    pinned_workspace_ids: Vec<String>,
+    selected_workspace_id: Option<String>,
+    selected_index: usize,
+    sidebar_list: gtk::ListBox,
+    row_to_select: Option<gtk::ListBoxRow>,
+}
+
+impl CustomSidebarWorkspaceReorderResult {
+    fn from_state(
+        state: &AppState,
+        workspace_id: String,
+        from_index: usize,
+        to_index: usize,
+        row_to_select: Option<gtk::ListBoxRow>,
+    ) -> Self {
+        Self {
+            workspace_id,
+            from_index,
+            to_index,
+            changed: from_index != to_index,
+            ordered_workspace_ids: state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect(),
+            pinned_workspace_ids: state
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.favorite)
+                .map(|workspace| workspace.id.clone())
+                .collect(),
+            selected_workspace_id: state
+                .workspaces
+                .get(state.active_idx)
+                .map(|workspace| workspace.id.clone()),
+            selected_index: state.active_idx,
+            sidebar_list: state.sidebar_list.clone(),
+            row_to_select,
+        }
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        let plan = serde_json::json!({
+            "workspace_id": self.workspace_id,
+            "workspace_ref": workspace_ref(&self.workspace_id),
+            "window_id": "window:1",
+            "window_ref": "window:1",
+            "from_index": self.from_index,
+            "to_index": self.to_index,
+        });
+        serde_json::json!({
+            "workspace_id": self.workspace_id,
+            "workspace_ref": workspace_ref(&self.workspace_id),
+            "window_id": "window:1",
+            "window_ref": "window:1",
+            "from_index": self.from_index,
+            "to_index": self.to_index,
+            "index": self.to_index,
+            "dry_run": false,
+            "plan": [plan.clone()],
+            "events": if self.changed { vec![plan] } else { Vec::<serde_json::Value>::new() },
+        })
+    }
 }
 
 /// purpose: Open a URL from a JSON custom-sidebar button action.
@@ -17157,8 +17336,9 @@ mod tests {
         custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action, custom_sidebar_font_size,
         custom_sidebar_is_hex_color, custom_sidebar_markup_attrs, custom_sidebar_pango_color,
         custom_sidebar_pango_weight, custom_sidebar_report_payload_at_with_beta,
-        desktop_notification_action_entries, desktop_notification_action_from_signal,
-        desktop_notification_actions, desktop_notification_activation_token_from_signal,
+        custom_sidebar_workspace_reorder_to_index, desktop_notification_action_entries,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -17850,6 +18030,14 @@ mod tests {
             message: None,
             params: surface_params,
         };
+        let mut reorder_params = serde_json::Map::new();
+        reorder_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        reorder_params.insert("index".to_string(), json!(2));
+        let workspace_reorder = CustomSidebarNodeAction {
+            action_type: "workspace.reorder".to_string(),
+            message: None,
+            params: reorder_params,
+        };
 
         assert_eq!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.next")),
@@ -17879,11 +18067,36 @@ mod tests {
             custom_sidebar_action_tooltip(&surface_focus),
             "cmux dispatcher: surface.focus"
         );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_reorder),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
+                workspace_id: "workspace:build".to_string(),
+                index: 2,
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_reorder),
+            "cmux dispatcher: workspace.reorder"
+        );
         assert!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.select"))
                 .expect_err("missing workspace id is invalid")
                 .contains("workspace_id")
         );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.reorder"))
+                .expect_err("missing reorder params are invalid")
+                .contains("workspace_id")
+        );
+    }
+
+    #[test]
+    fn custom_sidebar_workspace_reorder_index_clamps_like_cmux() {
+        assert_eq!(custom_sidebar_workspace_reorder_to_index(0, 2, 4), 2);
+        assert_eq!(custom_sidebar_workspace_reorder_to_index(3, 99, 4), 3);
+        assert_eq!(custom_sidebar_workspace_reorder_to_index(0, 99, 4), 3);
+        assert_eq!(custom_sidebar_workspace_reorder_to_index(0, 0, 1), 0);
+        assert_eq!(custom_sidebar_workspace_reorder_to_index(7, 0, 0), 0);
     }
 
     #[test]
