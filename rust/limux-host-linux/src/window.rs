@@ -240,6 +240,7 @@ struct CustomSidebarNode {
 struct CustomSidebarNodeAction {
     action_type: String,
     message: Option<String>,
+    params: serde_json::Map<String, serde_json::Value>,
 }
 
 pub(crate) struct AppState {
@@ -3822,7 +3823,29 @@ fn parse_custom_sidebar_action(
     Ok(Some(CustomSidebarNodeAction {
         action_type: action_type.to_string(),
         message: optional_json_string(object, "message"),
+        params: parse_custom_sidebar_action_params(object)?,
     }))
+}
+
+/// purpose: Parse CMUX dispatcher params from a JSON-sidebar action object.
+/// inputs: Raw action object, including optional `params` and direct param keys.
+/// returns/effects: Returns merged params or rejects malformed param containers.
+fn parse_custom_sidebar_action_params(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut params = serde_json::Map::new();
+    if let Some(value) = object.get("params") {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "node.action.params must be a JSON object".to_string())?;
+        params.extend(object.clone());
+    }
+    for (key, value) in object {
+        if !matches!(key.as_str(), "type" | "message" | "params") {
+            params.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(params)
 }
 
 /// purpose: Read an optional string from a JSON object.
@@ -4244,10 +4267,11 @@ fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
             .message
             .clone()
             .unwrap_or_else(|| "open URL".to_string()),
-        other if custom_sidebar_dispatcher_action(other).is_some() => {
-            format!("cmux dispatcher: {other}")
-        }
-        other => format!("not_supported: custom sidebar action {other}"),
+        other => match custom_sidebar_dispatcher_action(action) {
+            Ok(Some(_)) => format!("cmux dispatcher: {other}"),
+            Ok(None) => format!("not_supported: custom sidebar action {other}"),
+            Err(error) => format!("invalid custom sidebar action {other}: {error}"),
+        },
     }
 }
 
@@ -4261,45 +4285,105 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
             action.message.as_deref().unwrap_or("")
         ),
         "openURL" | "open" => open_custom_sidebar_url(button, action.message.as_deref()),
-        other => run_custom_sidebar_dispatcher_action(button, other),
+        _ => run_custom_sidebar_dispatcher_action(button, action),
     }
 }
 
 /// purpose: Map CMUX JSON action types to supported no-parameter dispatcher actions.
-/// inputs: Raw JSON action type.
-/// returns/effects: Returns the equivalent host action for no-param dispatcher actions only.
-fn custom_sidebar_dispatcher_action(method: &str) -> Option<CustomSidebarDispatcherAction> {
+/// inputs: Parsed JSON action with CMUX method and params.
+/// returns/effects: Returns a typed host action, no action for unsupported methods, or param error.
+fn custom_sidebar_dispatcher_action(
+    action: &CustomSidebarNodeAction,
+) -> Result<Option<CustomSidebarDispatcherAction>, String> {
+    let method = action.action_type.as_str();
     match method {
-        "workspace.next" | "next-window" => Some(CustomSidebarDispatcherAction::WorkspaceNext),
+        "workspace.next" | "next-window" => {
+            ensure_custom_sidebar_no_params(action)?;
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceNext))
+        }
         "workspace.previous" | "previous-window" => {
-            Some(CustomSidebarDispatcherAction::WorkspacePrevious)
+            ensure_custom_sidebar_no_params(action)?;
+            Ok(Some(CustomSidebarDispatcherAction::WorkspacePrevious))
         }
-        "workspace.last" | "last-window" => Some(CustomSidebarDispatcherAction::WorkspaceLast),
+        "workspace.last" | "last-window" => {
+            ensure_custom_sidebar_no_params(action)?;
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceLast))
+        }
         "notification.jump_to_unread" | "jump-to-unread" => {
-            Some(CustomSidebarDispatcherAction::JumpToUnread)
+            ensure_custom_sidebar_no_params(action)?;
+            Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
         }
-        _ => None,
+        "workspace.select" | "select-workspace" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
+                custom_sidebar_action_param_string(action, "workspace_id")?,
+            )))
+        }
+        "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
+            custom_sidebar_action_param_string(action, "surface_id")?,
+        ))),
+        _ => Ok(None),
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// purpose: Reject unexpected params for no-param CMUX sidebar actions.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns an error listing the first unsupported param key.
+fn ensure_custom_sidebar_no_params(action: &CustomSidebarNodeAction) -> Result<(), String> {
+    if let Some(key) = action.params.keys().next() {
+        return Err(format!("{} does not accept `{key}`", action.action_type));
+    }
+    Ok(())
+}
+
+/// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
+/// inputs: Parsed action metadata and parameter key.
+/// returns/effects: Returns the parameter or a loud validation error.
+fn custom_sidebar_action_param_string(
+    action: &CustomSidebarNodeAction,
+    key: &str,
+) -> Result<String, String> {
+    action
+        .params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} requires string `{key}`", action.action_type))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CustomSidebarDispatcherAction {
     WorkspaceNext,
     WorkspacePrevious,
     WorkspaceLast,
     JumpToUnread,
+    WorkspaceSelect(String),
+    SurfaceFocus(String),
 }
 
 /// purpose: Execute a supported CMUX dispatcher action from a JSON custom-sidebar button.
-/// inputs: Button widget for feedback and raw dispatcher method.
+/// inputs: Button widget for feedback and parsed action metadata.
 /// returns/effects: Mutates host state through existing workspace/notification helpers.
-fn run_custom_sidebar_dispatcher_action(button: &gtk::Button, method: &str) {
-    let Some(action) = custom_sidebar_dispatcher_action(method) else {
-        button.set_tooltip_text(Some(&format!(
-            "not_supported: custom sidebar dispatcher action {method}"
-        )));
-        return;
+fn run_custom_sidebar_dispatcher_action(button: &gtk::Button, action: &CustomSidebarNodeAction) {
+    let action = match custom_sidebar_dispatcher_action(action) {
+        Ok(Some(action)) => action,
+        Ok(None) => {
+            let method = action.action_type.as_str();
+            button.set_tooltip_text(Some(&format!(
+                "not_supported: custom sidebar dispatcher action {method}"
+            )));
+            return;
+        }
+        Err(error) => {
+            let method = action.action_type.as_str();
+            button.set_tooltip_text(Some(&format!(
+                "invalid custom sidebar dispatcher action {method}: {error}"
+            )));
+            return;
+        }
     };
+    let method = action.method_name();
     let result = CONTROL_STATE.with(|slot| {
         let state = slot.borrow().clone();
         state
@@ -4314,9 +4398,22 @@ fn run_custom_sidebar_dispatcher_action(button: &gtk::Button, method: &str) {
     }
 }
 
-/// purpose: Apply a no-parameter dispatcher action through existing host helpers.
+impl CustomSidebarDispatcherAction {
+    fn method_name(&self) -> &'static str {
+        match self {
+            CustomSidebarDispatcherAction::WorkspaceNext => "workspace.next",
+            CustomSidebarDispatcherAction::WorkspacePrevious => "workspace.previous",
+            CustomSidebarDispatcherAction::WorkspaceLast => "workspace.last",
+            CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
+            CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
+            CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
+        }
+    }
+}
+
+/// purpose: Apply a supported CMUX dispatcher action through existing host helpers.
 /// inputs: Live host state and parsed action.
-/// returns/effects: Navigates workspaces or jumps to unread notifications.
+/// returns/effects: Navigates workspaces, focuses surfaces, or jumps unread notifications.
 fn apply_custom_sidebar_dispatcher_action(
     state: &State,
     action: CustomSidebarDispatcherAction,
@@ -4332,6 +4429,12 @@ fn apply_custom_sidebar_dispatcher_action(
             select_relative_workspace_for_custom_sidebar(state, WorkspaceNavigation::Last)
         }
         CustomSidebarDispatcherAction::JumpToUnread => jump_to_unread_notification(state),
+        CustomSidebarDispatcherAction::WorkspaceSelect(workspace_id) => {
+            select_workspace_for_custom_sidebar(state, &workspace_id)
+        }
+        CustomSidebarDispatcherAction::SurfaceFocus(surface_id) => {
+            focus_surface_for_custom_sidebar(state, &surface_id)
+        }
     }
 }
 
@@ -4372,6 +4475,83 @@ fn select_relative_workspace_for_custom_sidebar(
         return Err(BridgeError::not_found("workspace not found"));
     };
     select_workspace_for_control(state, index)
+}
+
+/// purpose: Select a workspace from a parameterized JSON custom-sidebar action.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Reuses the same GTK selection path as workspace.select.
+fn select_workspace_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved = {
+        let app_state = state.borrow();
+        let target = WorkspaceTarget::Handle(workspace_id.to_string());
+        workspace_index_for_target(&app_state, &target).or_else(|| {
+            workspace_id.parse::<usize>().ok().and_then(|index| {
+                workspace_index_for_target(&app_state, &WorkspaceTarget::Index(index))
+            })
+        })
+    };
+    let Some(index) = resolved else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    select_workspace_for_control(state, index)
+}
+
+/// purpose: Focus a surface from a parameterized JSON custom-sidebar action.
+/// inputs: Live host state and CMUX surface id/ref/tab id parameter.
+/// returns/effects: Switches to the owning workspace and focuses the requested surface.
+fn focus_surface_for_custom_sidebar(
+    state: &State,
+    surface_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved = {
+        let app_state = state.borrow();
+        let requested = normalize_surface_handle(surface_id);
+        app_state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(index, workspace)| {
+                pane::surface_summaries_for_root(&workspace.root)
+                    .iter()
+                    .any(|surface| surface_hint_matches(&surface.surface_id, requested))
+                    .then_some(index)
+            })
+    };
+    let Some(index) = resolved else {
+        return Err(BridgeError::not_found("surface not found"));
+    };
+    select_workspace_for_control(state, index)?;
+    focus_surface_in_workspace_for_custom_sidebar(state, index, surface_id)
+}
+
+/// purpose: Focus a surface within one resolved workspace for custom-sidebar dispatch.
+/// inputs: Live host state, workspace index, and CMUX surface id/ref/tab id.
+/// returns/effects: Emits the same focused event and payload shape as surface.focus.
+fn focus_surface_in_workspace_for_custom_sidebar(
+    state: &State,
+    workspace_index: usize,
+    surface_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let result = {
+        let app_state = state.borrow();
+        let workspace = app_state
+            .workspaces
+            .get(workspace_index)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        pane::focus_surface_for_root(&workspace.root, surface_id).map(|surface| {
+            publish_surface_lifecycle_event(
+                "surface.focused",
+                &workspace.id,
+                &surface,
+                serde_json::json!({ "origin": "custom_sidebar.surface.focus" }),
+            );
+            pane_create_response_payload(&workspace.id, &workspace.name, surface)
+        })
+    };
+    result.ok_or_else(|| BridgeError::not_found("surface not found"))
 }
 
 /// purpose: Open a URL from a JSON custom-sidebar button action.
@@ -17518,7 +17698,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
             dir.path().join("build-board.json"),
-            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Logs","action":{"type":"workspace.next","message":"ignored"}}]}}"#,
+            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Build","action":{"type":"workspace.select","params":{"workspace_id":"workspace:build"}}}]}}"#,
         )
         .expect("write json sidebar");
 
@@ -17538,10 +17718,17 @@ mod tests {
             .action
             .as_ref()
             .expect("button action");
-        assert_eq!(action.action_type, "workspace.next");
+        assert_eq!(action.action_type, "workspace.select");
+        assert_eq!(
+            action
+                .params
+                .get("workspace_id")
+                .and_then(serde_json::Value::as_str),
+            Some("workspace:build")
+        );
         assert_eq!(
             custom_sidebar_action_tooltip(action),
-            "cmux dispatcher: workspace.next"
+            "cmux dispatcher: workspace.select"
         );
     }
 
@@ -17643,27 +17830,59 @@ mod tests {
     }
 
     #[test]
-    fn custom_sidebar_dispatcher_actions_allow_only_no_param_cmux_methods() {
+    fn custom_sidebar_dispatcher_actions_accept_documented_cmux_params() {
+        let no_param_action = |action_type: &str| CustomSidebarNodeAction {
+            action_type: action_type.to_string(),
+            message: None,
+            params: serde_json::Map::new(),
+        };
+        let mut workspace_params = serde_json::Map::new();
+        workspace_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        let workspace_select = CustomSidebarNodeAction {
+            action_type: "workspace.select".to_string(),
+            message: None,
+            params: workspace_params,
+        };
+        let mut surface_params = serde_json::Map::new();
+        surface_params.insert("surface_id".to_string(), json!("surface:7:tab-a"));
+        let surface_focus = CustomSidebarNodeAction {
+            action_type: "surface.focus".to_string(),
+            message: None,
+            params: surface_params,
+        };
+
         assert_eq!(
-            custom_sidebar_dispatcher_action("workspace.next"),
-            Some(CustomSidebarDispatcherAction::WorkspaceNext)
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.next")),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceNext))
         );
         assert_eq!(
-            custom_sidebar_dispatcher_action("previous-window"),
-            Some(CustomSidebarDispatcherAction::WorkspacePrevious)
+            custom_sidebar_dispatcher_action(&no_param_action("previous-window")),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspacePrevious))
         );
         assert_eq!(
-            custom_sidebar_dispatcher_action("notification.jump_to_unread"),
-            Some(CustomSidebarDispatcherAction::JumpToUnread)
+            custom_sidebar_dispatcher_action(&no_param_action("notification.jump_to_unread")),
+            Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
         );
-        assert_eq!(custom_sidebar_dispatcher_action("workspace.select"), None);
-        assert_eq!(custom_sidebar_dispatcher_action("surface.focus"), None);
         assert_eq!(
-            custom_sidebar_action_tooltip(&CustomSidebarNodeAction {
-                action_type: "surface.focus".to_string(),
-                message: None,
-            }),
-            "not_supported: custom sidebar action surface.focus"
+            custom_sidebar_dispatcher_action(&workspace_select),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&surface_focus),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
+                "surface:7:tab-a".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&surface_focus),
+            "cmux dispatcher: surface.focus"
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.select"))
+                .expect_err("missing workspace id is invalid")
+                .contains("workspace_id")
         );
     }
 
