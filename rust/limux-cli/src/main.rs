@@ -982,12 +982,6 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     if let Some(text) = command_help_probe_text(command, args) {
         return Ok(Some(CommandOutput::Text(text.to_string())));
     }
-    if is_unsupported_feed_cli_command(command, args) {
-        bail!(
-            "not_supported: {command} {} requires CMUX interactive Feed UI support",
-            args[0]
-        );
-    }
     if is_unsupported_remote_cli_command(command) {
         bail!(
             "not_supported: {command} requires CMUX remote daemon support, which Limux does not implement yet"
@@ -1018,13 +1012,6 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         _ => None,
     };
     Ok(out)
-}
-
-// purpose: Identify CMUX top-level Feed UI commands not yet backed by Limux.
-// inputs: Top-level command and remaining CLI args.
-// returns/effects: Returns true only for interactive Feed UI forms, not hook forwarding.
-fn is_unsupported_feed_cli_command(command: &str, args: &[String]) -> bool {
-    command == "feed" && matches!(args.first().map(String::as_str), Some("tui"))
 }
 
 // purpose: Clear CMUX-compatible Feed persistent history from the local state file.
@@ -5875,6 +5862,56 @@ async fn run_right_sidebar(
     Ok((payload, prints_state))
 }
 
+/// purpose: Run CMUX-compatible top-level Feed UI commands through Limux UI surfaces.
+/// inputs: Feed CLI args plus optional global window selector.
+/// returns/effects: Opens the live Feed right-sidebar surface or fails loudly on unsupported forms.
+async fn run_feed_command(
+    client: &mut Client,
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<Value> {
+    let request = build_feed_tui_request(args, global_window)?;
+    let mut payload = client.call("right_sidebar", Value::Object(request)).await?;
+    if let Value::Object(map) = &mut payload {
+        map.insert(
+            "implementation".to_string(),
+            Value::String("limux-right-sidebar".to_string()),
+        );
+    }
+    Ok(payload)
+}
+
+/// purpose: Parse `feed tui` into the existing right-sidebar Feed mode request.
+/// inputs: Raw Feed command args and optional inherited global `--window`.
+/// returns/effects: Returns bridge params, accepting CMUX implementation selector flags explicitly.
+fn build_feed_tui_request(
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<Map<String, Value>> {
+    if args.first().map(String::as_str) != Some("tui") {
+        bail!("Usage: limux feed tui [--opentui|--legacy]");
+    }
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--opentui" | "--legacy" => {}
+            "--help" | "-h" => bail!("Usage: limux feed tui [--opentui|--legacy]"),
+            other => bail!("unknown feed tui argument: {other}"),
+        }
+    }
+    build_right_sidebar_request(&["feed".to_string()], global_window)
+}
+
+/// purpose: Render the user-facing result for top-level Feed commands.
+/// inputs: JSON payload returned by the live bridge.
+/// returns/effects: Returns compact text that names the explicit Limux UI implementation.
+fn render_feed_command_text(payload: &Value) -> String {
+    let implementation = payload
+        .get("implementation")
+        .and_then(Value::as_str)
+        .unwrap_or("limux-right-sidebar");
+    format!("OK feed ui implementation={implementation}")
+}
+
 /// purpose: Parse CMUX right-sidebar CLI forms into live bridge params.
 /// inputs: Raw command args and optional global `--window`.
 /// returns/effects: Returns normalized params or fails loudly on malformed commands.
@@ -8195,6 +8232,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "hooks" => return run_hooks_command(client, args, opts.json_output).await,
+        "feed" => {
+            let payload = run_feed_command(client, args, opts.window.as_deref()).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_feed_command_text(&payload))
+            }
+        }
         "new-workspace" => {
             let payload = run_new_workspace(client, args).await?;
             if opts.json_output {
@@ -8771,11 +8816,18 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn cmux_feed_tui_commands_fail_locally_with_not_supported() {
+    fn cmux_feed_tui_maps_to_right_sidebar_feed_mode() {
         let opts = default_opts(args(&["feed", "tui"]));
-        let error = run_local_command(&opts).expect_err("feed UI command should fail locally");
-        assert!(error.to_string().contains("not_supported"));
-        assert!(!is_unsupported_feed_cli_command("feed", &args(&["clear"])));
+        assert!(run_local_command(&opts)
+            .expect("local command lookup")
+            .is_none());
+
+        let request = build_feed_tui_request(&args(&["tui", "--opentui"]), Some("window:7"))
+            .expect("feed tui request");
+        assert_eq!(request["action"], "set");
+        assert_eq!(request["mode"], "feed");
+        assert_eq!(request["focus"], true);
+        assert_eq!(request["window_id"], "window:7");
 
         let help = run_local_command(&default_opts(args(&["feed", "--help"])))
             .expect("help probe")

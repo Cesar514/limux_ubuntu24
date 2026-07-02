@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T05:51:07Z Implement and verify CMUX `feed tui [--opentui|--legacy]` routing to Limux's live Feed right-sidebar UI surface. \
 [x] 2026-07-02T05:47:22Z Implement and verify CMUX `feed clear [--yes|-y]` local workstream history deletion plus live `feed.clear` retained Feed clearing. \
 [x] 2026-07-02T05:40:41Z Implement and verify explicit CMUX top-level `feed tui` and `feed clear` `not_supported` surfacing while preserving `feed --help` and `hooks feed` behavior. \
 [x] 2026-07-02T05:38:17Z Implement and verify explicit CMUX `remote`/`remotes` cloud device-registry command `not_supported` surfacing while preserving no-socket help probes. \
