@@ -1532,6 +1532,55 @@ fn publish_surface_key_sent_event(workspace_id: &str, surface_id: &str, key: &st
     })
 }
 
+// purpose: Build a CMUX surface lifecycle event payload from a live surface summary.
+// inputs: Workspace id, surface summary, and event-specific metadata.
+// returns/effects: Returns JSON without mutating host state.
+fn surface_lifecycle_event_payload(
+    workspace_id: &str,
+    surface: &pane::SurfaceSummary,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "surface_id": surface.surface_id,
+        "surface_ref": surface_ref(&surface.surface_id),
+        "pane_id": surface.pane_id.to_string(),
+        "pane_ref": pane_ref(surface.pane_id),
+        "surface_title": surface.title,
+        "surface_type": surface.kind,
+        "selected": surface.selected,
+        "cwd": surface.cwd,
+        "uri": surface.uri,
+    });
+    if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    payload
+}
+
+// purpose: Publish a CMUX surface lifecycle event after a live surface mutation succeeds.
+// inputs: Event name, workspace id, surface summary, and event-specific metadata.
+// returns/effects: Appends a retained surface lifecycle event to the host event bus.
+fn publish_surface_lifecycle_event(
+    name: &'static str,
+    workspace_id: &str,
+    surface: &pane::SurfaceSummary,
+    extra: serde_json::Value,
+) -> u64 {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category: "surface",
+        source: "surface.lifecycle",
+        workspace_id: Some(serde_json::Value::String(workspace_id.to_string())),
+        surface_id: Some(serde_json::Value::String(surface.surface_id.clone())),
+        pane_id: Some(serde_json::Value::String(surface.pane_id.to_string())),
+        payload: surface_lifecycle_event_payload(workspace_id, surface, extra),
+    })
+}
+
 // purpose: Select a live workspace through the same GTK stack/sidebar path as UI navigation.
 // inputs: Shared app state and target workspace index.
 // returns/effects: Changes active workspace when needed and returns the CMUX-shaped payload.
@@ -1637,6 +1686,28 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
     (Some(surface.pane_id), Some(surface.surface_id))
 }
 
+// purpose: Preserve tmux-compatible last-pane history after a successful focus change.
+// inputs: App state, workspace id, newly focused pane id, and previously focused pane id.
+// returns/effects: Updates workspace last_pane_id only when focus moved to a different pane.
+fn record_previous_pane_if_changed(
+    state: &State,
+    workspace_id: &str,
+    pane_id: u32,
+    previous_pane_id: Option<u32>,
+) {
+    if previous_pane_id.is_none_or(|previous| previous == pane_id) {
+        return;
+    }
+    if let Some(workspace) = state
+        .borrow_mut()
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+    {
+        workspace.last_pane_id = previous_pane_id;
+    }
+}
+
 // purpose: Focus a live pane and record previous focus for tmux-compatible last-pane.
 // inputs: App state, workspace index, and pane id.
 // returns/effects: Focuses the pane's active tab and updates workspace last_pane_id.
@@ -1661,21 +1732,19 @@ fn focus_pane_for_control(
             .workspaces
             .get(workspace_index)
             .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
-        pane::focus_pane_for_root(&workspace.root, pane_id)
-            .map(|surface| pane_create_response_payload(&workspace.id, &workspace.name, surface))
+        pane::focus_pane_for_root(&workspace.root, pane_id).map(|surface| {
+            publish_surface_lifecycle_event(
+                "surface.focused",
+                &workspace.id,
+                &surface,
+                serde_json::json!({ "origin": "pane.focus" }),
+            );
+            pane_create_response_payload(&workspace.id, &workspace.name, surface)
+        })
     }
     .ok_or_else(|| BridgeError::not_found("pane not found"))?;
 
-    if previous_pane_id.is_some_and(|previous| previous != pane_id) {
-        if let Some(workspace) = state
-            .borrow_mut()
-            .workspaces
-            .iter_mut()
-            .find(|workspace| workspace.id == workspace_id)
-        {
-            workspace.last_pane_id = previous_pane_id;
-        }
-    }
+    record_previous_pane_if_changed(state, &workspace_id, pane_id, previous_pane_id);
 
     Ok(result)
 }
@@ -7274,6 +7343,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             request_session_save(state);
+            publish_surface_lifecycle_event(
+                "surface.created",
+                &workspace_id,
+                &surface,
+                serde_json::json!({ "origin": "surface.create" }),
+            );
             let response = pane_create_response_payload(&workspace_id, &workspace_name, surface);
             let _ = reply.send(Ok(response));
         }
@@ -7343,6 +7418,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     )));
                     return;
                 };
+                publish_surface_lifecycle_event(
+                    "surface.created",
+                    &workspace_id,
+                    &surface,
+                    serde_json::json!({ "origin": "surface.create_many", "batch_index": index }),
+                );
                 surfaces.push(pane_create_response_payload(
                     &workspace_id,
                     &workspace_name,
@@ -7399,6 +7480,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let app_state = state.borrow();
                 let workspace = &app_state.workspaces[index];
                 pane::focus_surface_for_root(&workspace.root, &surface_hint).map(|surface| {
+                    publish_surface_lifecycle_event(
+                        "surface.focused",
+                        &workspace.id,
+                        &surface,
+                        serde_json::json!({ "origin": "surface.focus" }),
+                    );
                     pane_create_response_payload(&workspace.id, &workspace.name, surface)
                 })
             };
@@ -7449,6 +7536,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let result = pane::close_surface_for_root(&workspace_root, &surface_hint)
                 .map(|surface| {
+                    publish_surface_lifecycle_event(
+                        "surface.closed",
+                        &workspace_id,
+                        &surface,
+                        serde_json::json!({ "origin": "surface.close" }),
+                    );
                     let mut payload =
                         pane_create_response_payload(&workspace_id, &workspace_name, surface);
                     payload["closed"] = serde_json::Value::Bool(true);
@@ -7493,6 +7586,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let workspace = &app_state.workspaces[workspace_index];
                 pane::move_surface_for_root(&workspace.root, &surface_hint, target_pane_id, index)
                     .map(|surface| {
+                        publish_surface_lifecycle_event(
+                            "surface.moved",
+                            &workspace.id,
+                            &surface,
+                            serde_json::json!({
+                                "origin": "surface.move",
+                                "target_pane_id": target_pane_id.to_string(),
+                                "target_pane_ref": pane_ref(target_pane_id),
+                                "requested_index": index,
+                            }),
+                        );
                         pane_create_response_payload(&workspace.id, &workspace.name, surface)
                     })
             };
@@ -7538,6 +7642,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     after_surface_hint.as_deref(),
                 )
                 .map(|surface| {
+                    publish_surface_lifecycle_event(
+                        "surface.reordered",
+                        &workspace.id,
+                        &surface,
+                        serde_json::json!({
+                            "origin": "surface.reorder",
+                            "requested_index": index,
+                            "before_surface_id": before_surface_hint,
+                            "after_surface_id": after_surface_hint,
+                        }),
+                    );
                     pane_create_response_payload(&workspace.id, &workspace.name, surface)
                 })
             };
@@ -7583,6 +7698,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            let direction_label = match &direction {
+                BridgePaneCreateDirection::Left => "left",
+                BridgePaneCreateDirection::Right => "right",
+                BridgePaneCreateDirection::Up => "up",
+                BridgePaneCreateDirection::Down => "down",
+            };
             let placement = pane_create_split_placement(PaneCreateDirection::from(direction));
             let new_pane = split_pane(
                 state,
@@ -7617,6 +7738,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             request_session_save(state);
+            publish_surface_lifecycle_event(
+                "surface.moved",
+                &workspace_id,
+                &surface,
+                serde_json::json!({
+                    "origin": "surface.drag_to_split",
+                    "direction": direction_label,
+                }),
+            );
             let result = pane_create_response_payload(&workspace_id, &workspace_name, surface);
             let _ = reply.send(Ok(result));
         }
@@ -10614,14 +10744,15 @@ mod tests {
         next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
         publish_surface_input_sent_event, publish_surface_key_sent_event,
-        publish_workspace_lifecycle_event, queue_session_save_request,
-        resolve_pane_create_source_id, resolved_system_prefers_dark, run_notification_hook_command,
-        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
-        shortcut_blocked_by_editable, shortcut_command_from_key_event,
-        shortcut_dispatch_propagation, should_emit_desktop_notification,
-        surface_input_event_payload, surface_key_event_payload, tab_drag_workspace_seed,
-        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_lifecycle_payload,
+        publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
+        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
+        run_notification_hook_command, sanitize_background_opacity,
+        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation,
+        should_emit_desktop_notification, surface_input_event_payload, surface_key_event_payload,
+        surface_lifecycle_event_payload, tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_lifecycle_payload,
         workspace_notification_message, workspace_reordered_payload, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
@@ -11085,6 +11216,99 @@ mod tests {
         assert_eq!(key_payload["surface_id"], "7:tab-a");
         assert_eq!(key_payload["pane_id"], "7");
         assert_eq!(key_payload["key"], "Enter");
+    }
+
+    #[test]
+    fn surface_lifecycle_payload_includes_cmux_surface_metadata() {
+        let surface = crate::pane::SurfaceSummary {
+            pane_id: 11,
+            surface_id: "11:tab-life".to_string(),
+            title: "server".to_string(),
+            kind: "terminal".to_string(),
+            selected: true,
+            cwd: Some("/tmp/project".to_string()),
+            uri: None,
+        };
+
+        let payload = surface_lifecycle_event_payload(
+            "workspace-life",
+            &surface,
+            serde_json::json!({ "origin": "test" }),
+        );
+
+        assert_eq!(payload["workspace_id"], "workspace-life");
+        assert_eq!(payload["workspace_ref"], "workspace:workspace-life");
+        assert_eq!(payload["surface_id"], "11:tab-life");
+        assert_eq!(payload["surface_ref"], "surface:11:tab-life");
+        assert_eq!(payload["pane_id"], "11");
+        assert_eq!(payload["pane_ref"], "pane:11");
+        assert_eq!(payload["surface_title"], "server");
+        assert_eq!(payload["surface_type"], "terminal");
+        assert_eq!(payload["selected"], true);
+        assert_eq!(payload["cwd"], "/tmp/project");
+        assert_eq!(payload["origin"], "test");
+    }
+
+    #[test]
+    fn surface_lifecycle_publish_streams_cmux_event_frame() {
+        let surface = crate::pane::SurfaceSummary {
+            pane_id: 12,
+            surface_id: "12:tab-created".to_string(),
+            title: "created".to_string(),
+            kind: "terminal".to_string(),
+            selected: true,
+            cwd: None,
+            uri: None,
+        };
+        let seq = publish_surface_lifecycle_event(
+            "surface.created",
+            "workspace-surface-test",
+            &surface,
+            serde_json::json!({ "origin": "test" }),
+        );
+
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let handle = thread::spawn(move || {
+            crate::event_bus::bus().stream(
+                &serde_json::json!({
+                    "after_seq": seq.saturating_sub(1),
+                    "name": "surface.created",
+                    "category": "surface",
+                    "include_heartbeats": false,
+                }),
+                &mut writer,
+            )
+        });
+
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("read ack");
+        let frame: serde_json::Value = serde_json::from_str(ack.trim()).expect("ack json");
+        assert_eq!(frame["type"], "ack");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("read event");
+        let frame: serde_json::Value = serde_json::from_str(event.trim()).expect("event json");
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["name"], "surface.created");
+        assert_eq!(frame["category"], "surface");
+        assert_eq!(frame["source"], "surface.lifecycle");
+        assert_eq!(frame["workspace_id"], "workspace-surface-test");
+        assert_eq!(frame["surface_id"], "12:tab-created");
+        assert_eq!(frame["pane_id"], "12");
+        assert_eq!(frame["payload"]["origin"], "test");
+
+        drop(reader);
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "surface.created",
+            category: "surface",
+            source: "test",
+            workspace_id: Some(serde_json::Value::String("workspace-wakeup".to_string())),
+            surface_id: Some(serde_json::Value::String("1:wakeup".to_string())),
+            pane_id: Some(serde_json::Value::String("1".to_string())),
+            payload: serde_json::json!({}),
+        });
+        let _ = handle.join().expect("event stream thread");
     }
 
     #[test]
