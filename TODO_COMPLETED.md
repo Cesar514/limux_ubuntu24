@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T06:08:15Z Implement and verify CMUX Feed hook setup wiring for Claude and Gemini JSON hook integrations. \
 [x] 2026-07-02T06:03:00Z Implement and verify direct right-sidebar Feed exit-plan and question controls for pending CMUX requests. \
 [x] 2026-07-02T05:57:12Z Implement and verify direct right-sidebar Feed permission controls for pending Codex/CMUX requests. \
 [x] 2026-07-02T05:51:07Z Implement and verify CMUX `feed tui [--opentui|--legacy]` routing to Limux's live Feed right-sidebar UI surface. \

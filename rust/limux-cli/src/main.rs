@@ -4492,7 +4492,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             codex_feed_hook_events(),
         ),
-        agent_hooks::AgentKind::Claude => install_json_hooks(
+        agent_hooks::AgentKind::Claude => install_json_hooks_with_feed(
             &claude_settings_path(),
             agent,
             &[
@@ -4502,9 +4502,10 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("Notification", "stop"),
                 ("SessionEnd", "session-end"),
             ],
+            claude_feed_hook_events(),
         ),
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
-        agent_hooks::AgentKind::Gemini => install_json_hooks(
+        agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
             &[
@@ -4513,6 +4514,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("AfterAgent", "stop"),
                 ("SessionEnd", "session-end"),
             ],
+            gemini_feed_hook_events(),
         ),
     }
 }
@@ -4531,14 +4533,6 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
     }
-}
-
-fn install_json_hooks(
-    path: &Path,
-    agent: agent_hooks::AgentKind,
-    events: &[(&str, &str)],
-) -> Result<()> {
-    install_json_hooks_with_feed(path, agent, events, &[])
 }
 
 // purpose: Install session lifecycle hooks and optional Feed hooks into an agent JSON hook file.
@@ -4607,9 +4601,22 @@ fn install_json_hooks_with_feed(
                 "timeout": feed_hook_timeout(agent)
             }]
         }));
+        if matches!(agent, agent_hooks::AgentKind::Claude) {
+            let Some(entry) = entries.last_mut() else {
+                bail!("failed to append {} Feed hook {agent_event}", agent.label());
+            };
+            entry["matcher"] = Value::String("*".to_string());
+        }
     }
 
     write_json_object(path, &root)
+}
+
+// purpose: List the Claude hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Claude hook event names without side effects.
+fn claude_feed_hook_events() -> &'static [&'static str] {
+    &["PreToolUse", "PermissionRequest"]
 }
 
 // purpose: List the Codex hook events that CMUX forwards into Feed.
@@ -4625,6 +4632,13 @@ fn codex_feed_hook_events() -> &'static [&'static str] {
         "SubagentStart",
         "SubagentStop",
     ]
+}
+
+// purpose: List the Gemini hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Gemini hook event names without side effects.
+fn gemini_feed_hook_events() -> &'static [&'static str] {
+    &["PreToolUse"]
 }
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
@@ -9881,10 +9895,11 @@ mod cli_arg_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.json");
 
-        install_json_hooks(
+        install_json_hooks_with_feed(
             &path,
             agent_hooks::AgentKind::Claude,
             &[("SessionStart", "session-start")],
+            &[],
         )
         .expect("install hooks");
 
@@ -9904,10 +9919,11 @@ mod cli_arg_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("hooks.json");
 
-        install_json_hooks(
+        install_json_hooks_with_feed(
             &path,
             agent_hooks::AgentKind::Codex,
             &[("SessionStart", "session-start")],
+            &[],
         )
         .expect("install hooks");
 
@@ -9960,6 +9976,75 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks codex session-start"));
+    }
+
+    /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.
+    /// inputs: Temporary settings JSON file and the Claude hook installer.
+    /// returns/effects: Asserts installed Feed hook event names, matcher, timeout, and command markers.
+    #[test]
+    fn claude_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        install_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Claude,
+            &[("SessionStart", "session-start")],
+            claude_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        let feed = &root["hooks"]["PermissionRequest"][0];
+
+        assert_eq!(feed["matcher"], "*");
+        assert_eq!(feed["hooks"][0]["timeout"], 120_000);
+        assert!(feed["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source claude --event 'PermissionRequest'"));
+        assert_eq!(root["hooks"]["PreToolUse"][0]["matcher"], "*");
+        assert!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source claude --event 'PreToolUse'"));
+        assert!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks claude session-start"));
+    }
+
+    /// purpose: Verify Gemini setup writes CMUX Feed PreToolUse hooks beside lifecycle hooks.
+    /// inputs: Temporary settings JSON file and the Gemini hook installer.
+    /// returns/effects: Asserts installed Feed hook shape, timeout, and command markers.
+    #[test]
+    fn gemini_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        install_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Gemini,
+            &[("SessionStart", "session-start")],
+            gemini_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        let feed = &root["hooks"]["PreToolUse"][0];
+
+        assert!(feed.get("matcher").is_none());
+        assert_eq!(feed["hooks"][0]["timeout"], 120_000);
+        assert!(feed["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source gemini --event 'PreToolUse'"));
+        assert!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks gemini session-start"));
     }
 
     /// purpose: Verify Codex uninstall removes both lifecycle hooks and Feed hooks.
