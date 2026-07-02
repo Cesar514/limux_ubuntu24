@@ -1650,6 +1650,20 @@ const SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_SHOW_PULL_REQUESTS_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showPullRequests",
+    section: "sidebar",
+    json_key: "showPullRequests",
+    default: true,
+};
+
+const SIDEBAR_WATCH_GIT_STATUS_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.watchGitStatus",
+    section: "sidebar",
+    json_key: "watchGitStatus",
+    default: true,
+};
+
 const SIDEBAR_SHOW_CUSTOM_METADATA_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showCustomMetadata",
     section: "sidebar",
@@ -1700,8 +1714,9 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
-    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.showBranchDirectory|sidebar.showPullRequests|",
+    "sidebar.watchGitStatus|sidebar.showCustomMetadata|sidebar.showProgress|",
+    "sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
@@ -1718,8 +1733,9 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
-    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.showBranchDirectory|sidebar.showPullRequests|",
+    "sidebar.watchGitStatus|sidebar.showCustomMetadata|sidebar.showProgress|",
+    "sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -1794,6 +1810,8 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showWorkspaceDescription" => Some(SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING),
         "sidebar.showNotificationMessage" => Some(SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING),
         "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
+        "sidebar.showPullRequests" => Some(SIDEBAR_SHOW_PULL_REQUESTS_SETTING),
+        "sidebar.watchGitStatus" => Some(SIDEBAR_WATCH_GIT_STATUS_SETTING),
         "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
         "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
         "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
@@ -16284,6 +16302,12 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING)
             .expect("get default sidebar branch directory");
         assert!(text.contains("sidebar.showBranchDirectory = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_PULL_REQUESTS_SETTING)
+            .expect("get default sidebar pull requests");
+        assert!(text.contains("sidebar.showPullRequests = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING)
+            .expect("get default sidebar git watch");
+        assert!(text.contains("sidebar.watchGitStatus = true"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING)
             .expect("get default sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = true"));
@@ -16319,6 +16343,12 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING, "false")
             .expect("set sidebar branch directory");
         assert!(text.contains("sidebar.showBranchDirectory = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_PULL_REQUESTS_SETTING, "false")
+            .expect("set sidebar pull requests");
+        assert!(text.contains("sidebar.showPullRequests = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING, "false")
+            .expect("set sidebar git watch");
+        assert!(text.contains("sidebar.watchGitStatus = false"));
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING, "false")
             .expect("set sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = false"));
@@ -16340,6 +16370,8 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showWorkspaceDescription"], false);
         assert_eq!(parsed["sidebar"]["showNotificationMessage"], false);
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
+        assert_eq!(parsed["sidebar"]["showPullRequests"], false);
+        assert_eq!(parsed["sidebar"]["watchGitStatus"], false);
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], false);
         assert_eq!(parsed["sidebar"]["showProgress"], false);
         assert_eq!(parsed["sidebar"]["showLog"], false);
@@ -16359,8 +16391,9 @@ mod cli_arg_tests {
             .expect_err("invalid bool");
         assert!(err.to_string().contains("requires true or false"));
 
-        fs::write(&path, br#"{"sidebar":{"showLog":"false"}}"#).expect("write malformed bool");
-        let err = render_config_boolean_get(&path, SIDEBAR_SHOW_LOG_SETTING)
+        fs::write(&path, br#"{"sidebar":{"watchGitStatus":"false"}}"#)
+            .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
 

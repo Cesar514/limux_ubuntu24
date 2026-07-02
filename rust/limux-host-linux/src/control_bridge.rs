@@ -2210,6 +2210,8 @@ fn validate_startup_env_key(key: &str) -> Result<(), BridgeError> {
             | "LIMUX_SOCKET_PATH"
             | "CMUX_SOCKET"
             | "CMUX_SOCKET_PATH"
+            | "CMUX_NO_GIT_WATCH"
+            | "CMUX_NO_PR_WATCH"
             | "LIMUX_CLI"
             | "CMUX_CLI"
             | "LIMUX_CODEX_WRAPPER_SHIM"
@@ -5779,6 +5781,8 @@ mod tests {
             json!({"type": "browser", "initial_command": "codex"}),
             json!({"startup_environment": {"PATH": "/tmp/bin"}}),
             json!({"startup_environment": {"CMUX_SOCKET": "/tmp/socket"}}),
+            json!({"startup_environment": {"CMUX_NO_GIT_WATCH": "1"}}),
+            json!({"startup_environment": {"CMUX_NO_PR_WATCH": "1"}}),
             json!({"startup_environment": {"BAD-NAME": "1"}}),
             json!({"startup_environment": {"CMUX_MANAGED_SUBAGENT": 1}}),
         ] {

@@ -130,6 +130,8 @@ pub struct SidebarConfig {
     pub show_workspace_description: bool,
     pub show_notification_message: bool,
     pub show_branch_directory: bool,
+    pub show_pull_requests: bool,
+    pub watch_git_status: bool,
     pub show_custom_metadata: bool,
     pub show_progress: bool,
     pub show_log: bool,
@@ -144,6 +146,8 @@ impl Default for SidebarConfig {
             show_workspace_description: true,
             show_notification_message: true,
             show_branch_directory: true,
+            show_pull_requests: true,
+            watch_git_status: true,
             show_custom_metadata: true,
             show_progress: true,
             show_log: true,
@@ -660,6 +664,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showBranchDirectory"))
         .map(|value| parse_bool_setting(value, "sidebar.showBranchDirectory"))
         .unwrap_or(sidebar_defaults.show_branch_directory);
+    let show_pull_requests = sidebar
+        .and_then(|sidebar| sidebar.get("showPullRequests"))
+        .map(|value| parse_bool_setting(value, "sidebar.showPullRequests"))
+        .unwrap_or(sidebar_defaults.show_pull_requests);
+    let watch_git_status = sidebar
+        .and_then(|sidebar| sidebar.get("watchGitStatus"))
+        .map(|value| parse_bool_setting(value, "sidebar.watchGitStatus"))
+        .unwrap_or(sidebar_defaults.watch_git_status);
     let show_custom_metadata = sidebar
         .and_then(|sidebar| sidebar.get("showCustomMetadata"))
         .map(|value| parse_bool_setting(value, "sidebar.showCustomMetadata"))
@@ -767,6 +779,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_workspace_description,
             show_notification_message,
             show_branch_directory,
+            show_pull_requests,
+            watch_git_status,
             show_custom_metadata,
             show_progress,
             show_log,
@@ -1209,6 +1223,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.sidebar.show_branch_directory),
         ),
         (
+            "showPullRequests".to_string(),
+            json!(config.sidebar.show_pull_requests),
+        ),
+        (
+            "watchGitStatus".to_string(),
+            json!(config.sidebar.watch_git_status),
+        ),
+        (
             "showCustomMetadata".to_string(),
             json!(config.sidebar.show_custom_metadata),
         ),
@@ -1355,6 +1377,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "showWorkspaceDescription": true,
             "showNotificationMessage": true,
             "showBranchDirectory": true,
+            "showPullRequests": true,
+            "watchGitStatus": true,
             "showCustomMetadata": true,
             "showProgress": true,
             "showLog": true
@@ -1882,6 +1906,8 @@ mod tests {
     "showWorkspaceDescription": false,
     "showNotificationMessage": false,
     "showBranchDirectory": false,
+    "showPullRequests": false,
+    "watchGitStatus": false,
     "showCustomMetadata": false,
     "showProgress": false,
     "showLog": false,
@@ -1900,6 +1926,8 @@ mod tests {
         assert!(!loaded.config.sidebar.show_workspace_description);
         assert!(!loaded.config.sidebar.show_notification_message);
         assert!(!loaded.config.sidebar.show_branch_directory);
+        assert!(!loaded.config.sidebar.show_pull_requests);
+        assert!(!loaded.config.sidebar.watch_git_status);
         assert!(!loaded.config.sidebar.show_custom_metadata);
         assert!(!loaded.config.sidebar.show_progress);
         assert!(!loaded.config.sidebar.show_log);
@@ -1913,6 +1941,20 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"showProgress":"false"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX sidebar git-watch settings fail loudly.
+    // inputs: Settings JSON with non-boolean sidebar.watchGitStatus.
+    // returns/effects: Panics instead of accepting a silent fallback.
+    #[test]
+    #[should_panic(expected = "sidebar.watchGitStatus must be a boolean")]
+    fn load_from_path_rejects_invalid_sidebar_watch_git_status() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"watchGitStatus":"false"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2367,6 +2409,8 @@ mod tests {
         config.sidebar.show_workspace_description = false;
         config.sidebar.show_notification_message = false;
         config.sidebar.show_branch_directory = false;
+        config.sidebar.show_pull_requests = false;
+        config.sidebar.watch_git_status = false;
         config.sidebar.show_custom_metadata = false;
         config.sidebar.show_progress = false;
         config.sidebar.show_log = false;
@@ -2389,6 +2433,8 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["showPullRequests"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["watchGitStatus"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));

@@ -144,6 +144,27 @@ fn install_codex_wrapper_env(surface_id: &str, extra_env: &mut Vec<(String, Stri
     extra_env.push(("LIMUX_CLI".to_string(), cli));
 }
 
+// purpose: Apply CMUX-compatible sidebar git and pull-request watch flags to terminal env.
+// inputs: Current host config and mutable terminal environment vector.
+// returns/effects: Adds managed CMUX_NO_GIT_WATCH and CMUX_NO_PR_WATCH values.
+fn append_git_watch_env(config: &AppConfig, extra_env: &mut Vec<(String, String)>) {
+    let watch_git = config.sidebar.watch_git_status;
+    let show_pull_requests = config.sidebar.show_pull_requests;
+    extra_env.push((
+        "CMUX_NO_GIT_WATCH".to_string(),
+        if watch_git { "" } else { "1" }.to_string(),
+    ));
+    extra_env.push((
+        "CMUX_NO_PR_WATCH".to_string(),
+        if watch_git && show_pull_requests {
+            ""
+        } else {
+            "1"
+        }
+        .to_string(),
+    ));
+}
+
 // purpose: Resolve the shim directory for one terminal surface.
 // inputs: CMUX/Limux surface id.
 // returns/effects: Returns a private temp path without touching disk.
@@ -1588,6 +1609,10 @@ fn add_terminal_tab_inner(
     extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
     extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
     extra_env.push(("CMUX_TAB_ID".to_string(), tab_id.clone()));
+    {
+        let config = (internals.callbacks.current_config)();
+        append_git_watch_env(&config.borrow(), &mut extra_env);
+    }
     install_codex_wrapper_env(&surface_id_for_env, &mut extra_env);
     if let Some(sock) = limux_control::socket_path::resolve_socket_path(
         None,
@@ -5406,20 +5431,21 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_diagnostics_snapshot, classify_content_drop_zone, codex_wrapper_root,
-        content_drop_preview_rect, effective_drop_target_dimensions, install_codex_wrapper_env,
-        is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, push_browser_diagnostic,
-        surface_hint_matches, write_executable_file, BrowserDiagnosticsBuffer, ContentDropZone,
-        TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT, BROWSER_SEARCH_ENTRY_CSS_CLASS,
-        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, CODEX_WRAPPER_SCRIPT, HOST_ENTRY_CSS_CLASS, PANE_CSS,
-        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
+        append_git_watch_env, browser_diagnostics_snapshot, classify_content_drop_zone,
+        codex_wrapper_root, content_drop_preview_rect, effective_drop_target_dimensions,
+        install_codex_wrapper_env, is_localhost_input, next_active_after_tab_removal,
+        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
+        push_browser_diagnostic, surface_hint_matches, write_executable_file,
+        BrowserDiagnosticsBuffer, ContentDropZone, TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT,
+        BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, CODEX_WRAPPER_SCRIPT,
+        HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
+    use crate::app_config::AppConfig;
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
     use serde_json::json;
     use std::fs;
@@ -5547,6 +5573,30 @@ mod tests {
             env_value(&env, "LIMUX_CODEX_WRAPPER_SHIM_ROOT"),
             root.display().to_string()
         );
+    }
+
+    // purpose: Verify CMUX git and pull-request watch env follows sidebar settings.
+    // inputs: Default config, disabled PRs, and disabled git-watch config variants.
+    // returns/effects: Asserts managed CMUX_NO_GIT_WATCH and CMUX_NO_PR_WATCH values.
+    #[test]
+    fn git_watch_env_follows_sidebar_settings() {
+        let mut config = AppConfig::default();
+        let mut env = Vec::new();
+        append_git_watch_env(&config, &mut env);
+        assert_eq!(env_value(&env, "CMUX_NO_GIT_WATCH"), "");
+        assert_eq!(env_value(&env, "CMUX_NO_PR_WATCH"), "");
+
+        config.sidebar.show_pull_requests = false;
+        let mut env = Vec::new();
+        append_git_watch_env(&config, &mut env);
+        assert_eq!(env_value(&env, "CMUX_NO_GIT_WATCH"), "");
+        assert_eq!(env_value(&env, "CMUX_NO_PR_WATCH"), "1");
+
+        config.sidebar.watch_git_status = false;
+        let mut env = Vec::new();
+        append_git_watch_env(&config, &mut env);
+        assert_eq!(env_value(&env, "CMUX_NO_GIT_WATCH"), "1");
+        assert_eq!(env_value(&env, "CMUX_NO_PR_WATCH"), "1");
     }
 
     #[test]
