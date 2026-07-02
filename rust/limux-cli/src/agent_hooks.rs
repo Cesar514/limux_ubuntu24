@@ -17,6 +17,7 @@ pub(crate) enum AgentKind {
     Kiro,
     Antigravity,
     RovoDev,
+    Omp,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -25,7 +26,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 13] {
+    pub(crate) fn all() -> [Self; 14] {
         [
             Self::Claude,
             Self::Codex,
@@ -35,6 +36,7 @@ impl AgentKind {
             Self::Kiro,
             Self::Antigravity,
             Self::RovoDev,
+            Self::Omp,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -53,6 +55,7 @@ impl AgentKind {
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "antigravity" | "agy" => Some(Self::Antigravity),
             "rovodev" | "rovo" | "acli" => Some(Self::RovoDev),
+            "omp" => Some(Self::Omp),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -72,6 +75,7 @@ impl AgentKind {
             Self::Kiro => "kiro",
             Self::Antigravity => "antigravity",
             Self::RovoDev => "rovodev",
+            Self::Omp => "omp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -90,6 +94,7 @@ impl AgentKind {
             Self::Kiro => "Kiro",
             Self::Antigravity => "Antigravity",
             Self::RovoDev => "Rovo Dev",
+            Self::Omp => "OMP",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -108,6 +113,7 @@ impl AgentKind {
             Self::Kiro => "kiro-cli",
             Self::Antigravity => "agy",
             Self::RovoDev => "acli",
+            Self::Omp => "omp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -392,6 +398,11 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::Omp => {
+            parts.push("--session".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -425,21 +436,20 @@ pub(crate) fn launch_record_from_env(
     kind: AgentKind,
     payload_cwd: Option<&str>,
 ) -> Option<AgentLaunchCommandRecord> {
-    let args = std::env::var("LIMUX_AGENT_LAUNCH_ARGV")
-        .ok()
-        .map(split_nul_or_space_separated)
+    let args = launch_argv_from_env()
         .filter(|args| !args.is_empty())
         .unwrap_or_else(|| vec![kind.fallback_executable().to_string()]);
     let sanitized = sanitize_launch_arguments(kind, &args);
-    let executable = std::env::var("LIMUX_AGENT_LAUNCH_EXECUTABLE")
-        .ok()
-        .and_then(|value| normalized(&value))
-        .or_else(|| sanitized.first().cloned())?;
+    let executable = first_env_value(&[
+        "LIMUX_AGENT_LAUNCH_EXECUTABLE",
+        "CMUX_AGENT_LAUNCH_EXECUTABLE",
+    ])
+    .and_then(|value| normalized(&value))
+    .or_else(|| sanitized.first().cloned())?;
     Some(AgentLaunchCommandRecord {
         executable,
         arguments: sanitized,
-        cwd: std::env::var("LIMUX_AGENT_LAUNCH_CWD")
-            .ok()
+        cwd: first_env_value(&["LIMUX_AGENT_LAUNCH_CWD", "CMUX_AGENT_LAUNCH_CWD"])
             .and_then(|value| normalized(&value))
             .or_else(|| payload_cwd.and_then(normalized))
             .or_else(|| {
@@ -450,6 +460,68 @@ pub(crate) fn launch_record_from_env(
         environment: selected_environment(),
         captured_at: now_seconds(),
     })
+}
+
+fn launch_argv_from_env() -> Option<Vec<String>> {
+    first_env_value(&["LIMUX_AGENT_LAUNCH_ARGV_B64", "CMUX_AGENT_LAUNCH_ARGV_B64"])
+        .and_then(|raw| decode_base64_nul_separated(&raw))
+        .or_else(|| {
+            first_env_value(&["LIMUX_AGENT_LAUNCH_ARGV", "CMUX_AGENT_LAUNCH_ARGV"])
+                .map(split_nul_or_space_separated)
+        })
+}
+
+fn first_env_value(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| normalized(&value))
+    })
+}
+
+fn decode_base64_nul_separated(raw: &str) -> Option<Vec<String>> {
+    let bytes = decode_base64_standard(raw.trim())?;
+    Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| std::str::from_utf8(part).ok())
+            .filter_map(normalized)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn decode_base64_standard(raw: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4];
+    let mut chunk_len = 0;
+    for byte in raw.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return None,
+        };
+        chunk[chunk_len] = value;
+        chunk_len += 1;
+        if chunk_len == 4 {
+            if chunk[0] == 64 || chunk[1] == 64 {
+                return None;
+            }
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            if chunk[2] != 64 {
+                out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            }
+            if chunk[3] != 64 {
+                out.push((chunk[2] << 6) | chunk[3]);
+            }
+            chunk_len = 0;
+        }
+    }
+    (chunk_len == 0).then_some(out)
 }
 
 pub(crate) fn now_seconds() -> f64 {
@@ -501,6 +573,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Kiro => arg == "--resume-id" || arg.starts_with("--resume-id="),
         AgentKind::Antigravity => false,
         AgentKind::RovoDev => arg == "--restore" || arg.starts_with("--restore="),
+        AgentKind::Omp => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -594,6 +667,8 @@ fn selected_environment() -> BTreeMap<String, String> {
         "GEMINI_CONFIG_DIR",
         "COPILOT_HOME",
         "CODEBUDDY_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        "PI_CONFIG_DIR",
         "QODER_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
@@ -819,5 +894,34 @@ mod tests {
             command,
             "'acli' 'rovodev' 'run' '--restore' 'new' '--profile' 'work'"
         );
+    }
+
+    #[test]
+    fn omp_resume_command_uses_session_flag() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "omp".to_string(),
+            arguments: vec![
+                "omp".to_string(),
+                "--session".to_string(),
+                "old".to_string(),
+                "--model".to_string(),
+                "fast".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 80.0,
+        };
+
+        let command =
+            build_resume_command(AgentKind::Omp, "new", Some(&launch), None).expect("resume");
+
+        assert_eq!(command, "'omp' '--session' 'new' '--model' 'fast'");
+    }
+
+    #[test]
+    fn launch_argv_decodes_cmux_base64_nul_payload() {
+        let decoded = decode_base64_nul_separated("b21wAC0tbW9kZWwAZmFzdAA=").expect("decoded");
+
+        assert_eq!(decoded, vec!["omp", "--model", "fast"]);
     }
 }

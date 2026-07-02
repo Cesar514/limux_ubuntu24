@@ -4561,6 +4561,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("on_tool_permission", "prompt-submit"),
             ],
         ),
+        agent_hooks::AgentKind::Omp => install_omp_extension(),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4637,6 +4638,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             uninstall_antigravity_hooks(&antigravity_hooks_path(), agent)
         }
         agent_hooks::AgentKind::RovoDev => uninstall_rovodev_hooks(&rovodev_config_path()),
+        agent_hooks::AgentKind::Omp => uninstall_omp_extension(),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -5239,6 +5241,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 5000,
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
+        agent_hooks::AgentKind::Omp => 0,
     }
 }
 
@@ -5259,6 +5262,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 120_000,
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
+        agent_hooks::AgentKind::Omp => 0,
     }
 }
 
@@ -5301,6 +5305,62 @@ fn install_opencode_plugin() -> Result<()> {
     }
     fs::write(&path, opencode_plugin_source()?).context("failed to write OpenCode plugin")?;
     opencode_config_register_plugin(&path)
+}
+
+// purpose: Install CMUX-compatible OMP extension hooks.
+// inputs: None; path is resolved from PI_CODING_AGENT_DIR, PI_CONFIG_DIR, HOME, or dirs.
+// returns/effects: Writes the generated extension, refusing to replace non-Limux files.
+fn install_omp_extension() -> Result<()> {
+    let path = omp_extension_path();
+    let source = omp_extension_source()?;
+    install_marked_extension_file(&path, &source, "cmux-omp-session-extension-marker")
+}
+
+// purpose: Remove the installed OMP extension only when it carries the owned marker.
+// inputs: None.
+// returns/effects: Deletes the generated extension or leaves missing files untouched.
+fn uninstall_omp_extension() -> Result<()> {
+    let path = omp_extension_path();
+    uninstall_marked_extension_file(&path, "cmux-omp-session-extension-marker")
+}
+
+// purpose: Write a generated extension file while protecting unrelated user files.
+// inputs: Destination path, new source, and required ownership marker.
+// returns/effects: Creates parent directories and writes source, or fails on unowned existing file.
+fn install_marked_extension_file(path: &Path, source: &str, marker: &str) -> Result<()> {
+    if path.exists() {
+        let existing = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if !existing.is_empty() && !existing.contains(marker) {
+            bail!(
+                "{} exists and is not a Limux/CMUX extension",
+                path.display()
+            );
+        }
+        if existing == source {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, source).with_context(|| format!("failed to write {}", path.display()))
+}
+
+// purpose: Delete an owned generated extension file.
+// inputs: Destination path and ownership marker.
+// returns/effects: Removes the file only when the marker is present.
+fn uninstall_marked_extension_file(path: &Path, marker: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if !existing.contains(marker) {
+        return Ok(());
+    }
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
 fn opencode_config_register_plugin(plugin_path: &Path) -> Result<()> {
@@ -5400,6 +5460,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Kiro => "hooks kiro",
         agent_hooks::AgentKind::Antigravity => "hooks antigravity",
         agent_hooks::AgentKind::RovoDev => "hooks rovodev",
+        agent_hooks::AgentKind::Omp => "hooks omp",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5518,6 +5579,42 @@ fn rovodev_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".rovodev/config.yml")
+}
+
+fn omp_extension_path() -> PathBuf {
+    resolved_omp_agent_directory().join("extensions/cmux-omp-session.ts")
+}
+
+fn resolved_omp_agent_directory() -> PathBuf {
+    if let Some(root) = env::var_os("PI_CODING_AGENT_DIR") {
+        return expand_tilde_path(PathBuf::from(root));
+    }
+    let config_dir = env::var_os("PI_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".omp"));
+    let expanded = expand_tilde_path(config_dir);
+    if expanded.is_absolute() {
+        return expanded.join("agent");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(expanded)
+        .join("agent")
+}
+
+fn expand_tilde_path(path: PathBuf) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path;
+    };
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or(path);
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path
 }
 
 fn gemini_settings_path() -> PathBuf {
@@ -5705,6 +5802,170 @@ const limuxSessionRestore = async (ctx) => {
 
 export const LimuxSessionRestore = limuxSessionRestore;
 export default limuxSessionRestore;
+"#
+        .replace("__LIMUX_COMMAND__", &limux_command_json),
+    )
+}
+
+fn omp_extension_source() -> Result<String> {
+    omp_extension_source_with_command(&opencode_plugin_cli_command()?)
+}
+
+fn omp_extension_source_with_command(limux_command: &str) -> Result<String> {
+    let limux_command_json =
+        serde_json::to_string(limux_command).context("failed to encode OMP hook command")?;
+    Ok(
+        r#"// cmux-omp-session-extension-marker v1
+// Bridges OMP session lifecycle events into Limux's CMUX-compatible restorable session store.
+// Installed by `limux hooks omp install` or `limux hooks setup`.
+// DO NOT EDIT MANUALLY. Limux upgrades this file in place.
+
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+const LIMUX_COMMAND = __LIMUX_COMMAND__;
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+function resolveExecutable(name) {
+  const pathEnv = process.env.PATH || "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch (_) {}
+  }
+  return name;
+}
+
+function normalizedLaunchArgv() {
+  const raw = Array.isArray(process.argv) ? process.argv.map((value) => String(value)) : [];
+  if (raw.length === 0) return [resolveExecutable("omp")];
+  const base = path.basename(raw[0]).toLowerCase();
+  if (base === "omp") return raw;
+  return [resolveExecutable("omp"), ...raw.slice(1)];
+}
+
+function base64NulSeparated(values) {
+  const bytes = [];
+  for (const value of values) {
+    bytes.push(Buffer.from(String(value), "utf8"));
+    bytes.push(Buffer.from([0]));
+  }
+  return Buffer.concat(bytes).toString("base64");
+}
+
+function hookEnvironment(cwd) {
+  const env = { ...process.env };
+  if (!env.LIMUX_AGENT_LAUNCH_ARGV_B64 && !env.CMUX_AGENT_LAUNCH_ARGV_B64) {
+    const argv = normalizedLaunchArgv();
+    env.LIMUX_AGENT_LAUNCH_EXECUTABLE = argv[0] || resolveExecutable("omp");
+    env.LIMUX_AGENT_LAUNCH_ARGV_B64 = base64NulSeparated(argv);
+    env.LIMUX_AGENT_LAUNCH_CWD = cwd || process.cwd();
+    env.CMUX_AGENT_LAUNCH_KIND = "omp";
+    env.CMUX_AGENT_LAUNCH_EXECUTABLE = env.LIMUX_AGENT_LAUNCH_EXECUTABLE;
+    env.CMUX_AGENT_LAUNCH_ARGV_B64 = env.LIMUX_AGENT_LAUNCH_ARGV_B64;
+    env.CMUX_AGENT_LAUNCH_CWD = env.LIMUX_AGENT_LAUNCH_CWD;
+  }
+  return env;
+}
+
+function eventName(subcommand) {
+  if (subcommand === "session-start") return "SessionStart";
+  if (subcommand === "prompt-submit") return "UserPromptSubmit";
+  if (subcommand === "stop") return "Stop";
+  return subcommand;
+}
+
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("\n") || null;
+}
+
+function lastAssistantMessage(event) {
+  const messages = Array.isArray(event && event.messages) ? event.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== "object" || message.role !== "assistant") continue;
+    const text = firstString(textFromContent(message.content));
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function hookInvocation(subcommand, ctx, extra = {}) {
+  if (process.env.LIMUX_OMP_HOOKS_DISABLED === "1" || process.env.CMUX_OMP_HOOKS_DISABLED === "1") return null;
+  if (!process.env.LIMUX_SURFACE_ID && !process.env.CMUX_SURFACE_ID) return null;
+  const sessionId = firstString(ctx && ctx.sessionManager && ctx.sessionManager.getSessionId && ctx.sessionManager.getSessionId());
+  if (!sessionId) return null;
+  const cwd = firstString(ctx && ctx.cwd, process.cwd()) || process.cwd();
+  const payload = {
+    session_id: sessionId,
+    cwd,
+    hook_event_name: eventName(subcommand),
+    event: eventName(subcommand),
+    ...extra,
+  };
+  return {
+    command: process.env.LIMUX_OMP_LIMUX_BIN || process.env.CMUX_OMP_CMUX_BIN || process.env.LIMUX_BIN || LIMUX_COMMAND,
+    cwd,
+    payload: JSON.stringify(payload),
+    env: hookEnvironment(cwd),
+  };
+}
+
+async function sendHook(subcommand, ctx, extra = {}) {
+  const invocation = hookInvocation(subcommand, ctx, extra);
+  if (!invocation) return;
+  await new Promise((resolve) => {
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    try {
+      const child = spawn(invocation.command, ["hooks", "omp", subcommand], {
+        env: invocation.env,
+        stdio: ["pipe", "ignore", "ignore"],
+        detached: true,
+      });
+      child.on("error", settle);
+      child.stdin.on("error", settle);
+      child.stdin.on("finish", settle);
+      child.unref();
+      child.stdin.end(invocation.payload);
+    } catch (_) {
+      settle();
+    }
+  });
+}
+
+export default function limuxOmpSessionExtension(api) {
+  api.on("session_start", async (_event, ctx) => {
+    await sendHook("session-start", ctx);
+  });
+  api.on("before_agent_start", async (event, ctx) => {
+    await sendHook("prompt-submit", ctx, { prompt: event && event.prompt });
+  });
+  api.on("agent_end", async (event, ctx) => {
+    await sendHook("stop", ctx, { last_assistant_message: lastAssistantMessage(event) });
+  });
+}
 "#
         .replace("__LIMUX_COMMAND__", &limux_command_json),
     )
@@ -10581,6 +10842,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::RovoDev)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("omp"),
+            Some(agent_hooks::AgentKind::Omp)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -10598,6 +10863,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Antigravity));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::RovoDev));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Omp));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -10620,6 +10886,48 @@ mod cli_arg_tests {
         assert!(source.contains("if (type === \"session.deleted\") send(\"cleanup\", ctx, event);"));
         assert!(source.contains("type === \"session.status\""));
         assert!(source.contains("type === \"session.compacted\""));
+    }
+
+    #[test]
+    fn omp_extension_embeds_lifecycle_hooks_and_launch_capture() {
+        let source = omp_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+
+        assert!(source.contains("cmux-omp-session-extension-marker v1"));
+        assert!(source.contains("const LIMUX_COMMAND = \"/tmp/limux-cli\";"));
+        assert!(source.contains("api.on(\"session_start\""));
+        assert!(source.contains("api.on(\"before_agent_start\""));
+        assert!(source.contains("api.on(\"agent_end\""));
+        assert!(source.contains("[\"hooks\", \"omp\", subcommand]"));
+        assert!(source.contains("LIMUX_AGENT_LAUNCH_ARGV_B64"));
+        assert!(source.contains("CMUX_AGENT_LAUNCH_ARGV_B64"));
+    }
+
+    #[test]
+    fn omp_extension_install_refuses_unmarked_file_and_removes_marked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux-omp-session.ts");
+
+        fs::write(&path, "export default {};\n").expect("seed user extension");
+        let refused = install_marked_extension_file(
+            &path,
+            "// cmux-omp-session-extension-marker v1\n",
+            "cmux-omp-session-extension-marker",
+        );
+        assert!(refused.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read user extension"),
+            "export default {};\n"
+        );
+
+        fs::write(&path, "// cmux-omp-session-extension-marker old\n").expect("seed marker");
+        let source = omp_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+        install_marked_extension_file(&path, &source, "cmux-omp-session-extension-marker")
+            .expect("install extension");
+        assert_eq!(fs::read_to_string(&path).expect("read extension"), source);
+
+        uninstall_marked_extension_file(&path, "cmux-omp-session-extension-marker")
+            .expect("uninstall extension");
+        assert!(!path.exists());
     }
 
     #[test]
