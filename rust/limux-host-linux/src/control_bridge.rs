@@ -64,6 +64,7 @@ const METHODS: &[&str] = &[
     "pane.last",
     "pane.resize",
     "pane.join",
+    "pane.break",
     "browser.open_split",
     "browser.navigate",
     "browser.url.get",
@@ -533,6 +534,12 @@ pub enum ControlCommand {
         target_pane_id: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    BreakPane {
+        target: WorkspaceTarget,
+        pane_id: Option<String>,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     BrowserAction {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -710,6 +717,7 @@ impl ControlCommand {
             | Self::LastPane { reply, .. }
             | Self::ResizePane { reply, .. }
             | Self::JoinPane { reply, .. }
+            | Self::BreakPane { reply, .. }
             | Self::BrowserAction { reply, .. }
             | Self::BrowserTabAction { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -2259,6 +2267,31 @@ fn handle_method(
                     source_pane_id,
                     source_surface_id,
                     target_pane_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.break" | "break-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_id = match optional_ref_handle(params, &["pane_id", "id"], "pane:") {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::BreakPane {
+                    target,
+                    pane_id,
+                    surface_hint,
                     reply,
                 },
                 rx,
@@ -4710,6 +4743,36 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn pane_break_route_accepts_cmux_alias_and_refs() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"break-pane","params":{"workspace_id":"codex","#,
+                r#""pane_id":"pane:11","surface_id":"surface:11:tab"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::BreakPane {
+                    target,
+                    pane_id,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(pane_id, Some("11".to_string()));
+                    assert_eq!(surface_hint, Some("11:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "workspace_ref": "workspace:new" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.break result")["workspace_ref"],
+            "workspace:new"
         );
     }
 

@@ -4458,18 +4458,28 @@ fn handle_tab_drop_to_workspace(state: &State, target_workspace_id: &str, payloa
 }
 
 fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
+    create_workspace_for_tab_payload(state, payload).is_ok()
+}
+
+// purpose: Move a tab into a newly-created workspace and return its control payload.
+// inputs: Shared app state and a `<pane_id>:<tab_id>` tab drag/control payload.
+// returns/effects: Creates a workspace, moves the tab there, selects it, and persists session state.
+fn create_workspace_for_tab_payload(
+    state: &State,
+    payload: &str,
+) -> Result<serde_json::Value, BridgeError> {
     let Some((pane_id, tab_id)) = payload.split_once(':') else {
-        return false;
+        return Err(BridgeError::invalid_params("invalid tab payload"));
     };
     let Ok(source_pane_id) = pane_id.parse::<u32>() else {
-        return false;
+        return Err(BridgeError::invalid_params("invalid pane id"));
     };
     let Some(source_pane) = pane::find_pane_widget_by_id(source_pane_id) else {
-        return false;
+        return Err(BridgeError::not_found("pane not found"));
     };
 
     let Some(title) = pane::tab_title(&source_pane, tab_id) else {
-        return false;
+        return Err(BridgeError::not_found("surface not found"));
     };
     let tab_cwd = pane::tab_working_directory(&source_pane, tab_id);
     let seed = {
@@ -4547,8 +4557,24 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
     }
 
     if pane::move_tab_to_pane(&source_pane, tab_id, &pane.clone().upcast()) {
+        let result = {
+            let app_state = state.borrow();
+            let index = app_state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == new_workspace_id)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+            let workspace = &app_state.workspaces[index];
+            let surface = pane::active_surface_summary(&pane.clone().upcast())
+                .ok_or_else(|| BridgeError::not_found("surface not found"))?;
+            let mut payload = pane_create_response_payload(&workspace.id, &workspace.name, surface);
+            if let Some(workspace_payload) = workspace_payload(&app_state, index) {
+                payload["workspace"] = workspace_payload["workspace"].clone();
+            }
+            payload
+        };
         request_session_save(state);
-        return true;
+        return Ok(result);
     }
     close_workspace_by_id_internal(
         state,
@@ -4556,7 +4582,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
         false,
         previous_active_workspace_id.as_deref(),
     );
-    false
+    Err(BridgeError::not_found("surface not found"))
 }
 
 fn install_workspace_row_interactions(
@@ -5775,6 +5801,75 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
             request_session_save(state);
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::BreakPane {
+            target,
+            pane_id,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+            let pane_raw = pane_id.clone();
+            let pane_id = pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| pane_id.as_deref().and_then(|raw| raw.parse::<u32>().ok()));
+            if pane_raw.is_some() && pane_id.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.break requires a valid pane_id",
+                )));
+                return;
+            }
+            if pane_id.is_none() && surface_hint.is_none() {
+                let app_state = state.borrow();
+                if app_state.active_idx != index {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                        "pane.break requires pane or surface for inactive workspaces",
+                    )));
+                    return;
+                }
+            }
+
+            let source_surface = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                if let Some(surface_hint) = surface_hint.as_deref() {
+                    pane::surface_summaries_for_root(&workspace.root)
+                        .into_iter()
+                        .find(|surface| surface_hint_matches(&surface.surface_id, surface_hint))
+                        .map(|surface| surface.surface_id)
+                } else if let Some(pane_id) = pane_id {
+                    pane::pane_widget_for_root(&workspace.root, pane_id)
+                        .and_then(|pane_widget| pane::active_surface_summary(&pane_widget))
+                        .map(|surface| surface.surface_id)
+                } else {
+                    focused_ids_for_workspace(state, &workspace.id).1
+                }
+            };
+            let Some(source_surface) = source_surface else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+            let payload = match create_workspace_for_tab_payload(state, &source_surface) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
             let _ = reply.send(Ok(payload));
         }
         ControlCommand::BrowserTabAction {
