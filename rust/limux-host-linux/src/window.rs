@@ -116,6 +116,12 @@ struct SidebarLogEntry {
     message: String,
 }
 
+struct WorkspaceGroupFolderTarget {
+    group_id: String,
+    reference_workspace_id: String,
+    placement: app_config::WorkspaceGroupNewPlacement,
+}
+
 #[derive(Clone)]
 struct HostNotification {
     id: u64,
@@ -7128,7 +7134,40 @@ fn workspace_folder_path_from_input(
     }
 }
 
+// purpose: Resolve the CMUX Cmd-N target for folder-created workspaces.
+// inputs: Current host state and active workspace/group selection.
+// returns/effects: Returns group placement metadata or None for ungrouped active workspaces.
+fn active_workspace_group_folder_target(state: &AppState) -> Option<WorkspaceGroupFolderTarget> {
+    let active_workspace = state.active_workspace()?;
+    let group_id = active_workspace.group_id.as_deref()?;
+    let group = state
+        .workspace_groups
+        .iter()
+        .find(|group| group.id == group_id)?;
+    let anchor_cwd = group.anchor_workspace_id.as_deref().and_then(|anchor_id| {
+        state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == anchor_id)
+            .and_then(|workspace| workspace.cwd.borrow().clone())
+    });
+    let placement = state
+        .config
+        .borrow()
+        .workspace_groups
+        .new_workspace_placement_for_cwd(anchor_cwd.as_deref());
+    Some(WorkspaceGroupFolderTarget {
+        group_id: group_id.to_string(),
+        reference_workspace_id: active_workspace.id.clone(),
+        placement,
+    })
+}
+
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
+    let group_target = {
+        let s = state.borrow();
+        active_workspace_group_folder_target(&s)
+    };
     let workspace = WorkspaceState {
         id: None,
         name: name.to_string(),
@@ -7136,11 +7175,28 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
-        group_id: None,
+        group_id: group_target.as_ref().map(|target| target.group_id.clone()),
         environment: BTreeMap::new(),
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
     add_workspace_from_state(state, &workspace);
+    if let Some(target) = group_target {
+        let created_workspace_id = {
+            let s = state.borrow();
+            s.workspaces
+                .last()
+                .map(|workspace| workspace.id.clone())
+                .expect("folder workspace creation must append a workspace")
+        };
+        place_created_workspace_in_group(
+            state,
+            &created_workspace_id,
+            &target.group_id,
+            Some(target.placement.as_str()),
+            Some(&target.reference_workspace_id),
+        )
+        .expect("active workspace group target must remain valid after folder workspace creation");
+    }
     request_session_save(state);
 }
 
