@@ -4354,6 +4354,31 @@ mod tests {
     }
 
     #[test]
+    fn feed_sidebar_permission_action_resolves_pending_request() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let push = dispatch_request(
+            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"PermissionRequest","_source":"codex","_opencode_request_id":"req-sidebar","tool_name":"Bash"},"wait_timeout_seconds":0}}"#,
+            &|command| panic!("feed.push should not queue command: {command:?}"),
+        );
+        assert_eq!(push.error, None);
+
+        crate::window::reply_to_feed_permission_request("req-sidebar", "once")
+            .expect("sidebar permission action resolves");
+
+        let listed = dispatch_request(r#"{"id":2,"method":"feed.list","params":{}}"#, &|command| {
+            panic!("feed.list should not queue command: {command:?}")
+        });
+        let result = listed.result.expect("feed.list result");
+        let items = result["items"].as_array().expect("items");
+        assert_eq!(items[0]["status"], "resolved");
+        assert_eq!(
+            items[0]["decision"],
+            json!({ "kind": "permission", "mode": "once" })
+        );
+    }
+
+    #[test]
     fn feed_push_blocks_until_permission_reply_resolves() {
         let _guard = feed_test_guard();
         crate::feed::coordinator().reset_for_tests();

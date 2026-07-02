@@ -2956,13 +2956,90 @@ fn sync_right_sidebar_feed_rows(body: &gtk::Box) {
     append_right_sidebar_section(body, "Feed");
     let params = serde_json::Map::new();
     match crate::feed::coordinator().list(&params) {
-        Ok(payload) => append_right_sidebar_lines(
-            body,
-            sidebar_feed_preview_lines_from_value(&payload, RIGHT_SIDEBAR_FEED_PREVIEW_LIMIT),
-            "No feed items",
-        ),
+        Ok(payload) => append_right_sidebar_feed_items(body, &payload),
         Err(error) => append_right_sidebar_muted(body, &format!("Feed unavailable: {error:?}")),
     }
+}
+
+/// purpose: Render Feed preview rows plus direct decision controls for pending permissions.
+/// inputs: Body widget and Feed list payload.
+/// returns/effects: Adds compact rows and GTK buttons that resolve permission requests.
+fn append_right_sidebar_feed_items(body: &gtk::Box, payload: &serde_json::Value) {
+    let items = sidebar_feed_visible_items(payload, RIGHT_SIDEBAR_FEED_PREVIEW_LIMIT);
+    if items.is_empty() {
+        append_right_sidebar_muted(body, "No feed items");
+        return;
+    }
+    for item in items {
+        append_right_sidebar_row(body, &sidebar_feed_preview_line(item));
+        append_feed_permission_actions(body, item);
+    }
+}
+
+/// purpose: Add permission decision buttons for pending Feed rows.
+/// inputs: Body widget and one Feed item row.
+/// returns/effects: Appends buttons that call feed.permission.reply for the row request id.
+fn append_feed_permission_actions(body: &gtk::Box, item: &serde_json::Value) {
+    let Some(request_id) = pending_permission_request_id(item) else {
+        return;
+    };
+    let action_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    action_row.add_css_class("limux-right-sidebar-actions");
+    for (label, mode) in feed_permission_action_specs() {
+        let button = gtk::Button::with_label(label);
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(&format!("Reply {mode} to {request_id}")));
+        let request_id = request_id.clone();
+        button.connect_clicked(move |clicked| {
+            match reply_to_feed_permission_request(&request_id, mode) {
+                Ok(()) => {
+                    clicked.set_label("Sent");
+                    clicked.set_sensitive(false);
+                }
+                Err(error) => {
+                    clicked.set_tooltip_text(Some(&format!("Feed reply failed: {error:?}")));
+                }
+            }
+        });
+        action_row.append(&button);
+    }
+    body.append(&action_row);
+}
+
+/// purpose: Resolve one Feed permission request through the shared coordinator.
+/// inputs: Request id and CMUX permission mode.
+/// returns/effects: Mutates Feed state and wakes any blocked feed.push caller.
+pub(crate) fn reply_to_feed_permission_request(
+    request_id: &str,
+    mode: &str,
+) -> Result<(), BridgeError> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    params.insert(
+        "mode".to_string(),
+        serde_json::Value::String(mode.to_string()),
+    );
+    crate::feed::coordinator()
+        .permission_reply(&params)
+        .map(|_| ())
+}
+
+/// purpose: Define direct CMUX permission decisions exposed in the Feed sidebar.
+/// inputs: None.
+/// returns/effects: Returns stable button label and mode pairs.
+fn feed_permission_action_specs() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Once", "once"),
+        ("Always", "always"),
+        ("Bypass", "bypass"),
+        ("Deny", "deny"),
+    ]
 }
 
 /// purpose: Render selected and open surfaces for Dock mode.
@@ -3189,16 +3266,25 @@ fn sidebar_log_preview_lines_from_entries(
 /// purpose: Format CMUX Feed list payload rows for the right-sidebar Feed panel.
 /// inputs: Feed list response payload and maximum rows.
 /// returns/effects: Returns newest retained rows first without mutating Feed state.
+#[cfg(test)]
 fn sidebar_feed_preview_lines_from_value(payload: &serde_json::Value, limit: usize) -> Vec<String> {
+    sidebar_feed_visible_items(payload, limit)
+        .into_iter()
+        .map(sidebar_feed_preview_line)
+        .collect()
+}
+
+/// purpose: Select the newest bounded Feed items visible in the right sidebar.
+/// inputs: Feed list response payload and maximum rows.
+/// returns/effects: Returns borrowed item rows newest-first without mutating Feed state.
+fn sidebar_feed_visible_items(
+    payload: &serde_json::Value,
+    limit: usize,
+) -> Vec<&serde_json::Value> {
     let Some(items) = payload.get("items").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
-    items
-        .iter()
-        .rev()
-        .take(limit)
-        .map(sidebar_feed_preview_line)
-        .collect()
+    items.iter().rev().take(limit).collect()
 }
 
 /// purpose: Format one CMUX Feed row for compact right-sidebar display.
@@ -3212,6 +3298,21 @@ fn sidebar_feed_preview_line(item: &serde_json::Value) -> String {
         Some(tool) => format!("[{status}] {source} {kind}: {tool}"),
         None => format!("[{status}] {source} {kind}"),
     }
+}
+
+/// purpose: Extract action-eligible pending permission request ids from Feed rows.
+/// inputs: One Feed item row.
+/// returns/effects: Returns request_id only for pending permission requests.
+fn pending_permission_request_id(item: &serde_json::Value) -> Option<String> {
+    let status = json_string_field(item, "status")?;
+    if status != "pending" {
+        return None;
+    }
+    let kind = json_string_field(item, "kind")?;
+    if !matches!(kind, "permissionRequest" | "PermissionRequest") {
+        return None;
+    }
+    json_string_field(item, "request_id").map(ToOwned::to_owned)
 }
 
 /// purpose: Extract one non-empty string field from a JSON object.
@@ -12261,10 +12362,11 @@ mod tests {
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
-        directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
-        notification_policy_effects_from_value, pane_create_split_placement, publish_browser_event,
+        directional_neighbor_score, favorites_prefix_len, feed_permission_action_specs,
+        font_size_after_delta, ghostty_prefers_dark, gtk_system_prefers_dark_from_raw,
+        host_notification_row, limit_text_to_last_lines, next_active_workspace_index,
+        notification_hook_policy_payload, notification_policy_effects_from_value,
+        pane_create_split_placement, pending_permission_request_id, publish_browser_event,
         publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
         queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
@@ -12272,19 +12374,20 @@ mod tests {
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
-        sidebar_feed_preview_lines_from_value, sidebar_file_preview_lines,
-        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
-        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
-        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
-        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input,
-        workspace_hidden_by_collapsed_group_id, workspace_lifecycle_payload,
-        workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
-        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
-        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
-        SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
-        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
+        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
+        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
+        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
+        tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_hidden_by_collapsed_group_id,
+        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
+        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
+        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
+        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
+        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{
@@ -12672,7 +12775,13 @@ mod tests {
         let payload = json!({
             "items": [
                 { "source": "codex", "kind": "PostToolUse", "status": "telemetry", "tool_name": "read" },
-                { "source": "codex", "kind": "PermissionRequest", "status": "pending", "tool_name": "shell" }
+                {
+                    "source": "codex",
+                    "kind": "PermissionRequest",
+                    "status": "pending",
+                    "tool_name": "shell",
+                    "request_id": "req-1"
+                }
             ]
         });
 
@@ -12683,6 +12792,21 @@ mod tests {
                 "[telemetry] codex PostToolUse: read".to_string()
             ]
         );
+        let visible = sidebar_feed_visible_items(&payload, 2);
+        assert_eq!(
+            pending_permission_request_id(visible[0]).as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(
+            feed_permission_action_specs(),
+            &[
+                ("Once", "once"),
+                ("Always", "always"),
+                ("Bypass", "bypass"),
+                ("Deny", "deny")
+            ]
+        );
+        assert_eq!(pending_permission_request_id(visible[1]), None);
     }
 
     #[test]
