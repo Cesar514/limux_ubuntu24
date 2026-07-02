@@ -2794,6 +2794,27 @@ fn window_list_payload(app_state: &AppState) -> serde_json::Value {
     })
 }
 
+// purpose: Report the current GTK host window in the CMUX window.current shape.
+// inputs: Live app state.
+// returns/effects: Returns current single-window metadata without mutating state.
+fn current_window_payload(app_state: &AppState) -> serde_json::Value {
+    let window = window_list_payload(app_state)["windows"][0].clone();
+    serde_json::json!({
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "window": window,
+    })
+}
+
+// purpose: Reject CMUX window.create until Limux has true multi-window support.
+// inputs: No state is required for the single-window host limitation.
+// returns/effects: Returns an explicit not_supported error instead of an unknown method.
+fn create_window_payload() -> Result<serde_json::Value, BridgeError> {
+    Err(BridgeError::not_supported(
+        "window.create requires multi-window GTK host support",
+    ))
+}
+
 // purpose: Focus the current live GTK host window in the CMUX window.focus shape.
 // inputs: Shared host state and an optional CMUX window id/ref/index.
 // returns/effects: Presents the current single host window or rejects unsupported ids.
@@ -2811,6 +2832,16 @@ fn focus_window_payload(
         "window_ref": "window:1",
         "window": window_list_payload(&app_state)["windows"][0].clone(),
     }))
+}
+
+// purpose: Reject CMUX window.close for the single live GTK host window.
+// inputs: CMUX window id/ref/index for validation.
+// returns/effects: Rejects unsupported ids or returns explicit not_supported for window:1.
+fn close_window_payload(window_id: &str) -> Result<serde_json::Value, BridgeError> {
+    validate_host_window_id(Some(window_id))?;
+    Err(BridgeError::not_supported(
+        "window.close would close the only live Limux host window",
+    ))
 }
 
 // purpose: Apply CMUX workspace.move_to_window for the current single GTK host window.
@@ -13927,8 +13958,22 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::CurrentWindow { reply } => {
+            let result = {
+                let app_state = state.borrow();
+                current_window_payload(&app_state)
+            };
+            let _ = reply.send(Ok(result));
+        }
+        ControlCommand::CreateWindow { reply } => {
+            let _ = reply.send(create_window_payload());
+        }
         ControlCommand::FocusWindow { window_id, reply } => {
             let result = focus_window_payload(state, window_id.as_deref());
+            let _ = reply.send(result);
+        }
+        ControlCommand::CloseWindow { window_id, reply } => {
+            let result = close_window_payload(&window_id);
             let _ = reply.send(result);
         }
         ControlCommand::MoveWorkspaceToWindow {

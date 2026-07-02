@@ -13833,6 +13833,9 @@ fn build_window_alias_request(
         params.insert("window_id".to_string(), Value::String(window));
         return Ok(Some((method, Value::Object(params))));
     }
+    if command == "close-window" && parse_opt(args, "--window").is_none() {
+        bail!("close-window requires --window");
+    }
     if let Some(window) = parse_opt(args, "--window").or_else(|| first_positional(args)) {
         params.insert("window_id".to_string(), Value::String(window));
     }
@@ -21053,6 +21056,11 @@ mod cli_arg_tests {
             .expect("neww maps");
         assert_eq!(created.0, "window.create");
 
+        let current = build_window_alias_request("current-window", &args(&[]))
+            .expect("current-window parses")
+            .expect("current-window maps");
+        assert_eq!(current.0, "window.current");
+
         let window = build_window_alias_request("focus-window", &args(&["--window", "window:3"]))
             .expect("window parses")
             .expect("window maps");
@@ -21081,6 +21089,16 @@ mod cli_arg_tests {
         )
         .expect_err("missing move target window rejected");
         assert!(missing_window.to_string().contains("requires --window"));
+
+        let close_window =
+            build_window_alias_request("close-window", &args(&["--window", "window:2"]))
+                .expect("close-window parses")
+                .expect("close-window maps");
+        assert_eq!(close_window.0, "window.close");
+        assert_eq!(close_window.1["window_id"], "window:2");
+        let missing_close = build_window_alias_request("close-window", &args(&[]))
+            .expect_err("missing close target window rejected");
+        assert!(missing_close.to_string().contains("requires --window"));
 
         let workspace = build_workspace_alias_request("select-workspace", &args(&["workspace:4"]))
             .expect("workspace parses")

@@ -44,7 +44,10 @@ const METHODS: &[&str] = &[
     "feed.exit_plan.reply",
     "workspace.current",
     "window.list",
+    "window.current",
+    "window.create",
     "window.focus",
+    "window.close",
     "workspace.list",
     "workspace.env",
     "workspace.create",
@@ -703,8 +706,18 @@ pub enum ControlCommand {
     ListWindows {
         reply: mpsc::Sender<BridgeResult>,
     },
+    CurrentWindow {
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    CreateWindow {
+        reply: mpsc::Sender<BridgeResult>,
+    },
     FocusWindow {
         window_id: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    CloseWindow {
+        window_id: String,
         reply: mpsc::Sender<BridgeResult>,
     },
     MoveWorkspaceToWindow {
@@ -1072,7 +1085,10 @@ impl ControlCommand {
             | Self::SystemTop { reply, .. }
             | Self::SystemTree { reply, .. }
             | Self::ListWindows { reply }
+            | Self::CurrentWindow { reply }
+            | Self::CreateWindow { reply }
             | Self::FocusWindow { reply, .. }
+            | Self::CloseWindow { reply, .. }
             | Self::MoveWorkspaceToWindow { reply, .. }
             | Self::SimulateSidebarDrag { reply, .. }
             | Self::ReloadConfig { reply }
@@ -3167,10 +3183,28 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWindows { reply }, rx)
         }
+        "window.current" | "current-window" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CurrentWindow { reply }, rx)
+        }
+        "window.create" | "new-window" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CreateWindow { reply }, rx)
+        }
         "window.focus" | "focus-window" => {
             let window_id = optional_string(params, &["window_id", "window", "id"]);
             let (reply, rx) = mpsc::channel();
             (ControlCommand::FocusWindow { window_id, reply }, rx)
+        }
+        "window.close" | "close-window" => {
+            let Some(window_id) = optional_string(params, &["window_id", "window", "id"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("window.close requires window_id"),
+                );
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CloseWindow { window_id, reply }, rx)
         }
         "workspace.move_to_window" | "move-workspace-to-window" => {
             let target =
@@ -9254,6 +9288,54 @@ mod tests {
             },
         );
         assert_eq!(windows.error, None);
+    }
+
+    #[test]
+    fn window_current_create_and_close_routes_are_explicit() {
+        let current = dispatch_request(
+            r#"{"id":2,"method":"window.current","params":{}}"#,
+            &|command| match command {
+                ControlCommand::CurrentWindow { reply } => {
+                    let _ = reply.send(Ok(json!({ "window_id": "window:1" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(current.error, None);
+
+        let created = dispatch_request(
+            r#"{"id":3,"method":"window.create","params":{}}"#,
+            &|command| match command {
+                ControlCommand::CreateWindow { reply } => {
+                    let _ = reply.send(Err(BridgeError::not_supported("window.create")));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(
+            created.error.as_ref().map(|error| error.code),
+            Some(NOT_SUPPORTED_CODE)
+        );
+
+        let closed = dispatch_request(
+            r#"{"id":4,"method":"window.close","params":{"window_id":"window:1"}}"#,
+            &|command| match command {
+                ControlCommand::CloseWindow { window_id, reply } => {
+                    assert_eq!(window_id, "window:1");
+                    let _ = reply.send(Err(BridgeError::not_supported("window.close")));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(
+            closed.error.as_ref().map(|error| error.code),
+            Some(NOT_SUPPORTED_CODE)
+        );
+
+        let missing = dispatch_request(r#"{"id":5,"method":"window.close","params":{}}"#, &|_| {
+            panic!("invalid request should fail before dispatch")
+        });
+        assert_eq!(missing.error.as_ref().map(|error| error.code), Some(-32602));
     }
 
     #[test]
