@@ -2710,6 +2710,10 @@ fn apply_tab_metadata_action(
             entry.pinned = false;
             apply_pin_visuals(&entry.tab_button, false);
         }
+        "toggle_pin" => {
+            entry.pinned = !entry.pinned;
+            apply_pin_visuals(&entry.tab_button, entry.pinned);
+        }
         _ => return None,
     }
     Some(entry.pinned)
@@ -2860,7 +2864,10 @@ fn apply_tab_action_mutation(
     action_key: &str,
     title: Option<&str>,
 ) -> Result<TabActionMutation, TabActionError> {
-    if matches!(action_key, "rename" | "clear_name" | "pin" | "unpin") {
+    if matches!(
+        action_key,
+        "rename" | "clear_name" | "pin" | "unpin" | "toggle_pin"
+    ) {
         apply_tab_metadata_action(internals, tab_id, action_key, title)
             .ok_or(TabActionError::NotFound)?;
         return Ok((None, Vec::new(), false));

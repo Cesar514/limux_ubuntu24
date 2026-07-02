@@ -4474,6 +4474,9 @@ fn custom_sidebar_dispatcher_action(
             ensure_custom_sidebar_no_params(action)?;
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkAllRead))
         }
+        "tab.togglePin" | "tab.toggle-pin" | "toggle-tab-pin" => Ok(Some(
+            CustomSidebarDispatcherAction::TabTogglePin(custom_sidebar_action_tab_id(action)?),
+        )),
         "workspace.reorder" | "reorder-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: custom_sidebar_action_workspace_id(action)?,
@@ -4506,6 +4509,13 @@ fn custom_sidebar_action_workspace_id(action: &CustomSidebarNodeAction) -> Resul
 /// returns/effects: Returns the surface id or a loud validation error.
 fn custom_sidebar_action_surface_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
     custom_sidebar_action_param_string_any(action, &["surface_id", "tab_id", "param", "value"])
+}
+
+/// purpose: Read a CMUX tab id from documented or corpus-observed parameter names.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the tab/surface id or a loud validation error.
+fn custom_sidebar_action_tab_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    custom_sidebar_action_param_string_any(action, &["tab_id", "surface_id", "param", "value"])
 }
 
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
@@ -4613,6 +4623,7 @@ enum CustomSidebarDispatcherAction {
     WorkspaceTogglePin(String),
     WorkspaceMarkRead(String),
     WorkspaceMarkAllRead,
+    TabTogglePin(String),
     WorkspaceReorder {
         workspace_id: String,
         target: CustomSidebarWorkspaceReorderTarget,
@@ -4669,6 +4680,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspaceTogglePin(_) => "workspace.togglePin",
             CustomSidebarDispatcherAction::WorkspaceMarkRead(_) => "workspace.markRead",
             CustomSidebarDispatcherAction::WorkspaceMarkAllRead => "workspace.markAllRead",
+            CustomSidebarDispatcherAction::TabTogglePin(_) => "tab.togglePin",
             CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
     }
@@ -4712,6 +4724,9 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::WorkspaceMarkAllRead => {
             Ok(mark_all_host_notifications_read(state))
+        }
+        CustomSidebarDispatcherAction::TabTogglePin(tab_id) => {
+            toggle_tab_pin_for_custom_sidebar(state, &tab_id)
         }
         CustomSidebarDispatcherAction::WorkspaceReorder {
             workspace_id,
@@ -4978,6 +4993,43 @@ fn resolve_workspace_id_for_custom_sidebar(
         return Err(BridgeError::not_found("workspace not found"));
     };
     Ok(app_state.workspaces[index].id.clone())
+}
+
+/// purpose: Toggle a tab pin from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state and CMUX tab/surface id parameter.
+/// returns/effects: Reuses the existing tab action mutation path and persists state.
+fn toggle_tab_pin_for_custom_sidebar(
+    state: &State,
+    tab_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let requested = normalize_surface_handle(tab_id).to_string();
+    let target = {
+        let app_state = state.borrow();
+        app_state.workspaces.iter().find_map(|workspace| {
+            pane::surface_summaries_for_root(&workspace.root)
+                .iter()
+                .any(|surface| surface_hint_matches(&surface.surface_id, &requested))
+                .then(|| (workspace.id.clone(), workspace.root.clone()))
+        })
+    };
+    let Some((workspace_id, workspace_root)) = target else {
+        return Err(BridgeError::not_found("tab not found"));
+    };
+    let summary =
+        pane::apply_tab_action_for_root(&workspace_root, Some(&requested), "toggle_pin", None)
+            .map_err(|error| match error {
+                pane::TabActionError::NotFound => BridgeError::not_found("tab not found"),
+                pane::TabActionError::UnsupportedForSurface => {
+                    BridgeError::invalid_params("tab.togglePin unsupported for surface type")
+                }
+            })?;
+    request_session_save(state);
+    Ok(tab_action_payload(
+        &workspace_id,
+        "toggle_pin",
+        &summary,
+        None,
+    ))
 }
 
 /// purpose: Reorder a workspace from a JSON custom-sidebar dispatcher action.
@@ -18516,6 +18568,13 @@ mod tests {
             message: None,
             params: workspace_param_alias,
         };
+        let mut tab_param_alias = serde_json::Map::new();
+        tab_param_alias.insert("param".to_string(), json!("tab-a"));
+        let tab_toggle_pin = CustomSidebarNodeAction {
+            action_type: "tab.togglePin".to_string(),
+            message: None,
+            params: tab_param_alias,
+        };
         let mut surface_params = serde_json::Map::new();
         surface_params.insert("surface_id".to_string(), json!("surface:7:tab-a"));
         let surface_focus = CustomSidebarNodeAction {
@@ -18661,6 +18720,16 @@ mod tests {
             "cmux dispatcher: workspace.markAllRead"
         );
         assert_eq!(
+            custom_sidebar_dispatcher_action(&tab_toggle_pin),
+            Ok(Some(CustomSidebarDispatcherAction::TabTogglePin(
+                "tab-a".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&tab_toggle_pin),
+            "cmux dispatcher: tab.togglePin"
+        );
+        assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_reorder),
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: "workspace:build".to_string(),
@@ -18704,6 +18773,11 @@ mod tests {
             custom_sidebar_dispatcher_action(&no_param_action("surface.close"))
                 .expect_err("missing close surface id is invalid")
                 .contains("surface_id")
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("tab.togglePin"))
+                .expect_err("missing tab id is invalid")
+                .contains("tab_id")
         );
         assert!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.reorder"))
