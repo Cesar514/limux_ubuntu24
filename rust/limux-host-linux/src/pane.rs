@@ -788,6 +788,7 @@ pub fn create_pane(
                 settings_editor::SettingsEditorInput {
                     config: (internals.callbacks.current_config)(),
                     shortcuts: (internals.callbacks.current_shortcuts)(),
+                    initial_page: None,
                     on_capture: internals.callbacks.on_capture_shortcut.clone(),
                     on_config_changed: internals.callbacks.on_config_changed.clone(),
                 },

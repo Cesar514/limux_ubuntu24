@@ -21,6 +21,7 @@ type OnConfigChanged = dyn Fn(&AppConfig, &AppConfig);
 pub struct SettingsEditorInput {
     pub config: Rc<RefCell<AppConfig>>,
     pub shortcuts: Rc<ResolvedShortcutConfig>,
+    pub initial_page: Option<String>,
     pub on_capture: Rc<
         dyn Fn(ShortcutId, Option<NormalizedShortcut>) -> Result<ResolvedShortcutConfig, String>,
     >,
@@ -77,9 +78,14 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
         stack.add_titled(&notifications_page, Some("notifications"), "Notifications");
     notifications_stack_page.set_icon_name(Some("preferences-system-notifications-symbolic"));
 
+    let initial_page = input.initial_page.clone();
     let keybinds_page = keybind_editor::build_keybind_editor(&input.shortcuts, input.on_capture);
     let keybinds_stack_page = stack.add_titled(&keybinds_page, Some("keybindings"), "Keybindings");
     keybinds_stack_page.set_icon_name(Some("input-keyboard-symbolic"));
+
+    if let Some(page) = settings_stack_page_for_target(initial_page.as_deref()) {
+        stack.set_visible_child_name(page);
+    }
 
     let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
@@ -111,6 +117,18 @@ fn build_settings_window_content(window: &adw::Window, input: SettingsEditorInpu
     outer.append(&header_bar);
     outer.append(&stack);
     outer.upcast()
+}
+
+// purpose: Map CMUX settings targets onto pages that exist in Limux's current GTK settings dialog.
+// inputs: Optional CMUX target raw value.
+// returns/effects: Returns a ViewStack page name or None to leave the default page visible.
+fn settings_stack_page_for_target(target: Option<&str>) -> Option<&'static str> {
+    match target {
+        Some("keyboardShortcuts") => Some("keybindings"),
+        Some("notifications") => Some("notifications"),
+        Some(_) => Some("general"),
+        None => None,
+    }
 }
 
 fn build_general_page(input: &SettingsEditorInput) -> gtk::Widget {

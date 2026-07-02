@@ -598,6 +598,8 @@ pub enum ControlCommand {
         reply: mpsc::Sender<BridgeResult>,
     },
     OpenSettings {
+        target: Option<String>,
+        activate: bool,
         reply: mpsc::Sender<BridgeResult>,
     },
     CurrentWorkspace {
@@ -857,7 +859,7 @@ impl ControlCommand {
             Self::Identify { reply, .. }
             | Self::Memory { reply, .. }
             | Self::ReloadConfig { reply }
-            | Self::OpenSettings { reply }
+            | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListWorkspaceGroups { reply }
@@ -1389,6 +1391,48 @@ fn optional_bool(params: &Map<String, Value>, key: &str) -> Result<Option<bool>,
         .as_bool()
         .map(Some)
         .ok_or_else(|| BridgeError::invalid_params(format!("{key} must be a boolean")))
+}
+
+const SETTINGS_TARGETS: &[&str] = &[
+    "account",
+    "app",
+    "terminal",
+    "textBox",
+    "sleepyMode",
+    "mobile",
+    "sidebarAppearance",
+    "customSidebars",
+    "betaFeatures",
+    "automation",
+    "browser",
+    "browserImport",
+    "globalHotkey",
+    "keyboardShortcuts",
+    "workspaceColors",
+    "settingsJSON",
+    "reset",
+];
+
+// purpose: Validate the optional CMUX `settings.open` target parameter.
+// inputs: JSON-RPC params for settings.open.
+// returns/effects: Returns a canonical CMUX target or invalid_params for unknown targets.
+fn parse_settings_target(params: &Map<String, Value>) -> Result<Option<String>, BridgeError> {
+    let Some(value) = params.get("target") else {
+        return Ok(None);
+    };
+    let Some(target) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return Err(BridgeError::invalid_params(
+            "settings.open target must be a string",
+        ));
+    };
+    if SETTINGS_TARGETS.contains(&target) {
+        return Ok(Some(target.to_string()));
+    }
+    Err(BridgeError::invalid_params("Unknown settings target"))
 }
 
 fn optional_u64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, BridgeError> {
@@ -1960,8 +2004,23 @@ fn handle_method(
             (ControlCommand::ReloadConfig { reply }, rx)
         }
         "settings.open" => {
+            let target = match parse_settings_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let activate = match optional_bool(params, "activate") {
+                Ok(activate) => activate.unwrap_or(true),
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
-            (ControlCommand::OpenSettings { reply }, rx)
+            (
+                ControlCommand::OpenSettings {
+                    target,
+                    activate,
+                    reply,
+                },
+                rx,
+            )
         }
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
@@ -3985,10 +4044,20 @@ mod tests {
     #[test]
     fn settings_open_routes_queue_live_command() {
         let response = dispatch_request(
-            r#"{"id":1,"method":"settings.open","params":{}}"#,
+            r#"{"id":1,"method":"settings.open","params":{"target":"keyboardShortcuts","activate":false}}"#,
             &|command| match command {
-                ControlCommand::OpenSettings { reply } => {
-                    let _ = reply.send(Ok(json!({ "ok": true, "opened": true })));
+                ControlCommand::OpenSettings {
+                    target,
+                    activate,
+                    reply,
+                } => {
+                    assert_eq!(target.as_deref(), Some("keyboardShortcuts"));
+                    assert!(!activate);
+                    let _ = reply.send(Ok(json!({
+                        "ok": true,
+                        "opened": true,
+                        "target": target,
+                    })));
                 }
                 other => panic!("unexpected command: {other:?}"),
             },
@@ -3996,6 +4065,18 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.expect("settings result")["opened"], true);
+    }
+
+    #[test]
+    fn settings_open_rejects_unknown_target() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"settings.open","params":{"target":"general"}}"#,
+            &|command| panic!("unexpected command: {command:?}"),
+        );
+
+        let error = response.error.expect("settings target error");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
+        assert!(error.message.contains("Unknown settings target"));
     }
 
     #[test]

@@ -1247,6 +1247,35 @@ fn run_settings_command(args: &[String]) -> Result<CommandOutput> {
     }
 }
 
+// purpose: Normalize CMUX settings target aliases accepted by `settings open`.
+// inputs: Raw CLI settings target.
+// returns/effects: Returns the canonical CMUX target or None for unknown aliases.
+fn settings_target_raw_value(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "account" => Some("account"),
+        "app" | "general" => Some("app"),
+        "terminal" => Some("terminal"),
+        "text-box" | "textbox" => Some("textBox"),
+        "sleepy-mode" | "sleepymode" => Some("sleepyMode"),
+        "mobile" => Some("mobile"),
+        "sidebar" | "sidebar-appearance" | "sidebarappearance" => Some("sidebarAppearance"),
+        "custom-sidebars" | "customsidebars" => Some("customSidebars"),
+        "beta-features" | "betafeatures" => Some("betaFeatures"),
+        "automation" => Some("automation"),
+        "browser" => Some("browser"),
+        "browser-import" | "browserimport" | "import-browser-data" => Some("browserImport"),
+        "global-hotkey" | "globalhotkey" | "hotkey" => Some("globalHotkey"),
+        "keyboard-shortcuts" | "keyboardshortcuts" | "shortcuts" | "keys" | "keybindings" => {
+            Some("keyboardShortcuts")
+        }
+        "workspace-colors" | "workspacecolors" | "colors" => Some("workspaceColors"),
+        "cmux-json" | "cmuxjson" | "settings-json" | "settingsjson" | "json" | "file"
+        | "settings-file" => Some("settingsJSON"),
+        "reset" => Some("reset"),
+        _ => None,
+    }
+}
+
 /// purpose: Implement CMUX config path, docs, validation, and reload probes.
 /// inputs: Config subcommand arguments.
 /// returns/effects: Reads local JSON config and fails on corrupt files.
@@ -7871,16 +7900,26 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "settings" if args.first().map(String::as_str) == Some("open") => {
-            if args.len() != 1 {
-                bail!("Usage: limux settings open");
+            if args.len() > 2 {
+                bail!("Usage: limux settings open [target]");
             }
-            let payload = client
-                .call("settings.open", Value::Object(Map::new()))
-                .await?;
+            let mut params = Map::new();
+            params.insert("activate".to_string(), json!(true));
+            if let Some(raw_target) = args.get(1) {
+                let target = settings_target_raw_value(raw_target).ok_or_else(|| {
+                    anyhow!("Unknown settings target `{raw_target}`. Run `limux settings --help`.")
+                })?;
+                params.insert("target".to_string(), json!(target));
+            }
+            let payload = client.call("settings.open", Value::Object(params)).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
-                CommandOutput::Text("OK settings opened".to_string())
+                let target = payload
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("general");
+                CommandOutput::Text(format!("OK target={target}"))
             }
         }
         "config" if args.first().map(String::as_str) == Some("reload") => {
@@ -8664,6 +8703,16 @@ mod cli_arg_tests {
             .expect("settings path local check")
             .expect("settings path stays local");
         assert!(matches!(path_output, CommandOutput::Text(_)));
+        assert_eq!(settings_target_raw_value("general"), Some("app"));
+        assert_eq!(
+            settings_target_raw_value("shortcuts"),
+            Some("keyboardShortcuts")
+        );
+        assert_eq!(
+            settings_target_raw_value("settings-json"),
+            Some("settingsJSON")
+        );
+        assert_eq!(settings_target_raw_value("missing"), None);
     }
 
     #[test]

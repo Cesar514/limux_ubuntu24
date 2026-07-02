@@ -5494,9 +5494,13 @@ fn reload_config_for_control(state: &State) -> Result<serde_json::Value, BridgeE
 }
 
 // purpose: Present the live host settings dialog for CMUX `settings open` parity.
-// inputs: Shared app state receiving a control-socket settings.open request.
+// inputs: Shared app state plus optional CMUX settings target and activation flag.
 // returns/effects: Opens a modal settings dialog and returns an acknowledgement.
-fn open_settings_for_control(state: &State) -> Result<serde_json::Value, BridgeError> {
+fn open_settings_for_control(
+    state: &State,
+    target: Option<String>,
+    activate: bool,
+) -> Result<serde_json::Value, BridgeError> {
     let (window, config, shortcuts) = {
         let app_state = state.borrow();
         (
@@ -5508,6 +5512,7 @@ fn open_settings_for_control(state: &State) -> Result<serde_json::Value, BridgeE
     let input = crate::settings_editor::SettingsEditorInput {
         config,
         shortcuts,
+        initial_page: target.clone(),
         on_capture: {
             let state = state.clone();
             Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
@@ -5515,12 +5520,17 @@ fn open_settings_for_control(state: &State) -> Result<serde_json::Value, BridgeE
         on_config_changed: settings_dialog_config_changed_handler(state),
     };
     crate::settings_editor::present_settings_dialog(&window, input);
+    if activate {
+        window.present();
+    }
     let settings_path = app_config::settings_path()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<unavailable>".to_string());
+    let target = target.unwrap_or_else(|| "general".to_string());
     Ok(serde_json::json!({
         "ok": true,
         "opened": true,
+        "target": target,
         "settings_path": settings_path,
     }))
 }
@@ -7304,8 +7314,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let result = reload_config_for_control(state);
             let _ = reply.send(result);
         }
-        ControlCommand::OpenSettings { reply } => {
-            let result = open_settings_for_control(state);
+        ControlCommand::OpenSettings {
+            target,
+            activate,
+            reply,
+        } => {
+            let result = open_settings_for_control(state, target, activate);
             let _ = reply.send(result);
         }
         ControlCommand::ListWorkspaces { reply } => {
