@@ -385,6 +385,15 @@ fn limux_shortcuts_path() -> Result<PathBuf> {
     Ok(limux_config_dir()?.join("shortcuts.json"))
 }
 
+// purpose: Resolve the Ghostty config path used by CMUX-compatible theme commands.
+// inputs: The process XDG config directory environment.
+// returns/effects: Returns ~/.config/ghostty/config or a fatal config-dir error.
+fn ghostty_config_path() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|base| base.join("ghostty/config"))
+        .ok_or_else(|| anyhow!("XDG config directory is unavailable"))
+}
+
 /// purpose: Produce CMUX-compatible docs pointers for local command families.
 /// inputs: Optional docs topic from the CLI.
 /// returns/effects: Returns text only; never contacts the Limux socket.
@@ -502,69 +511,323 @@ fn write_settings_root(path: &Path, root: &Map<String, Value>) -> Result<()> {
     })
 }
 
-/// purpose: Update Limux appearance theme settings from CMUX-compatible theme commands.
-/// inputs: Optional light and dark scheme names.
-/// returns/effects: Writes settings.json and rejects unknown schemes.
-fn set_theme_settings(light: Option<&str>, dark: Option<&str>) -> Result<String> {
-    let path = limux_settings_path()?;
-    set_theme_settings_at(&path, light, dark)
+const CMUX_THEMES_BLOCK_START: &str = "# cmux themes start";
+const CMUX_THEMES_BLOCK_END: &str = "# cmux themes end";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemeSelection {
+    raw_value: Option<String>,
+    light: Option<String>,
+    dark: Option<String>,
+    source_path: Option<String>,
 }
 
-/// purpose: Update a specific settings file with CMUX-compatible theme values.
-/// inputs: Settings path plus optional light and dark scheme names.
-/// returns/effects: Writes settings JSON and rejects unknown schemes.
-fn set_theme_settings_at(path: &Path, light: Option<&str>, dark: Option<&str>) -> Result<String> {
-    let mut root = read_settings_root(path)?;
-    let appearance = root
-        .entry("appearance".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Value::Object(map) = appearance else {
-        bail!("{} appearance must be a JSON object", path.display());
+// purpose: Reject malformed Ghostty theme names before writing a managed config block.
+// inputs: Raw CLI theme argument.
+// returns/effects: Returns a trimmed theme name or a fatal user-facing error.
+fn validated_theme_name(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("themes set requires a non-empty theme name");
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch == ',' || ch == '\n' || ch == '\r' || ch == '\0')
+    {
+        bail!("theme name contains unsupported control or separator characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+// purpose: Encode CMUX/Ghostty conditional theme values for light and dark appearances.
+// inputs: Optional validated light and dark theme names.
+// returns/effects: Returns Ghostty config value syntax or None when both sides are absent.
+fn encoded_theme_value(light: Option<&str>, dark: Option<&str>) -> Option<String> {
+    match (light, dark) {
+        (Some(light), Some(dark)) => Some(format!("light:{light},dark:{dark}")),
+        (Some(light), None) => Some(format!("light:{light}")),
+        (None, Some(dark)) => Some(format!("dark:{dark}")),
+        (None, None) => None,
+    }
+}
+
+// purpose: Build inherited theme selection state for absent Ghostty theme directives.
+// inputs: Optional source path for the checked Ghostty config.
+// returns/effects: Returns a selection with no active theme names.
+fn empty_theme_selection(source_path: Option<String>) -> ThemeSelection {
+    ThemeSelection {
+        raw_value: None,
+        light: None,
+        dark: None,
+        source_path,
+    }
+}
+
+// purpose: Fold one Ghostty theme token into CMUX light/dark/fallback slots.
+// inputs: One comma-separated token plus mutable theme slots.
+// returns/effects: Updates the first matching slot and ignores empty tokens.
+fn apply_theme_selection_token(
+    entry: &str,
+    fallback_theme: &mut Option<String>,
+    light_theme: &mut Option<String>,
+    dark_theme: &mut Option<String>,
+) {
+    if entry.is_empty() {
+        return;
+    }
+    let Some((key, value)) = entry.split_once(':') else {
+        fallback_theme.get_or_insert_with(|| entry.to_string());
+        return;
     };
-    if let Some(value) = light {
-        map.insert(
-            "color_scheme".to_string(),
-            Value::String(parse_theme(value)?.to_string()),
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    match key.trim().to_ascii_lowercase().as_str() {
+        "light" => light_theme.get_or_insert_with(|| value.to_string()),
+        "dark" => dark_theme.get_or_insert_with(|| value.to_string()),
+        _ => fallback_theme.get_or_insert_with(|| value.to_string()),
+    };
+}
+
+// purpose: Parse a Ghostty theme directive into CMUX light/dark selection fields.
+// inputs: Raw theme directive value plus optional source path.
+// returns/effects: Returns current light/dark selections without touching files.
+fn parse_theme_selection(raw_value: Option<String>, source_path: Option<String>) -> ThemeSelection {
+    let Some(raw) = raw_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    else {
+        return empty_theme_selection(source_path);
+    };
+
+    let mut fallback_theme = None;
+    let mut light_theme = None;
+    let mut dark_theme = None;
+    for token in raw.split(',') {
+        apply_theme_selection_token(
+            token.trim(),
+            &mut fallback_theme,
+            &mut light_theme,
+            &mut dark_theme,
         );
     }
-    if let Some(value) = dark {
-        map.insert(
-            "ghostty_color_scheme".to_string(),
-            Value::String(parse_theme(value)?.to_string()),
+
+    ThemeSelection {
+        raw_value: Some(raw.to_string()),
+        light: light_theme.or_else(|| fallback_theme.clone()),
+        dark: dark_theme.or(fallback_theme),
+        source_path,
+    }
+}
+
+// purpose: Find the last Ghostty theme directive in a config file.
+// inputs: Full Ghostty config contents.
+// returns/effects: Returns the raw theme value after `=` when present.
+fn last_theme_directive(contents: &str) -> Option<String> {
+    contents.lines().rev().find_map(parse_theme_directive)
+}
+
+// purpose: Parse one Ghostty config line as a theme directive.
+// inputs: One config line.
+// returns/effects: Returns the trimmed theme value when the line declares `theme`.
+fn parse_theme_directive(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, value) = trimmed.split_once('=')?;
+    if key.trim() != "theme" {
+        return None;
+    }
+    Some(value.trim().to_string())
+}
+
+// purpose: Read the current CMUX/Ghostty theme selection from a config path.
+// inputs: Ghostty config path.
+// returns/effects: Reads the file when present and returns inherited state when absent.
+fn current_theme_selection_at(path: &Path) -> Result<ThemeSelection> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(parse_theme_selection(
+            last_theme_directive(&contents),
+            Some(path.display().to_string()),
+        )),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(parse_theme_selection(
+            None,
+            Some(path.display().to_string()),
+        )),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+// purpose: Remove the CMUX-managed theme block while preserving user Ghostty config lines.
+// inputs: Full Ghostty config contents.
+// returns/effects: Returns config contents without the managed block or errors on malformed markers.
+fn remove_managed_theme_block(contents: &str) -> Result<String> {
+    let mut output = Vec::new();
+    let mut in_block = false;
+    for line in contents.lines() {
+        match line.trim() {
+            CMUX_THEMES_BLOCK_START if in_block => {
+                bail!("nested cmux themes block in Ghostty config")
+            }
+            CMUX_THEMES_BLOCK_START => in_block = true,
+            CMUX_THEMES_BLOCK_END if in_block => in_block = false,
+            CMUX_THEMES_BLOCK_END => bail!("cmux themes block end without start in Ghostty config"),
+            _ if !in_block => output.push(line.to_string()),
+            _ => {}
+        }
+    }
+    if in_block {
+        bail!("unterminated cmux themes block in Ghostty config");
+    }
+    Ok(output.join("\n").trim_end().to_string())
+}
+
+// purpose: Write or replace CMUX's managed Ghostty theme block.
+// inputs: Ghostty config path and encoded theme directive value.
+// returns/effects: Creates the parent directory and atomically writes the config.
+fn write_managed_theme_override_at(path: &Path, raw_theme_value: &str) -> Result<()> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let mut next = remove_managed_theme_block(&existing)?;
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(CMUX_THEMES_BLOCK_START);
+    next.push('\n');
+    next.push_str(&format!("theme = {raw_theme_value}\n"));
+    next.push_str(CMUX_THEMES_BLOCK_END);
+    next.push('\n');
+    write_text_atomically(path, &next)
+}
+
+// purpose: Clear CMUX's managed Ghostty theme override block.
+// inputs: Ghostty config path.
+// returns/effects: Rewrites the config with the managed block removed.
+fn clear_managed_theme_override_at(path: &Path) -> Result<()> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let next = remove_managed_theme_block(&existing)?;
+    let serialized = if next.is_empty() {
+        String::new()
+    } else {
+        format!("{next}\n")
+    };
+    write_text_atomically(path, &serialized)
+}
+
+// purpose: Persist text through a same-directory temporary file.
+// inputs: Target path and complete serialized contents.
+// returns/effects: Creates the parent directory and atomically replaces the target file.
+fn write_text_atomically(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent directory: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, contents).with_context(|| format!("failed to write {}", temp.display()))?;
+    fs::rename(&temp, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp.display()
+        )
+    })
+}
+
+#[derive(Default)]
+struct ThemeSetParts {
+    light: Option<String>,
+    dark: Option<String>,
+    positional: Vec<String>,
+}
+
+// purpose: Consume one CLI token from `themes set` parsing.
+// inputs: Argument slice, current index, and mutable parsed parts.
+// returns/effects: Updates parsed parts and returns the next index to inspect.
+fn consume_theme_set_arg(
+    args: &[String],
+    index: usize,
+    parts: &mut ThemeSetParts,
+) -> Result<usize> {
+    match args[index].as_str() {
+        "--light" | "--dark" => {
+            let flag = args[index].as_str();
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| anyhow!("themes set: {flag} requires a theme name"))?;
+            if flag == "--light" {
+                parts.light = Some(validated_theme_name(value)?);
+            } else {
+                parts.dark = Some(validated_theme_name(value)?);
+            }
+            Ok(index + 2)
+        }
+        value if value.starts_with("--") => {
+            bail!(
+                "themes set: unknown flag `{value}`. Known flags: --light <theme>, --dark <theme>"
+            );
+        }
+        value => {
+            parts.positional.push(value.to_string());
+            Ok(index + 1)
+        }
+    }
+}
+
+// purpose: Parse raw `themes set` arguments into explicit flags and positional tokens.
+// inputs: Theme set arguments after the subcommand.
+// returns/effects: Returns parsed parts or a fatal usage error.
+fn parse_theme_set_parts(args: &[String]) -> Result<ThemeSetParts> {
+    let mut parts = ThemeSetParts::default();
+    let mut index = 0;
+    while index < args.len() {
+        index = consume_theme_set_arg(args, index, &mut parts)?;
+    }
+    Ok(parts)
+}
+
+// purpose: Resolve parsed `themes set` parts against the current theme selection.
+// inputs: Parsed CLI parts and current CMUX/Ghostty selection.
+// returns/effects: Returns validated light/dark names or a fatal usage error.
+fn resolve_theme_set_parts(
+    parts: ThemeSetParts,
+    current: &ThemeSelection,
+) -> Result<(Option<String>, Option<String>)> {
+    if parts.light.is_none() && parts.dark.is_none() {
+        let joined = parts.positional.join(" ");
+        let theme = validated_theme_name(&joined)?;
+        return Ok((Some(theme.clone()), Some(theme)));
+    }
+    if !parts.positional.is_empty() {
+        bail!(
+            "themes set: unexpected argument `{}`",
+            parts.positional.join(" ")
         );
     }
-    write_settings_root(path, &root)?;
-    Ok(format!("OK {}", path.display()))
+    Ok((
+        parts.light.or_else(|| current.light.clone()),
+        parts.dark.or_else(|| current.dark.clone()),
+    ))
 }
 
-fn parse_theme(raw: &str) -> Result<&'static str> {
-    match raw {
-        "system" | "default" => Ok("system"),
-        "dark" => Ok("dark"),
-        "light" => Ok("light"),
-        _ => bail!("unsupported Limux theme `{raw}`; expected system, dark, or light"),
-    }
-}
-
-/// purpose: Remove Limux appearance theme overrides from settings JSON.
-/// inputs: The current Limux settings file, if present.
-/// returns/effects: Writes settings.json only when an appearance object exists.
-fn clear_theme_settings() -> Result<String> {
-    let path = limux_settings_path()?;
-    clear_theme_settings_at(&path)
-}
-
-/// purpose: Remove appearance theme override keys from a concrete settings file.
-/// inputs: Settings path.
-/// returns/effects: Writes the settings JSON with theme override keys removed.
-fn clear_theme_settings_at(path: &Path) -> Result<String> {
-    let mut root = read_settings_root(path)?;
-    if let Some(Value::Object(map)) = root.get_mut("appearance") {
-        map.remove("color_scheme");
-        map.remove("ghostty_color_scheme");
-    }
-    write_settings_root(path, &root)?;
-    Ok(format!("OK {}", path.display()))
+// purpose: Parse `themes set` arguments into CMUX light and dark theme selections.
+// inputs: Theme set arguments after the subcommand and the current selection.
+// returns/effects: Returns validated light/dark names or a fatal usage error.
+fn parse_theme_set_args(
+    args: &[String],
+    current: &ThemeSelection,
+) -> Result<(Option<String>, Option<String>)> {
+    resolve_theme_set_parts(parse_theme_set_parts(args)?, current)
 }
 
 #[derive(Clone, Copy)]
@@ -699,7 +962,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "shortcuts" => Some(CommandOutput::Text(
             limux_shortcuts_path()?.display().to_string(),
         )),
-        "themes" => Some(run_themes_command(args)?),
+        "themes" => Some(run_themes_command(args, opts.json_output)?),
         "sessions" => Some(run_sessions_local_command(args, opts.json_output)?),
         "session-debug" => {
             let mut debug_args = vec!["debug".to_string()];
@@ -1056,34 +1319,114 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
     }
 }
 
-/// purpose: Implement CMUX-compatible theme list/set/clear commands for Limux schemes.
+/// purpose: Implement CMUX-compatible theme list/set/clear commands for Ghostty themes.
 /// inputs: Theme subcommand arguments.
-/// returns/effects: Reads or writes settings.json for set/clear.
-fn run_themes_command(args: &[String]) -> Result<CommandOutput> {
+/// returns/effects: Reads or writes CMUX's managed block in the Ghostty config.
+fn run_themes_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
-        "--help" | "-h" | "list" => Ok(CommandOutput::Text(
-            "system\ndark\nlight\ncurrent file: ".to_string()
-                + &limux_settings_path()?.display().to_string(),
+        "--help" | "-h" => Ok(CommandOutput::Text(
+            "Usage: limux themes [list|set|clear]".to_string(),
         )),
+        "list" => render_themes_list(&ghostty_config_path()?, json_output),
         "set" => {
-            let light = parse_opt(args, "--light");
-            let dark = parse_opt(args, "--dark");
-            let positional = args.get(1).filter(|value| !value.starts_with('-'));
-            let text = match (light.as_deref(), dark.as_deref(), positional) {
-                (None, None, Some(value)) => set_theme_settings(Some(value), Some(value))?,
-                (Some(_), None, _) => set_theme_settings(light.as_deref(), None)?,
-                (None, Some(_), _) => set_theme_settings(None, dark.as_deref())?,
-                (Some(_), Some(_), _) => set_theme_settings(light.as_deref(), dark.as_deref())?,
-                (None, None, None) => {
-                    bail!("themes set requires <theme>, --light <theme>, or --dark <theme>")
-                }
-            };
-            Ok(CommandOutput::Text(text))
+            let path = ghostty_config_path()?;
+            run_themes_set_at(&path, &args[1..], json_output)
         }
-        "clear" => Ok(CommandOutput::Text(clear_theme_settings()?)),
+        "clear" => {
+            if args.len() > 1 {
+                bail!("themes clear does not take any positional arguments");
+            }
+            run_themes_clear_at(&ghostty_config_path()?, json_output)
+        }
+        target if !target.starts_with('-') => {
+            run_themes_set_at(&ghostty_config_path()?, args, json_output)
+        }
         target => bail!("unsupported themes command `{target}`"),
     }
+}
+
+/// purpose: Render CMUX-style current theme state for the Ghostty config path.
+/// inputs: Ghostty config path plus JSON output preference.
+/// returns/effects: Reads config and returns text or JSON output.
+fn render_themes_list(path: &Path, json_output: bool) -> Result<CommandOutput> {
+    let current = current_theme_selection_at(path)?;
+    if json_output {
+        return Ok(CommandOutput::Json(json!({
+            "themes": [],
+            "current": {
+                "raw_value": current.raw_value,
+                "light": current.light,
+                "dark": current.dark,
+                "source_path": current.source_path,
+            },
+            "config_path": path.display().to_string(),
+            "catalog": "external_ghostty",
+        })));
+    }
+
+    Ok(CommandOutput::Text(format!(
+        concat!(
+            "Current light: {}\n",
+            "Current dark: {}\n",
+            "Config: {}\n\n",
+            "Theme catalog: external Ghostty theme names are accepted; ",
+            "run `limux config reload` to validate and apply."
+        ),
+        current.light.as_deref().unwrap_or("inherit"),
+        current.dark.as_deref().unwrap_or("inherit"),
+        path.display()
+    )))
+}
+
+/// purpose: Apply a CMUX-compatible theme selection to Ghostty config.
+/// inputs: Ghostty config path, set arguments, and JSON output preference.
+/// returns/effects: Writes managed theme block and returns status payload.
+fn run_themes_set_at(path: &Path, args: &[String], json_output: bool) -> Result<CommandOutput> {
+    let current = current_theme_selection_at(path)?;
+    let (light, dark) = parse_theme_set_args(args, &current)?;
+    let raw_theme_value = encoded_theme_value(light.as_deref(), dark.as_deref())
+        .ok_or_else(|| anyhow!("themes set requires at least one theme"))?;
+    write_managed_theme_override_at(path, &raw_theme_value)?;
+
+    if json_output {
+        return Ok(CommandOutput::Json(json!({
+            "ok": true,
+            "light": light,
+            "dark": dark,
+            "raw_value": raw_theme_value,
+            "config_path": path.display().to_string(),
+            "reload_requested": false,
+            "reload_command": "limux config reload",
+        })));
+    }
+
+    Ok(CommandOutput::Text(format!(
+        "OK light={} dark={} config={} reload=manual",
+        light.as_deref().unwrap_or("-"),
+        dark.as_deref().unwrap_or("-"),
+        path.display()
+    )))
+}
+
+/// purpose: Clear CMUX's managed Ghostty theme selection.
+/// inputs: Ghostty config path plus JSON output preference.
+/// returns/effects: Removes the managed block and returns status payload.
+fn run_themes_clear_at(path: &Path, json_output: bool) -> Result<CommandOutput> {
+    clear_managed_theme_override_at(path)?;
+    if json_output {
+        return Ok(CommandOutput::Json(json!({
+            "ok": true,
+            "cleared": true,
+            "config_path": path.display().to_string(),
+            "reload_requested": false,
+            "reload_command": "limux config reload",
+        })));
+    }
+    Ok(CommandOutput::Text(format!(
+        "OK cleared config={} reload=manual",
+        path.display()
+    )))
 }
 
 fn should_launch_host(opts: &GlobalOptions) -> bool {
@@ -8324,40 +8667,81 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn theme_set_and_clear_update_settings_without_losing_other_sections() {
+    fn theme_set_and_clear_manage_ghostty_config_block_without_losing_user_lines() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("limux/settings.json");
-        fs::create_dir_all(path.parent().expect("settings parent")).expect("create config dir");
-        fs::write(&path, br#"{"focus":{"hover_terminal_focus":true}}"#).expect("write settings");
+        let path = dir.path().join("ghostty/config");
+        fs::create_dir_all(path.parent().expect("ghostty parent")).expect("create config dir");
+        fs::write(&path, "font-size = 12\n").expect("write config");
 
-        set_theme_settings_at(&path, Some("light"), Some("dark")).expect("set themes");
-        let parsed: Value =
-            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
-        assert_eq!(parsed["focus"]["hover_terminal_focus"], true);
-        assert_eq!(parsed["appearance"]["color_scheme"], "light");
-        assert_eq!(parsed["appearance"]["ghostty_color_scheme"], "dark");
+        let output =
+            run_themes_set_at(&path, &args(&["Catppuccin", "Mocha"]), false).expect("set themes");
+        assert!(matches!(output, CommandOutput::Text(_)));
 
-        clear_theme_settings_at(&path).expect("clear themes");
-        let parsed: Value =
-            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
-        assert!(parsed["appearance"].get("color_scheme").is_none());
-        assert!(parsed["appearance"].get("ghostty_color_scheme").is_none());
-        assert_eq!(parsed["focus"]["hover_terminal_focus"], true);
+        let contents = fs::read_to_string(&path).expect("read config");
+        assert!(contents.contains("font-size = 12"));
+        assert!(contents.contains(CMUX_THEMES_BLOCK_START));
+        assert!(contents.contains("theme = light:Catppuccin Mocha,dark:Catppuccin Mocha"));
+
+        let current = current_theme_selection_at(&path).expect("current theme");
+        assert_eq!(current.light.as_deref(), Some("Catppuccin Mocha"));
+        assert_eq!(current.dark.as_deref(), Some("Catppuccin Mocha"));
+
+        run_themes_clear_at(&path, false).expect("clear themes");
+        let contents = fs::read_to_string(&path).expect("read cleared config");
+        assert!(contents.contains("font-size = 12"));
+        assert!(!contents.contains(CMUX_THEMES_BLOCK_START));
+        assert!(!contents.contains("Catppuccin Mocha"));
     }
 
     #[test]
-    fn theme_set_rejects_unknown_scheme_without_rewriting_file() {
+    fn theme_set_updates_one_side_from_current_selection() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("settings.json");
-        fs::write(&path, br#"{"appearance":{"color_scheme":"dark"}}"#).expect("write settings");
+        let path = dir.path().join("ghostty/config");
+        write_managed_theme_override_at(&path, "light:Catppuccin Latte,dark:Catppuccin Mocha")
+            .expect("seed themes");
 
-        let err = set_theme_settings_at(&path, Some("solarized"), None)
-            .expect_err("unknown theme should fail");
-        assert!(err.to_string().contains("unsupported Limux theme"));
+        run_themes_set_at(&path, &args(&["--dark", "Tokyo Night"]), false).expect("set dark theme");
+        let current = current_theme_selection_at(&path).expect("current theme");
+        assert_eq!(current.light.as_deref(), Some("Catppuccin Latte"));
+        assert_eq!(current.dark.as_deref(), Some("Tokyo Night"));
+    }
+
+    #[test]
+    fn theme_set_rejects_malformed_name_without_rewriting_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ghostty/config");
+        fs::create_dir_all(path.parent().expect("ghostty parent")).expect("create config dir");
+        fs::write(&path, "font-size = 12\n").expect("write config");
+
+        let err = run_themes_set_at(&path, &args(&["Bad,Theme"]), false)
+            .expect_err("bad theme should fail");
+        assert!(err.to_string().contains("unsupported control or separator"));
         assert_eq!(
-            fs::read_to_string(&path).expect("read settings"),
-            r#"{"appearance":{"color_scheme":"dark"}}"#
+            fs::read_to_string(&path).expect("read config"),
+            "font-size = 12\n"
         );
+    }
+
+    #[test]
+    fn themes_json_outputs_cmux_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ghostty/config");
+
+        let output = run_themes_set_at(&path, &args(&["--light", "Gruvbox Light"]), true)
+            .expect("json set themes");
+        let CommandOutput::Json(payload) = output else {
+            panic!("expected json output");
+        };
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["light"], "Gruvbox Light");
+        assert_eq!(payload["raw_value"], "light:Gruvbox Light");
+
+        let output = render_themes_list(&path, true).expect("json list themes");
+        let CommandOutput::Json(payload) = output else {
+            panic!("expected json list");
+        };
+        assert_eq!(payload["current"]["light"], "Gruvbox Light");
+        assert_eq!(payload["catalog"], "external_ghostty");
     }
 
     #[test]
