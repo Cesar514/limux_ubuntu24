@@ -476,44 +476,223 @@ fn docs_text(topic: Option<&str>) -> Result<String> {
 /// purpose: Parse a JSON config file if it exists and fail loudly if it is corrupt.
 /// inputs: A settings or shortcuts path.
 /// returns/effects: Returns true when the file existed and parsed; false when absent.
-fn validate_json_file(path: &Path) -> Result<bool> {
-    match fs::read_to_string(path) {
-        Ok(raw) => {
-            serde_json::from_str::<Value>(&raw)
-                .with_context(|| format!("{} is not valid JSON", path.display()))?;
-            Ok(true)
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
-    }
+struct ConfigDoctorTarget {
+    label: String,
+    path: PathBuf,
+    missing_is_error: bool,
+}
+
+struct ConfigDoctorFinding {
+    label: String,
+    path: PathBuf,
+    status: &'static str,
+    message: String,
+    keys: Vec<String>,
+    byte_count: Option<usize>,
 }
 
 /// purpose: Validate Limux local config files for CMUX-compatible config commands.
 /// inputs: The current XDG config directory.
 /// returns/effects: Reads settings and shortcuts JSON; does not create or modify files.
 fn config_validation_text() -> Result<String> {
-    config_validation_text_for(&limux_settings_path()?, &limux_shortcuts_path()?)
+    config_validation_text_for_targets(default_config_doctor_targets()?)
 }
 
-/// purpose: Validate specific settings and shortcuts files for tests and CLI output.
-/// inputs: Concrete settings and shortcuts paths.
+/// purpose: Validate specific config targets for tests and CLI output.
+/// inputs: Concrete doctor targets.
 /// returns/effects: Reads JSON files; does not create or modify them.
-fn config_validation_text_for(settings: &Path, shortcuts: &Path) -> Result<String> {
-    let settings_state = if validate_json_file(settings)? {
-        "valid"
+fn config_validation_text_for_targets(targets: Vec<ConfigDoctorTarget>) -> Result<String> {
+    let findings = targets
+        .iter()
+        .map(config_doctor_finding)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(render_config_doctor_findings(&findings))
+}
+
+/// purpose: Build default Limux config doctor targets.
+/// inputs: Current config paths and nearest project cmux.json, if present.
+/// returns/effects: Includes project config once when it differs from settings.
+fn default_config_doctor_targets() -> Result<Vec<ConfigDoctorTarget>> {
+    let settings = limux_settings_path()?;
+    let mut targets = vec![
+        ConfigDoctorTarget {
+            label: "settings".to_string(),
+            path: settings.clone(),
+            missing_is_error: false,
+        },
+        ConfigDoctorTarget {
+            label: "shortcuts".to_string(),
+            path: limux_shortcuts_path()?,
+            missing_is_error: false,
+        },
+    ];
+    if let Some(project) = find_project_cmux_config_path()? {
+        if project != settings {
+            targets.push(ConfigDoctorTarget {
+                label: "project".to_string(),
+                path: project,
+                missing_is_error: false,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+/// purpose: Parse CMUX-compatible config doctor --path options.
+/// inputs: Args after the `doctor` subcommand.
+/// returns/effects: Returns explicit custom targets or None for default targets.
+fn parse_config_doctor_targets(args: &[String]) -> Result<Option<Vec<ConfigDoctorTarget>>> {
+    let mut paths = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--path" {
+            let Some(path) = args.get(index + 1) else {
+                bail!("limux config doctor --path requires a path");
+            };
+            paths.push(path.clone());
+            index += 2;
+            continue;
+        }
+        if let Some(path) = argument.strip_prefix("--path=") {
+            if path.is_empty() {
+                bail!("limux config doctor --path requires a path");
+            }
+            paths.push(path.to_string());
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            bail!("unknown config doctor option `{argument}`");
+        }
+        bail!("unknown config doctor argument `{argument}`. Use --path <path>.");
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            Ok(ConfigDoctorTarget {
+                label: format!("custom {}", index + 1),
+                path: absolute_cli_path(&raw)?,
+                missing_is_error: true,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// purpose: Resolve a CLI path like CMUX config doctor does.
+/// inputs: Raw absolute, relative, or tilde path.
+/// returns/effects: Expands `~` using HOME and anchors relative paths at cwd.
+fn absolute_cli_path(raw: &str) -> Result<PathBuf> {
+    let expanded = if raw == "~" {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is required to expand ~"))?
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is required to expand ~/ paths"))?
+            .join(rest)
     } else {
-        "missing"
+        PathBuf::from(raw)
     };
-    let shortcuts_state = if validate_json_file(shortcuts)? {
-        "valid"
+    if expanded.is_absolute() {
+        Ok(expanded)
     } else {
-        "missing"
+        Ok(env::current_dir()
+            .context("failed to read current directory")?
+            .join(expanded))
+    }
+}
+
+/// purpose: Validate one config doctor target.
+/// inputs: Target label, path, and missing-file policy.
+/// returns/effects: Reports status, message, JSON object keys, and byte count.
+fn config_doctor_finding(target: &ConfigDoctorTarget) -> Result<ConfigDoctorFinding> {
+    let raw = match fs::read(&target.path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(ConfigDoctorFinding {
+                label: target.label.clone(),
+                path: target.path.clone(),
+                status: if target.missing_is_error {
+                    "error"
+                } else {
+                    "missing"
+                },
+                message: if target.missing_is_error {
+                    "file not found".to_string()
+                } else {
+                    "not found; Limux will use defaults until this file exists".to_string()
+                },
+                keys: Vec::new(),
+                byte_count: None,
+            });
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", target.path.display()))
+        }
     };
-    Ok(format!(
-        "settings: {settings_state} ({})\nshortcuts: {shortcuts_state} ({})",
-        settings.display(),
-        shortcuts.display()
-    ))
+    if raw.is_empty() {
+        return Ok(ConfigDoctorFinding {
+            label: target.label.clone(),
+            path: target.path.clone(),
+            status: "error",
+            message: "file is empty".to_string(),
+            keys: Vec::new(),
+            byte_count: Some(0),
+        });
+    }
+    let value: Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("{} is not valid JSON", target.path.display()))?;
+    let Some(object) = value.as_object() else {
+        return Ok(ConfigDoctorFinding {
+            label: target.label.clone(),
+            path: target.path.clone(),
+            status: "error",
+            message: "top-level value must be a JSON object".to_string(),
+            keys: Vec::new(),
+            byte_count: Some(raw.len()),
+        });
+    };
+    Ok(ConfigDoctorFinding {
+        label: target.label.clone(),
+        path: target.path.clone(),
+        status: "ok",
+        message: "JSON syntax is valid".to_string(),
+        keys: object.keys().cloned().collect(),
+        byte_count: Some(raw.len()),
+    })
+}
+
+/// purpose: Render text config doctor output.
+/// inputs: Config doctor findings.
+/// returns/effects: Produces deterministic CMUX-style text for terminal output.
+fn render_config_doctor_findings(findings: &[ConfigDoctorFinding]) -> String {
+    let mut lines = vec!["limux config doctor".to_string()];
+    for finding in findings {
+        lines.push(format!(
+            "{} {}: {}",
+            finding.status.to_ascii_uppercase(),
+            finding.label,
+            finding.path.display()
+        ));
+        lines.push(format!("  path: {}", finding.path.display()));
+        if let Some(byte_count) = finding.byte_count {
+            lines.push(format!("  bytes: {byte_count}"));
+        }
+        if !finding.keys.is_empty() {
+            lines.push(format!("  keys: {}", finding.keys.join(", ")));
+        }
+        lines.push(format!("  {}", finding.message));
+    }
+    lines.push("Docs: limux docs settings".to_string());
+    lines.push("Reload: limux reload-config".to_string());
+    lines.join("\n")
 }
 
 /// purpose: Read the settings JSON object while rejecting corrupt or non-object config.
@@ -1446,7 +1625,12 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             limux_settings_path()?.display(),
             limux_shortcuts_path()?.display()
         ))),
-        "check" | "validate" | "doctor" => Ok(CommandOutput::Text(config_validation_text()?)),
+        "check" | "validate" => Ok(CommandOutput::Text(config_validation_text()?)),
+        "doctor" => {
+            let targets =
+                parse_config_doctor_targets(&args[1..])?.unwrap_or(default_config_doctor_targets()?);
+            Ok(CommandOutput::Text(config_validation_text_for_targets(targets)?))
+        }
         "reload" => bail!("config reload requires running host reload support; restart Limux after editing settings"),
         "get" => {
             if args.len() != 2 {
@@ -11304,17 +11488,49 @@ mod cli_arg_tests {
         let shortcuts = dir.path().join("shortcuts.json");
         fs::write(&settings, br#"{"appearance":{"color_scheme":"dark"}}"#).expect("write settings");
 
-        let text = config_validation_text_for(&settings, &shortcuts).expect("validate config");
-        assert!(text.contains("settings: valid"));
-        assert!(text.contains("shortcuts: missing"));
+        let text = config_validation_text_for_targets(vec![
+            ConfigDoctorTarget {
+                label: "settings".to_string(),
+                path: settings.clone(),
+                missing_is_error: false,
+            },
+            ConfigDoctorTarget {
+                label: "shortcuts".to_string(),
+                path: shortcuts.clone(),
+                missing_is_error: false,
+            },
+        ])
+        .expect("validate config");
+        assert!(text.contains("OK settings"));
+        assert!(text.contains("MISSING shortcuts"));
 
         fs::write(&shortcuts, b"{invalid").expect("write corrupt shortcuts");
-        let err = config_validation_text_for(&settings, &shortcuts)
-            .expect_err("corrupt shortcuts must fail");
+        let err = config_validation_text_for_targets(vec![ConfigDoctorTarget {
+            label: "shortcuts".to_string(),
+            path: shortcuts.clone(),
+            missing_is_error: false,
+        }])
+        .expect_err("corrupt shortcuts must fail");
         assert!(
             err.to_string().contains("is not valid JSON"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn config_doctor_accepts_custom_path_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux.json");
+        fs::write(&path, br#"{"commands":[]}"#).expect("write custom config");
+
+        let targets =
+            parse_config_doctor_targets(&args(&["--path", path.to_str().expect("utf8 path")]))
+                .expect("parse targets")
+                .expect("custom targets");
+        let text = config_validation_text_for_targets(targets).expect("doctor output");
+
+        assert!(text.contains("OK custom 1"));
+        assert!(text.contains("keys: commands"));
     }
 
     #[test]

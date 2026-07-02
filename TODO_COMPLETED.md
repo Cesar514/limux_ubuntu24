@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T08:31:28Z Implement and verify CMUX-compatible `config doctor --path` and project config doctor target parity, including custom target parsing, default project `.cmux/cmux.json`/`cmux.json` inclusion, top-level object validation, key listing, and missing/error statuses. \
 [x] 2026-07-02T08:26:54Z Implement and verify CMUX-compatible project `cmux.json` workspace environment loading for `new-workspace` and `workspace create`, including upward `.cmux/cmux.json`/`cmux.json` search order, `newWorkspaceCommand` workspace env extraction, protected-key rejection, and CLI override precedence. \
 [x] 2026-07-02T07:23:28Z Implement and verify CMUX-compatible `new-workspace` and `workspace create` name/title flag serialization so `--name` and `--title` reach the live `workspace.create` bridge alongside cwd, command, and workspace env params. \
 [x] 2026-07-02T07:17:14Z Implement and verify CMUX-compatible Kiro Feed denial exit-status parity: Kiro deny and malformed permission decisions fail closed with exit status 2, allow modes exit 0 with `{}`, and generated Kiro Feed hook commands preserve denial status instead of masking it with a generic fallback. \
