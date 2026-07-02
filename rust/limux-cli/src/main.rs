@@ -4528,6 +4528,49 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             gemini_feed_hook_events(),
         ),
+        agent_hooks::AgentKind::Copilot => install_json_hooks_with_feed(
+            &copilot_config_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("Stop", "stop"),
+                ("Notification", "stop"),
+                ("SessionEnd", "session-end"),
+            ],
+            pre_tool_use_feed_hook_events(),
+        ),
+        agent_hooks::AgentKind::CodeBuddy => install_json_hooks_with_feed(
+            &codebuddy_settings_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("Stop", "stop"),
+                ("Notification", "stop"),
+                ("SessionEnd", "session-end"),
+            ],
+            pre_tool_use_feed_hook_events(),
+        ),
+        agent_hooks::AgentKind::Factory => install_json_hooks_with_feed(
+            &factory_settings_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("Stop", "stop"),
+                ("Notification", "stop"),
+                ("SessionEnd", "session-end"),
+            ],
+            pre_tool_use_feed_hook_events(),
+        ),
+        agent_hooks::AgentKind::Qoder => install_json_hooks_with_feed(
+            &qoder_settings_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("Stop", "stop"),
+                ("SessionEnd", "session-end"),
+            ],
+            pre_tool_use_feed_hook_events(),
+        ),
     }
 }
 
@@ -4545,6 +4588,12 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             opencode_config_unregister_plugin()
         }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
+        agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
+        agent_hooks::AgentKind::CodeBuddy => {
+            uninstall_json_hooks(&codebuddy_settings_path(), agent)
+        }
+        agent_hooks::AgentKind::Factory => uninstall_json_hooks(&factory_settings_path(), agent),
+        agent_hooks::AgentKind::Qoder => uninstall_json_hooks(&qoder_settings_path(), agent),
     }
 }
 
@@ -4661,10 +4710,22 @@ fn gemini_feed_hook_events() -> &'static [&'static str] {
     &["PreToolUse"]
 }
 
+// purpose: List the common CMUX PreToolUse Feed event for nested JSON hook agents.
+// inputs: None.
+// returns/effects: Returns static hook event names without side effects.
+fn pre_tool_use_feed_hook_events() -> &'static [&'static str] {
+    &["PreToolUse"]
+}
+
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Grok => 5,
-        agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
+        agent_hooks::AgentKind::Codex
+        | agent_hooks::AgentKind::Gemini
+        | agent_hooks::AgentKind::Copilot
+        | agent_hooks::AgentKind::CodeBuddy
+        | agent_hooks::AgentKind::Factory
+        | agent_hooks::AgentKind::Qoder => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
 }
@@ -4676,7 +4737,12 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Codex => 5,
         agent_hooks::AgentKind::Grok => 120,
-        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Gemini => 120_000,
+        agent_hooks::AgentKind::Claude
+        | agent_hooks::AgentKind::Gemini
+        | agent_hooks::AgentKind::Copilot
+        | agent_hooks::AgentKind::CodeBuddy
+        | agent_hooks::AgentKind::Factory
+        | agent_hooks::AgentKind::Qoder => 120_000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
 }
@@ -4816,6 +4882,10 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Grok => "hooks grok",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
+        agent_hooks::AgentKind::Copilot => "hooks copilot",
+        agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
+        agent_hooks::AgentKind::Factory => "hooks factory",
+        agent_hooks::AgentKind::Qoder => "hooks qoder",
     }
 }
 
@@ -4893,6 +4963,36 @@ fn gemini_settings_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".gemini/settings.json")
+}
+
+fn copilot_config_path() -> PathBuf {
+    env::var_os("COPILOT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".copilot")))
+        .unwrap_or_else(|| PathBuf::from(".copilot"))
+        .join("config.json")
+}
+
+fn codebuddy_settings_path() -> PathBuf {
+    env::var_os("CODEBUDDY_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codebuddy")))
+        .unwrap_or_else(|| PathBuf::from(".codebuddy"))
+        .join("settings.json")
+}
+
+fn factory_settings_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".factory/settings.json")
+}
+
+fn qoder_settings_path() -> PathBuf {
+    env::var_os("QODER_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".qoder")))
+        .unwrap_or_else(|| PathBuf::from(".qoder"))
+        .join("settings.json")
 }
 
 fn opencode_config_dir() -> PathBuf {
@@ -9867,8 +9967,21 @@ mod cli_arg_tests {
             agent_hooks::AgentKind::from_hook_name("grok"),
             Some(agent_hooks::AgentKind::Grok)
         );
+        assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("code-buddy"),
+            Some(agent_hooks::AgentKind::CodeBuddy)
+        );
+        assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("droid"),
+            Some(agent_hooks::AgentKind::Factory)
+        );
+        assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("qodercli"),
+            Some(agent_hooks::AgentKind::Qoder)
+        );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
     #[test]
@@ -10120,6 +10233,66 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks gemini session-start"));
+    }
+
+    /// purpose: Verify a nested JSON hook agent writes lifecycle and Feed entries.
+    /// inputs: Agent kind, temporary hook path, and expected source marker.
+    /// returns/effects: Asserts installed hook shape, timeouts, and command markers.
+    fn assert_nested_pretool_hook_install(
+        agent: agent_hooks::AgentKind,
+        path: &Path,
+        source: &str,
+    ) {
+        install_json_hooks_with_feed(
+            path,
+            agent,
+            &[("SessionStart", "session-start"), ("Stop", "stop")],
+            pre_tool_use_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(path).expect("read hooks")).expect("json");
+        let feed = &root["hooks"]["PreToolUse"][0];
+
+        assert!(feed.get("matcher").is_none());
+        assert_eq!(feed["hooks"][0]["timeout"], 120_000);
+        assert!(feed["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains(&format!(
+                "hooks feed --source {source} --event 'PreToolUse'"
+            )));
+        assert_eq!(
+            root["hooks"]["SessionStart"][0]["hooks"][0]["timeout"],
+            5000
+        );
+        assert!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains(&format!("hooks {source} session-start")));
+    }
+
+    /// purpose: Verify Copilot, CodeBuddy, Factory, and Qoder nested JSON hook setup.
+    /// inputs: Temporary hook JSON files and shared nested installer helper.
+    /// returns/effects: Asserts Feed PreToolUse parity for four CMUX agent integrations.
+    #[test]
+    fn nested_json_agents_install_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (agent_hooks::AgentKind::Copilot, "copilot", "copilot.json"),
+            (
+                agent_hooks::AgentKind::CodeBuddy,
+                "codebuddy",
+                "codebuddy.json",
+            ),
+            (agent_hooks::AgentKind::Factory, "factory", "factory.json"),
+            (agent_hooks::AgentKind::Qoder, "qoder", "qoder.json"),
+        ];
+
+        for (agent, source, file) in cases {
+            assert_nested_pretool_hook_install(agent, &dir.path().join(file), source);
+        }
     }
 
     /// purpose: Verify Codex uninstall removes both lifecycle hooks and Feed hooks.

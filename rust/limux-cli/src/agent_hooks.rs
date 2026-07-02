@@ -14,16 +14,24 @@ pub(crate) enum AgentKind {
     Grok,
     OpenCode,
     Gemini,
+    Copilot,
+    CodeBuddy,
+    Factory,
+    Qoder,
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 5] {
+    pub(crate) fn all() -> [Self; 9] {
         [
             Self::Claude,
             Self::Codex,
             Self::Grok,
             Self::OpenCode,
             Self::Gemini,
+            Self::Copilot,
+            Self::CodeBuddy,
+            Self::Factory,
+            Self::Qoder,
         ]
     }
 
@@ -34,6 +42,10 @@ impl AgentKind {
             "grok" => Some(Self::Grok),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "gemini" => Some(Self::Gemini),
+            "copilot" => Some(Self::Copilot),
+            "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
+            "factory" | "droid" => Some(Self::Factory),
+            "qoder" | "qodercli" => Some(Self::Qoder),
             _ => None,
         }
     }
@@ -45,6 +57,10 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::CodeBuddy => "codebuddy",
+            Self::Factory => "factory",
+            Self::Qoder => "qoder",
         }
     }
 
@@ -55,6 +71,10 @@ impl AgentKind {
             Self::Grok => "Grok",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini",
+            Self::Copilot => "Copilot",
+            Self::CodeBuddy => "CodeBuddy",
+            Self::Factory => "Factory",
+            Self::Qoder => "Qoder",
         }
     }
 
@@ -65,6 +85,10 @@ impl AgentKind {
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::CodeBuddy => "codebuddy",
+            Self::Factory => "droid",
+            Self::Qoder => "qodercli",
         }
     }
 }
@@ -320,7 +344,12 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
-        AgentKind::Claude | AgentKind::Gemini => {
+        AgentKind::Claude
+        | AgentKind::Gemini
+        | AgentKind::Copilot
+        | AgentKind::CodeBuddy
+        | AgentKind::Factory
+        | AgentKind::Qoder => {
             parts.push("--resume".to_string());
             parts.push(session_id);
             parts.extend(preserved_tail);
@@ -420,7 +449,12 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Codex => arg == "resume" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
-        AgentKind::Claude | AgentKind::Gemini => {
+        AgentKind::Claude
+        | AgentKind::Gemini
+        | AgentKind::Copilot
+        | AgentKind::CodeBuddy
+        | AgentKind::Factory
+        | AgentKind::Qoder => {
             arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
     }
@@ -504,6 +538,9 @@ fn selected_environment() -> BTreeMap<String, String> {
         "GROK_HOME",
         "OPENCODE_CONFIG_DIR",
         "GEMINI_CONFIG_DIR",
+        "COPILOT_HOME",
+        "CODEBUDDY_CONFIG_DIR",
+        "QODER_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL",
@@ -630,5 +667,33 @@ mod tests {
             .expect("resume command");
 
         assert_eq!(command, "'grok' '-r' 'new-session' '--model' 'fast'");
+    }
+
+    #[test]
+    fn nested_json_agents_resume_with_native_resume_flag() {
+        let cases = [
+            (AgentKind::Copilot, "copilot"),
+            (AgentKind::CodeBuddy, "codebuddy"),
+            (AgentKind::Factory, "droid"),
+            (AgentKind::Qoder, "qodercli"),
+        ];
+
+        for (kind, executable) in cases {
+            let launch = AgentLaunchCommandRecord {
+                executable: executable.to_string(),
+                arguments: vec![
+                    executable.to_string(),
+                    "--resume".to_string(),
+                    "old".to_string(),
+                ],
+                cwd: None,
+                environment: Default::default(),
+                captured_at: 40.0,
+            };
+            let command =
+                build_resume_command(kind, "new", Some(&launch), None).expect("resume command");
+
+            assert_eq!(command, format!("'{executable}' '--resume' 'new'"));
+        }
     }
 }
