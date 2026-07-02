@@ -51,6 +51,7 @@ const MAX_SIDEBAR_LOG_ENTRIES: usize = 500;
 struct Workspace {
     id: String,
     name: String,
+    description: Option<String>,
     /// The root widget in the content stack for this workspace.
     root: gtk::Widget,
     /// Manages the split tree data model and async widget rebuild.
@@ -135,6 +136,7 @@ struct WorkspaceEventSnapshot {
     workspace_id: String,
     workspace_ref: String,
     title: String,
+    description: Option<String>,
     index: usize,
     selected: bool,
     favorite: bool,
@@ -1389,6 +1391,7 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
         "workspace_ref": workspace_ref(&workspace.id),
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
+        "description": workspace.description.as_deref(),
         "selected": index == selected_idx,
         "focused": index == selected_idx,
         "cwd": cwd,
@@ -1490,6 +1493,7 @@ fn workspace_event_snapshot(state: &AppState, index: usize) -> Option<WorkspaceE
         workspace_id: workspace.id.clone(),
         workspace_ref: workspace_ref(&workspace.id),
         title: workspace.name.clone(),
+        description: workspace.description.clone(),
         index,
         selected: index == state.active_idx,
         favorite: workspace.favorite,
@@ -1510,6 +1514,7 @@ fn workspace_lifecycle_payload(
         "workspace_id": snapshot.workspace_id,
         "workspace_ref": snapshot.workspace_ref,
         "title": snapshot.title,
+        "description": snapshot.description,
         "index": snapshot.index,
         "selected": snapshot.selected,
         "favorite": snapshot.favorite,
@@ -2645,6 +2650,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
             WorkspaceState {
                 id: Some(workspace.id.clone()),
                 name: workspace.name.clone(),
+                description: workspace.description.clone(),
                 favorite: workspace.favorite,
                 cwd,
                 folder_path,
@@ -6661,6 +6667,7 @@ fn create_workspace_for_tab_payload(
         app_state.workspaces.push(Workspace {
             id: new_workspace_id.clone(),
             name: seed.name.clone(),
+            description: None,
             root: root.clone().upcast(),
             split_container,
             sidebar_row: row,
@@ -7125,6 +7132,7 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
     let workspace = WorkspaceState {
         id: None,
         name: name.to_string(),
+        description: None,
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
@@ -7175,6 +7183,7 @@ fn add_group_anchor_workspace(
     let workspace = WorkspaceState {
         id: Some(workspace_id.clone()),
         name: name.to_string(),
+        description: None,
         favorite: false,
         cwd: cwd.map(ToOwned::to_owned),
         folder_path: cwd.map(ToOwned::to_owned),
@@ -7404,6 +7413,116 @@ fn add_workspace_to_group(
     };
     request_session_save(state);
     Ok(serde_json::json!({ "group": workspace_group_row(&group), "workspace": workspace }))
+}
+
+// purpose: Validate CMUX workspace.create group placement before creating a workspace.
+// inputs: Live state, optional group id/ref, placement, and explicit reference workspace.
+// returns/effects: Returns an error for impossible group placement without mutating state.
+fn validate_workspace_create_group_request(
+    state: &State,
+    group_id: Option<&str>,
+    group_placement: Option<&str>,
+    reference_workspace_id: Option<&str>,
+) -> Result<(), BridgeError> {
+    let s = state.borrow();
+    if group_id.is_none() && (group_placement.is_some() || reference_workspace_id.is_some()) {
+        return Err(BridgeError::invalid_params(
+            "workspace.create group placement requires group_id",
+        ));
+    }
+    if let Some(group_id) = group_id {
+        if workspace_group_index(&s, group_id).is_none() {
+            return Err(BridgeError::not_found("workspace group not found"));
+        }
+    }
+    if let Some(reference_workspace_id) = reference_workspace_id {
+        if workspace_index_for_raw_id(&s, reference_workspace_id).is_none() {
+            return Err(BridgeError::not_found(
+                "group reference workspace not found",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// purpose: Attach a newly-created workspace to a CMUX group and place it in row order.
+// inputs: Created workspace id plus requested group placement metadata.
+// returns/effects: Mutates workspace membership/order or returns a placement error.
+fn place_created_workspace_in_group(
+    state: &State,
+    workspace_id: &str,
+    group_id: &str,
+    placement: Option<&str>,
+    reference_workspace_id: Option<&str>,
+) -> Result<(), BridgeError> {
+    let mut s = state.borrow_mut();
+    let Some(group_index) = workspace_group_index(&s, group_id) else {
+        return Err(BridgeError::not_found("workspace group not found"));
+    };
+    let group_id = s.workspace_groups[group_index].id.clone();
+    let Some(source_index) = workspace_index_for_raw_id(&s, workspace_id) else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+    s.workspaces[source_index].group_id = Some(group_id.clone());
+    let target_index = workspace_create_group_insert_index(
+        &s,
+        &group_id,
+        source_index,
+        placement.unwrap_or("top"),
+        reference_workspace_id,
+    );
+    let moved = source_index != target_index;
+    if moved {
+        let workspace = s.workspaces.remove(source_index);
+        let adjusted = if target_index > source_index {
+            target_index - 1
+        } else {
+            target_index
+        };
+        s.workspaces.insert(adjusted, workspace);
+        if let Some(active_workspace_id) = active_workspace_id {
+            if let Some(active_index) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_workspace_id)
+            {
+                s.active_idx = active_index;
+            }
+        }
+    }
+    sync_sidebar_row_order(&mut s);
+    Ok(())
+}
+
+// purpose: Resolve CMUX group placement into a workspace-vector insertion index.
+// inputs: Host state, group id, source index, placement, and optional reference id/ref.
+// returns/effects: Returns an insertion index without mutating state.
+fn workspace_create_group_insert_index(
+    state: &AppState,
+    group_id: &str,
+    source_index: usize,
+    placement: &str,
+    reference_workspace_id: Option<&str>,
+) -> usize {
+    match placement {
+        "end" => state
+            .workspaces
+            .iter()
+            .rposition(|workspace| workspace.group_id.as_deref() == Some(group_id))
+            .map(|index| index + 1)
+            .unwrap_or(source_index),
+        "afterCurrent" => reference_workspace_id
+            .and_then(|raw| workspace_index_for_raw_id(state, raw))
+            .or(Some(state.active_idx))
+            .map(|index| index + 1)
+            .unwrap_or(source_index),
+        _ => state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.group_id.as_deref() == Some(group_id))
+            .unwrap_or(source_index),
+    }
 }
 
 // purpose: Detach an existing workspace from whichever group contains it.
@@ -9765,13 +9884,26 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::CreateWorkspace {
             name,
+            description,
             cwd,
             command,
             focus,
             layout,
+            group_id,
+            group_placement,
+            group_reference_workspace_id,
             environment,
             reply,
         } => {
+            if let Err(error) = validate_workspace_create_group_request(
+                state,
+                group_id.as_deref(),
+                group_placement.as_deref(),
+                group_reference_workspace_id.as_deref(),
+            ) {
+                let _ = reply.send(Err(error));
+                return;
+            }
             let home = dirs::home_dir()
                 .map(|path| path.to_string_lossy().to_string())
                 .unwrap_or_default();
@@ -9788,21 +9920,55 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let workspace = WorkspaceState {
                 id: None,
                 name: title,
+                description,
                 favorite: false,
                 cwd: Some(folder_path.to_string()),
                 folder_path: Some(folder_path.to_string()),
-                group_id: None,
+                group_id: group_id
+                    .as_deref()
+                    .map(normalize_workspace_group_handle)
+                    .map(ToOwned::to_owned),
                 environment,
                 layout: layout.unwrap_or_else(|| {
                     LayoutNodeState::Pane(PaneState::fallback(Some(folder_path)))
                 }),
             };
             add_workspace_from_state_internal(state, &workspace, focus);
+
+            let created_workspace_id = {
+                let app_state = state.borrow();
+                app_state
+                    .workspaces
+                    .last()
+                    .map(|workspace| workspace.id.clone())
+            };
+            let Some(created_workspace_id) = created_workspace_id else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
+                    "workspace.create did not produce a workspace",
+                )));
+                return;
+            };
+            if let Some(group_id) = group_id.as_deref() {
+                if let Err(error) = place_created_workspace_in_group(
+                    state,
+                    &created_workspace_id,
+                    group_id,
+                    group_placement.as_deref(),
+                    group_reference_workspace_id.as_deref(),
+                ) {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            }
             request_session_save(state);
 
             let result = {
                 let app_state = state.borrow();
-                workspace_payload(&app_state, app_state.workspaces.len() - 1)
+                app_state
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == created_workspace_id)
+                    .and_then(|index| workspace_payload(&app_state, index))
             };
 
             if let (false, Some(command), Some(workspace_id)) = (
@@ -9856,6 +10022,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let workspace = WorkspaceState {
                     id: None,
                     name: format!("{name_prefix}-{index}"),
+                    description: None,
                     favorite: false,
                     cwd: Some(folder_path.to_string()),
                     folder_path: Some(folder_path.to_string()),
@@ -10457,6 +10624,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
     let ws = Workspace {
         id,
         name: workspace.name.clone(),
+        description: workspace.description.clone(),
         root,
         split_container,
         sidebar_row: row.clone(),
@@ -13539,6 +13707,7 @@ mod tests {
             workspace_id: "workspace-a".to_string(),
             workspace_ref: "workspace:workspace-a".to_string(),
             title: "Agents".to_string(),
+            description: Some("Agent group".to_string()),
             index: 2,
             selected: true,
             favorite: false,
@@ -13555,6 +13724,7 @@ mod tests {
         assert_eq!(payload["workspace_id"], "workspace-a");
         assert_eq!(payload["workspace_ref"], "workspace:workspace-a");
         assert_eq!(payload["title"], "Agents");
+        assert_eq!(payload["description"], "Agent group");
         assert_eq!(payload["index"], 2);
         assert_eq!(payload["selected"], true);
         assert_eq!(payload["favorite"], false);
@@ -13571,6 +13741,7 @@ mod tests {
             workspace_id: "workspace-stream-test".to_string(),
             workspace_ref: "workspace:workspace-stream-test".to_string(),
             title: "Stream Test".to_string(),
+            description: None,
             index: 1,
             selected: true,
             favorite: false,

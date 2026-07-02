@@ -62,6 +62,8 @@ pub struct WorkspaceState {
     pub id: Option<String>,
     pub name: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub favorite: bool,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -567,6 +569,7 @@ impl AppSessionState {
                 WorkspaceState {
                     id: None,
                     name: workspace.name,
+                    description: None,
                     favorite: workspace.favorite,
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
@@ -1112,6 +1115,7 @@ mod tests {
             workspaces: vec![WorkspaceState {
                 id: Some("11111111-1111-4111-8111-111111111111".to_string()),
                 name: "canonical".to_string(),
+                description: Some("primary session".to_string()),
                 favorite: true,
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
@@ -1242,6 +1246,7 @@ mod tests {
             workspaces: vec![WorkspaceState {
                 id: Some("22222222-2222-4222-8222-222222222222".to_string()),
                 name: "workspace".to_string(),
+                description: None,
                 favorite: false,
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
@@ -1765,6 +1770,7 @@ mod tests {
             workspaces: vec![WorkspaceState {
                 id: Some("33333333-3333-4333-8333-333333333333".to_string()),
                 name: "workspace".to_string(),
+                description: None,
                 favorite: false,
                 cwd: None,
                 folder_path: None,
@@ -1810,6 +1816,7 @@ mod tests {
             workspaces: vec![WorkspaceState {
                 id: Some("44444444-4444-4444-8444-444444444444".to_string()),
                 name: "workspace".to_string(),
+                description: Some("Agent surfaces".to_string()),
                 favorite: false,
                 cwd: None,
                 folder_path: None,
@@ -1829,6 +1836,10 @@ mod tests {
         assert_eq!(
             decoded.workspace_groups[0].custom_color.as_deref(),
             Some("#3366ff")
+        );
+        assert_eq!(
+            decoded.workspaces[0].description.as_deref(),
+            Some("Agent surfaces")
         );
         assert_eq!(decoded.workspaces[0].group_id.as_deref(), Some("group-1"));
     }
@@ -1859,6 +1870,7 @@ mod tests {
             workspaces: vec![WorkspaceState {
                 id: Some("55555555-5555-4555-8555-555555555555".to_string()),
                 name: "workspace".to_string(),
+                description: None,
                 favorite: false,
                 cwd: None,
                 folder_path: None,

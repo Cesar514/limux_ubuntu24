@@ -765,10 +765,14 @@ pub enum ControlCommand {
     },
     CreateWorkspace {
         name: Option<String>,
+        description: Option<String>,
         cwd: Option<String>,
         command: Option<String>,
         focus: bool,
         layout: Option<LayoutNodeState>,
+        group_id: Option<String>,
+        group_placement: Option<String>,
+        group_reference_workspace_id: Option<String>,
         environment: BTreeMap<String, String>,
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -1401,6 +1405,26 @@ fn optional_bool(params: &Map<String, Value>, key: &str) -> Result<Option<bool>,
         .as_bool()
         .map(Some)
         .ok_or_else(|| BridgeError::invalid_params(format!("{key} must be a boolean")))
+}
+
+// purpose: Parse CMUX workspace-create group placement values.
+// inputs: workspace.create params with optional group_placement.
+// returns/effects: Returns normalized placement or rejects malformed socket input.
+fn optional_group_placement(params: &Map<String, Value>) -> Result<Option<String>, BridgeError> {
+    let Some(value) = params.get("group_placement") else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(BridgeError::invalid_params(
+            "workspace.create group_placement must be a string",
+        ));
+    };
+    match raw {
+        "top" | "end" | "afterCurrent" => Ok(Some(raw.to_string())),
+        _ => Err(BridgeError::invalid_params(
+            "workspace.create group_placement must be top, end, or afterCurrent",
+        )),
+    }
 }
 
 // purpose: Parse optional CMUX workspace layout JSON into Limux layout state.
@@ -3529,14 +3553,25 @@ fn handle_method(
                 Ok(layout) => layout,
                 Err(error) => return error_response(id, error),
             };
+            let group_placement = match optional_group_placement(params) {
+                Ok(group_placement) => group_placement,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreateWorkspace {
                     name: optional_string(params, &["name", "title"]),
+                    description: optional_string(params, &["description"]),
                     cwd,
                     command: optional_string(params, &["command"]),
                     focus,
                     layout,
+                    group_id: optional_string(params, &["group_id", "group"]),
+                    group_placement,
+                    group_reference_workspace_id: optional_string(
+                        params,
+                        &["group_reference_workspace_id", "group_reference"],
+                    ),
                     environment,
                     reply,
                 },
@@ -4973,6 +5008,51 @@ mod tests {
         let invalid = dispatch_request(
             r#"{"id":2,"method":"workspace.create","params":{"focus":"yes"}}"#,
             &|command| panic!("invalid focus should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn workspace_create_route_accepts_description_and_group_placement() {
+        let request = json!({
+            "id": 1,
+            "method": "workspace.create",
+            "params": {
+                "description": "Ship checklist",
+                "group_id": "workspace_group:agents",
+                "group_placement": "afterCurrent",
+                "group_reference_workspace_id": "workspace:build",
+            }
+        })
+        .to_string();
+        let created = dispatch_request(&request, &|command| match command {
+            ControlCommand::CreateWorkspace {
+                description,
+                group_id,
+                group_placement,
+                group_reference_workspace_id,
+                reply,
+                ..
+            } => {
+                assert_eq!(description.as_deref(), Some("Ship checklist"));
+                assert_eq!(group_id.as_deref(), Some("workspace_group:agents"));
+                assert_eq!(group_placement.as_deref(), Some("afterCurrent"));
+                assert_eq!(
+                    group_reference_workspace_id.as_deref(),
+                    Some("workspace:build")
+                );
+                let _ = reply.send(Ok(json!({ "workspace_id": "workspace-a" })));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+        assert_eq!(created.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":2,"method":"workspace.create","params":{"group_placement":"middle"}}"#,
+            &|command| panic!("invalid placement should not dispatch: {command:?}"),
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),

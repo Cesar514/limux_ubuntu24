@@ -7119,14 +7119,29 @@ export default function limuxOmpSessionExtension(api) {
 
 // purpose: Build CMUX-compatible workspace.create params from new-workspace args.
 // inputs: CLI args for new-workspace or workspace create.
-// returns/effects: Serializes title, cwd, command, focus, and workspace env.
+// returns/effects: Serializes title, description, cwd, command, focus, group, and workspace env.
 fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     let mut params = Map::new();
     if let Some(name) = parse_opt(args, "--name").or_else(|| parse_opt(args, "--title")) {
         params.insert("title".to_string(), Value::String(name));
     }
+    if let Some(description) = parse_opt(args, "--description") {
+        params.insert("description".to_string(), Value::String(description));
+    }
     if let Some(cwd_value) = parse_opt(args, "--cwd") {
         params.insert("cwd".to_string(), Value::String(cwd_value.clone()));
+    }
+    if let Some(group) = parse_opt(args, "--group") {
+        params.insert("group_id".to_string(), Value::String(group));
+    }
+    if let Some(placement) = parse_opt(args, "--group-placement") {
+        params.insert("group_placement".to_string(), Value::String(placement));
+    }
+    if let Some(reference) = parse_opt(args, "--group-reference") {
+        params.insert(
+            "group_reference_workspace_id".to_string(),
+            Value::String(reference),
+        );
     }
     let layout = parse_opt(args, "--layout")
         .map(|raw| {
@@ -11397,6 +11412,26 @@ mod cli_arg_tests {
             build_new_workspace_params(&args(&["--title", "Launch"])).expect("workspace params");
 
         assert_eq!(params["title"], "Launch");
+    }
+
+    #[test]
+    fn new_workspace_params_include_description_and_group_placement() {
+        let params = build_new_workspace_params(&args(&[
+            "--description",
+            "Ship checklist",
+            "--group",
+            "workspace_group:agents",
+            "--group-placement",
+            "afterCurrent",
+            "--group-reference",
+            "workspace:build",
+        ]))
+        .expect("workspace params");
+
+        assert_eq!(params["description"], "Ship checklist");
+        assert_eq!(params["group_id"], "workspace_group:agents");
+        assert_eq!(params["group_placement"], "afterCurrent");
+        assert_eq!(params["group_reference_workspace_id"], "workspace:build");
     }
 
     #[test]
