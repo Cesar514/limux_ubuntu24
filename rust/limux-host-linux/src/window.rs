@@ -2173,6 +2173,141 @@ fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value 
     serde_json::json!({ "panes": panes })
 }
 
+// purpose: Report the current GTK host window in the CMUX window.list shape.
+// inputs: Live app state.
+// returns/effects: Returns one focused window row for the single GTK host window.
+fn window_list_payload(app_state: &AppState) -> serde_json::Value {
+    let pane_count = app_state
+        .workspaces
+        .iter()
+        .map(|workspace| pane::pane_summaries_for_root(&workspace.root).len())
+        .sum::<usize>();
+    serde_json::json!({
+        "windows": [{
+            "index": 1,
+            "id": "window:1",
+            "ref": "window:1",
+            "window_id": "window:1",
+            "window_ref": "window:1",
+            "title": "Limux",
+            "focused": true,
+            "workspace_count": app_state.workspaces.len(),
+            "pane_count": pane_count,
+        }]
+    })
+}
+
+// purpose: Validate a system.tree window scope against the current single GTK host window.
+// inputs: Optional CMUX window id/ref/index string.
+// returns/effects: Returns not_found for unsupported live host windows.
+fn validate_system_tree_window(window_id: Option<&str>) -> Result<(), BridgeError> {
+    let Some(window_id) = window_id else {
+        return Ok(());
+    };
+    match window_id.strip_prefix("window:").unwrap_or(window_id) {
+        "1" => Ok(()),
+        _ => Err(BridgeError::not_found("window not found")),
+    }
+}
+
+// purpose: Build one workspace node for system.tree from live host state.
+// inputs: Shared app state and a workspace.
+// returns/effects: Attaches pane and surface child nodes under the workspace row.
+fn system_tree_workspace_node(
+    state: &State,
+    app_state: &AppState,
+    index: usize,
+    workspace: &Workspace,
+) -> serde_json::Value {
+    let mut workspace_node = workspace_row(index, app_state.active_idx, workspace);
+    let surfaces = surface_list_payload(state, workspace, None)
+        .get("surfaces")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pane_nodes = pane_list_payload(state, workspace)
+        .get("panes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pane| system_tree_pane_node(pane, &surfaces))
+        .collect::<Vec<_>>();
+    if let Some(map) = workspace_node.as_object_mut() {
+        map.insert("panes".to_string(), serde_json::Value::Array(pane_nodes));
+    }
+    workspace_node
+}
+
+// purpose: Attach matching surface child nodes to one system.tree pane row.
+// inputs: Pane row and all surface rows for the containing workspace.
+// returns/effects: Returns the pane row with a surfaces array.
+fn system_tree_pane_node(
+    mut pane: serde_json::Value,
+    surfaces: &[serde_json::Value],
+) -> serde_json::Value {
+    let pane_handle = pane
+        .get("pane_id")
+        .or_else(|| pane.get("pane_ref"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let child_surfaces = surfaces
+        .iter()
+        .filter(|surface| {
+            surface
+                .get("pane_id")
+                .or_else(|| surface.get("pane_ref"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value == pane_handle)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(map) = pane.as_object_mut() {
+        map.insert(
+            "surfaces".to_string(),
+            serde_json::Value::Array(child_surfaces),
+        );
+    }
+    pane
+}
+
+// purpose: Build native CMUX system.tree output from live GTK host state.
+// inputs: Optional workspace and window scopes plus all-window flag.
+// returns/effects: Returns a single-window topology snapshot or a loud scope error.
+fn system_tree_payload(
+    state: &State,
+    workspace_target: Option<&WorkspaceTarget>,
+    window_id: Option<&str>,
+    _include_all: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    validate_system_tree_window(window_id)?;
+    let app_state = state.borrow();
+    let workspace_indexes = if let Some(target) = workspace_target {
+        vec![workspace_index_for_target(&app_state, target)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?]
+    } else {
+        (0..app_state.workspaces.len()).collect::<Vec<_>>()
+    };
+    let workspaces = workspace_indexes
+        .into_iter()
+        .map(|index| {
+            system_tree_workspace_node(state, &app_state, index, &app_state.workspaces[index])
+        })
+        .collect::<Vec<_>>();
+    let mut window = window_list_payload(&app_state)["windows"][0].clone();
+    if let Some(map) = window.as_object_mut() {
+        map.insert(
+            "workspaces".to_string(),
+            serde_json::Value::Array(workspaces),
+        );
+    }
+    Ok(serde_json::json!({
+        "source": "limux_live_system_tree",
+        "windows": [window],
+    }))
+}
+
 fn surface_list_payload(
     state: &State,
     workspace: &Workspace,
@@ -8006,6 +8141,20 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 .map_err(BridgeError::internal);
             let _ = reply.send(result);
         }
+        ControlCommand::SystemTree {
+            workspace_target,
+            window_id,
+            include_all,
+            reply,
+        } => {
+            let result = system_tree_payload(
+                state,
+                workspace_target.as_ref(),
+                window_id.as_deref(),
+                include_all,
+            );
+            let _ = reply.send(result);
+        }
         ControlCommand::ReloadConfig { reply } => {
             let result = reload_config_for_control(state);
             let _ = reply.send(result);
@@ -8029,6 +8178,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::ListWindows { reply } => {
+            let result = {
+                let app_state = state.borrow();
+                window_list_payload(&app_state)
+            };
+            let _ = reply.send(Ok(result));
         }
         ControlCommand::WorkspaceEnv {
             target,

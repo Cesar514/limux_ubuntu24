@@ -28,6 +28,7 @@ const METHODS: &[&str] = &[
     "system.identify",
     "system.capabilities",
     "system.memory",
+    "system.tree",
     "auth.login",
     "auth.status",
     "reload_config",
@@ -41,6 +42,7 @@ const METHODS: &[&str] = &[
     "feed.question.reply",
     "feed.exit_plan.reply",
     "workspace.current",
+    "window.list",
     "workspace.list",
     "workspace.env",
     "workspace.create",
@@ -609,6 +611,15 @@ pub enum ControlCommand {
         top_group_limit: usize,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SystemTree {
+        workspace_target: Option<WorkspaceTarget>,
+        window_id: Option<String>,
+        include_all: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ListWindows {
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -880,6 +891,8 @@ impl ControlCommand {
         match self {
             Self::Identify { reply, .. }
             | Self::Memory { reply, .. }
+            | Self::SystemTree { reply, .. }
+            | Self::ListWindows { reply }
             | Self::ReloadConfig { reply }
             | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
@@ -1822,6 +1835,39 @@ fn parse_optional_workspace_target(
     Ok(WorkspaceTarget::Active)
 }
 
+// purpose: Parse an optional tree workspace scope only when the caller supplied one.
+// inputs: system.tree params and accepted workspace target fields.
+// returns/effects: Returns None for unscoped current-window tree requests.
+fn parse_optional_tree_workspace_target(
+    params: &Map<String, Value>,
+) -> Result<Option<WorkspaceTarget>, BridgeError> {
+    if ["workspace_id", "id", "name", "index"]
+        .iter()
+        .any(|key| params.contains_key(*key))
+    {
+        parse_optional_workspace_target(params, true).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+// purpose: Parse CMUX-compatible system.tree scope fields.
+// inputs: JSON params for system.tree.
+// returns/effects: Rejects unsupported all+window combinations loudly.
+fn parse_system_tree_scope(
+    params: &Map<String, Value>,
+) -> Result<(Option<WorkspaceTarget>, Option<String>, bool), BridgeError> {
+    let workspace_target = parse_optional_tree_workspace_target(params)?;
+    let window_id = optional_string(params, &["window_id", "window"]);
+    let include_all = optional_bool(params, "all")?.unwrap_or(false);
+    if include_all && window_id.is_some() {
+        return Err(BridgeError::invalid_params(
+            "system.tree all cannot be combined with window_id",
+        ));
+    }
+    Ok((workspace_target, window_id, include_all))
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_pane_create_direction(raw: &str) -> Result<PaneCreateDirection, BridgeError> {
     match raw {
@@ -2344,6 +2390,22 @@ fn handle_method(
                 rx,
             )
         }
+        "system.tree" => {
+            let (workspace_target, window_id, include_all) = match parse_system_tree_scope(params) {
+                Ok(scope) => scope,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SystemTree {
+                    workspace_target,
+                    window_id,
+                    include_all,
+                    reply,
+                },
+                rx,
+            )
+        }
         "right_sidebar" => {
             let (action, target) = match parse_right_sidebar_request(params) {
                 Ok(parsed) => parsed,
@@ -2421,6 +2483,10 @@ fn handle_method(
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CurrentWorkspace { reply }, rx)
+        }
+        "window.list" | "list-windows" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ListWindows { reply }, rx)
         }
         "workspace.list" | "list-workspaces" => {
             let (reply, rx) = mpsc::channel();
@@ -4447,6 +4513,12 @@ mod tests {
     fn capabilities_include_config_reload_methods() {
         assert!(METHODS.contains(&"reload_config"));
         assert!(METHODS.contains(&"config.reload"));
+    }
+
+    #[test]
+    fn capabilities_include_tree_and_window_list_methods() {
+        assert!(METHODS.contains(&"system.tree"));
+        assert!(METHODS.contains(&"window.list"));
     }
 
     #[test]
@@ -7484,6 +7556,82 @@ mod tests {
         let invalid = dispatch_request(
             r#"{"id":1,"method":"system.memory","params":{"top_group_limit":101}}"#,
             &|command| panic!("invalid system.memory should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn system_tree_route_preserves_workspace_scope() {
+        assert_system_tree_route_preserves_workspace_scope();
+    }
+
+    // purpose: Verify system.tree queues a live tree command with workspace scope.
+    // inputs: V2 system.tree request with workspace_id.
+    // returns/effects: Asserts parsed scope and mocked response payload.
+    fn assert_system_tree_route_preserves_workspace_scope() {
+        let tree = dispatch_request(
+            r#"{"id":1,"method":"system.tree","params":{"workspace_id":"workspace:7"}}"#,
+            &|command| match command {
+                ControlCommand::SystemTree {
+                    workspace_target,
+                    window_id,
+                    include_all,
+                    reply,
+                } => {
+                    assert_eq!(
+                        workspace_target,
+                        Some(WorkspaceTarget::Handle("workspace:7".to_string()))
+                    );
+                    assert_eq!(window_id, None);
+                    assert!(!include_all);
+                    let _ = reply.send(Ok(json!({ "source": "limux_live_system_tree" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(tree.error, None);
+        assert_eq!(
+            tree.result.expect("system.tree result")["source"],
+            "limux_live_system_tree"
+        );
+    }
+
+    #[test]
+    fn window_list_route_queues_command() {
+        assert_window_list_route_queues_command();
+    }
+
+    // purpose: Verify window.list queues the live host window listing command.
+    // inputs: V2 window.list request with empty params.
+    // returns/effects: Asserts the route reaches ControlCommand::ListWindows.
+    fn assert_window_list_route_queues_command() {
+        let windows = dispatch_request(
+            r#"{"id":2,"method":"window.list","params":{}}"#,
+            &|command| match command {
+                ControlCommand::ListWindows { reply } => {
+                    let _ = reply.send(Ok(json!({ "windows": [] })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(windows.error, None);
+    }
+
+    #[test]
+    fn system_tree_route_rejects_all_window_scope() {
+        assert_system_tree_route_rejects_all_window_scope();
+    }
+
+    // purpose: Verify system.tree rejects unsupported all+window scope combinations.
+    // inputs: V2 system.tree request with all=true and window_id.
+    // returns/effects: Asserts invalid_params before GTK dispatch.
+    fn assert_system_tree_route_rejects_all_window_scope() {
+        let invalid = dispatch_request(
+            r#"{"id":3,"method":"system.tree","params":{"all":true,"window_id":"window:1"}}"#,
+            &|command| panic!("invalid system.tree should not dispatch: {command:?}"),
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),

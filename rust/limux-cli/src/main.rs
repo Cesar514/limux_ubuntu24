@@ -3689,28 +3689,14 @@ fn set_tree_scope(options: &mut TreeOptions, flag: &str, value: String) {
     }
 }
 
-// purpose: Build a CMUX-style tree payload from existing Limux list APIs.
+// purpose: Request a native CMUX-style tree payload from the live Limux host.
 // inputs: Socket client and parsed tree command arguments.
-// returns/effects: Performs list calls and assembles a scoped tree JSON payload.
+// returns/effects: Calls system.tree with validated scope params.
 async fn run_tree(client: &mut Client, args: &[String]) -> Result<Value> {
     let options = parse_tree_options(args)?;
-    let windows = client.call("window.list", json!({})).await?;
-    let workspaces = client
-        .call("workspace.list", tree_workspace_params(&options))
-        .await?;
-    let panes = client
-        .call("pane.list", tree_workspace_params(&options))
-        .await?;
-    let surfaces = client
-        .call("surface.list", tree_workspace_params(&options))
-        .await?;
-    Ok(tree_payload_from_lists(
-        &options,
-        &windows,
-        &workspaces,
-        &panes,
-        &surfaces,
-    ))
+    client
+        .call("system.tree", tree_workspace_params(&options))
+        .await
 }
 
 // purpose: Build scoped params shared by tree list calls.
@@ -3718,6 +3704,9 @@ async fn run_tree(client: &mut Client, args: &[String]) -> Result<Value> {
 // returns/effects: Returns window/workspace filters when present.
 fn tree_workspace_params(options: &TreeOptions) -> Value {
     let mut params = Map::new();
+    if options.include_all {
+        params.insert("all".to_string(), Value::Bool(true));
+    }
     if let Some(workspace) = options.workspace.as_ref() {
         params.insert("workspace_id".to_string(), Value::String(workspace.clone()));
     }
@@ -3730,6 +3719,7 @@ fn tree_workspace_params(options: &TreeOptions) -> Value {
 // purpose: Assemble a tree payload from window, workspace, pane, and surface rows.
 // inputs: Parsed options plus list API payloads.
 // returns/effects: Returns JSON without further socket calls.
+#[cfg(test)]
 fn tree_payload_from_lists(
     options: &TreeOptions,
     windows_payload: &Value,
@@ -3755,6 +3745,7 @@ fn tree_payload_from_lists(
 // purpose: Attach pane and surface rows to workspace rows.
 // inputs: Workspace list payload plus current workspace pane/surface rows.
 // returns/effects: Returns workspace tree nodes.
+#[cfg(test)]
 fn tree_workspace_nodes(payload: &Value, panes: &[Value], surfaces: &[Value]) -> Vec<Value> {
     let rows = payload
         .get("workspaces")
@@ -3769,6 +3760,7 @@ fn tree_workspace_nodes(payload: &Value, panes: &[Value], surfaces: &[Value]) ->
 // purpose: Attach pane nodes to one workspace row.
 // inputs: Workspace row plus current workspace pane/surface rows.
 // returns/effects: Returns a workspace JSON node.
+#[cfg(test)]
 fn tree_workspace_node(mut workspace: Value, panes: &[Value], surfaces: &[Value]) -> Value {
     let pane_nodes = panes
         .iter()
@@ -3784,6 +3776,7 @@ fn tree_workspace_node(mut workspace: Value, panes: &[Value], surfaces: &[Value]
 // purpose: Attach matching surface rows to one pane row.
 // inputs: Pane row and all current workspace surface rows.
 // returns/effects: Returns a pane JSON node.
+#[cfg(test)]
 fn tree_pane_node(mut pane: Value, surfaces: &[Value]) -> Value {
     let pane_handle = handle_from_payload(&pane, "pane_id", "pane_ref");
     let surface_nodes = surfaces
@@ -3800,6 +3793,7 @@ fn tree_pane_node(mut pane: Value, surfaces: &[Value]) -> Value {
 // purpose: Check whether a surface row belongs under a pane handle.
 // inputs: Surface row and pane handle/ref.
 // returns/effects: Returns true for id or ref matches.
+#[cfg(test)]
 fn tree_related_pane_matches(surface: &Value, pane_handle: &str) -> bool {
     get_string(surface, &["pane_id", "pane_ref", "pane"])
         .as_deref()
@@ -3809,6 +3803,7 @@ fn tree_related_pane_matches(surface: &Value, pane_handle: &str) -> bool {
 // purpose: Attach workspace nodes to matching window rows.
 // inputs: Parsed options, window list payload, and workspace nodes.
 // returns/effects: Returns scoped window tree nodes.
+#[cfg(test)]
 fn tree_window_nodes(options: &TreeOptions, payload: &Value, workspaces: Vec<Value>) -> Vec<Value> {
     let rows = payload
         .get("windows")
@@ -3824,6 +3819,7 @@ fn tree_window_nodes(options: &TreeOptions, payload: &Value, workspaces: Vec<Val
 // purpose: Check whether a window row is inside the selected scope.
 // inputs: Window row and parsed options.
 // returns/effects: Returns true for all/current/explicit scope.
+#[cfg(test)]
 fn tree_window_in_scope(row: &Value, options: &TreeOptions) -> bool {
     options.include_all
         || options
@@ -3836,6 +3832,7 @@ fn tree_window_in_scope(row: &Value, options: &TreeOptions) -> bool {
 // purpose: Attach workspace rows to one window row.
 // inputs: Window row plus workspace nodes.
 // returns/effects: Returns a window JSON node.
+#[cfg(test)]
 fn tree_window_node(mut window: Value, workspaces: &[Value]) -> Value {
     if let Some(map) = window.as_object_mut() {
         map.insert("workspaces".to_string(), Value::Array(workspaces.to_vec()));
@@ -3847,6 +3844,7 @@ fn tree_window_node(mut window: Value, workspaces: &[Value]) -> Value {
 // purpose: Compare a list row against a handle/ref/index string.
 // inputs: JSON row and raw handle.
 // returns/effects: Returns true when known id/ref/index fields match.
+#[cfg(test)]
 fn tree_row_matches_handle(row: &Value, handle: &str) -> bool {
     get_string(row, &["id", "ref", "window_id", "window_ref"])
         .as_deref()
