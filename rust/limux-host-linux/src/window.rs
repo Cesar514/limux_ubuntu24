@@ -4420,7 +4420,7 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
     }
 }
 
-/// purpose: Map CMUX JSON action types to supported no-parameter dispatcher actions.
+/// purpose: Map CMUX JSON action types to supported custom-sidebar dispatcher actions.
 /// inputs: Parsed JSON action with CMUX method and params.
 /// returns/effects: Returns a typed host action, no action for unsupported methods, or param error.
 fn custom_sidebar_dispatcher_action(
@@ -4444,25 +4444,39 @@ fn custom_sidebar_dispatcher_action(
             ensure_custom_sidebar_no_params(action)?;
             Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
         }
-        "workspace.select" | "select-workspace" => {
+        "workspace.select" | "workspace.focus" | "select-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
-                custom_sidebar_action_param_string(action, "workspace_id")?,
+                custom_sidebar_action_workspace_id(action)?,
             )))
         }
         "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
-            custom_sidebar_action_param_string(action, "surface_id")?,
+            custom_sidebar_action_surface_id(action)?,
         ))),
         "workspace.close" | "close-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceClose(
-                custom_sidebar_action_param_string(action, "workspace_id")?,
+                custom_sidebar_action_workspace_id(action)?,
             )))
         }
         "surface.close" | "close-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
-            custom_sidebar_action_param_string(action, "surface_id")?,
+            custom_sidebar_action_surface_id(action)?,
         ))),
+        "workspace.pin" | "workspace.togglePin" | "toggle-workspace-pin" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceTogglePin(
+                custom_sidebar_action_workspace_id(action)?,
+            )))
+        }
+        "workspace.markRead" | "workspace.mark-read" | "mark-workspace-read" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkRead(
+                custom_sidebar_action_workspace_id(action)?,
+            )))
+        }
+        "workspace.markAllRead" | "workspace.mark-all-read" | "mark-all-workspaces-read" => {
+            ensure_custom_sidebar_no_params(action)?;
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkAllRead))
+        }
         "workspace.reorder" | "reorder-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
-                workspace_id: custom_sidebar_action_param_string(action, "workspace_id")?,
+                workspace_id: custom_sidebar_action_workspace_id(action)?,
                 target: custom_sidebar_workspace_reorder_target(action)?,
             }))
         }
@@ -4480,6 +4494,20 @@ fn ensure_custom_sidebar_no_params(action: &CustomSidebarNodeAction) -> Result<(
     Ok(())
 }
 
+/// purpose: Read a CMUX workspace id from documented or corpus-observed parameter names.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the workspace id or a loud validation error.
+fn custom_sidebar_action_workspace_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    custom_sidebar_action_param_string_any(action, &["workspace_id", "param", "value"])
+}
+
+/// purpose: Read a CMUX surface id from documented or corpus-observed parameter names.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the surface id or a loud validation error.
+fn custom_sidebar_action_surface_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    custom_sidebar_action_param_string_any(action, &["surface_id", "tab_id", "param", "value"])
+}
+
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
 /// inputs: Parsed action metadata and parameter key.
 /// returns/effects: Returns the parameter or a loud validation error.
@@ -4495,6 +4523,25 @@ fn custom_sidebar_action_param_string(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| format!("{} requires string `{key}`", action.action_type))
+}
+
+/// purpose: Read a non-empty string from any accepted CMUX parameter alias.
+/// inputs: Parsed action metadata and ordered parameter aliases.
+/// returns/effects: Returns the first present non-empty string or a validation error listing aliases.
+fn custom_sidebar_action_param_string_any(
+    action: &CustomSidebarNodeAction,
+    keys: &[&str],
+) -> Result<String, String> {
+    for key in keys {
+        if action.params.contains_key(*key) {
+            return custom_sidebar_action_param_string(action, key);
+        }
+    }
+    Err(format!(
+        "{} requires one string parameter: {}",
+        action.action_type,
+        keys.join(", ")
+    ))
 }
 
 /// purpose: Read a required non-negative integer parameter from a CMUX sidebar action.
@@ -4563,6 +4610,9 @@ enum CustomSidebarDispatcherAction {
     SurfaceFocus(String),
     WorkspaceClose(String),
     SurfaceClose(String),
+    WorkspaceTogglePin(String),
+    WorkspaceMarkRead(String),
+    WorkspaceMarkAllRead,
     WorkspaceReorder {
         workspace_id: String,
         target: CustomSidebarWorkspaceReorderTarget,
@@ -4616,6 +4666,9 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
             CustomSidebarDispatcherAction::WorkspaceClose(_) => "workspace.close",
             CustomSidebarDispatcherAction::SurfaceClose(_) => "surface.close",
+            CustomSidebarDispatcherAction::WorkspaceTogglePin(_) => "workspace.togglePin",
+            CustomSidebarDispatcherAction::WorkspaceMarkRead(_) => "workspace.markRead",
+            CustomSidebarDispatcherAction::WorkspaceMarkAllRead => "workspace.markAllRead",
             CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
     }
@@ -4650,6 +4703,15 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::SurfaceClose(surface_id) => {
             close_surface_for_custom_sidebar(state, &surface_id)
+        }
+        CustomSidebarDispatcherAction::WorkspaceTogglePin(workspace_id) => {
+            toggle_workspace_pin_for_custom_sidebar(state, &workspace_id)
+        }
+        CustomSidebarDispatcherAction::WorkspaceMarkRead(workspace_id) => {
+            mark_workspace_read_for_custom_sidebar(state, &workspace_id)
+        }
+        CustomSidebarDispatcherAction::WorkspaceMarkAllRead => {
+            Ok(mark_all_host_notifications_read(state))
         }
         CustomSidebarDispatcherAction::WorkspaceReorder {
             workspace_id,
@@ -4842,6 +4904,80 @@ fn close_surface_for_custom_sidebar(
     payload["closed"] = serde_json::Value::Bool(true);
     request_session_save(state);
     Ok(payload)
+}
+
+/// purpose: Toggle a workspace pin from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Reuses Limux favorite/pinned ordering, emits reorder event, and persists.
+fn toggle_workspace_pin_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved_id = resolve_workspace_id_for_custom_sidebar(state, workspace_id)?;
+    toggle_workspace_favorite(state, &resolved_id);
+    let (pinned, ordered_workspace_ids, pinned_workspace_ids) = {
+        let app_state = state.borrow();
+        let Some(workspace) = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == resolved_id)
+        else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        (
+            workspace.favorite,
+            app_state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>(),
+            app_state
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.favorite)
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    Ok(serde_json::json!({
+        "workspace_id": resolved_id,
+        "workspace_ref": workspace_ref(&resolved_id),
+        "pinned": pinned,
+        "favorite": pinned,
+        "ordered_workspace_ids": ordered_workspace_ids,
+        "pinned_workspace_ids": pinned_workspace_ids,
+    }))
+}
+
+/// purpose: Mark a workspace read from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Reuses the notification mark-read path for workspace unread state.
+fn mark_workspace_read_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved_id = resolve_workspace_id_for_custom_sidebar(state, workspace_id)?;
+    mark_workspace_notifications_read(state, &WorkspaceTarget::Handle(resolved_id))
+}
+
+/// purpose: Resolve custom-sidebar workspace arguments with the same semantics as selection.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Returns the canonical host workspace id or not_found.
+fn resolve_workspace_id_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<String, BridgeError> {
+    let app_state = state.borrow();
+    let target = WorkspaceTarget::Handle(workspace_id.to_string());
+    let index = workspace_index_for_target(&app_state, &target).or_else(|| {
+        workspace_id.parse::<usize>().ok().and_then(|index| {
+            workspace_index_for_target(&app_state, &WorkspaceTarget::Index(index))
+        })
+    });
+    let Some(index) = index else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    Ok(app_state.workspaces[index].id.clone())
 }
 
 /// purpose: Reorder a workspace from a JSON custom-sidebar dispatcher action.
@@ -18358,6 +18494,28 @@ mod tests {
             message: None,
             params: workspace_params,
         };
+        let mut workspace_param_alias = serde_json::Map::new();
+        workspace_param_alias.insert("param".to_string(), json!("workspace:build"));
+        let workspace_focus = CustomSidebarNodeAction {
+            action_type: "workspace.focus".to_string(),
+            message: None,
+            params: workspace_param_alias.clone(),
+        };
+        let workspace_toggle_pin = CustomSidebarNodeAction {
+            action_type: "workspace.togglePin".to_string(),
+            message: None,
+            params: workspace_param_alias.clone(),
+        };
+        let workspace_pin = CustomSidebarNodeAction {
+            action_type: "workspace.pin".to_string(),
+            message: None,
+            params: workspace_param_alias.clone(),
+        };
+        let workspace_mark_read = CustomSidebarNodeAction {
+            action_type: "workspace.markRead".to_string(),
+            message: None,
+            params: workspace_param_alias,
+        };
         let mut surface_params = serde_json::Map::new();
         surface_params.insert("surface_id".to_string(), json!("surface:7:tab-a"));
         let surface_focus = CustomSidebarNodeAction {
@@ -18433,6 +18591,12 @@ mod tests {
             )))
         );
         assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_focus),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
             custom_sidebar_dispatcher_action(&surface_focus),
             Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
                 "surface:7:tab-a".to_string()
@@ -18461,6 +18625,40 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&surface_close),
             "cmux dispatcher: surface.close"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_toggle_pin),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceTogglePin(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_pin),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceTogglePin(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_pin),
+            "cmux dispatcher: workspace.pin"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_mark_read),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkRead(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_mark_read),
+            "cmux dispatcher: workspace.markRead"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.markAllRead")),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkAllRead))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&no_param_action("workspace.markAllRead")),
+            "cmux dispatcher: workspace.markAllRead"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_reorder),
@@ -18495,6 +18693,11 @@ mod tests {
         assert!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.close"))
                 .expect_err("missing close workspace id is invalid")
+                .contains("workspace_id")
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.markRead"))
+                .expect_err("missing mark-read workspace id is invalid")
                 .contains("workspace_id")
         );
         assert!(
