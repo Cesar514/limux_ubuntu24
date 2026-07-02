@@ -11306,6 +11306,24 @@ pub(crate) fn create_pane_for_workspace(
         }),
         on_empty: Box::new(move |pane_widget, reason| {
             let persist = matches!(reason, pane::PaneEmptyReason::ClosedLastTab);
+            let should_keep_workspace_open = {
+                let s = state_for_empty.borrow();
+                let config = s.config.borrow();
+                let remaining_surfaces = s
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == ws_id_empty)
+                    .map(|workspace| pane::surface_summaries_for_root(&workspace.root).len())
+                    .unwrap_or(0);
+                should_keep_workspace_open_after_empty_pane(&config, reason, remaining_surfaces)
+            };
+            if should_keep_workspace_open {
+                pane::add_terminal_tab_to_pane(pane_widget);
+                if persist {
+                    request_session_save(&state_for_empty);
+                }
+                return;
+            }
             remove_pane_internal(&state_for_empty, &ws_id_empty, pane_widget, persist);
         }),
         on_state_changed: Box::new({
@@ -11892,6 +11910,19 @@ fn split_pane(
 
 fn remove_pane(state: &State, ws_id: &str, pane_widget: &gtk::Widget) {
     remove_pane_internal(state, ws_id, pane_widget, true);
+}
+
+// purpose: Decide whether closing an empty pane should preserve its workspace.
+// inputs: Current app config, empty reason, and remaining surfaces in the workspace.
+// returns/effects: Returns true only for CMUX keep-open-on-last-surface semantics.
+fn should_keep_workspace_open_after_empty_pane(
+    config: &app_config::AppConfig,
+    reason: pane::PaneEmptyReason,
+    remaining_surfaces: usize,
+) -> bool {
+    config.app.keep_workspace_open_when_closing_last_surface
+        && reason == pane::PaneEmptyReason::ClosedLastTab
+        && remaining_surfaces == 0
 }
 
 fn remove_pane_internal(state: &State, ws_id: &str, pane_widget: &gtk::Widget, persist: bool) {
@@ -13333,13 +13364,13 @@ mod tests {
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
-        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
-        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
-        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
-        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
-        tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_group_insert_index,
+        should_keep_workspace_open_after_empty_pane, sidebar_feed_preview_lines_from_value,
+        sidebar_feed_visible_items, sidebar_file_preview_lines,
+        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
+        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
+        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
@@ -13980,6 +14011,36 @@ mod tests {
         let clamped =
             clamp_workspace_insert_index_for_pinning(&after_removal, true, after_removal.len());
         assert_eq!(clamped, 2);
+    }
+
+    // purpose: Verify the CMUX keep-workspace-open behavior only applies to the final closed surface.
+    // inputs: App config, pane-empty reason, and remaining surface count.
+    // returns/effects: Asserts non-last and moved-tab cases still use normal pane removal.
+    #[test]
+    fn keep_workspace_open_on_empty_pane_requires_last_closed_surface() {
+        let mut config = crate::app_config::AppConfig::default();
+        assert!(!should_keep_workspace_open_after_empty_pane(
+            &config,
+            crate::pane::PaneEmptyReason::ClosedLastTab,
+            0
+        ));
+
+        config.app.keep_workspace_open_when_closing_last_surface = true;
+        assert!(should_keep_workspace_open_after_empty_pane(
+            &config,
+            crate::pane::PaneEmptyReason::ClosedLastTab,
+            0
+        ));
+        assert!(!should_keep_workspace_open_after_empty_pane(
+            &config,
+            crate::pane::PaneEmptyReason::ClosedLastTab,
+            1
+        ));
+        assert!(!should_keep_workspace_open_after_empty_pane(
+            &config,
+            crate::pane::PaneEmptyReason::MovedLastTabOut,
+            0
+        ));
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub appearance: AppearanceConfig,
     #[serde(skip)]
+    pub app: AppBehaviorConfig,
+    #[serde(skip)]
     pub notifications: NotificationConfig,
     #[serde(skip)]
     pub workspace_groups: WorkspaceGroupsConfig,
@@ -67,6 +69,11 @@ pub struct AppearanceConfig {
 pub struct FocusConfig {
     #[serde(default)]
     pub hover_terminal_focus: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppBehaviorConfig {
+    pub keep_workspace_open_when_closing_last_surface: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -490,6 +497,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("newWorkspacePlacement"))
         .map(|value| parse_workspace_new_placement(value, "app.newWorkspacePlacement"))
         .unwrap_or_default();
+    let app_defaults = AppBehaviorConfig::default();
+    let keep_workspace_open_when_closing_last_surface = app
+        .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
+        .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
+        .unwrap_or(app_defaults.keep_workspace_open_when_closing_last_surface);
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -539,6 +551,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
+        },
+        app: AppBehaviorConfig {
+            keep_workspace_open_when_closing_last_surface,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -899,6 +914,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "appearance".to_string(),
         json!(config.appearance.color_scheme.as_str()),
     );
+    app.as_object_mut().expect("app object").insert(
+        "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
+        json!(config.app.keep_workspace_open_when_closing_last_surface),
+    );
     root.insert(
         "notifications".to_string(),
         json!({
@@ -1175,6 +1194,53 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"app":{"appearance":"auto"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host config loading accepts the CMUX keep-workspace-open key.
+    // inputs: Temporary settings JSON with app.keepWorkspaceOpenWhenClosingLastSurface.
+    // returns/effects: Asserts the loaded behavior config is enabled.
+    #[test]
+    fn load_from_path_reads_keep_workspace_open_on_last_surface() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "keepWorkspaceOpenWhenClosingLastSurface": true
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(
+            loaded
+                .config
+                .app
+                .keep_workspace_open_when_closing_last_surface
+        );
+    }
+
+    // purpose: Verify host config loading rejects malformed keep-workspace-open values.
+    // inputs: Temporary settings JSON with a string instead of a boolean.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "app.keepWorkspaceOpenWhenClosingLastSurface must be a boolean")]
+    fn load_from_path_rejects_invalid_keep_workspace_open_on_last_surface() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"app":{"keepWorkspaceOpenWhenClosingLastSurface":"true"}}"#,
+        )
+        .expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -1513,6 +1579,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.appearance.color_scheme = ColorScheme::Light;
         config.appearance.ghostty_color_scheme = ColorScheme::Dark;
+        config.app.keep_workspace_open_when_closing_last_surface = true;
         save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -1528,6 +1595,10 @@ mod tests {
         assert_eq!(
             parsed["app"]["appearance"],
             Value::String("light".to_string())
+        );
+        assert_eq!(
+            parsed["app"]["keepWorkspaceOpenWhenClosingLastSurface"],
+            Value::Bool(true)
         );
     }
 

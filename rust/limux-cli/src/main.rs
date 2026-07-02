@@ -1484,6 +1484,14 @@ struct AppearanceSetting {
     json_key: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct BooleanSetting {
+    key: &'static str,
+    section: &'static str,
+    json_key: &'static str,
+    default: bool,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -1526,6 +1534,13 @@ const APP_APPEARANCE_SETTING: AppearanceSetting = AppearanceSetting {
     json_key: "appearance",
 };
 
+const APP_KEEP_WORKSPACE_OPEN_SETTING: BooleanSetting = BooleanSetting {
+    key: "app.keepWorkspaceOpenWhenClosingLastSurface",
+    section: "app",
+    json_key: "keepWorkspaceOpenWhenClosingLastSurface",
+    default: false,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1536,14 +1551,16 @@ const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.appearance|app.newWorkspacePlacement|",
+    "notifications.agentIdleReminder|app.appearance|",
+    "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.appearance|app.newWorkspacePlacement|",
+    "notifications.agentIdleReminder|app.appearance|",
+    "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -1591,6 +1608,16 @@ fn placement_setting(raw: &str) -> Option<PlacementSetting> {
 fn appearance_setting(raw: &str) -> Option<AppearanceSetting> {
     match raw {
         "app.appearance" => Some(APP_APPEARANCE_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map supported CMUX boolean settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
+    match raw {
+        "app.keepWorkspaceOpenWhenClosingLastSurface" => Some(APP_KEEP_WORKSPACE_OPEN_SETTING),
         _ => None,
     }
 }
@@ -1765,6 +1792,41 @@ fn set_config_appearance_setting_at(
     Ok(appearance.to_string())
 }
 
+// purpose: Read a nested boolean setting with CMUX defaults.
+// inputs: Settings path and supported boolean setting descriptor.
+// returns/effects: Returns the effective value and whether it was configured.
+fn get_config_boolean_setting_at(path: &Path, setting: BooleanSetting) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get(setting.section)
+        .and_then(Value::as_object)
+        .and_then(|section| section.get(setting.json_key))
+    else {
+        return Ok((setting.default.to_string(), false));
+    };
+    Ok((parse_boolean_value(setting.key, value)?, true))
+}
+
+// purpose: Write a nested boolean setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw boolean value.
+// returns/effects: Strictly parses true/false and atomically writes settings JSON.
+fn set_config_boolean_setting_at(
+    path: &Path,
+    setting: BooleanSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = parse_boolean_str(setting.key, raw)?;
+    let mut root = read_settings_root(path)?;
+    let section = root
+        .entry(setting.section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be a JSON object", setting.section))?;
+    section.insert(setting.json_key.to_string(), Value::Bool(value));
+    write_settings_root(path, &root)?;
+    Ok(value.to_string())
+}
+
 // purpose: Render CMUX-compatible config get output for one font-size setting.
 // inputs: Settings path and setting descriptor.
 // returns/effects: Returns text with effective value and backing path.
@@ -1873,6 +1935,32 @@ fn render_config_appearance_set(
     raw: &str,
 ) -> Result<String> {
     let value = set_config_appearance_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for one boolean setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_boolean_get(path: &Path, setting: BooleanSetting) -> Result<String> {
+    let (value, _) = get_config_boolean_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one boolean setting.
+// inputs: Settings path, setting descriptor, and raw boolean argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_boolean_set(path: &Path, setting: BooleanSetting, raw: &str) -> Result<String> {
+    let value = set_config_boolean_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -2004,6 +2092,27 @@ fn parse_appearance_str<'a>(key: &str, raw: &'a str) -> Result<&'a str> {
     match raw {
         "system" | "light" | "dark" => Ok(raw),
         _ => bail!("{key} must be system, light, or dark"),
+    }
+}
+
+// purpose: Parse an existing JSON value for a supported boolean config key.
+// inputs: User-facing key and raw JSON value.
+// returns/effects: Returns rendered bool or errors on malformed settings JSON.
+fn parse_boolean_value(key: &str, value: &Value) -> Result<String> {
+    value
+        .as_bool()
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("{key} must be a boolean"))
+}
+
+// purpose: Validate CMUX boolean strings.
+// inputs: User-facing key and raw boolean.
+// returns/effects: Returns the bool or a loud config error.
+fn parse_boolean_str(key: &str, raw: &str) -> Result<bool> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!("{key} requires true or false"),
     }
 }
 
@@ -2548,6 +2657,9 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
                     &path, setting,
                 )?));
             }
+            if let Some(setting) = boolean_setting(key) {
+                return Ok(CommandOutput::Text(render_config_boolean_get(&path, setting)?));
+            }
             let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
             Ok(CommandOutput::Text(render_config_placement_get(
                 &path, setting,
@@ -2576,6 +2688,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             }
             if let Some(setting) = appearance_setting(key) {
                 return Ok(CommandOutput::Text(render_config_appearance_set(
+                    &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = boolean_setting(key) {
+                return Ok(CommandOutput::Text(render_config_boolean_set(
                     &path, setting, value,
                 )?));
             }
@@ -15398,6 +15515,59 @@ mod cli_arg_tests {
         let err = render_config_appearance_get(&path, APP_APPEARANCE_SETTING)
             .expect_err("invalid existing appearance");
         assert!(err.to_string().contains("must be system, light, or dark"));
+    }
+
+    // purpose: Verify the CMUX keep-workspace-open key defaults and preserves sibling settings.
+    // inputs: Temporary settings file and the local config renderer helpers.
+    // returns/effects: Writes test settings JSON and asserts the nested boolean update.
+    #[test]
+    fn config_app_keep_workspace_open_get_defaults_and_writes_nested_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_boolean_get(&path, APP_KEEP_WORKSPACE_OPEN_SETTING)
+            .expect("get default keep workspace open");
+        assert!(text.contains("app.keepWorkspaceOpenWhenClosingLastSurface = false"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark"},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_boolean_set(&path, APP_KEEP_WORKSPACE_OPEN_SETTING, "true")
+            .expect("set keep workspace open");
+        assert!(text.contains("app.keepWorkspaceOpenWhenClosingLastSurface = true"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(
+            parsed["app"]["keepWorkspaceOpenWhenClosingLastSurface"],
+            true
+        );
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed CMUX keep-workspace-open values fail loudly.
+    // inputs: Invalid CLI value and malformed persisted settings JSON.
+    // returns/effects: Asserts errors instead of accepting silent defaults.
+    #[test]
+    fn config_app_keep_workspace_open_rejects_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_boolean_set(&path, APP_KEEP_WORKSPACE_OPEN_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"keepWorkspaceOpenWhenClosingLastSurface":"true"}}"#,
+        )
+        .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, APP_KEEP_WORKSPACE_OPEN_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
     }
 
     #[test]
