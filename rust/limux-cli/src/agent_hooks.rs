@@ -20,6 +20,7 @@ pub(crate) enum AgentKind {
     Pi,
     Omp,
     Amp,
+    HermesAgent,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -28,7 +29,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 16] {
+    pub(crate) fn all() -> [Self; 17] {
         [
             Self::Claude,
             Self::Codex,
@@ -41,6 +42,7 @@ impl AgentKind {
             Self::Pi,
             Self::Omp,
             Self::Amp,
+            Self::HermesAgent,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -62,6 +64,7 @@ impl AgentKind {
             "pi" | "pi-coding-agent" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
             "amp" => Some(Self::Amp),
+            "hermes" | "hermes-agent" => Some(Self::HermesAgent),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -84,6 +87,7 @@ impl AgentKind {
             Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Amp => "amp",
+            Self::HermesAgent => "hermes-agent",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -105,6 +109,7 @@ impl AgentKind {
             Self::Pi => "Pi",
             Self::Omp => "OMP",
             Self::Amp => "Amp",
+            Self::HermesAgent => "Hermes Agent",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -126,6 +131,7 @@ impl AgentKind {
             Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Amp => "amp",
+            Self::HermesAgent => "hermes",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -430,6 +436,11 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::HermesAgent => {
+            parts.push("--resume".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -611,6 +622,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         }
         AgentKind::Omp => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Amp => false,
+        AgentKind::HermesAgent => arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -723,6 +735,9 @@ fn selected_environment() -> BTreeMap<String, String> {
         "PI_CODING_AGENT_DIR",
         "PI_CONFIG_DIR",
         "AMP_CONFIG_DIR",
+        "HERMES_HOME",
+        "HERMES_CODEX_BASE_URL",
+        "CUSTOM_BASE_URL",
         "QODER_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
@@ -1027,6 +1042,39 @@ mod tests {
         assert_eq!(
             command,
             "'amp' 'threads' 'continue' 'new-thread' '--model' 'fast'"
+        );
+    }
+
+    #[test]
+    fn hermes_agent_resume_command_uses_resume_flag_and_preserves_home() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "hermes".to_string(),
+            arguments: vec![
+                "hermes".to_string(),
+                "--resume".to_string(),
+                "old-session".to_string(),
+                "--model".to_string(),
+                "gpt-5.4".to_string(),
+            ],
+            cwd: Some("/tmp/hermes repo".to_string()),
+            environment: BTreeMap::from([(
+                "HERMES_HOME".to_string(),
+                "/tmp/hermes home".to_string(),
+            )]),
+            captured_at: 110.0,
+        };
+
+        let command = build_resume_command(
+            AgentKind::HermesAgent,
+            "new-session",
+            Some(&launch),
+            Some("/tmp/hermes repo"),
+        )
+        .expect("resume");
+
+        assert_eq!(
+            command,
+            "cd '/tmp/hermes repo' && 'hermes' '--resume' 'new-session' '--model' 'gpt-5.4'"
         );
     }
 

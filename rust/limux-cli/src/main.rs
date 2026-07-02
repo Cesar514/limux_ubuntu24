@@ -4044,7 +4044,9 @@ enum AgentHookPersistenceAction {
 
 fn agent_hook_persistence_action(event: &str) -> AgentHookPersistenceAction {
     match event {
-        "Cleanup" | "cleanup" | "restore-exit" => AgentHookPersistenceAction::Remove,
+        "Cleanup" | "cleanup" | "restore-exit" | "session-finalize" => {
+            AgentHookPersistenceAction::Remove
+        }
         "SessionEnd" | "session-end" => AgentHookPersistenceAction::Preserve,
         _ => AgentHookPersistenceAction::Upsert,
     }
@@ -4564,6 +4566,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::Pi => install_pi_extension(),
         agent_hooks::AgentKind::Omp => install_omp_extension(),
         agent_hooks::AgentKind::Amp => install_amp_extension(),
+        agent_hooks::AgentKind::HermesAgent => install_hermes_agent_hooks(),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4643,6 +4646,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::Pi => uninstall_pi_extension(),
         agent_hooks::AgentKind::Omp => uninstall_omp_extension(),
         agent_hooks::AgentKind::Amp => uninstall_amp_extension(),
+        agent_hooks::AgentKind::HermesAgent => uninstall_hermes_agent_hooks(),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -5092,6 +5096,207 @@ fn rovodev_removing_marked_block(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HermesAgentHookEvent {
+    name: &'static str,
+    command: String,
+    timeout: u64,
+}
+
+// purpose: Build CMUX-compatible Hermes Agent lifecycle and Feed hook entries.
+// inputs: Current Limux executable path.
+// returns/effects: Returns shell-wrapped commands without filesystem changes.
+fn hermes_agent_events() -> Result<Vec<HermesAgentHookEvent>> {
+    let lifecycle = [
+        ("on_session_start", "session-start"),
+        ("pre_llm_call", "prompt-submit"),
+        ("post_llm_call", "agent-response"),
+        ("pre_approval_request", "notification"),
+        ("post_approval_response", "approval-response"),
+        ("on_session_end", "session-end"),
+        ("on_session_finalize", "session-finalize"),
+        ("on_session_reset", "session-start"),
+    ];
+    let feed = [
+        "pre_tool_call",
+        "post_tool_call",
+        "pre_approval_request",
+        "post_approval_response",
+    ];
+    let mut events = Vec::new();
+    for (agent_event, limux_event) in lifecycle {
+        events.push(HermesAgentHookEvent {
+            name: agent_event,
+            command: hermes_agent_shell_command(hook_command(
+                agent_hooks::AgentKind::HermesAgent,
+                limux_event,
+            )?),
+            timeout: 5,
+        });
+    }
+    for agent_event in feed {
+        events.push(HermesAgentHookEvent {
+            name: agent_event,
+            command: hermes_agent_shell_command(feed_hook_command(
+                agent_hooks::AgentKind::HermesAgent,
+                agent_event,
+            )?),
+            timeout: 120,
+        });
+    }
+    Ok(events)
+}
+
+fn hermes_agent_shell_command(script: String) -> String {
+    format!("sh -c {}", shell_single_quote(&script))
+}
+
+// purpose: Install marked Hermes Agent hook blocks into config YAML text.
+// inputs: Existing YAML text and desired hook events.
+// returns/effects: Returns rewritten text without touching files.
+fn hermes_agent_hooks_installing(existing: &str, events: &[HermesAgentHookEvent]) -> String {
+    let mut lines = hermes_agent_removing_marked_blocks(normalized_text_lines(existing));
+    if events.is_empty() {
+        return serialize_text_lines(&lines);
+    }
+    let mut block = Vec::new();
+    block.push("# cmux hooks hermes-agent begin".to_string());
+    block.push("hooks:".to_string());
+    for (name, grouped) in hermes_agent_grouped_events(events) {
+        block.push(format!("  {name}:"));
+        block.extend(hermes_agent_hook_entries(&grouped, "    "));
+    }
+    block.push("# cmux hooks hermes-agent end".to_string());
+    if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    lines.extend(block);
+    serialize_text_lines(&lines)
+}
+
+fn hermes_agent_hooks_uninstalling(existing: &str) -> String {
+    serialize_text_lines(&hermes_agent_removing_marked_blocks(normalized_text_lines(
+        existing,
+    )))
+}
+
+fn hermes_agent_grouped_events(
+    events: &[HermesAgentHookEvent],
+) -> Vec<(&'static str, Vec<&HermesAgentHookEvent>)> {
+    let mut grouped: Vec<(&'static str, Vec<&HermesAgentHookEvent>)> = Vec::new();
+    for event in events {
+        if let Some((_, entries)) = grouped.iter_mut().find(|(name, _)| *name == event.name) {
+            entries.push(event);
+        } else {
+            grouped.push((event.name, vec![event]));
+        }
+    }
+    grouped
+}
+
+fn hermes_agent_hook_entries(events: &[&HermesAgentHookEvent], item_indent: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for event in events {
+        lines.push(format!(
+            "{item_indent}- command: {}",
+            yaml_double_quoted(&event.command)
+        ));
+        lines.push(format!("{item_indent}  timeout: {}", event.timeout));
+    }
+    lines
+}
+
+// purpose: Remove complete Hermes Agent marked blocks from normalized lines.
+// inputs: Config lines without a synthetic final trailing newline.
+// returns/effects: Returns remaining lines and leaves dangling begin markers untouched.
+fn hermes_agent_removing_marked_blocks(mut lines: Vec<String>) -> Vec<String> {
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim() != "# cmux hooks hermes-agent begin" {
+            index += 1;
+            continue;
+        }
+        let Some(relative_end) = lines[index + 1..]
+            .iter()
+            .position(|line| line.trim() == "# cmux hooks hermes-agent end")
+        else {
+            index += 1;
+            continue;
+        };
+        let end_index = index + 1 + relative_end;
+        let start_index = if index > 0 && lines[index - 1].trim().is_empty() {
+            index - 1
+        } else {
+            index
+        };
+        lines.drain(start_index..=end_index);
+        index = start_index;
+    }
+    lines
+}
+
+fn hermes_agent_allowlist_installing(
+    existing: Option<&[u8]>,
+    events: &[HermesAgentHookEvent],
+) -> Result<Vec<u8>> {
+    let mut root = hermes_agent_allowlist_root(existing)?;
+    let mut approvals = root
+        .remove("approvals")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for event in events {
+        approvals.retain(|approval| !hermes_agent_approval_matches(approval, event));
+        approvals.push(json!({
+            "event": event.name,
+            "command": event.command,
+            "approved_at": format!("{:.3}", agent_hooks::now_seconds()),
+        }));
+    }
+    root.insert("approvals".to_string(), Value::Array(approvals));
+    serde_json::to_vec_pretty(&Value::Object(root)).context("failed to encode Hermes allowlist")
+}
+
+fn hermes_agent_allowlist_uninstalling(
+    existing: &[u8],
+    events: &[HermesAgentHookEvent],
+) -> Result<Vec<u8>> {
+    let mut root = hermes_agent_allowlist_root(Some(existing))?;
+    let mut approvals = root
+        .remove("approvals")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    approvals.retain(|approval| {
+        !events
+            .iter()
+            .any(|event| hermes_agent_approval_matches(approval, event))
+    });
+    root.insert("approvals".to_string(), Value::Array(approvals));
+    serde_json::to_vec_pretty(&Value::Object(root)).context("failed to encode Hermes allowlist")
+}
+
+fn hermes_agent_allowlist_root(existing: Option<&[u8]>) -> Result<Map<String, Value>> {
+    let Some(existing) = existing.filter(|bytes| !bytes.is_empty()) else {
+        return Ok(Map::new());
+    };
+    let value: Value =
+        serde_json::from_slice(existing).context("failed to parse Hermes allowlist JSON")?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("Hermes allowlist must contain a JSON object"))
+}
+
+fn hermes_agent_approval_matches(approval: &Value, event: &HermesAgentHookEvent) -> bool {
+    approval
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == event.name)
+        && approval
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == event.command)
+}
+
 // purpose: Find the top-level Rovo Dev eventHooks line.
 // inputs: Normalized YAML lines.
 // returns/effects: Returns the line index when present.
@@ -5248,6 +5453,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
         agent_hooks::AgentKind::Amp => 0,
+        agent_hooks::AgentKind::HermesAgent => 5,
     }
 }
 
@@ -5271,6 +5477,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
         agent_hooks::AgentKind::Amp => 0,
+        agent_hooks::AgentKind::HermesAgent => 120,
     }
 }
 
@@ -5366,6 +5573,73 @@ fn uninstall_amp_extension() -> Result<()> {
     uninstall_marked_extension_file(&path, "cmux-amp-session-extension-marker")
 }
 
+// purpose: Install CMUX-compatible Hermes Agent YAML hooks and shell allowlist entries.
+// inputs: None; config path is resolved from HERMES_HOME or HOME.
+// returns/effects: Rewrites marked YAML hook blocks and approved command JSON.
+fn install_hermes_agent_hooks() -> Result<()> {
+    let config_dir = hermes_agent_config_dir();
+    if !config_dir.exists() {
+        bail!(
+            "{} does not exist. Install Hermes Agent first.",
+            config_dir.display()
+        );
+    }
+    let events = hermes_agent_events()?;
+    let config_path = config_dir.join("config.yaml");
+    let existing = read_optional_text(&config_path)?;
+    let updated = hermes_agent_hooks_installing(&existing, &events);
+    if updated != existing {
+        write_text_file(&config_path, &updated)?;
+    }
+    let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
+    let existing_allowlist = if allowlist_path.exists() {
+        Some(
+            fs::read(&allowlist_path)
+                .with_context(|| format!("failed to read {}", allowlist_path.display()))?,
+        )
+    } else {
+        None
+    };
+    let updated_allowlist =
+        hermes_agent_allowlist_installing(existing_allowlist.as_deref(), &events)?;
+    if existing_allowlist.as_deref() != Some(updated_allowlist.as_slice()) {
+        if let Some(parent) = allowlist_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&allowlist_path, updated_allowlist)
+            .with_context(|| format!("failed to write {}", allowlist_path.display()))?;
+    }
+    Ok(())
+}
+
+// purpose: Remove Limux-owned Hermes Agent YAML hooks and shell allowlist entries.
+// inputs: None; config path is resolved from HERMES_HOME or HOME.
+// returns/effects: Preserves unrelated config and approvals.
+fn uninstall_hermes_agent_hooks() -> Result<()> {
+    let config_dir = hermes_agent_config_dir();
+    let config_path = config_dir.join("config.yaml");
+    if config_path.exists() {
+        let existing = read_optional_text(&config_path)?;
+        let updated = hermes_agent_hooks_uninstalling(&existing);
+        if updated != existing {
+            write_text_file(&config_path, &updated)?;
+        }
+    }
+    let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
+    if allowlist_path.exists() {
+        let existing = fs::read(&allowlist_path)
+            .with_context(|| format!("failed to read {}", allowlist_path.display()))?;
+        let events = hermes_agent_events()?;
+        let updated = hermes_agent_allowlist_uninstalling(&existing, &events)?;
+        if updated.as_slice() != existing.as_slice() {
+            fs::write(&allowlist_path, updated)
+                .with_context(|| format!("failed to write {}", allowlist_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 // purpose: Write a generated extension file while protecting unrelated user files.
 // inputs: Destination path, new source, and required ownership marker.
 // returns/effects: Creates parent directories and writes source, or fails on unowned existing file.
@@ -5436,13 +5710,11 @@ fn opencode_config_unregister_plugin() -> Result<()> {
 }
 
 fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
-    let disable_var = format!(
-        "LIMUX_{}_HOOKS_DISABLED",
-        agent.store_name().to_ascii_uppercase()
-    );
+    let limux_disable_var = hook_disable_var("LIMUX", agent);
+    let cmux_disable_var = hook_disable_var("CMUX", agent);
     let limux_command = hook_cli_command()?;
     Ok(format!(
-        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
+        "[ \"${{{limux_disable_var}:-}}\" != \"1\" ] && [ \"${{{cmux_disable_var}:-}}\" != \"1\" ] && {limux_command} --json hooks {} {} || echo '{{\"continue\":true,\"suppressOutput\":false}}'",
         agent.store_name(),
         event
     ))
@@ -5452,16 +5724,19 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
 // inputs: Agent kind and raw agent hook event name.
 // returns/effects: Returns the command string or fails if the Limux CLI path cannot be resolved.
 fn feed_hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
-    let disable_var = format!(
-        "LIMUX_{}_HOOKS_DISABLED",
-        agent.store_name().to_ascii_uppercase()
-    );
+    let limux_disable_var = hook_disable_var("LIMUX", agent);
+    let cmux_disable_var = hook_disable_var("CMUX", agent);
     let limux_command = hook_cli_command()?;
     Ok(format!(
-        "[ \"${{{disable_var}:-}}\" != \"1\" ] && {limux_command} hooks feed --source {} --event {} || echo '{{}}'",
+        "[ \"${{{limux_disable_var}:-}}\" != \"1\" ] && [ \"${{{cmux_disable_var}:-}}\" != \"1\" ] && {limux_command} hooks feed --source {} --event {} || echo '{{}}'",
         agent.store_name(),
         shell_single_quote(event)
     ))
+}
+
+fn hook_disable_var(prefix: &str, agent: agent_hooks::AgentKind) -> String {
+    let name = agent.store_name().replace('-', "_").to_ascii_uppercase();
+    format!("{prefix}_{name}_HOOKS_DISABLED")
 }
 
 fn hook_cli_command() -> Result<String> {
@@ -5505,6 +5780,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Pi => "hooks pi",
         agent_hooks::AgentKind::Omp => "hooks omp",
         agent_hooks::AgentKind::Amp => "hooks amp",
+        agent_hooks::AgentKind::HermesAgent => "hooks hermes-agent",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5659,6 +5935,14 @@ fn amp_config_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config/amp")))
         .unwrap_or_else(|| PathBuf::from(".config/amp"))
+}
+
+fn hermes_agent_config_dir() -> PathBuf {
+    env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .map(expand_tilde_path)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".hermes")))
+        .unwrap_or_else(|| PathBuf::from(".hermes"))
 }
 
 fn resolved_omp_agent_directory() -> PathBuf {
@@ -6816,6 +7100,7 @@ fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
         "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
         "pi" | "pi-coding-agent" => Some(("pi", "pi".to_string())),
         "amp" => Some(("amp", "amp".to_string())),
+        "hermes" | "hermes-agent" => Some(("hermes", "hermes".to_string())),
         _ => None,
     }
 }
@@ -10250,6 +10535,33 @@ fn print_command_output(output: CommandOutput, pretty: bool) -> Result<()> {
 mod cli_arg_tests {
     use super::*;
 
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.previous.as_ref() {
+                    env::set_var(self.key, value);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
     }
@@ -11509,6 +11821,23 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn feed_hook_keeps_hermes_tool_calls_nonblocking() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "pre_tool_call",
+            "tool_name": "terminal"
+        });
+
+        let (params, actionable, event_name, _, _) =
+            build_feed_hook_push(&args(&["--source", "hermes-agent"]), &payload)
+                .expect("feed push");
+
+        assert!(!actionable);
+        assert_eq!(event_name, "PreToolUse");
+        assert_eq!(params["wait_timeout_seconds"], json!(0.0));
+    }
+
+    #[test]
     fn feed_permission_decision_renders_antigravity_output() {
         let output = render_feed_decision(
             &args(&["--source", "antigravity"]),
@@ -11637,6 +11966,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Amp)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("hermes"),
+            Some(agent_hooks::AgentKind::HermesAgent)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -11657,6 +11990,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Pi));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Omp));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Amp));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::HermesAgent));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -11791,6 +12125,100 @@ mod cli_arg_tests {
         uninstall_marked_extension_file(&path, "cmux-amp-session-extension-marker")
             .expect("uninstall extension");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn hermes_agent_hooks_install_and_uninstall_marked_yaml_and_allowlist() {
+        let events = vec![
+            HermesAgentHookEvent {
+                name: "on_session_start",
+                command: "sh -c 'limux hooks hermes-agent session-start'".to_string(),
+                timeout: 5,
+            },
+            HermesAgentHookEvent {
+                name: "pre_approval_request",
+                command: "sh -c 'limux hooks hermes-agent notification'".to_string(),
+                timeout: 5,
+            },
+            HermesAgentHookEvent {
+                name: "pre_approval_request",
+                command:
+                    "sh -c 'limux hooks feed --source hermes-agent --event pre_approval_request'"
+                        .to_string(),
+                timeout: 120,
+            },
+        ];
+        let existing = "model: anthropic/claude-sonnet-4.6\n";
+
+        let installed = hermes_agent_hooks_installing(existing, &events);
+
+        assert!(installed.contains("# cmux hooks hermes-agent begin\nhooks:"));
+        assert!(installed.contains("  on_session_start:"));
+        assert!(installed.contains("  pre_approval_request:"));
+        assert!(
+            installed.contains("    - command: \"sh -c 'limux hooks hermes-agent notification'\"")
+        );
+        assert!(installed.contains("      timeout: 120"));
+        assert_eq!(hermes_agent_hooks_uninstalling(&installed), existing);
+
+        let allowlist = hermes_agent_allowlist_installing(
+            Some(br#"{"approvals":[{"event":"user","command":"echo user"}]}"#),
+            &events,
+        )
+        .expect("install allowlist");
+        let value: Value = serde_json::from_slice(&allowlist).expect("allowlist json");
+        let approvals = value
+            .get("approvals")
+            .and_then(Value::as_array)
+            .expect("approvals");
+        assert_eq!(approvals.len(), 4);
+        assert!(approvals.iter().any(|approval| {
+            approval.get("command").and_then(Value::as_str) == Some("echo user")
+        }));
+
+        let uninstalled =
+            hermes_agent_allowlist_uninstalling(&allowlist, &events).expect("uninstall allowlist");
+        let value: Value = serde_json::from_slice(&uninstalled).expect("allowlist json");
+        let approvals = value
+            .get("approvals")
+            .and_then(Value::as_array)
+            .expect("approvals");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(
+            approvals[0].get("command").and_then(Value::as_str),
+            Some("echo user")
+        );
+    }
+
+    #[test]
+    fn hermes_agent_install_writes_config_and_allowlist_under_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("hermes");
+        fs::create_dir_all(&home).expect("create hermes home");
+        let config = home.join("config.yaml");
+        fs::write(&config, "model: test\n").expect("seed config");
+
+        let _guard = EnvGuard::set("HERMES_HOME", home.to_string_lossy().as_ref());
+        install_hermes_agent_hooks().expect("install hermes hooks");
+
+        let installed = fs::read_to_string(&config).expect("read config");
+        assert!(installed.contains("# cmux hooks hermes-agent begin"));
+        assert!(installed.contains("on_session_start:"));
+        assert!(installed.contains("pre_tool_call:"));
+        assert!(installed.contains("hooks feed --source hermes-agent"));
+        assert!(installed.contains("LIMUX_HERMES_AGENT_HOOKS_DISABLED"));
+        assert!(installed.contains("CMUX_HERMES_AGENT_HOOKS_DISABLED"));
+
+        let allowlist =
+            fs::read_to_string(home.join("shell-hooks-allowlist.json")).expect("read allowlist");
+        assert!(allowlist.contains("pre_tool_call"));
+        assert!(allowlist.contains("hooks hermes-agent session-start"));
+
+        uninstall_hermes_agent_hooks().expect("uninstall hermes hooks");
+        assert_eq!(
+            fs::read_to_string(&config).expect("read config"),
+            "model: test\n"
+        );
     }
 
     #[test]
