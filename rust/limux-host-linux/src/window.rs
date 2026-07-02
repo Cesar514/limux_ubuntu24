@@ -1635,6 +1635,21 @@ fn publish_surface_key_sent_event(workspace_id: &str, surface_id: &str, key: &st
     })
 }
 
+// purpose: Return only the last requested text lines while preserving line endings.
+// inputs: Plain terminal text and optional positive line limit.
+// returns/effects: Returns the original text when no limit or a non-truncating limit is supplied.
+fn limit_text_to_last_lines(text: String, lines: Option<u64>) -> String {
+    let Some(lines) = lines else {
+        return text;
+    };
+    let max_lines = usize::try_from(lines).unwrap_or(usize::MAX);
+    let chunks = text.split_inclusive('\n').collect::<Vec<_>>();
+    if chunks.len() <= max_lines {
+        return text;
+    }
+    chunks[chunks.len().saturating_sub(max_lines)..].concat()
+}
+
 // purpose: Build a CMUX surface lifecycle event payload from a live surface summary.
 // inputs: Workspace id, surface summary, and event-specific metadata.
 // returns/effects: Returns JSON without mutating host state.
@@ -8602,6 +8617,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         ControlCommand::ReadSurfaceText {
             target,
             surface_hint,
+            lines,
+            scrollback,
             reply,
         } => {
             let resolved = {
@@ -8627,6 +8644,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                                 "workspace_ref": workspace_ref(&workspace.id),
                                 "surface_id": surface_id.as_str(),
                                 "surface_ref": surface_ref(&surface_id),
+                                "lines": lines,
+                                "scrollback_requested": scrollback,
+                                "scrollback_included": false,
+                                "source": "viewport",
                             }),
                             handle,
                         )
@@ -8648,7 +8669,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
             if let Some(map) = payload.as_object_mut() {
-                map.insert("text".to_string(), serde_json::Value::String(text));
+                map.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(limit_text_to_last_lines(text, lines)),
+                );
             }
             let _ = reply.send(Ok(payload));
         }
@@ -11106,7 +11130,7 @@ mod tests {
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        next_active_workspace_index, notification_hook_policy_payload,
+        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement, publish_browser_event,
         publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
@@ -11581,6 +11605,23 @@ mod tests {
         assert_eq!(key_payload["surface_id"], "7:tab-a");
         assert_eq!(key_payload["pane_id"], "7");
         assert_eq!(key_payload["key"], "Enter");
+    }
+
+    #[test]
+    fn limit_text_to_last_lines_preserves_line_endings() {
+        assert_eq!(
+            limit_text_to_last_lines("one\ntwo\nthree\n".to_string(), Some(2)),
+            "two\nthree\n"
+        );
+        assert_eq!(
+            limit_text_to_last_lines("one\ntwo\nthree".to_string(), Some(2)),
+            "two\nthree"
+        );
+        assert_eq!(
+            limit_text_to_last_lines("one\ntwo".to_string(), Some(5)),
+            "one\ntwo"
+        );
+        assert_eq!(limit_text_to_last_lines("one".to_string(), None), "one");
     }
 
     #[test]

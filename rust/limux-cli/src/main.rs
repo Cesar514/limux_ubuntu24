@@ -4398,15 +4398,23 @@ async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
     call_in_workspace_scope(client, workspace, "pane.create", params).await
 }
 
-async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
-    if let Some(lines) = parse_opt(args, "--lines") {
-        if lines.parse::<u64>().unwrap_or(0) == 0 {
+// purpose: Convert CMUX read-screen/capture-pane flags into surface.read_text params.
+// inputs: CLI arguments after the command name.
+// returns/effects: Validates --lines and returns socket params without contacting the host.
+fn build_read_screen_params(args: &[String]) -> Result<Map<String, Value>> {
+    let lines = if let Some(lines) = parse_opt(args, "--lines") {
+        let parsed = lines.parse::<u64>().unwrap_or(0);
+        if parsed == 0 {
             bail!("--lines must be greater than 0");
         }
-    }
+        Some(parsed)
+    } else {
+        None
+    };
 
     let workspace = parse_opt(args, "--workspace");
     let surface = parse_opt(args, "--surface");
+    let scrollback = parse_flag(args, "--scrollback") || lines.is_some();
     let mut params = Map::new();
     if let Some(workspace) = workspace {
         params.insert("workspace_id".to_string(), Value::String(workspace));
@@ -4414,9 +4422,21 @@ async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> 
     if let Some(surface) = surface {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
+    if let Some(lines) = lines {
+        params.insert("lines".to_string(), Value::Number(lines.into()));
+    }
+    if scrollback {
+        params.insert("scrollback".to_string(), Value::Bool(true));
+    }
+    Ok(params)
+}
 
+async fn run_read_screen(client: &mut Client, args: &[String]) -> Result<Value> {
     client
-        .call("surface.read_text", Value::Object(params))
+        .call(
+            "surface.read_text",
+            Value::Object(build_read_screen_params(args)?),
+        )
         .await
 }
 
@@ -6571,6 +6591,32 @@ mod cli_arg_tests {
             }
             CommandOutput::Json(_) => panic!("docs should render text"),
         }
+    }
+
+    #[test]
+    fn read_screen_params_include_lines_and_scrollback() {
+        let params = build_read_screen_params(&args(&[
+            "--workspace",
+            "workspace:2",
+            "--surface",
+            "surface:9:tab",
+            "--lines",
+            "5",
+        ]))
+        .expect("read-screen params");
+
+        assert_eq!(params["workspace_id"], "workspace:2");
+        assert_eq!(params["surface_id"], "surface:9:tab");
+        assert_eq!(params["lines"], 5);
+        assert_eq!(params["scrollback"], true);
+
+        let explicit =
+            build_read_screen_params(&args(&["--scrollback"])).expect("explicit scrollback params");
+        assert_eq!(explicit["scrollback"], true);
+
+        let error =
+            build_read_screen_params(&args(&["--lines", "0"])).expect_err("zero lines should fail");
+        assert!(error.to_string().contains("--lines must be greater than 0"));
     }
 
     #[test]

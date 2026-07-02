@@ -654,6 +654,8 @@ pub enum ControlCommand {
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
+        lines: Option<u64>,
+        scrollback: bool,
         reply: mpsc::Sender<BridgeResult>,
     },
     CreateWorkspace {
@@ -2870,11 +2872,27 @@ fn handle_method(
                 Ok(surface_hint) => surface_hint,
                 Err(error) => return error_response(id, error),
             };
+            let lines = match optional_u64(params, &["lines"]) {
+                Ok(lines) => lines,
+                Err(error) => return error_response(id, error),
+            };
+            if lines == Some(0) {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("lines must be greater than 0"),
+                );
+            }
+            let scrollback = match optional_bool(params, "scrollback") {
+                Ok(scrollback) => scrollback.unwrap_or(lines.is_some()),
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::ReadSurfaceText {
                     target,
                     surface_hint,
+                    lines,
+                    scrollback,
                     reply,
                 },
                 rx,
@@ -5907,10 +5925,40 @@ mod tests {
                 ControlCommand::ReadSurfaceText {
                     target,
                     surface_hint,
+                    lines,
+                    scrollback,
                     reply,
                 } => {
                     assert_eq!(target, WorkspaceTarget::Active);
                     assert_eq!(surface_hint, Some("9:tab".to_string()));
+                    assert_eq!(lines, None);
+                    assert!(!scrollback);
+                    let _ = reply.send(Ok(json!({ "text": "ready" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("result")["text"], "ready");
+    }
+
+    #[test]
+    fn read_text_route_accepts_lines_and_scrollback_flags() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"read-screen","params":{"surface_id":"surface:9:tab","lines":5,"scrollback":true}}"#,
+            &|command| match command {
+                ControlCommand::ReadSurfaceText {
+                    target,
+                    surface_hint,
+                    lines,
+                    scrollback,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Active);
+                    assert_eq!(surface_hint, Some("9:tab".to_string()));
+                    assert_eq!(lines, Some(5));
+                    assert!(scrollback);
                     let _ = reply.send(Ok(json!({ "text": "ready" })));
                 }
                 other => panic!("unexpected command: {other:?}"),
