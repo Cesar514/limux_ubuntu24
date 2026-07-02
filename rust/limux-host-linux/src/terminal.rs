@@ -178,6 +178,12 @@ pub struct TerminalHandle {
     callbacks: Rc<RefCell<TerminalCallbacks>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalReadScope {
+    Viewport,
+    Screen,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalHealth {
     pub realized: bool,
@@ -293,26 +299,15 @@ impl TerminalHandle {
         }
     }
 
-    pub fn read_viewport_text(&self) -> Option<String> {
+    // purpose: Read terminal text from Ghostty using either visible viewport or full screen history.
+    // inputs: Terminal handle with optional Ghostty surface plus requested read scope.
+    // returns/effects: Returns UTF-8 lossy terminal text and frees Ghostty-owned text buffers.
+    pub(crate) fn read_text(&self, scope: TerminalReadScope) -> Option<String> {
         let Some(surface) = *self.surface_cell.borrow() else {
             return Some(String::new());
         };
 
-        let selection = ghostty_selection_s {
-            top_left: ghostty_point_s {
-                tag: GHOSTTY_POINT_VIEWPORT,
-                coord: GHOSTTY_POINT_COORD_TOP_LEFT,
-                x: 0,
-                y: 0,
-            },
-            bottom_right: ghostty_point_s {
-                tag: GHOSTTY_POINT_VIEWPORT,
-                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
-                x: 0,
-                y: 0,
-            },
-            rectangle: false,
-        };
+        let selection = terminal_read_selection(scope);
         let mut text = empty_ghostty_text();
 
         let has_text = unsafe { ghostty_surface_read_text(surface, selection, &mut text) };
@@ -396,6 +391,32 @@ impl TerminalHandle {
         let selection = String::from_utf8_lossy(bytes).into_owned();
         unsafe { ghostty_surface_free_text(surface, &mut text) };
         selection
+    }
+}
+
+// purpose: Build the Ghostty selection used for terminal read commands.
+// inputs: Requested read scope, where screen includes available scrollback and the active buffer.
+// returns/effects: Returns a non-rectangular full-range Ghostty selection without touching runtime state.
+fn terminal_read_selection(scope: TerminalReadScope) -> ghostty_selection_s {
+    let tag = match scope {
+        TerminalReadScope::Viewport => GHOSTTY_POINT_VIEWPORT,
+        TerminalReadScope::Screen => GHOSTTY_POINT_SCREEN,
+    };
+
+    ghostty_selection_s {
+        top_left: ghostty_point_s {
+            tag,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0,
+            y: 0,
+        },
+        bottom_right: ghostty_point_s {
+            tag,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0,
+            y: 0,
+        },
+        rectangle: false,
     }
 }
 
@@ -2331,6 +2352,34 @@ mod tests {
         assert_eq!(terminal_search_action(""), "search:");
         assert_eq!(terminal_search_action("needle"), "search:needle");
         assert_eq!(terminal_search_action("two words"), "search:two words");
+    }
+
+    #[test]
+    fn terminal_read_selection_uses_viewport_bounds_by_default() {
+        let selection = terminal_read_selection(TerminalReadScope::Viewport);
+
+        assert_eq!(selection.top_left.tag, GHOSTTY_POINT_VIEWPORT);
+        assert_eq!(selection.top_left.coord, GHOSTTY_POINT_COORD_TOP_LEFT);
+        assert_eq!(selection.bottom_right.tag, GHOSTTY_POINT_VIEWPORT);
+        assert_eq!(
+            selection.bottom_right.coord,
+            GHOSTTY_POINT_COORD_BOTTOM_RIGHT
+        );
+        assert!(!selection.rectangle);
+    }
+
+    #[test]
+    fn terminal_read_selection_uses_screen_bounds_for_scrollback() {
+        let selection = terminal_read_selection(TerminalReadScope::Screen);
+
+        assert_eq!(selection.top_left.tag, GHOSTTY_POINT_SCREEN);
+        assert_eq!(selection.top_left.coord, GHOSTTY_POINT_COORD_TOP_LEFT);
+        assert_eq!(selection.bottom_right.tag, GHOSTTY_POINT_SCREEN);
+        assert_eq!(
+            selection.bottom_right.coord,
+            GHOSTTY_POINT_COORD_BOTTOM_RIGHT
+        );
+        assert!(!selection.rectangle);
     }
 
     #[test]

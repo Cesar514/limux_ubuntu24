@@ -16342,6 +16342,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             scrollback,
             reply,
         } => {
+            let read_scope = if scrollback {
+                crate::terminal::TerminalReadScope::Screen
+            } else {
+                crate::terminal::TerminalReadScope::Viewport
+            };
+            let read_source = if scrollback { "screen" } else { "viewport" };
             let resolved = {
                 let app_state = state.borrow();
                 workspace_index_for_target(&app_state, &target)
@@ -16367,8 +16373,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                                 "surface_ref": surface_ref(&surface_id),
                                 "lines": lines,
                                 "scrollback_requested": scrollback,
-                                "scrollback_included": false,
-                                "source": "viewport",
+                                "scrollback_included": scrollback,
+                                "source": read_source,
                             }),
                             handle,
                         )
@@ -16383,7 +16389,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let Some(text) = handle.read_viewport_text() else {
+            let Some(text) = handle.read_text(read_scope) else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
                     "surface.read_text failed",
                 )));
