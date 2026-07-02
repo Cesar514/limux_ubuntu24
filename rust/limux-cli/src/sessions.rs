@@ -327,14 +327,15 @@ fn collect_session_entries(
         if !record_matches(options, record) {
             continue;
         }
-        let mut payload = base_session_payload(snapshot, record);
+        let resolved_record = resolved_session_record(snapshot.agent, record);
+        let mut payload = base_session_payload(snapshot, &resolved_record);
         if snapshot.agent == AgentKind::Codex {
             let index =
                 codex_index.get_or_insert_with(|| build_codex_debug_index(&options.codex_home));
-            add_codex_payload(&mut payload, &options.codex_home, record, index);
+            add_codex_payload(&mut payload, &options.codex_home, &resolved_record, index);
         }
         entries.push(SessionEntry {
-            updated_at: record.updated_at,
+            updated_at: resolved_record.updated_at,
             payload,
         });
     }
@@ -378,6 +379,19 @@ fn cwd_filter_matches(filter: &Option<String>, record: &AgentHookSessionRecord) 
                 .and_then(|launch| launch.cwd.as_deref()),
         )
         .any(|value| value.to_ascii_lowercase().contains(filter))
+}
+
+// purpose: Resolve agent-specific diagnostic records before payload rendering.
+// inputs: Agent kind and raw saved hook record.
+// returns/effects: Returns a cloned record with trusted workflow transcript metadata when found.
+fn resolved_session_record(
+    agent: AgentKind,
+    record: &AgentHookSessionRecord,
+) -> AgentHookSessionRecord {
+    if agent == AgentKind::Claude {
+        return resolved_claude_workflow_record(record);
+    }
+    record.clone()
 }
 
 // purpose: Render a CMUX-shaped JSON payload for one saved session.
@@ -513,6 +527,156 @@ fn claude_transcript_path(record: &AgentHookSessionRecord) -> Option<String> {
     claude_config_roots(record)
         .into_iter()
         .find_map(|root| claude_transcript_in_root(&root, record, cwd.as_deref()))
+}
+
+// purpose: Resolve Claude workflow-container records to their single sibling transcript.
+// inputs: Raw Claude hook record.
+// returns/effects: Returns a cloned record with session id/path changed only on an unambiguous match.
+fn resolved_claude_workflow_record(record: &AgentHookSessionRecord) -> AgentHookSessionRecord {
+    if !safe_session_filename(&record.session_id) {
+        return record.clone();
+    }
+    if record
+        .transcript_path
+        .as_deref()
+        .and_then(normalized)
+        .map(expand_tilde)
+        .is_some_and(|path| regular_nonempty_file(&path))
+    {
+        return record.clone();
+    }
+    let Some((session_id, transcript_path)) = single_claude_workflow_sibling(record) else {
+        return record.clone();
+    };
+    let mut resolved = record.clone();
+    resolved.session_id = session_id;
+    resolved.transcript_path = Some(transcript_path.display().to_string());
+    resolved
+}
+
+// purpose: Find the sole sibling transcript for a Claude workflow-container record.
+// inputs: Raw Claude hook record.
+// returns/effects: Returns None when zero or multiple transcript candidates exist.
+fn single_claude_workflow_sibling(record: &AgentHookSessionRecord) -> Option<(String, PathBuf)> {
+    let matches = claude_workflow_project_dirs(record)
+        .into_iter()
+        .flat_map(|project| collect_claude_sibling_transcripts(&project, &record.session_id, 4))
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+// purpose: Locate Claude project dirs that contain the workflow container.
+// inputs: Raw Claude hook record.
+// returns/effects: Returns deduplicated project roots.
+fn claude_workflow_project_dirs(record: &AgentHookSessionRecord) -> Vec<PathBuf> {
+    let cwd_candidates = claude_cwd_candidates(record);
+    let mut dirs = Vec::new();
+    for root in claude_config_roots(record) {
+        let projects_root = root.join("projects");
+        for cwd in &cwd_candidates {
+            push_workflow_project_dir(
+                &mut dirs,
+                projects_root.join(encode_claude_project_dir(cwd)),
+                &record.session_id,
+            );
+        }
+        for project in read_dir_paths(&projects_root) {
+            push_workflow_project_dir(&mut dirs, project, &record.session_id);
+        }
+    }
+    dirs
+}
+
+// purpose: Get cwd candidates used for Claude project-dir lookup.
+// inputs: Raw Claude hook record.
+// returns/effects: Returns normalized cwd strings.
+fn claude_cwd_candidates(record: &AgentHookSessionRecord) -> Vec<String> {
+    [
+        record
+            .launch_command
+            .as_ref()
+            .and_then(|launch| launch.cwd.as_deref()),
+        record.cwd.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(normalized)
+    .collect()
+}
+
+// purpose: Add a project dir only when it has the workflow-container child.
+// inputs: Mutable dir list, candidate project dir, and workflow container id.
+// returns/effects: Mutates the list on unique directory matches.
+fn push_workflow_project_dir(dirs: &mut Vec<PathBuf>, project: PathBuf, session_id: &str) {
+    if project.join(session_id).is_dir() && !dirs.iter().any(|existing| existing == &project) {
+        dirs.push(project);
+    }
+}
+
+// purpose: Recursively collect Claude sibling transcript files.
+// inputs: Search dir, excluded container session id, and remaining recursion depth.
+// returns/effects: Returns safe nonempty transcript ids and paths.
+fn collect_claude_sibling_transcripts(
+    directory: &Path,
+    excluded_session_id: &str,
+    remaining_depth: usize,
+) -> Vec<(String, PathBuf)> {
+    let mut matches = Vec::new();
+    collect_claude_sibling_transcripts_into(
+        directory,
+        excluded_session_id,
+        remaining_depth,
+        &mut matches,
+    );
+    matches
+}
+
+// purpose: Recursive implementation for Claude sibling transcript discovery.
+// inputs: Search dir, excluded id, remaining depth, and mutable results.
+// returns/effects: Appends safe nonempty transcript candidates.
+fn collect_claude_sibling_transcripts_into(
+    directory: &Path,
+    excluded_session_id: &str,
+    remaining_depth: usize,
+    matches: &mut Vec<(String, PathBuf)>,
+) {
+    for path in read_dir_paths(directory) {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            push_claude_sibling_transcript(matches, &path, excluded_session_id);
+            continue;
+        }
+        if remaining_depth == 0 || !path.is_dir() {
+            continue;
+        }
+        collect_claude_sibling_transcripts_into(
+            &path,
+            excluded_session_id,
+            remaining_depth - 1,
+            matches,
+        );
+    }
+}
+
+// purpose: Add one Claude sibling transcript candidate when safe and nonempty.
+// inputs: Mutable result list, candidate path, and excluded id.
+// returns/effects: Mutates results only for usable transcript files.
+fn push_claude_sibling_transcript(
+    matches: &mut Vec<(String, PathBuf)>,
+    path: &Path,
+    excluded_session_id: &str,
+) {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(session_id) = file_name.strip_suffix(".jsonl") else {
+        return;
+    };
+    if session_id != excluded_session_id
+        && safe_session_filename(session_id)
+        && regular_nonempty_file(path)
+    {
+        matches.push((session_id.to_string(), path.to_path_buf()));
+    }
 }
 
 // purpose: Search one Claude config root for a session transcript.
@@ -1282,6 +1446,52 @@ mod tests {
     #[test]
     fn claude_transcript_lookup_uses_launch_config_dir() {
         assert_claude_transcript_lookup_uses_launch_config_dir();
+    }
+
+    // purpose: Exercise CMUX Claude workflow-container transcript resolution.
+    // inputs: Hook record whose transcriptPath is a workflow directory with one sibling JSONL.
+    // returns/effects: Asserts diagnostics use the sibling transcript session id.
+    fn assert_claude_workflow_container_resolves_single_sibling_transcript() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let config = dir.path().join("claude-config");
+        let container_id = "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa";
+        let sibling_id = "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb";
+        let project = config
+            .join("projects")
+            .join(encode_claude_project_dir(repo.to_str().expect("repo path")));
+        let container = project.join(container_id);
+        fs::create_dir_all(&container).expect("container");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::write(project.join(format!("{sibling_id}.jsonl")), "{}\n").expect("transcript");
+        seed_claude_record(
+            dir.path(),
+            container_id,
+            &repo,
+            ClaudeSeed {
+                is_restorable: Some(false),
+                transcript_path: Some(container.display().to_string()),
+                environment: BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    config.display().to_string(),
+                )]),
+            },
+        );
+
+        let value = sessions_json_for(dir.path(), "claude", container_id);
+        let session = &value["sessions"][0];
+        assert_eq!(session["session_id"], sibling_id);
+        assert_eq!(session["hook_record_restorable"], true);
+        assert_eq!(session["fork_command_available"], true);
+        assert!(session["transcript_path"]
+            .as_str()
+            .expect("transcript path")
+            .ends_with(&format!("{sibling_id}.jsonl")));
+    }
+
+    #[test]
+    fn claude_workflow_container_resolves_single_sibling_transcript() {
+        assert_claude_workflow_container_resolves_single_sibling_transcript();
     }
 
     // purpose: Seed one Claude session record for diagnostics tests.
