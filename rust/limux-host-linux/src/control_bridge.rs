@@ -56,6 +56,7 @@ const METHODS: &[&str] = &[
     "workspace.rename",
     "workspace.reorder",
     "workspace.reorder_many",
+    "debug.sidebar.simulate_drag",
     "workspace.action",
     "workspace.close",
     "workspace.remote.reconnect",
@@ -711,6 +712,14 @@ pub enum ControlCommand {
         window_id: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SimulateSidebarDrag {
+        window_id: String,
+        from: WorkspaceTarget,
+        to: WorkspaceTarget,
+        duration_ms: Option<u64>,
+        steps: Option<u64>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -1065,6 +1074,7 @@ impl ControlCommand {
             | Self::ListWindows { reply }
             | Self::FocusWindow { reply, .. }
             | Self::MoveWorkspaceToWindow { reply, .. }
+            | Self::SimulateSidebarDrag { reply, .. }
             | Self::ReloadConfig { reply }
             | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
@@ -2428,6 +2438,51 @@ fn parse_required_workspace_target(
     }
 }
 
+// purpose: Parse one CMUX debug sidebar workspace endpoint.
+// inputs: Socket params plus accepted field aliases for one endpoint.
+// returns/effects: Returns a workspace target or a method-specific invalid params error.
+fn parse_required_workspace_endpoint(
+    params: &Map<String, Value>,
+    keys: &[&str],
+    method: &str,
+) -> Result<WorkspaceTarget, BridgeError> {
+    let Some(raw) = optional_string(params, keys) else {
+        return Err(BridgeError::invalid_params(format!(
+            "{method} requires {}",
+            keys[0]
+        )));
+    };
+    if let Some(stripped) = raw.strip_prefix("workspace:") {
+        return Ok(WorkspaceTarget::Handle(stripped.to_string()));
+    }
+    if let Ok(index) = raw.parse::<usize>() {
+        return Ok(WorkspaceTarget::Index(index));
+    }
+    if looks_like_workspace_handle(&raw) {
+        return Ok(WorkspaceTarget::Handle(raw));
+    }
+    Ok(WorkspaceTarget::Name(raw))
+}
+
+// purpose: Parse an optional positive integer from CMUX debug sidebar params.
+// inputs: Socket params, accepted key aliases, and the canonical error label.
+// returns/effects: Returns None when absent or invalid_params when zero/malformed.
+fn optional_positive_u64(
+    params: &Map<String, Value>,
+    keys: &[&str],
+    label: &str,
+) -> Result<Option<u64>, BridgeError> {
+    let Some(value) = optional_u64(params, keys)? else {
+        return Ok(None);
+    };
+    if value == 0 {
+        return Err(BridgeError::invalid_params(format!(
+            "{label} must be a positive integer"
+        )));
+    }
+    Ok(Some(value))
+}
+
 fn required_group_id(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
     optional_handle(params, &["group_id", "group", "id"])?.ok_or_else(|| {
         BridgeError::invalid_params(format!("{method} requires group_id/id or --group"))
@@ -3134,6 +3189,54 @@ fn handle_method(
                 ControlCommand::MoveWorkspaceToWindow {
                     target,
                     window_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "debug.sidebar.simulate_drag" | "simulate-sidebar-drag" => {
+            let Some(window_id) = optional_string(params, &["window_id", "window"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("debug.sidebar.simulate_drag requires window_id"),
+                );
+            };
+            let from = match parse_required_workspace_endpoint(
+                params,
+                &["from_tab_id", "from_workspace_id", "from"],
+                "debug.sidebar.simulate_drag",
+            ) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let to = match parse_required_workspace_endpoint(
+                params,
+                &["to_tab_id", "to_workspace_id", "to"],
+                "debug.sidebar.simulate_drag",
+            ) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let duration_ms = match optional_positive_u64(
+                params,
+                &["duration_ms", "durationMs"],
+                "duration_ms",
+            ) {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let steps = match optional_positive_u64(params, &["steps"], "steps") {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SimulateSidebarDrag {
+                    window_id,
+                    from,
+                    to,
+                    duration_ms,
+                    steps,
                     reply,
                 },
                 rx,
@@ -9208,6 +9311,57 @@ mod tests {
             &|_| panic!("invalid request should fail before dispatch"),
         );
         assert_eq!(missing.error.as_ref().map(|error| error.code), Some(-32602));
+    }
+
+    #[test]
+    fn simulate_sidebar_drag_route_queues_command() {
+        let simulated = dispatch_request(
+            concat!(
+                r#"{"id":5,"method":"debug.sidebar.simulate_drag","params":{"window_id":"window:1","#,
+                r#""from_tab_id":"workspace:abc","to_tab_id":"2","duration_ms":250,"steps":8}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SimulateSidebarDrag {
+                    window_id,
+                    from,
+                    to,
+                    duration_ms,
+                    steps,
+                    reply,
+                } => {
+                    assert_eq!(window_id, "window:1");
+                    assert_eq!(from, WorkspaceTarget::Handle("abc".to_string()));
+                    assert_eq!(to, WorkspaceTarget::Index(2));
+                    assert_eq!(duration_ms, Some(250));
+                    assert_eq!(steps, Some(8));
+                    let _ = reply.send(Ok(json!({
+                        "ok": true,
+                        "simulated": true,
+                        "committed": false,
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(simulated.error, None);
+
+        let missing = dispatch_request(
+            r#"{"id":6,"method":"simulate-sidebar-drag","params":{"window_id":"window:1","from_tab_id":"workspace:abc"}}"#,
+            &|_| panic!("invalid request should fail before dispatch"),
+        );
+        assert_eq!(missing.error.as_ref().map(|error| error.code), Some(-32602));
+
+        let bad_steps = dispatch_request(
+            concat!(
+                r#"{"id":7,"method":"simulate-sidebar-drag","params":{"window_id":"window:1","#,
+                r#""from_tab_id":"workspace:abc","to_tab_id":"workspace:def","steps":0}}"#
+            ),
+            &|_| panic!("invalid request should fail before dispatch"),
+        );
+        assert_eq!(
+            bad_steps.error.as_ref().map(|error| error.code),
+            Some(-32602)
+        );
     }
 
     #[test]

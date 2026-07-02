@@ -4347,6 +4347,7 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("reorder-surface", "Usage: limux reorder-surface"),
     ("reorder-workspace", "Usage: limux reorder-workspace"),
     ("reorder-workspaces", "Usage: limux reorder-workspaces"),
+    ("simulate-sidebar-drag", "Usage: limux simulate-sidebar-drag"),
     (
         "workspace-action",
         "Usage: limux workspace-action --action <name>",
@@ -5565,6 +5566,22 @@ fn parse_optional_index_arg(args: &[String], name: &str) -> Result<Option<usize>
     raw.parse::<usize>()
         .map(Some)
         .map_err(|_| anyhow!("{name} must be a non-negative integer"))
+}
+
+// purpose: Parse a positive integer CLI option used by CMUX debug commands.
+// inputs: Raw command args and option name.
+// returns/effects: Returns parsed value or a loud validation error.
+fn parse_optional_positive_u64_arg(args: &[String], name: &str) -> Result<Option<u64>> {
+    let Some(raw) = parse_opt(args, name) else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| anyhow!("{name} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{name} must be a positive integer");
+    }
+    Ok(Some(value))
 }
 
 // purpose: Parse CMUX boolean option values.
@@ -14035,6 +14052,10 @@ fn first_positional(args: &[String]) -> Option<String> {
         "--before",
         "--after-surface",
         "--after",
+        "--from",
+        "--to",
+        "--duration-ms",
+        "--steps",
     ];
     let mut skip = false;
     for arg in args {
@@ -14383,6 +14404,30 @@ fn build_reorder_workspaces_params(args: &[String]) -> Result<Value> {
     Ok(Value::Object(params))
 }
 
+// purpose: Build CMUX simulate-sidebar-drag socket params.
+// inputs: `simulate-sidebar-drag` window/from/to args plus optional timing controls.
+// returns/effects: Returns strict `debug.sidebar.simulate_drag` params or a parser error.
+fn build_simulate_sidebar_drag_params(args: &[String]) -> Result<Value> {
+    let window = parse_opt(args, "--window")
+        .ok_or_else(|| anyhow!("simulate-sidebar-drag requires --window <id|ref|index>"))?;
+    let from = parse_opt(args, "--from")
+        .ok_or_else(|| anyhow!("simulate-sidebar-drag requires --from <workspace id|ref|index>"))?;
+    let to = parse_opt(args, "--to")
+        .ok_or_else(|| anyhow!("simulate-sidebar-drag requires --to <workspace id|ref|index>"))?;
+
+    let mut params = Map::new();
+    params.insert("window_id".to_string(), Value::String(window));
+    params.insert("from_tab_id".to_string(), Value::String(from));
+    params.insert("to_tab_id".to_string(), Value::String(to));
+    if let Some(duration_ms) = parse_optional_positive_u64_arg(args, "--duration-ms")? {
+        params.insert("duration_ms".to_string(), json!(duration_ms));
+    }
+    if let Some(steps) = parse_optional_positive_u64_arg(args, "--steps")? {
+        params.insert("steps".to_string(), json!(steps));
+    }
+    Ok(Value::Object(params))
+}
+
 async fn run_reorder_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     if parse_flag(args, "--help") {
         return Ok(json!({
@@ -14413,6 +14458,24 @@ async fn run_reorder_workspaces(client: &mut Client, args: &[String]) -> Result<
         .call(
             "workspace.reorder_many",
             build_reorder_workspaces_params(args)?,
+        )
+        .await
+}
+
+async fn run_simulate_sidebar_drag(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_flag(args, "--help") {
+        return Ok(json!({
+            "help": concat!(
+                "Usage: limux simulate-sidebar-drag --window <id|ref|index> ",
+                "--from <workspace id|ref|index> --to <workspace id|ref|index> ",
+                "[--duration-ms <positive-ms>] [--steps <positive-count>]"
+            )
+        }));
+    }
+    client
+        .call(
+            "debug.sidebar.simulate_drag",
+            build_simulate_sidebar_drag_params(args)?,
         )
         .await
 }
@@ -17622,6 +17685,16 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "reorder-workspaces" => {
             let payload = run_reorder_workspaces(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if let Some(help) = get_string(&payload, &["help"]) {
+                CommandOutput::Text(help)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "simulate-sidebar-drag" => {
+            let payload = run_simulate_sidebar_drag(client, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else if let Some(help) = get_string(&payload, &["help"]) {
@@ -20898,6 +20971,49 @@ mod cli_arg_tests {
             .expect_err("empty refs rejected")
             .to_string()
             .contains("empty workspace refs"));
+    }
+
+    #[test]
+    fn cmux_simulate_sidebar_drag_builds_debug_params() {
+        let params = build_simulate_sidebar_drag_params(&args(&[
+            "--window",
+            "window:1",
+            "--from",
+            "workspace:alpha",
+            "--to",
+            "2",
+            "--duration-ms",
+            "250",
+            "--steps",
+            "8",
+        ]))
+        .expect("simulate sidebar drag parses");
+
+        assert_eq!(params["window_id"], "window:1");
+        assert_eq!(params["from_tab_id"], "workspace:alpha");
+        assert_eq!(params["to_tab_id"], "2");
+        assert_eq!(params["duration_ms"], 250);
+        assert_eq!(params["steps"], 8);
+
+        let missing = build_simulate_sidebar_drag_params(&args(&[
+            "--window",
+            "window:1",
+            "--from",
+            "workspace:alpha",
+        ]))
+        .expect_err("missing target is rejected");
+        assert!(missing.to_string().contains("requires --to"));
+        assert!(build_simulate_sidebar_drag_params(&args(&[
+            "--window",
+            "window:1",
+            "--from",
+            "workspace:alpha",
+            "--to",
+            "workspace:beta",
+            "--steps",
+            "0",
+        ]))
+        .is_err());
     }
 
     #[test]

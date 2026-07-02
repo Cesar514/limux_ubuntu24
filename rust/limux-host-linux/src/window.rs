@@ -2839,6 +2839,54 @@ fn move_workspace_to_window_payload(
     Ok(payload)
 }
 
+// purpose: Simulate a CMUX sidebar workspace drag without committing a reorder.
+// inputs: Shared host state, source/destination workspaces, current window id, and timing knobs.
+// returns/effects: Returns debug drag metadata and does not mutate, publish, or persist state.
+fn simulate_sidebar_drag_payload(
+    state: &State,
+    window_id: &str,
+    from: &WorkspaceTarget,
+    to: &WorkspaceTarget,
+    duration_ms: Option<u64>,
+    steps: Option<u64>,
+) -> Result<serde_json::Value, BridgeError> {
+    validate_host_window_id(Some(window_id))?;
+    let app_state = state.borrow();
+    let from_index = workspace_index_for_target(&app_state, from)
+        .ok_or_else(|| BridgeError::not_found("from workspace not found"))?;
+    let to_index = workspace_index_for_target(&app_state, to)
+        .ok_or_else(|| BridgeError::not_found("to workspace not found"))?;
+    let from_workspace = &app_state.workspaces[from_index];
+    let to_workspace = &app_state.workspaces[to_index];
+    let edge = match from_index.cmp(&to_index) {
+        std::cmp::Ordering::Less => "bottom",
+        std::cmp::Ordering::Greater => "top",
+        std::cmp::Ordering::Equal => "same",
+    };
+    let duration_ms = duration_ms.unwrap_or(1000);
+    let steps = steps.unwrap_or(from_index.abs_diff(to_index).max(1) as u64 + 1);
+    Ok(serde_json::json!({
+        "ok": true,
+        "simulated": true,
+        "committed": false,
+        "debug_only": true,
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "window": window_list_payload(&app_state)["windows"][0].clone(),
+        "from_workspace_id": from_workspace.id.as_str(),
+        "from_workspace_ref": workspace_ref(&from_workspace.id),
+        "from_tab_id": workspace_ref(&from_workspace.id),
+        "from_index": from_index,
+        "to_workspace_id": to_workspace.id.as_str(),
+        "to_workspace_ref": workspace_ref(&to_workspace.id),
+        "to_tab_id": workspace_ref(&to_workspace.id),
+        "to_index": to_index,
+        "duration_ms": duration_ms,
+        "steps": steps,
+        "edge": edge,
+    }))
+}
+
 // purpose: Validate a CMUX window scope against the current single GTK host window.
 // inputs: Optional CMUX window id/ref/index string.
 // returns/effects: Returns not_found for unsupported live host windows.
@@ -13889,6 +13937,18 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             reply,
         } => {
             let result = move_workspace_to_window_payload(state, &target, &window_id);
+            let _ = reply.send(result);
+        }
+        ControlCommand::SimulateSidebarDrag {
+            window_id,
+            from,
+            to,
+            duration_ms,
+            steps,
+            reply,
+        } => {
+            let result =
+                simulate_sidebar_drag_payload(state, &window_id, &from, &to, duration_ms, steps);
             let _ = reply.send(result);
         }
         ControlCommand::WorkspaceEnv {
