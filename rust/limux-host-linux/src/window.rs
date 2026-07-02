@@ -4397,6 +4397,9 @@ fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
         "openURL" | "open" | "open.url" | "link.open" => {
             custom_sidebar_action_url(action).unwrap_or_else(|_| "open URL".to_string())
         }
+        "clipboard.write" => custom_sidebar_action_text(action)
+            .map(|text| format!("copy: {text}"))
+            .unwrap_or_else(|_| "copy to clipboard".to_string()),
         other => match custom_sidebar_dispatcher_action(action) {
             Ok(Some(_)) => format!("cmux dispatcher: {other}"),
             Ok(None) => format!("not_supported: custom sidebar action {other}"),
@@ -4416,6 +4419,9 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
         ),
         "openURL" | "open" | "open.url" | "link.open" => {
             open_custom_sidebar_url(button, custom_sidebar_action_url(action).ok().as_deref())
+        }
+        "clipboard.write" => {
+            run_custom_sidebar_clipboard_write(button, custom_sidebar_action_text(action).ok())
         }
         _ => run_custom_sidebar_dispatcher_action(button, action),
     }
@@ -4538,6 +4544,21 @@ fn custom_sidebar_action_url(action: &CustomSidebarNodeAction) -> Result<String,
         return Ok(message.to_string());
     }
     custom_sidebar_action_param_string_any(action, &["url", "param", "value"])
+}
+
+/// purpose: Read copyable text from CMUX custom-sidebar text action aliases.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns message/text/param/value text or a loud validation error.
+fn custom_sidebar_action_text(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    if let Some(message) = action
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(message.to_string());
+    }
+    custom_sidebar_action_param_string_any(action, &["text", "param", "value"])
 }
 
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
@@ -5270,6 +5291,27 @@ fn open_custom_sidebar_url(button: &gtk::Button, url: Option<&str>) {
     if let Err(error) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
         button.set_tooltip_text(Some(&format!("custom sidebar openURL failed: {error}")));
     }
+}
+
+/// purpose: Copy CMUX custom-sidebar text to the GTK standard and primary clipboards.
+/// inputs: Button widget for feedback and optional resolved text.
+/// returns/effects: Writes clipboard text or marks the button with a loud error.
+fn run_custom_sidebar_clipboard_write(button: &gtk::Button, text: Option<String>) {
+    let Some(text) = text.filter(|value| !value.trim().is_empty()) else {
+        button.set_tooltip_text(Some(
+            "custom sidebar clipboard.write action requires message or text param",
+        ));
+        return;
+    };
+    let Some(display) = gtk::gdk::Display::default() else {
+        button.set_tooltip_text(Some(
+            "custom sidebar clipboard.write failed: no GTK display is available",
+        ));
+        return;
+    };
+    display.clipboard().set_text(&text);
+    display.primary_clipboard().set_text(&text);
+    button.set_tooltip_text(Some("copied to clipboard"));
 }
 
 /// purpose: Build the right-sidebar title from current mode/focus state.
@@ -18616,6 +18658,20 @@ mod tests {
             message: None,
             params: open_url_param_alias,
         };
+        let mut clipboard_text_param = serde_json::Map::new();
+        clipboard_text_param.insert("text".to_string(), json!("#AABBCC"));
+        let clipboard_write_text = CustomSidebarNodeAction {
+            action_type: "clipboard.write".to_string(),
+            message: None,
+            params: clipboard_text_param,
+        };
+        let mut clipboard_param_alias = serde_json::Map::new();
+        clipboard_param_alias.insert("param".to_string(), json!("--token-color"));
+        let clipboard_write_param = CustomSidebarNodeAction {
+            action_type: "clipboard.write".to_string(),
+            message: None,
+            params: clipboard_param_alias,
+        };
         let mut tab_param_alias = serde_json::Map::new();
         tab_param_alias.insert("param".to_string(), json!("tab-a"));
         let tab_toggle_pin = CustomSidebarNodeAction {
@@ -18798,6 +18854,18 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&no_param_action("open.url")),
             "open URL"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&clipboard_write_text),
+            "copy: #AABBCC"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&clipboard_write_param),
+            "copy: --token-color"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&no_param_action("clipboard.write")),
+            "copy to clipboard"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&tab_toggle_pin),
