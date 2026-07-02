@@ -4495,6 +4495,12 @@ fn custom_sidebar_dispatcher_action(
             surface_id: custom_sidebar_action_optional_surface_id(action)?,
             command: custom_sidebar_action_command(action)?,
         })),
+        "tab.create" | "tab.new" | "new-tab" => {
+            Ok(Some(CustomSidebarDispatcherAction::TabCreate {
+                workspace_id: custom_sidebar_action_optional_workspace_id(action)?,
+                command: custom_sidebar_action_optional_command(action)?,
+            }))
+        }
         "workspace.close" | "close-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceClose(
                 custom_sidebar_action_workspace_id(action)?,
@@ -4548,6 +4554,20 @@ fn ensure_custom_sidebar_no_params(action: &CustomSidebarNodeAction) -> Result<(
 /// returns/effects: Returns the workspace id or a loud validation error.
 fn custom_sidebar_action_workspace_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
     custom_sidebar_action_param_string_any(action, &["workspace_id", "param", "value"])
+}
+
+/// purpose: Read an optional CMUX workspace id from sidebar action params.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the workspace id when present or validates malformed aliases loudly.
+fn custom_sidebar_action_optional_workspace_id(
+    action: &CustomSidebarNodeAction,
+) -> Result<Option<String>, String> {
+    for key in ["workspace_id", "workspace", "param", "value"] {
+        if action.params.contains_key(key) {
+            return custom_sidebar_action_param_string(action, key).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 /// purpose: Read a CMUX surface id from documented or corpus-observed parameter names.
@@ -4635,6 +4655,28 @@ fn custom_sidebar_action_command(action: &CustomSidebarNodeAction) -> Result<Str
         return Ok(message.to_string());
     }
     custom_sidebar_action_param_string_any(action, &["command", "text", "param", "value"])
+}
+
+/// purpose: Read optional command text from CMUX custom-sidebar command action aliases.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns command/message text when present, otherwise None.
+fn custom_sidebar_action_optional_command(
+    action: &CustomSidebarNodeAction,
+) -> Result<Option<String>, String> {
+    if let Some(message) = action
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(message.to_string()));
+    }
+    for key in ["command", "text"] {
+        if action.params.contains_key(key) {
+            return custom_sidebar_action_param_string(action, key).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
@@ -4742,6 +4784,10 @@ enum CustomSidebarDispatcherAction {
         surface_id: Option<String>,
         command: String,
     },
+    TabCreate {
+        workspace_id: Option<String>,
+        command: Option<String>,
+    },
     WorkspaceClose(String),
     SurfaceClose(String),
     WorkspaceTogglePin(String),
@@ -4801,6 +4847,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
             CustomSidebarDispatcherAction::SurfaceRun { .. } => "surface.run",
+            CustomSidebarDispatcherAction::TabCreate { .. } => "tab.create",
             CustomSidebarDispatcherAction::WorkspaceClose(_) => "workspace.close",
             CustomSidebarDispatcherAction::SurfaceClose(_) => "surface.close",
             CustomSidebarDispatcherAction::WorkspaceTogglePin(_) => "workspace.togglePin",
@@ -4843,6 +4890,10 @@ fn apply_custom_sidebar_dispatcher_action(
             surface_id,
             command,
         } => run_surface_command_for_custom_sidebar(state, surface_id.as_deref(), &command),
+        CustomSidebarDispatcherAction::TabCreate {
+            workspace_id,
+            command,
+        } => create_tab_for_custom_sidebar(state, workspace_id.as_deref(), command.as_deref()),
         CustomSidebarDispatcherAction::WorkspaceClose(workspace_id) => {
             close_workspace_for_custom_sidebar(state, &workspace_id)
         }
@@ -5029,6 +5080,64 @@ fn run_surface_command_for_custom_sidebar(
         "surface_ref": surface_ref(&surface_id),
         "text_length": text.len(),
     }))
+}
+
+/// purpose: Create a terminal tab from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state, optional workspace id/name/ref, and optional startup command.
+/// returns/effects: Adds a terminal surface to the target workspace focused pane and emits lifecycle metadata.
+fn create_tab_for_custom_sidebar(
+    state: &State,
+    workspace_id: Option<&str>,
+    command: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved_workspace_id = workspace_id
+        .map(|id| resolve_workspace_id_for_custom_sidebar(state, id))
+        .transpose()?;
+    let (workspace_id, workspace_name, workspace_root) = {
+        let app_state = state.borrow();
+        let index = if let Some(id) = resolved_workspace_id.as_deref() {
+            workspace_index_for_target(&app_state, &WorkspaceTarget::Handle(id.to_string()))
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))?
+        } else {
+            app_state.active_idx
+        };
+        let Some(workspace) = app_state.workspaces.get(index) else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        (
+            workspace.id.clone(),
+            workspace.name.clone(),
+            workspace.root.clone(),
+        )
+    };
+    let pane_id = focused_ids_for_workspace(state, &workspace_id)
+        .0
+        .or_else(|| {
+            pane::pane_summaries_for_root(&workspace_root)
+                .first()
+                .map(|summary| summary.pane_id)
+        })
+        .ok_or_else(|| BridgeError::not_found("pane not found"))?;
+    let pane_widget = pane::pane_widget_for_root(&workspace_root, pane_id)
+        .ok_or_else(|| BridgeError::not_found("pane not found"))?;
+    let surface = pane::add_terminal_tab_to_pane_with_command(
+        &pane_widget,
+        command.map(str::to_string),
+        true,
+    )
+    .ok_or_else(|| BridgeError::internal("tab.create did not produce a terminal surface"))?;
+    request_session_save(state);
+    publish_surface_lifecycle_event(
+        "surface.created",
+        &workspace_id,
+        &surface,
+        serde_json::json!({ "origin": "tab.create" }),
+    );
+    Ok(pane_create_response_payload(
+        &workspace_id,
+        &workspace_name,
+        surface,
+    ))
 }
 
 /// purpose: Close a workspace from a parameterized JSON custom-sidebar action.
@@ -18859,6 +18968,21 @@ mod tests {
             message: None,
             params: focused_surface_run_params,
         };
+        let mut tab_create_params = serde_json::Map::new();
+        tab_create_params.insert("param".to_string(), json!("workspace:build"));
+        let tab_create = CustomSidebarNodeAction {
+            action_type: "tab.create".to_string(),
+            message: None,
+            params: tab_create_params,
+        };
+        let mut tab_create_command_params = serde_json::Map::new();
+        tab_create_command_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        tab_create_command_params.insert("command".to_string(), json!("npm test"));
+        let tab_create_command = CustomSidebarNodeAction {
+            action_type: "new-tab".to_string(),
+            message: None,
+            params: tab_create_command_params,
+        };
         let mut workspace_close_params = serde_json::Map::new();
         workspace_close_params.insert("workspace_id".to_string(), json!("workspace:build"));
         let workspace_close = CustomSidebarNodeAction {
@@ -18979,6 +19103,31 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&surface_run),
             "cmux dispatcher: surface.run"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&tab_create),
+            Ok(Some(CustomSidebarDispatcherAction::TabCreate {
+                workspace_id: Some("workspace:build".to_string()),
+                command: None,
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&tab_create_command),
+            Ok(Some(CustomSidebarDispatcherAction::TabCreate {
+                workspace_id: Some("workspace:build".to_string()),
+                command: Some("npm test".to_string()),
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&no_param_action("tab.create")),
+            Ok(Some(CustomSidebarDispatcherAction::TabCreate {
+                workspace_id: None,
+                command: None,
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&tab_create),
+            "cmux dispatcher: tab.create"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_close),
