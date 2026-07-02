@@ -1548,6 +1548,13 @@ const APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING: BooleanSetting = BooleanS
     default: true,
 };
 
+const APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING: BooleanSetting = BooleanSetting {
+    key: "app.focusPaneOnFirstClick",
+    section: "app",
+    json_key: "focusPaneOnFirstClick",
+    default: false,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1560,6 +1567,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
+    "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement>"
 );
@@ -1569,6 +1577,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
+    "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
@@ -1630,6 +1639,7 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "app.workspaceInheritWorkingDirectory" => {
             Some(APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
         }
+        "app.focusPaneOnFirstClick" => Some(APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING),
         _ => None,
     }
 }
@@ -15634,6 +15644,53 @@ mod cli_arg_tests {
         )
         .expect("write malformed bool");
         let err = render_config_boolean_get(&path, APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify the CMUX first-click pane focus key defaults and preserves siblings.
+    // inputs: Temporary settings file and the local config renderer helpers.
+    // returns/effects: Writes test settings JSON and asserts the nested boolean update.
+    #[test]
+    fn config_app_focus_pane_on_first_click_get_defaults_and_writes_nested_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_boolean_get(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING)
+            .expect("get default focus pane on first click");
+        assert!(text.contains("app.focusPaneOnFirstClick = false"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark"},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_boolean_set(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING, "true")
+            .expect("set focus pane on first click");
+        assert!(text.contains("app.focusPaneOnFirstClick = true"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["app"]["focusPaneOnFirstClick"], true);
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed CMUX first-click pane focus values fail loudly.
+    // inputs: Invalid CLI value and malformed persisted settings JSON.
+    // returns/effects: Asserts errors instead of accepting silent defaults.
+    #[test]
+    fn config_app_focus_pane_on_first_click_rejects_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_boolean_set(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(&path, br#"{"app":{"focusPaneOnFirstClick":"true"}}"#)
+            .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
     }

@@ -1563,6 +1563,14 @@ fn add_terminal_tab_inner(
             hover_focus
         })
     };
+    let focus_pane_on_first_click = {
+        let callbacks = internals.callbacks.clone();
+        Rc::new(move || {
+            let config = (callbacks.current_config)();
+            let focus_pane_on_first_click = config.borrow().app.focus_pane_on_first_click;
+            focus_pane_on_first_click
+        })
+    };
 
     // Build the env the spawned shell will see. Encodes this terminal's
     // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
@@ -1615,6 +1623,7 @@ fn add_terminal_tab_inner(
         working_directory,
         terminal::TerminalOptions {
             hover_focus,
+            focus_pane_on_first_click,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
             extra_env,

@@ -75,6 +75,7 @@ pub struct FocusConfig {
 pub struct AppBehaviorConfig {
     pub keep_workspace_open_when_closing_last_surface: bool,
     pub workspace_inherit_working_directory: bool,
+    pub focus_pane_on_first_click: bool,
 }
 
 impl Default for AppBehaviorConfig {
@@ -86,11 +87,12 @@ impl Default for AppBehaviorConfig {
 impl AppBehaviorConfig {
     // purpose: Return CMUX app behavior defaults that differ from Rust primitive defaults.
     // inputs: None.
-    // returns/effects: Defaults workspace cwd inheritance on and keep-last-surface off.
+    // returns/effects: Defaults app behavior from CMUX runtime settings.
     fn cmux_default() -> Self {
         Self {
             keep_workspace_open_when_closing_last_surface: false,
             workspace_inherit_working_directory: true,
+            focus_pane_on_first_click: false,
         }
     }
 }
@@ -521,6 +523,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("workspaceInheritWorkingDirectory"))
         .map(|value| parse_bool_setting(value, "app.workspaceInheritWorkingDirectory"))
         .unwrap_or(app_defaults.workspace_inherit_working_directory);
+    let focus_pane_on_first_click = app
+        .and_then(|app| app.get("focusPaneOnFirstClick"))
+        .map(|value| parse_bool_setting(value, "app.focusPaneOnFirstClick"))
+        .unwrap_or(app_defaults.focus_pane_on_first_click);
     let keep_workspace_open_when_closing_last_surface = app
         .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
         .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
@@ -578,6 +584,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         app: AppBehaviorConfig {
             keep_workspace_open_when_closing_last_surface,
             workspace_inherit_working_directory,
+            focus_pane_on_first_click,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -941,6 +948,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     app.as_object_mut().expect("app object").insert(
         "workspaceInheritWorkingDirectory".to_string(),
         json!(config.app.workspace_inherit_working_directory),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "focusPaneOnFirstClick".to_string(),
+        json!(config.app.focus_pane_on_first_click),
     );
     app.as_object_mut().expect("app object").insert(
         "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
@@ -1315,6 +1326,44 @@ mod tests {
         let _ = load_from_path(&path);
     }
 
+    // purpose: Verify host config loading accepts the CMUX first-click focus key.
+    // inputs: Temporary settings JSON with app.focusPaneOnFirstClick.
+    // returns/effects: Asserts explicit true overrides the CMUX runtime false default.
+    #[test]
+    fn load_from_path_reads_focus_pane_on_first_click() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "focusPaneOnFirstClick": true
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.config.app.focus_pane_on_first_click);
+    }
+
+    // purpose: Verify host config loading rejects malformed first-click focus values.
+    // inputs: Temporary settings JSON with a string instead of a boolean.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "app.focusPaneOnFirstClick must be a boolean")]
+    fn load_from_path_rejects_invalid_focus_pane_on_first_click() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"app":{"focusPaneOnFirstClick":"true"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
     #[test]
     fn load_from_path_reads_font_size_when_valid() {
         let dir = TempDir::new().expect("temp dir");
@@ -1651,6 +1700,7 @@ mod tests {
         config.appearance.ghostty_color_scheme = ColorScheme::Dark;
         config.app.keep_workspace_open_when_closing_last_surface = true;
         config.app.workspace_inherit_working_directory = false;
+        config.app.focus_pane_on_first_click = true;
         save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -1675,6 +1725,7 @@ mod tests {
             parsed["app"]["workspaceInheritWorkingDirectory"],
             Value::Bool(false)
         );
+        assert_eq!(parsed["app"]["focusPaneOnFirstClick"], Value::Bool(true));
     }
 
     #[test]

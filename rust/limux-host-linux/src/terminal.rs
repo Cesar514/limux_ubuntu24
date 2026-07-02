@@ -424,6 +424,10 @@ fn request_terminal_focus(gl_area: &gtk::GLArea, had_focus: &Cell<bool>) {
     gl_area.grab_focus();
 }
 
+fn should_request_terminal_focus_on_click(focus_pane_on_first_click: bool) -> bool {
+    focus_pane_on_first_click
+}
+
 fn refresh_surface_display(surface: ghostty_surface_t, gl_area: &gtk::GLArea) {
     let alloc = gl_area.allocation();
     let w = alloc.width() as u32;
@@ -1099,6 +1103,7 @@ pub struct TerminalCallbacks {
 
 pub struct TerminalOptions {
     pub hover_focus: Rc<dyn Fn() -> bool>,
+    pub focus_pane_on_first_click: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
     /// Extra environment variables to expose to the spawned shell
@@ -1115,6 +1120,7 @@ impl Default for TerminalOptions {
     fn default() -> Self {
         Self {
             hover_focus: Rc::new(|| false),
+            focus_pane_on_first_click: Rc::new(|| false),
             saved_font_size: None,
             startup_command: None,
             extra_env: Vec::new(),
@@ -1623,10 +1629,12 @@ pub fn create_terminal(
         let sc = surface_cell.clone();
         let gl_for_focus = gl_area.clone();
         let had_focus = had_focus.clone();
+        let focus_pane_on_first_click = options.focus_pane_on_first_click.clone();
         click.connect_pressed(move |gesture, _n, x, y| {
             let btn = gesture.current_button();
-            // Grab keyboard focus on any click
-            request_terminal_focus(&gl_for_focus, &had_focus);
+            if should_request_terminal_focus_on_click((focus_pane_on_first_click)()) {
+                request_terminal_focus(&gl_for_focus, &had_focus);
+            }
             // Skip right-click — context menu handles it
             if btn == 3 {
                 return;
@@ -2524,5 +2532,11 @@ mod tests {
         release_wakeup_idle_slot(&flag);
 
         assert!(claim_wakeup_idle_slot(&flag));
+    }
+
+    #[test]
+    fn terminal_click_focus_follows_cmux_first_click_setting() {
+        assert!(!should_request_terminal_focus_on_click(false));
+        assert!(should_request_terminal_focus_on_click(true));
     }
 }
