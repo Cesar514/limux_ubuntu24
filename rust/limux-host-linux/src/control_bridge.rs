@@ -167,6 +167,24 @@ const METHODS: &[&str] = &[
     "notification.open",
     "notification.jump_to_unread",
     "notification.clear",
+    "sidebar.status.set",
+    "sidebar.status.clear",
+    "sidebar.status.list",
+    "sidebar.progress.set",
+    "sidebar.progress.clear",
+    "sidebar.log.append",
+    "sidebar.log.clear",
+    "sidebar.log.list",
+    "sidebar.state",
+    "set_status",
+    "clear_status",
+    "list_status",
+    "set_progress",
+    "clear_progress",
+    "log",
+    "clear_log",
+    "list_log",
+    "sidebar_state",
     "right_sidebar",
 ];
 
@@ -534,6 +552,37 @@ pub struct RightSidebarTarget {
     pub window_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SidebarAction {
+    SetStatus {
+        key: String,
+        value: String,
+        icon: Option<String>,
+        color: Option<String>,
+        url: Option<String>,
+        priority: i64,
+    },
+    ClearStatus {
+        key: String,
+    },
+    ListStatus,
+    SetProgress {
+        value: f64,
+        label: Option<String>,
+    },
+    ClearProgress,
+    AppendLog {
+        level: String,
+        source: Option<String>,
+        message: String,
+    },
+    ClearLog,
+    ListLog {
+        limit: Option<usize>,
+    },
+    State,
+}
+
 #[derive(Debug)]
 pub enum ControlCommand {
     Identify {
@@ -791,6 +840,11 @@ pub enum ControlCommand {
         target: RightSidebarTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    Sidebar {
+        action: SidebarAction,
+        target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
 }
 
 impl ControlCommand {
@@ -844,7 +898,8 @@ impl ControlCommand {
             | Self::OpenNotification { reply, .. }
             | Self::JumpToUnreadNotification { reply }
             | Self::ClearNotifications { reply, .. }
-            | Self::RightSidebar { reply, .. } => {
+            | Self::RightSidebar { reply, .. }
+            | Self::Sidebar { reply, .. } => {
                 let _ = reply.send(result);
             }
         }
@@ -1146,6 +1201,116 @@ fn parse_right_sidebar_request(
         }
     };
     Ok((action, target))
+}
+
+/// purpose: Parse a CMUX sidebar metadata/log method into a live host action.
+/// inputs: Socket method name and JSON parameter map.
+/// returns/effects: Returns a normalized action or invalid_params for malformed requests.
+fn parse_sidebar_action(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<SidebarAction, BridgeError> {
+    match method {
+        "sidebar.status.set" | "set_status" => parse_sidebar_status_set(params),
+        "sidebar.status.clear" | "clear_status" => Ok(SidebarAction::ClearStatus {
+            key: required_sidebar_string(params, &["key"], method)?,
+        }),
+        "sidebar.status.list" | "list_status" => Ok(SidebarAction::ListStatus),
+        "sidebar.progress.set" | "set_progress" => parse_sidebar_progress_set(params),
+        "sidebar.progress.clear" | "clear_progress" => Ok(SidebarAction::ClearProgress),
+        "sidebar.log.append" | "log" => parse_sidebar_log_append(params),
+        "sidebar.log.clear" | "clear_log" => Ok(SidebarAction::ClearLog),
+        "sidebar.log.list" | "list_log" => Ok(SidebarAction::ListLog {
+            limit: optional_usize(params, &["limit"])?,
+        }),
+        "sidebar.state" | "sidebar_state" => Ok(SidebarAction::State),
+        _ => Err(BridgeError::invalid_params(format!(
+            "unsupported sidebar method: {method}"
+        ))),
+    }
+}
+
+/// purpose: Parse a CMUX set-status request.
+/// inputs: JSON parameter map containing key, value, and optional presentation fields.
+/// returns/effects: Returns a SetStatus action with validated priority.
+fn parse_sidebar_status_set(params: &Map<String, Value>) -> Result<SidebarAction, BridgeError> {
+    Ok(SidebarAction::SetStatus {
+        key: required_sidebar_string(params, &["key"], "sidebar.status.set")?,
+        value: required_sidebar_string(params, &["value"], "sidebar.status.set")?,
+        icon: optional_string(params, &["icon"]),
+        color: optional_string(params, &["color"]),
+        url: optional_string(params, &["url"]),
+        priority: optional_i64(params, &["priority"])?.unwrap_or(0),
+    })
+}
+
+/// purpose: Parse a CMUX set-progress request.
+/// inputs: JSON parameter map containing progress value and optional label.
+/// returns/effects: Returns a SetProgress action after clamping validation.
+fn parse_sidebar_progress_set(params: &Map<String, Value>) -> Result<SidebarAction, BridgeError> {
+    let value = required_f64(params, "value", "sidebar.progress.set")?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(BridgeError::invalid_params(
+            "sidebar.progress.set value must be between 0.0 and 1.0",
+        ));
+    }
+    Ok(SidebarAction::SetProgress {
+        value,
+        label: optional_string(params, &["label"]),
+    })
+}
+
+/// purpose: Parse a CMUX sidebar log append request.
+/// inputs: JSON parameter map with message plus optional level/source.
+/// returns/effects: Returns an AppendLog action with a known log level.
+fn parse_sidebar_log_append(params: &Map<String, Value>) -> Result<SidebarAction, BridgeError> {
+    let level = optional_string(params, &["level"]).unwrap_or_else(|| "info".to_string());
+    if !matches!(
+        level.as_str(),
+        "info" | "progress" | "success" | "warning" | "error"
+    ) {
+        return Err(BridgeError::invalid_params(format!(
+            "unsupported sidebar log level: {level}"
+        )));
+    }
+    Ok(SidebarAction::AppendLog {
+        level,
+        source: optional_string(params, &["source"]),
+        message: required_sidebar_string(params, &["message"], "sidebar.log.append")?,
+    })
+}
+
+/// purpose: Read a required non-empty sidebar string parameter.
+/// inputs: Parameter map, accepted keys, and method name for diagnostics.
+/// returns/effects: Returns the trimmed value or invalid_params.
+fn required_sidebar_string(
+    params: &Map<String, Value>,
+    keys: &[&str],
+    method: &str,
+) -> Result<String, BridgeError> {
+    optional_string(params, keys).ok_or_else(|| {
+        BridgeError::invalid_params(format!("{method} requires {}", keys.join(" or ")))
+    })
+}
+
+/// purpose: Read a required floating-point sidebar parameter.
+/// inputs: Parameter map, field name, and method name for diagnostics.
+/// returns/effects: Returns a finite f64 or invalid_params.
+fn required_f64(params: &Map<String, Value>, key: &str, method: &str) -> Result<f64, BridgeError> {
+    let value = params
+        .get(key)
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires {key}")))?;
+    let parsed = value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+    });
+    match parsed {
+        Some(number) if number.is_finite() => Ok(number),
+        _ => Err(BridgeError::invalid_params(format!(
+            "{key} must be a number"
+        ))),
+    }
 }
 
 fn optional_handle(
@@ -1742,6 +1907,42 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::RightSidebar {
+                    action,
+                    target,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "sidebar.status.set"
+        | "sidebar.status.clear"
+        | "sidebar.status.list"
+        | "sidebar.progress.set"
+        | "sidebar.progress.clear"
+        | "sidebar.log.append"
+        | "sidebar.log.clear"
+        | "sidebar.log.list"
+        | "sidebar.state"
+        | "set_status"
+        | "clear_status"
+        | "list_status"
+        | "set_progress"
+        | "clear_progress"
+        | "log"
+        | "clear_log"
+        | "list_log"
+        | "sidebar_state" => {
+            let action = match parse_sidebar_action(method, params) {
+                Ok(action) => action,
+                Err(error) => return error_response(id, error),
+            };
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::Sidebar {
                     action,
                     target,
                     reply,
@@ -3602,6 +3803,15 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_sidebar_metadata_methods() {
+        assert!(METHODS.contains(&"sidebar.status.set"));
+        assert!(METHODS.contains(&"sidebar.progress.set"));
+        assert!(METHODS.contains(&"sidebar.log.append"));
+        assert!(METHODS.contains(&"sidebar.state"));
+        assert!(METHODS.contains(&"set_status"));
+    }
+
+    #[test]
     fn right_sidebar_route_accepts_cmux_modes_and_targets() {
         let request = r#"{"id":1,"method":"right_sidebar","params":{"action":"set","mode":"dock","focus":false,"workspace_id":"workspace:2","window_id":"window:7"}}"#;
         let response = dispatch_request(request, &|command| match command {
@@ -3644,6 +3854,79 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
         assert!(error.message.contains("Unknown right-sidebar mode"));
+    }
+
+    #[test]
+    fn sidebar_status_route_accepts_cmux_aliases_and_targets() {
+        let request = r##"{"id":1,"method":"set_status","params":{"workspace_id":"workspace:2","key":"build","value":"running","color":"#ff9500","priority":"80"}}"##;
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::Sidebar {
+                action,
+                target,
+                reply,
+            } => {
+                assert_eq!(target, WorkspaceTarget::Handle("workspace:2".to_string()));
+                assert_eq!(
+                    action,
+                    SidebarAction::SetStatus {
+                        key: "build".to_string(),
+                        value: "running".to_string(),
+                        icon: None,
+                        color: Some("#ff9500".to_string()),
+                        url: None,
+                        priority: 80,
+                    }
+                );
+                reply.send(Ok(json!({"ok": true}))).expect("reply sends");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+    }
+
+    #[test]
+    fn sidebar_progress_and_log_routes_validate_params() {
+        let progress = dispatch_request(
+            r#"{"id":1,"method":"sidebar.progress.set","params":{"value":0.5,"label":"Building"}}"#,
+            &|command| match command {
+                ControlCommand::Sidebar {
+                    action,
+                    target,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Active);
+                    assert_eq!(
+                        action,
+                        SidebarAction::SetProgress {
+                            value: 0.5,
+                            label: Some("Building".to_string())
+                        }
+                    );
+                    reply.send(Ok(json!({"ok": true}))).expect("reply sends");
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(progress.error, None);
+
+        let invalid_progress = dispatch_request(
+            r#"{"id":1,"method":"sidebar.progress.set","params":{"value":1.5}}"#,
+            &|command| panic!("invalid progress should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_progress.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_log = dispatch_request(
+            r#"{"id":1,"method":"sidebar.log.append","params":{"level":"debug","message":"x"}}"#,
+            &|command| panic!("invalid log should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_log.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]

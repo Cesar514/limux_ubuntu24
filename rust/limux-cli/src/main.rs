@@ -4863,52 +4863,343 @@ async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Val
 }
 
 async fn run_sidebar_state(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
-        .ok_or_else(|| anyhow!("sidebar-state requires --workspace <id|ref>"))?;
+    let request = build_sidebar_command_request("sidebar-state", args, None)?;
+    client.call("sidebar.state", Value::Object(request)).await
+}
 
-    let listed = client.call("workspace.list", json!({})).await?;
-    let rows = listed
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+/// purpose: Build and run a CMUX-compatible sidebar metadata command.
+/// inputs: Command name, CLI args, and optional global window selector.
+/// returns/effects: Sends one live bridge request and returns the JSON payload.
+async fn run_sidebar_command(
+    client: &mut Client,
+    command: &str,
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<Value> {
+    let request = build_sidebar_command_request(command, args, global_window)?;
+    client
+        .call(sidebar_command_method(command)?, Value::Object(request))
+        .await
+}
 
-    let matched = rows.into_iter().find(|row| {
-        let id = get_string(row, &["workspace_id", "id"]).unwrap_or_default();
-        let rf = get_string(row, &["workspace_ref", "ref"]).unwrap_or_default();
-        workspace == id || workspace == rf
-    });
+/// purpose: Map CMUX sidebar command names to live bridge method names.
+/// inputs: User-facing command name.
+/// returns/effects: Returns a bridge method or a usage error.
+fn sidebar_command_method(command: &str) -> Result<&'static str> {
+    match command {
+        "set-status" => Ok("sidebar.status.set"),
+        "clear-status" => Ok("sidebar.status.clear"),
+        "list-status" => Ok("sidebar.status.list"),
+        "set-progress" => Ok("sidebar.progress.set"),
+        "clear-progress" => Ok("sidebar.progress.clear"),
+        "log" => Ok("sidebar.log.append"),
+        "clear-log" => Ok("sidebar.log.clear"),
+        "list-log" => Ok("sidebar.log.list"),
+        "sidebar-state" => Ok("sidebar.state"),
+        _ => bail!("unsupported sidebar command: {command}"),
+    }
+}
 
-    let cwd = matched
-        .as_ref()
-        .and_then(|row| get_string(row, &["cwd"]))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "none".to_string());
-
-    let git_branch = if cwd != "none" {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&cwd)
-            .arg("rev-parse")
-            .arg("--abbrev-ref")
-            .arg("HEAD")
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            }
-            _ => "none".to_string(),
+/// purpose: Parse CMUX sidebar metadata CLI args into bridge params.
+/// inputs: Command name, raw args, and optional inherited global `--window`.
+/// returns/effects: Returns normalized params or fails loudly on malformed commands.
+fn build_sidebar_command_request(
+    command: &str,
+    args: &[String],
+    global_window: Option<&str>,
+) -> Result<Map<String, Value>> {
+    let mut parsed = SidebarCommandArgs::default();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        if consume_sidebar_option(args, &mut idx, &mut parsed)? {
+            continue;
         }
-    } else {
-        "none".to_string()
-    };
+        if args[idx] == "--" {
+            parsed.positional.extend(args[idx + 1..].iter().cloned());
+            break;
+        }
+        parsed.positional.push(args[idx].clone());
+        idx += 1;
+    }
+    sidebar_command_params(command, parsed, global_window)
+}
 
-    Ok(json!({
-        "workspace": workspace,
-        "cwd": cwd,
-        "git_branch": git_branch,
-    }))
+#[derive(Default)]
+struct SidebarCommandArgs {
+    workspace: Option<String>,
+    window: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
+    url: Option<String>,
+    priority: Option<String>,
+    label: Option<String>,
+    level: Option<String>,
+    source: Option<String>,
+    limit: Option<String>,
+    positional: Vec<String>,
+}
+
+/// purpose: Consume one CMUX sidebar command option.
+/// inputs: CLI args, current index, and mutable parsed state.
+/// returns/effects: Advances idx when an option is consumed.
+fn consume_sidebar_option(
+    args: &[String],
+    idx: &mut usize,
+    parsed: &mut SidebarCommandArgs,
+) -> Result<bool> {
+    let raw = args[*idx].as_str();
+    let Some(flag) = raw.strip_prefix("--") else {
+        return Ok(false);
+    };
+    let (name, inline) = flag
+        .split_once('=')
+        .map(|(name, value)| (format!("--{name}"), Some(value.to_string())))
+        .unwrap_or_else(|| (raw.to_string(), None));
+    match name.as_str() {
+        "--workspace" => parsed.workspace = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--window" => parsed.window = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--icon" => parsed.icon = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--color" => parsed.color = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--url" => parsed.url = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--priority" => parsed.priority = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--label" => parsed.label = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--level" => parsed.level = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--source" => parsed.source = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--limit" => parsed.limit = Some(sidebar_option_value(args, idx, &name, inline)?),
+        "--" => return Ok(false),
+        _ => bail!("Unknown sidebar option {name}"),
+    }
+    Ok(true)
+}
+
+/// purpose: Read a sidebar option value from `--flag=value` or `--flag value`.
+/// inputs: CLI args, mutable current index, option name, and optional inline value.
+/// returns/effects: Advances idx past the consumed option/value pair.
+fn sidebar_option_value(
+    args: &[String],
+    idx: &mut usize,
+    name: &str,
+    inline: Option<String>,
+) -> Result<String> {
+    if let Some(value) = inline {
+        *idx += 1;
+        return Ok(value);
+    }
+    let value = args
+        .get(*idx + 1)
+        .ok_or_else(|| anyhow!("{name} requires a value"))?
+        .clone();
+    *idx += 2;
+    Ok(value)
+}
+
+/// purpose: Convert parsed sidebar CLI state into bridge params.
+/// inputs: Command name, parsed args, and optional global window selector.
+/// returns/effects: Returns command-specific JSON params.
+fn sidebar_command_params(
+    command: &str,
+    parsed: SidebarCommandArgs,
+    global_window: Option<&str>,
+) -> Result<Map<String, Value>> {
+    let mut params = sidebar_target_params(&parsed, global_window);
+    match command {
+        "set-status" => sidebar_set_status_params(&mut params, parsed)?,
+        "clear-status" => sidebar_single_key_params(&mut params, parsed, "clear-status")?,
+        "list-status" | "clear-progress" | "clear-log" | "sidebar-state" => {}
+        "set-progress" => sidebar_set_progress_params(&mut params, parsed)?,
+        "log" => sidebar_log_params(&mut params, parsed)?,
+        "list-log" => sidebar_list_log_params(&mut params, parsed)?,
+        _ => bail!("unsupported sidebar command: {command}"),
+    }
+    Ok(params)
+}
+
+/// purpose: Build shared workspace/window target params for sidebar commands.
+/// inputs: Parsed sidebar args and optional inherited global window.
+/// returns/effects: Omits absent values so the host may target the active workspace.
+fn sidebar_target_params(
+    parsed: &SidebarCommandArgs,
+    global_window: Option<&str>,
+) -> Map<String, Value> {
+    let mut params = Map::new();
+    let workspace = parsed
+        .workspace
+        .clone()
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+        .or_else(|| context_env_value("CMUX_WORKSPACE_ID"));
+    if let Some(workspace) = workspace {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    let window = parsed
+        .window
+        .clone()
+        .or_else(|| global_window.map(ToOwned::to_owned));
+    if let Some(window) = window {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    params
+}
+
+/// purpose: Add set-status positional and presentation params.
+/// inputs: Mutable param map plus parsed CLI args.
+/// returns/effects: Fails when key/value or priority is malformed.
+fn sidebar_set_status_params(
+    params: &mut Map<String, Value>,
+    parsed: SidebarCommandArgs,
+) -> Result<()> {
+    let key = parsed
+        .positional
+        .first()
+        .ok_or_else(|| anyhow!("set-status requires <key> <value>"))?;
+    let value = parsed
+        .positional
+        .get(1)
+        .ok_or_else(|| anyhow!("set-status requires <key> <value>"))?;
+    params.insert("key".to_string(), Value::String(key.clone()));
+    params.insert("value".to_string(), Value::String(value.clone()));
+    insert_optional_string(params, "icon", parsed.icon);
+    insert_optional_string(params, "color", parsed.color);
+    insert_optional_string(params, "url", parsed.url);
+    if let Some(priority) = parsed.priority {
+        let priority = priority
+            .parse::<i64>()
+            .map_err(|_| anyhow!("--priority must be an integer"))?;
+        params.insert("priority".to_string(), json!(priority));
+    }
+    Ok(())
+}
+
+/// purpose: Add a required single-key positional param.
+/// inputs: Mutable param map, parsed CLI args, and command name for diagnostics.
+/// returns/effects: Fails when the key is missing.
+fn sidebar_single_key_params(
+    params: &mut Map<String, Value>,
+    parsed: SidebarCommandArgs,
+    command: &str,
+) -> Result<()> {
+    let key = parsed
+        .positional
+        .first()
+        .ok_or_else(|| anyhow!("{command} requires <key>"))?;
+    params.insert("key".to_string(), Value::String(key.clone()));
+    Ok(())
+}
+
+/// purpose: Add set-progress value/label params.
+/// inputs: Mutable param map plus parsed CLI args.
+/// returns/effects: Fails when progress is missing or outside 0.0..=1.0.
+fn sidebar_set_progress_params(
+    params: &mut Map<String, Value>,
+    parsed: SidebarCommandArgs,
+) -> Result<()> {
+    let raw = parsed
+        .positional
+        .first()
+        .ok_or_else(|| anyhow!("set-progress requires <0.0-1.0>"))?;
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| anyhow!("set-progress value must be a number"))?;
+    if !(0.0..=1.0).contains(&value) {
+        bail!("set-progress value must be between 0.0 and 1.0");
+    }
+    params.insert("value".to_string(), json!(value));
+    insert_optional_string(params, "label", parsed.label);
+    Ok(())
+}
+
+/// purpose: Add sidebar log append params.
+/// inputs: Mutable param map plus parsed CLI args.
+/// returns/effects: Joins positional message tokens and validates level.
+fn sidebar_log_params(params: &mut Map<String, Value>, parsed: SidebarCommandArgs) -> Result<()> {
+    let message = parsed.positional.join(" ");
+    if message.trim().is_empty() {
+        bail!("log requires <message>");
+    }
+    if let Some(level) = parsed.level {
+        match level.as_str() {
+            "info" | "progress" | "success" | "warning" | "error" => {
+                params.insert("level".to_string(), Value::String(level));
+            }
+            _ => bail!("--level must be info, progress, success, warning, or error"),
+        }
+    }
+    insert_optional_string(params, "source", parsed.source);
+    params.insert("message".to_string(), Value::String(message));
+    Ok(())
+}
+
+/// purpose: Add list-log limit params.
+/// inputs: Mutable param map plus parsed CLI args.
+/// returns/effects: Fails when --limit is not a non-negative integer.
+fn sidebar_list_log_params(
+    params: &mut Map<String, Value>,
+    parsed: SidebarCommandArgs,
+) -> Result<()> {
+    if let Some(limit) = parsed.limit {
+        let limit = limit
+            .parse::<usize>()
+            .map_err(|_| anyhow!("--limit must be a non-negative integer"))?;
+        params.insert("limit".to_string(), json!(limit));
+    }
+    Ok(())
+}
+
+fn insert_optional_string(params: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        params.insert(key.to_string(), Value::String(value));
+    }
+}
+
+/// purpose: Render CMUX sidebar list command payloads as compact text.
+/// inputs: Command name and JSON payload from the live bridge.
+/// returns/effects: Returns newline-delimited rows for terminal output.
+fn render_sidebar_list_text(command: &str, payload: &Value) -> String {
+    match command {
+        "list-status" => payload
+            .get("status")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(render_sidebar_status_row)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .join("\n"),
+        "list-log" => payload
+            .get("log")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().map(render_sidebar_log_row).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// purpose: Render one sidebar status row for non-JSON CLI output.
+/// inputs: JSON status row from the live bridge.
+/// returns/effects: Returns key=value plus priority when present.
+fn render_sidebar_status_row(row: &Value) -> String {
+    let key = get_string(row, &["key"]).unwrap_or_else(|| "unknown".to_string());
+    let value = get_string(row, &["value"]).unwrap_or_default();
+    let priority = row
+        .get("priority")
+        .and_then(Value::as_i64)
+        .map(|value| format!(" priority={value}"))
+        .unwrap_or_default();
+    format!("{key}={value}{priority}")
+}
+
+/// purpose: Render one sidebar log row for non-JSON CLI output.
+/// inputs: JSON log row from the live bridge.
+/// returns/effects: Returns timestamp, level/source, and message.
+fn render_sidebar_log_row(row: &Value) -> String {
+    let created_at = get_string(row, &["created_at"]).unwrap_or_else(|| "unknown".to_string());
+    let level = get_string(row, &["level"]).unwrap_or_else(|| "info".to_string());
+    let source = get_string(row, &["source"])
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    let message = get_string(row, &["message"]).unwrap_or_default();
+    format!("{created_at} {level}{source}: {message}")
 }
 
 /// purpose: Build and run a CMUX-compatible right-sidebar control command.
@@ -7287,6 +7578,24 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 ))
             }
         }
+        "set-status" | "clear-status" | "set-progress" | "clear-progress" | "log" | "clear-log" => {
+            let payload =
+                run_sidebar_command(client, command, args, opts.window.as_deref()).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "list-status" | "list-log" => {
+            let payload =
+                run_sidebar_command(client, command, args, opts.window.as_deref()).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_sidebar_list_text(command, &payload))
+            }
+        }
         "right-sidebar" => {
             let (payload, prints_state) =
                 run_right_sidebar(client, args, opts.window.as_deref()).await?;
@@ -7598,6 +7907,72 @@ mod cli_arg_tests {
         let bad_mode = build_right_sidebar_request(&args(&["set", "unknown"]), None)
             .expect_err("unknown mode fails");
         assert!(bad_mode.to_string().contains("Unknown right-sidebar mode"));
+    }
+
+    #[test]
+    fn cmux_sidebar_status_cli_maps_to_bridge_params() {
+        let params = build_sidebar_command_request(
+            "set-status",
+            &args(&[
+                "build",
+                "running",
+                "--icon=hammer",
+                "--color",
+                "#ff9500",
+                "--priority",
+                "80",
+                "--workspace",
+                "workspace:2",
+            ]),
+            Some("window:7"),
+        )
+        .expect("set-status parses");
+
+        assert_eq!(params["key"], "build");
+        assert_eq!(params["value"], "running");
+        assert_eq!(params["icon"], "hammer");
+        assert_eq!(params["color"], "#ff9500");
+        assert_eq!(params["priority"], 80);
+        assert_eq!(params["workspace_id"], "workspace:2");
+        assert_eq!(params["window_id"], "window:7");
+    }
+
+    #[test]
+    fn cmux_sidebar_progress_and_log_cli_validate_values() {
+        let progress = build_sidebar_command_request(
+            "set-progress",
+            &args(&["0.5", "--label", "Building"]),
+            None,
+        )
+        .expect("set-progress parses");
+        assert_eq!(progress["value"], 0.5);
+        assert_eq!(progress["label"], "Building");
+
+        let bad_progress = build_sidebar_command_request("set-progress", &args(&["1.5"]), None)
+            .expect_err("out-of-range progress fails");
+        assert!(bad_progress.to_string().contains("between 0.0 and 1.0"));
+
+        let log = build_sidebar_command_request(
+            "log",
+            &args(&[
+                "--level",
+                "error",
+                "--source",
+                "build",
+                "--",
+                "Compilation failed",
+            ]),
+            None,
+        )
+        .expect("log parses");
+        assert_eq!(log["level"], "error");
+        assert_eq!(log["source"], "build");
+        assert_eq!(log["message"], "Compilation failed");
+
+        let bad_level =
+            build_sidebar_command_request("log", &args(&["--level", "debug", "message"]), None)
+                .expect_err("bad log level fails");
+        assert!(bad_level.to_string().contains("--level must be"));
     }
 
     #[test]

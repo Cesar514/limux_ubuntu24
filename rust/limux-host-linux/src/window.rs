@@ -23,7 +23,7 @@ use crate::app_config;
 use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
-    RightSidebarMode, RightSidebarTarget, WorkspaceGroupAction, WorkspaceNavigation,
+    RightSidebarMode, RightSidebarTarget, SidebarAction, WorkspaceGroupAction, WorkspaceNavigation,
     WorkspaceTarget,
 };
 use crate::keybind_editor;
@@ -41,6 +41,7 @@ const PANE_CREATE_COMMAND_READY_INTERVAL_MS: u64 = 50;
 const PANE_CREATE_COMMAND_READY_ATTEMPTS: u32 = 40;
 const BROWSER_WAIT_POLL_INTERVAL_MS: u64 = 50;
 const MAX_HOST_NOTIFICATIONS: usize = 200;
+const MAX_SIDEBAR_LOG_ENTRIES: usize = 500;
 
 // ---------------------------------------------------------------------------
 // State
@@ -80,6 +81,37 @@ struct Workspace {
     /// Path label shown below workspace name in sidebar.
     #[allow(dead_code)]
     path_label: gtk::Label,
+    /// CMUX-compatible sidebar status entries keyed by agent/tool id.
+    sidebar_status: BTreeMap<String, SidebarStatusEntry>,
+    /// CMUX-compatible workspace progress metadata.
+    sidebar_progress: Option<SidebarProgress>,
+    /// Bounded CMUX-compatible sidebar log stream for this workspace.
+    sidebar_log: Vec<SidebarLogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarStatusEntry {
+    key: String,
+    value: String,
+    icon: Option<String>,
+    color: Option<String>,
+    url: Option<String>,
+    priority: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarProgress {
+    value: f64,
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarLogEntry {
+    id: u64,
+    created_at: String,
+    level: String,
+    source: Option<String>,
+    message: String,
 }
 
 #[derive(Clone)]
@@ -136,6 +168,7 @@ pub(crate) struct AppState {
     save_queued: bool,
     workspace_dragging: Option<String>,
     next_notification_id: u64,
+    next_sidebar_log_id: u64,
     notifications: Vec<HostNotification>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
@@ -2711,6 +2744,338 @@ fn apply_right_sidebar_action(
     Ok(right_sidebar_state_payload(&app_state, workspace_id))
 }
 
+/// purpose: Resolve a CMUX sidebar metadata workspace selector.
+/// inputs: Host state and a workspace target from the control bridge.
+/// returns/effects: Returns the live workspace index or a not_found error.
+fn sidebar_workspace_index(
+    state: &AppState,
+    target: &WorkspaceTarget,
+) -> Result<usize, BridgeError> {
+    workspace_index_for_target(state, target)
+        .ok_or_else(|| BridgeError::not_found("sidebar workspace target not found"))
+}
+
+/// purpose: Render one sidebar status entry in the public control API shape.
+/// inputs: Retained sidebar status entry plus owning workspace id.
+/// returns/effects: Returns JSON without mutating state.
+fn sidebar_status_row(workspace_id: &str, entry: &SidebarStatusEntry) -> serde_json::Value {
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "key": entry.key,
+        "value": entry.value,
+        "icon": entry.icon,
+        "color": entry.color,
+        "url": entry.url,
+        "priority": entry.priority,
+    })
+}
+
+/// purpose: Render all status entries for a workspace in CMUX priority order.
+/// inputs: Workspace with retained sidebar status state.
+/// returns/effects: Returns sorted JSON rows without mutating state.
+fn sidebar_status_rows(workspace: &Workspace) -> Vec<serde_json::Value> {
+    let mut entries = workspace.sidebar_status.values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    entries
+        .into_iter()
+        .map(|entry| sidebar_status_row(&workspace.id, entry))
+        .collect()
+}
+
+/// purpose: Render the optional sidebar progress state for a workspace.
+/// inputs: Workspace with retained progress metadata.
+/// returns/effects: Returns JSON null when progress is absent.
+fn sidebar_progress_row(workspace: &Workspace) -> serde_json::Value {
+    match workspace.sidebar_progress.as_ref() {
+        Some(progress) => serde_json::json!({
+            "workspace_id": workspace.id,
+            "workspace_ref": workspace_ref(&workspace.id),
+            "value": progress.value,
+            "label": progress.label,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// purpose: Render one sidebar log entry in the public control API shape.
+/// inputs: Retained sidebar log entry plus owning workspace id.
+/// returns/effects: Returns JSON without mutating state.
+fn sidebar_log_row(workspace_id: &str, entry: &SidebarLogEntry) -> serde_json::Value {
+    serde_json::json!({
+        "id": entry.id,
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "created_at": entry.created_at,
+        "level": entry.level,
+        "source": entry.source,
+        "message": entry.message,
+    })
+}
+
+/// purpose: Render sidebar log rows, optionally limited to the newest entries.
+/// inputs: Workspace with bounded log state and optional limit.
+/// returns/effects: Returns JSON rows without mutating state.
+fn sidebar_log_rows(workspace: &Workspace, limit: Option<usize>) -> Vec<serde_json::Value> {
+    let start = limit
+        .map(|limit| workspace.sidebar_log.len().saturating_sub(limit))
+        .unwrap_or(0);
+    workspace.sidebar_log[start..]
+        .iter()
+        .map(|entry| sidebar_log_row(&workspace.id, entry))
+        .collect()
+}
+
+/// purpose: Publish a CMUX-compatible sidebar metadata event.
+/// inputs: Event name, workspace id, and redaction-safe payload.
+/// returns/effects: Appends the event to the retained/live event stream.
+fn publish_sidebar_event(name: &str, workspace_id: &str, payload: serde_json::Value) {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category: "sidebar",
+        source: "sidebar.metadata",
+        workspace_id: Some(serde_json::Value::String(workspace_id.to_string())),
+        surface_id: None,
+        pane_id: None,
+        payload,
+    });
+}
+
+/// purpose: Read the current git branch for sidebar-state metadata.
+/// inputs: Optional workspace cwd/folder path.
+/// returns/effects: Runs `git rev-parse` when a cwd exists; returns "none" on non-git dirs.
+fn sidebar_git_branch(cwd: Option<&str>) -> String {
+    let Some(cwd) = cwd.filter(|value| !value.is_empty()) else {
+        return "none".to_string();
+    };
+    match Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "none".to_string(),
+    }
+}
+
+/// purpose: Render all retained CMUX sidebar metadata for one workspace.
+/// inputs: Workspace with status/progress/log state.
+/// returns/effects: Returns aggregate JSON without mutating state.
+fn sidebar_state_payload(workspace: &Workspace) -> serde_json::Value {
+    let cwd = workspace
+        .folder_path
+        .clone()
+        .or_else(|| workspace.cwd.borrow().clone())
+        .unwrap_or_else(|| "none".to_string());
+    let git_branch = if cwd == "none" {
+        "none".to_string()
+    } else {
+        sidebar_git_branch(Some(&cwd))
+    };
+    serde_json::json!({
+        "workspace": workspace.id,
+        "workspace_id": workspace.id,
+        "workspace_ref": workspace_ref(&workspace.id),
+        "cwd": cwd,
+        "git_branch": git_branch,
+        "ports": [],
+        "status": sidebar_status_rows(workspace),
+        "progress": sidebar_progress_row(workspace),
+        "log": sidebar_log_rows(workspace, None),
+    })
+}
+
+/// purpose: Apply one CMUX sidebar metadata/status/progress/log action.
+/// inputs: Live host state, parsed sidebar action, and workspace target.
+/// returns/effects: Mutates bounded per-workspace sidebar state and returns JSON.
+fn apply_sidebar_action(
+    state: &State,
+    action: SidebarAction,
+    target: WorkspaceTarget,
+) -> Result<serde_json::Value, BridgeError> {
+    let mut app_state = state.borrow_mut();
+    let index = sidebar_workspace_index(&app_state, &target)?;
+    let workspace_id = app_state.workspaces[index].id.clone();
+    match action {
+        SidebarAction::SetStatus {
+            key,
+            value,
+            icon,
+            color,
+            url,
+            priority,
+        } => apply_sidebar_status_set(
+            &mut app_state.workspaces[index],
+            key,
+            value,
+            icon,
+            color,
+            url,
+            priority,
+        ),
+        SidebarAction::ClearStatus { key } => {
+            apply_sidebar_status_clear(&mut app_state.workspaces[index], &key)
+        }
+        SidebarAction::ListStatus => Ok(serde_json::json!({
+            "workspace_id": workspace_id,
+            "status": sidebar_status_rows(&app_state.workspaces[index]),
+        })),
+        SidebarAction::SetProgress { value, label } => {
+            apply_sidebar_progress_set(&mut app_state.workspaces[index], value, label)
+        }
+        SidebarAction::ClearProgress => {
+            apply_sidebar_progress_clear(&mut app_state.workspaces[index])
+        }
+        SidebarAction::AppendLog {
+            level,
+            source,
+            message,
+        } => apply_sidebar_log_append(&mut app_state, index, level, source, message),
+        SidebarAction::ClearLog => apply_sidebar_log_clear(&mut app_state.workspaces[index]),
+        SidebarAction::ListLog { limit } => Ok(serde_json::json!({
+            "workspace_id": workspace_id,
+            "log": sidebar_log_rows(&app_state.workspaces[index], limit),
+        })),
+        SidebarAction::State => Ok(sidebar_state_payload(&app_state.workspaces[index])),
+    }
+}
+
+/// purpose: Store or replace one sidebar status entry.
+/// inputs: Workspace, key/value, and presentation metadata.
+/// returns/effects: Mutates status state, publishes an update event, and returns JSON.
+fn apply_sidebar_status_set(
+    workspace: &mut Workspace,
+    key: String,
+    value: String,
+    icon: Option<String>,
+    color: Option<String>,
+    url: Option<String>,
+    priority: i64,
+) -> Result<serde_json::Value, BridgeError> {
+    let entry = SidebarStatusEntry {
+        key: key.clone(),
+        value,
+        icon,
+        color,
+        url,
+        priority,
+    };
+    workspace.sidebar_status.insert(key, entry.clone());
+    publish_sidebar_event(
+        "sidebar.metadata.updated",
+        &workspace.id,
+        serde_json::json!({"key": entry.key, "value_length": entry.value.len()}),
+    );
+    Ok(serde_json::json!({"ok": true, "status": sidebar_status_row(&workspace.id, &entry)}))
+}
+
+/// purpose: Remove one sidebar status entry by key.
+/// inputs: Workspace and status key.
+/// returns/effects: Mutates status state or fails when the key is absent.
+fn apply_sidebar_status_clear(
+    workspace: &mut Workspace,
+    key: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let removed = workspace.sidebar_status.remove(key);
+    if removed.is_none() {
+        return Err(BridgeError::not_found("sidebar status key not found"));
+    }
+    publish_sidebar_event(
+        "sidebar.metadata.cleared",
+        &workspace.id,
+        serde_json::json!({"key": key}),
+    );
+    Ok(serde_json::json!({"ok": true, "key": key, "workspace_id": workspace.id}))
+}
+
+/// purpose: Store sidebar progress metadata for a workspace.
+/// inputs: Workspace, progress value, and optional label.
+/// returns/effects: Mutates progress state, publishes an event, and returns JSON.
+fn apply_sidebar_progress_set(
+    workspace: &mut Workspace,
+    value: f64,
+    label: Option<String>,
+) -> Result<serde_json::Value, BridgeError> {
+    workspace.sidebar_progress = Some(SidebarProgress { value, label });
+    publish_sidebar_event(
+        "sidebar.progress.updated",
+        &workspace.id,
+        serde_json::json!({"value": value}),
+    );
+    Ok(serde_json::json!({"ok": true, "progress": sidebar_progress_row(workspace)}))
+}
+
+/// purpose: Clear sidebar progress metadata for a workspace.
+/// inputs: Workspace whose progress may be set.
+/// returns/effects: Mutates progress state, publishes an event, and returns JSON.
+fn apply_sidebar_progress_clear(
+    workspace: &mut Workspace,
+) -> Result<serde_json::Value, BridgeError> {
+    workspace.sidebar_progress = None;
+    publish_sidebar_event(
+        "sidebar.progress.cleared",
+        &workspace.id,
+        serde_json::json!({}),
+    );
+    Ok(serde_json::json!({"ok": true, "workspace_id": workspace.id}))
+}
+
+/// purpose: Append one bounded sidebar log entry for a workspace.
+/// inputs: Host state, workspace index, level/source, and message.
+/// returns/effects: Mutates log state, evicts oldest rows past cap, and publishes an event.
+fn apply_sidebar_log_append(
+    app_state: &mut AppState,
+    index: usize,
+    level: String,
+    source: Option<String>,
+    message: String,
+) -> Result<serde_json::Value, BridgeError> {
+    let id = app_state.next_sidebar_log_id;
+    app_state.next_sidebar_log_id = app_state.next_sidebar_log_id.saturating_add(1);
+    let entry = SidebarLogEntry {
+        id,
+        created_at: notification_created_at(),
+        level,
+        source,
+        message,
+    };
+    let workspace = &mut app_state.workspaces[index];
+    workspace.sidebar_log.push(entry.clone());
+    if workspace.sidebar_log.len() > MAX_SIDEBAR_LOG_ENTRIES {
+        workspace.sidebar_log.remove(0);
+    }
+    publish_sidebar_event(
+        "sidebar.log.appended",
+        &workspace.id,
+        serde_json::json!({"id": id, "level": entry.level, "message_length": entry.message.len()}),
+    );
+    Ok(serde_json::json!({"ok": true, "entry": sidebar_log_row(&workspace.id, &entry)}))
+}
+
+/// purpose: Clear all retained sidebar log entries for a workspace.
+/// inputs: Workspace with bounded sidebar log state.
+/// returns/effects: Mutates log state, publishes an event, and returns removed count.
+fn apply_sidebar_log_clear(workspace: &mut Workspace) -> Result<serde_json::Value, BridgeError> {
+    let count = workspace.sidebar_log.len();
+    workspace.sidebar_log.clear();
+    publish_sidebar_event(
+        "sidebar.log.cleared",
+        &workspace.id,
+        serde_json::json!({"count": count}),
+    );
+    Ok(serde_json::json!({"ok": true, "count": count, "workspace_id": workspace.id}))
+}
+
 fn begin_window_move_from_widget(
     widget: &impl IsA<gtk::Widget>,
     window: &adw::ApplicationWindow,
@@ -3246,6 +3611,7 @@ pub fn build_window(app: &adw::Application) {
         save_queued: false,
         workspace_dragging: None,
         next_notification_id: 1,
+        next_sidebar_log_id: 1,
         notifications: Vec::new(),
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
@@ -5312,6 +5678,9 @@ fn create_workspace_for_tab_payload(
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             path_label,
+            sidebar_status: BTreeMap::new(),
+            sidebar_progress: None,
+            sidebar_log: Vec::new(),
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
         app_state.stack.set_visible_child_name(&stack_name);
@@ -9019,6 +9388,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             let _ = reply.send(apply_right_sidebar_action(state, action, target));
         }
+        ControlCommand::Sidebar {
+            action,
+            target,
+            reply,
+        } => {
+            let _ = reply.send(apply_sidebar_action(state, action, target));
+        }
     }
 }
 
@@ -9074,6 +9450,9 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         cwd,
         folder_path: workspace.folder_path.clone(),
         path_label,
+        sidebar_status: BTreeMap::new(),
+        sidebar_progress: None,
+        sidebar_log: Vec::new(),
     };
 
     if workspace.favorite {
