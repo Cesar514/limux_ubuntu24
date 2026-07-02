@@ -2841,6 +2841,7 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "move-tab-to-new-workspace",
         "Usage: limux move-tab-to-new-workspace",
     ),
+    ("detach-tab", "Usage: limux detach-tab"),
     ("tab-action", "Usage: limux tab-action --action <name>"),
     ("rename-tab", "Usage: limux rename-tab"),
     ("new-workspace", "Usage: limux new-workspace"),
@@ -12441,12 +12442,12 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
     Ok(payload)
 }
 
-// purpose: Implement CMUX `move-tab-to-new-workspace` as a strict tab-action wrapper.
-// inputs: CLI flags for tab/surface/workspace/window/title/focus.
-// returns/effects: Calls the live host with action `move-to-new-workspace`.
-async fn run_move_tab_to_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
+// purpose: Build CMUX `move-tab-to-new-workspace`/`detach-tab` params.
+// inputs: Command name plus CLI flags for tab/surface/workspace/window/title/focus.
+// returns/effects: Returns strict `tab.action move-to-new-workspace` params.
+fn build_move_tab_to_new_workspace_params(command: &str, args: &[String]) -> Result<Value> {
     if parse_opt(args, "--action").is_some() || parse_flag(args, "--action") {
-        bail!("move-tab-to-new-workspace does not accept --action");
+        bail!("{command} does not accept --action");
     }
 
     let mut params = Map::new();
@@ -12481,7 +12482,19 @@ async fn run_move_tab_to_new_workspace(client: &mut Client, args: &[String]) -> 
         params.insert("focus".to_string(), Value::Bool(false));
     }
 
-    client.call("tab.action", Value::Object(params)).await
+    Ok(Value::Object(params))
+}
+
+// purpose: Implement CMUX `move-tab-to-new-workspace` and `detach-tab` aliases.
+// inputs: Command name plus CLI flags for tab/surface/workspace/window/title/focus.
+// returns/effects: Calls the live host with action `move-to-new-workspace`.
+async fn run_move_tab_to_new_workspace(
+    client: &mut Client,
+    command: &str,
+    args: &[String],
+) -> Result<Value> {
+    let params = build_move_tab_to_new_workspace_params(command, args)?;
+    client.call("tab.action", params).await
 }
 
 async fn run_browser(
@@ -15431,8 +15444,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
-        "move-tab-to-new-workspace" => {
-            let payload = run_move_tab_to_new_workspace(client, args).await?;
+        "move-tab-to-new-workspace" | "detach-tab" => {
+            let payload = run_move_tab_to_new_workspace(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else {
@@ -18166,6 +18179,36 @@ mod cli_arg_tests {
 
         let bad_focus = build_tab_action_request(&args(&["--action", "pin", "--focus", "later"]));
         assert!(bad_focus.is_err());
+    }
+
+    #[test]
+    fn detach_tab_alias_builds_move_tab_to_new_workspace_request() {
+        let detach_args = [
+            "--surface",
+            "surface:7:tab-a",
+            "--workspace",
+            "workspace:3",
+            "--window",
+            "window:2",
+            "--title",
+            "detached",
+            "--focus",
+            "true",
+        ]
+        .map(str::to_owned);
+        let params = build_move_tab_to_new_workspace_params("detach-tab", &detach_args)
+            .expect("detach-tab parses");
+
+        assert_eq!(params["action"], "move-to-new-workspace");
+        assert_eq!(params["surface_id"], "surface:7:tab-a");
+        assert_eq!(params["workspace_id"], "workspace:3");
+        assert_eq!(params["window_id"], "window:2");
+        assert_eq!(params["title"], "detached");
+        assert_eq!(params["focus"], true);
+        assert!(
+            build_move_tab_to_new_workspace_params("detach-tab", &args(&["--action", "pin"]))
+                .is_err()
+        );
     }
 
     #[test]

@@ -7874,20 +7874,35 @@ mod tests {
     #[test]
     fn tab_action_aliases_route_to_live_command() {
         for (raw_action, normalized) in [
+            ("rename", "rename"),
+            ("clear-name", "clear_name"),
+            ("pin", "pin"),
+            ("unpin", "unpin"),
             ("reload-tab", "reload"),
+            ("reload", "reload"),
             ("duplicate-tab", "duplicate"),
+            ("duplicate", "duplicate"),
+            ("close-left", "close_left"),
+            ("close-right", "close_right"),
+            ("close-others", "close_others"),
             ("close-to-left", "close_left"),
             ("close-to-right", "close_right"),
             ("close-other-tabs", "close_others"),
             ("mark-as-unread", "mark_unread"),
             ("mark-read", "mark_read"),
+            ("mark-unread", "mark_unread"),
         ] {
+            let title = if raw_action == "rename" {
+                r#","title":"build logs""#
+            } else {
+                ""
+            };
             let request = format!(
                 concat!(
                     r#"{{"id":1,"method":"tab.action","params":"#,
-                    r#"{{"action":"{}","tab_id":"tab:4:tab"}}}}"#
+                    r#"{{"action":"{}","tab_id":"tab:4:tab"{}}}}}"#
                 ),
-                raw_action
+                raw_action, title
             );
             let response = dispatch_request(&request, &|command| match command {
                 ControlCommand::TabAction {
