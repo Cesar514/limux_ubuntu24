@@ -405,6 +405,7 @@ fn full_help_text() -> &'static str {
         "  hooks setup [agent] | hooks uninstall [agent] | hooks <agent> <event>\n",
         "  claude-hook | opencode-hook | gemini-hook --event <name>\n",
         "      [--subtitle <text>] [--body <text>] [--title <text>]\n",
+        "  codex-teams [codex-args...]\n",
         "  agent-team [--agents codex,claude[,opencode,gemini]] [--cwd <path>]\n",
         "      [--no-launch] [--dry-run]\n",
         "      Splits the active workspace into one pane per agent and writes AGENTS.md.\n"
@@ -1344,6 +1345,11 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     if let Some(text) = command_help_probe_text(command, args) {
         return Ok(Some(CommandOutput::Text(text.to_string())));
     }
+    if command == "codex-teams" {
+        bail!(
+            "not_supported: codex-teams requires CMUX Codex app-server orchestration, which Limux does not implement yet"
+        );
+    }
     if is_unsupported_remote_cli_command(command) {
         bail!(
             "not_supported: {command} requires CMUX remote daemon support, which Limux does not implement yet"
@@ -1530,6 +1536,15 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     (
         "codex",
         "Usage: limux codex <install-hooks|uninstall-hooks>",
+    ),
+    (
+        "codex-teams",
+        "Usage: limux codex-teams [codex-args...]\n\n\
+         Launch Codex with cmux-managed subagent panes.\n\n\
+         This CMUX command starts a private Codex app-server, launches the root Codex TUI against it, \
+         watches live Codex thread-spawn subagents, opens subagents up to depth 2 as native splits, \
+         and forwards all remaining arguments to codex.\n\n\
+         Limux currently reports this command as not_supported until the Codex app-server watcher exists.",
     ),
     ("themes", "Usage: limux themes"),
     ("omo", "Usage: limux omo [opencode-args...]"),
@@ -11522,6 +11537,23 @@ mod cli_arg_tests {
             panic!("help should render text");
         };
         assert!(text.contains("Usage: limux feed tui"));
+    }
+
+    #[test]
+    fn cmux_codex_teams_help_is_local_and_execution_fails_explicitly() {
+        let help = run_local_command(&default_opts(args(&["codex-teams", "--help"])))
+            .expect("help probe")
+            .expect("help output");
+        let CommandOutput::Text(text) = help else {
+            panic!("help should render text");
+        };
+        assert!(text.contains("Usage: limux codex-teams [codex-args...]"));
+        assert!(text.contains("Codex app-server watcher"));
+
+        let opts = default_opts(args(&["codex-teams", "--model", "gpt-5.4"]));
+        let error = run_local_command(&opts).expect_err("codex-teams should fail locally");
+        assert!(error.to_string().contains("not_supported"));
+        assert!(error.to_string().contains("Codex app-server orchestration"));
     }
 
     #[test]

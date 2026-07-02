@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T09:33:00Z Implement and verify explicit CMUX `codex-teams` CLI surface handling, including local help text, loud `not_supported` execution failure for the missing Codex app-server watcher/subagent orchestration, focused CLI tests, direct smoke commands, clippy, and parity matrix updates. \
 [x] 2026-07-02T09:32:00Z Implement and verify CMUX-compatible Linux inline Feed notification actions for pending permission, exit-plan, and question rows, including freedesktop action mapping, shared Feed reply routing, focused Feed/notification tests, clippy, and parity matrix updates. \
 [x] 2026-07-02T09:31:18Z Implement and verify CMUX-compatible native Feed notifications for pending actionable permission, exit-plan, and question rows, including workspace/surface targeting, telemetry suppression, focused host tests, clippy, and parity matrix updates. \
 [x] 2026-07-02T09:09:12Z Implement and verify CMUX-compatible pid-anchored Codex transcript diagnostics for wrapper-started sessions, including `/proc/<pid>/fd` transcript discovery under the configured Codex home, native Codex session-id/path reporting, strict sessions-root JSONL validation, focused tests, SCPlus lint, and CLI clippy. \
