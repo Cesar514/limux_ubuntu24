@@ -4,8 +4,10 @@
 // returns/effects: Sends JSON responses, mutates live host state through ControlCommand, and exits loudly on invalid requests.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -94,6 +96,7 @@ const METHODS: &[&str] = &[
     "pane.swap",
     "pane.join",
     "pane.break",
+    "markdown.open",
     "browser.open_split",
     "browser.navigate",
     "browser.url.get",
@@ -479,6 +482,8 @@ pub struct CreatePaneRequest {
     pub focus: bool,
     pub initial_divider_position: Option<f64>,
     pub url: Option<String>,
+    pub markdown_path: Option<String>,
+    pub markdown_font_size: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1234,6 +1239,22 @@ fn optional_string(params: &Map<String, Value>, keys: &[&str]) -> Option<String>
     })
 }
 
+// purpose: Percent-encode a local path byte stream for a browser-safe `file://` URL.
+// inputs: Canonical filesystem path text.
+// returns/effects: Returns an ASCII URL path segment without touching the filesystem.
+fn file_url_from_path(path: &str) -> String {
+    let mut encoded = String::from("file://");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
 /// purpose: Parse CMUX report_ports parameters into validated TCP port numbers.
 /// inputs: JSON params containing `ports`, `port`, or `values` as numbers/strings.
 /// returns/effects: Returns non-empty port list or invalid_params for malformed values.
@@ -1749,6 +1770,21 @@ fn optional_f64(params: &Map<String, Value>, keys: &[&str]) -> Result<Option<f64
         };
     }
     Ok(None)
+}
+
+// purpose: Parse CMUX markdown viewer font-size bounds.
+// inputs: JSON params with optional `font_size` or `fontSize`.
+// returns/effects: Returns a two-decimal bounded value or invalid_params.
+fn optional_markdown_font_size(params: &Map<String, Value>) -> Result<Option<f64>, BridgeError> {
+    let Some(raw) = optional_f64(params, &["font_size", "fontSize"])? else {
+        return Ok(None);
+    };
+    if !(8.0..=96.0).contains(&raw) {
+        return Err(BridgeError::invalid_params(
+            "markdown.open font_size must be between 8 and 96",
+        ));
+    }
+    Ok(Some((raw * 100.0).round() / 100.0))
 }
 
 fn optional_handle(
@@ -2379,6 +2415,47 @@ fn parse_create_pane_request(
             &["initial_divider_position", "initialDividerPosition"],
         )?,
         url,
+        markdown_path: None,
+        markdown_font_size: None,
+    })
+}
+
+// purpose: Parse CMUX `markdown.open` into a browser-backed pane creation request.
+// inputs: JSON params containing path plus optional workspace/surface/window routing and viewer options.
+// returns/effects: Canonicalizes an existing file path or fails before dispatch.
+fn parse_markdown_open_request(
+    params: &Map<String, Value>,
+) -> Result<CreatePaneRequest, BridgeError> {
+    let path = optional_string(params, &["path"])
+        .ok_or_else(|| BridgeError::invalid_params("markdown.open requires path"))?;
+    let canonical = fs::canonicalize(Path::new(&path)).map_err(|error| {
+        BridgeError::invalid_params(format!("markdown.open path invalid: {error}"))
+    })?;
+    if !canonical.is_file() {
+        return Err(BridgeError::invalid_params(
+            "markdown.open path must be a file",
+        ));
+    }
+    let canonical_path = canonical.to_string_lossy().into_owned();
+    Ok(CreatePaneRequest {
+        target: parse_optional_workspace_target(params, true)?,
+        source_pane_id: optional_ref_handle(params, &["pane_id"], "pane:")?,
+        source_surface_id: optional_ref_handle(params, &["surface_id"], "surface:")?,
+        direction: parse_pane_create_direction(
+            optional_string(params, &["direction"])
+                .unwrap_or_else(|| "right".to_string())
+                .as_str(),
+        )?,
+        pane_type: PaneCreateType::Browser,
+        command: None,
+        initial_command: None,
+        working_directory: None,
+        startup_environment: BTreeMap::new(),
+        focus: optional_bool(params, "focus")?.unwrap_or(false),
+        initial_divider_position: None,
+        url: Some(file_url_from_path(&canonical_path)),
+        markdown_path: Some(canonical_path),
+        markdown_font_size: optional_markdown_font_size(params)?,
     })
 }
 
@@ -3370,6 +3447,14 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::CreatePane { request, reply }, rx)
         }
+        "markdown.open" => {
+            let request = match parse_markdown_open_request(params) {
+                Ok(request) => request,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::CreatePane { request, reply }, rx)
+        }
         "browser.navigate"
         | "browser.url.get"
         | "browser.back"
@@ -4210,6 +4295,8 @@ fn handle_method(
                             Err(error) => return error_response(id, error),
                         },
                         url: None,
+                        markdown_path: None,
+                        markdown_font_size: None,
                     },
                     reply,
                 },
@@ -7229,6 +7316,63 @@ mod tests {
             .result
             .expect("browser.open_split should return a result");
         assert_eq!(result["surface_ref"], "surface:9:browser");
+    }
+
+    // purpose: Verify CMUX markdown.open queues a browser-backed viewer pane.
+    // inputs: Real temporary markdown file and routing/viewer params.
+    // returns/effects: Asserts canonical path, encoded file URL, focus default, and font-size rounding.
+    #[test]
+    fn markdown_open_route_queues_browser_pane() {
+        let path = std::env::temp_dir().join(format!(
+            "limux-markdown-route-{}.md",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&path, "# Route\n").expect("write markdown fixture");
+        let escaped = path.to_string_lossy().replace('\\', "\\\\");
+        let request = format!(
+            r#"{{"id":1,"method":"markdown.open","params":{{"workspace_id":"codex","path":"{escaped}","font_size":12.345}}}}"#
+        );
+        let expected_path = fs::canonicalize(&path)
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        let expected_url = file_url_from_path(&expected_path);
+
+        let response = dispatch_request(&request, &|command| match command {
+            ControlCommand::CreatePane { request, reply } => {
+                assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
+                assert_eq!(request.pane_type, PaneCreateType::Browser);
+                assert_eq!(request.direction, PaneCreateDirection::Right);
+                assert!(!request.focus);
+                assert_eq!(request.url.as_deref(), Some(expected_url.as_str()));
+                assert_eq!(
+                    request.markdown_path.as_deref(),
+                    Some(expected_path.as_str())
+                );
+                assert_eq!(request.markdown_font_size, Some(12.35));
+                let _ = reply.send(Ok(json!({
+                    "pane_id": "9",
+                    "pane_ref": "pane:9",
+                    "surface_id": "9:browser",
+                    "surface_ref": "surface:9:browser",
+                    "path": expected_path,
+                    "url": expected_url,
+                    "markdown": true,
+                    "font_size": 12.35
+                })));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("markdown.open result")["markdown"],
+            true
+        );
+        fs::remove_file(path).expect("remove markdown fixture");
     }
 
     #[test]

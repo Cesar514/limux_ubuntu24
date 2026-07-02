@@ -344,6 +344,30 @@ fn pane_create_response_payload(
     })
 }
 
+// purpose: Add CMUX markdown.open metadata to the generic pane-create response.
+// inputs: Mutable pane-create payload plus canonical markdown path, file URL, and optional font size.
+// returns/effects: Mutates the response JSON object with viewer metadata.
+fn add_markdown_response_metadata(
+    payload: &mut serde_json::Value,
+    path: Option<String>,
+    url: Option<String>,
+    font_size: Option<f64>,
+) {
+    let object = payload
+        .as_object_mut()
+        .expect("pane_create_response_payload must return a JSON object");
+    if let Some(path) = path {
+        object.insert("path".to_string(), serde_json::Value::String(path));
+    }
+    if let Some(url) = url {
+        object.insert("url".to_string(), serde_json::Value::String(url));
+    }
+    if let Some(font_size) = font_size {
+        object.insert("font_size".to_string(), serde_json::json!(font_size));
+    }
+    object.insert("markdown".to_string(), serde_json::Value::Bool(true));
+}
+
 fn browser_action_response_payload(
     workspace_id: &str,
     workspace_name: &str,
@@ -15470,6 +15494,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            let markdown_path = request.markdown_path.clone();
+            let markdown_url = request.url.clone();
+            let markdown_font_size = request.markdown_font_size;
             let startup_requested = request.initial_command.is_some()
                 || request.working_directory.is_some()
                 || !request.startup_environment.is_empty();
@@ -15519,8 +15546,16 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             let surface_id = surface.surface_id.clone();
-            let response =
+            let mut response =
                 pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
+            if markdown_path.is_some() {
+                add_markdown_response_metadata(
+                    &mut response,
+                    markdown_path,
+                    markdown_url,
+                    markdown_font_size,
+                );
+            }
 
             if !startup_requested {
                 if let Some(command) = request.command {

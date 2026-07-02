@@ -13510,6 +13510,121 @@ fn build_new_pane_request(
     (workspace, Value::Object(params))
 }
 
+// purpose: Percent-encode a canonical local path for WebKit's `file://` viewer.
+// inputs: Absolute filesystem path text.
+// returns/effects: Returns an ASCII URL string without filesystem writes.
+fn file_url_from_path(path: &str) -> String {
+    let mut encoded = String::from("file://");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+// purpose: Parse CMUX markdown viewer font size from CLI flags.
+// inputs: Raw command args.
+// returns/effects: Returns a bounded two-decimal number or fails loudly.
+fn parse_markdown_font_size(args: &[String]) -> Result<Option<f64>> {
+    let Some(raw) = parse_opt(args, "--font-size") else {
+        return Ok(None);
+    };
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| anyhow!("--font-size must be a number"))?;
+    if !parsed.is_finite() || !(8.0..=96.0).contains(&parsed) {
+        bail!("--font-size must be between 8 and 96");
+    }
+    Ok(Some((parsed * 100.0).round() / 100.0))
+}
+
+// purpose: Build CMUX `markdown.open` params from CLI shorthand and long forms.
+// inputs: Args after `markdown`.
+// returns/effects: Canonicalizes the file path and rejects unknown/trailing args.
+fn build_markdown_open_params(args: &[String]) -> Result<Map<String, Value>> {
+    let mut positional = Vec::new();
+    let mut skip_next = false;
+    for (idx, arg) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--workspace" | "--surface" | "--window" | "--direction" | "--focus"
+            | "--font-size" => {
+                if idx + 1 >= args.len() {
+                    bail!("{arg} requires a value");
+                }
+                skip_next = true;
+            }
+            value if value.starts_with('-') => bail!("unknown markdown option: {value}"),
+            _ => positional.push(arg.clone()),
+        }
+    }
+
+    if positional.first().map(String::as_str) == Some("open") {
+        positional.remove(0);
+    }
+    if positional.len() != 1 {
+        bail!("markdown open requires exactly one path");
+    }
+
+    let canonical = fs::canonicalize(Path::new(&positional[0]))
+        .with_context(|| format!("markdown path invalid: {}", positional[0]))?;
+    if !canonical.is_file() {
+        bail!("markdown path must be a file: {}", canonical.display());
+    }
+
+    let path = canonical.to_string_lossy().into_owned();
+    let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
+    if !matches!(direction.as_str(), "left" | "right" | "up" | "down") {
+        bail!("--direction must be one of left, right, up, or down");
+    }
+    let mut params = Map::new();
+    params.insert("path".to_string(), Value::String(path.clone()));
+    params.insert("url".to_string(), Value::String(file_url_from_path(&path)));
+    params.insert("direction".to_string(), Value::String(direction));
+    params.insert(
+        "focus".to_string(),
+        Value::Bool(parse_optional_bool_arg(args, "--focus")?.unwrap_or(false)),
+    );
+    insert_optional_string(&mut params, "workspace_id", parse_opt(args, "--workspace"));
+    insert_optional_string(&mut params, "surface_id", parse_opt(args, "--surface"));
+    insert_optional_string(&mut params, "window_id", parse_opt(args, "--window"));
+    if let Some(font_size) = parse_markdown_font_size(args)? {
+        let number = serde_json::Number::from_f64(font_size)
+            .ok_or_else(|| anyhow!("--font-size must be a finite number"))?;
+        params.insert("font_size".to_string(), Value::Number(number));
+    }
+    Ok(params)
+}
+
+// purpose: Run CMUX `markdown open` against the live host.
+// inputs: CLI args after `markdown` plus output preference.
+// returns/effects: Sends `markdown.open` and formats CMUX-compatible status text.
+async fn run_markdown(
+    client: &mut Client,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let params = build_markdown_open_params(args)?;
+    let requested_path = get_string(&Value::Object(params.clone()), &["path"]).unwrap_or_default();
+    let payload = client.call("markdown.open", Value::Object(params)).await?;
+    if json_output {
+        return Ok(CommandOutput::Json(payload));
+    }
+    let surface = get_string(&payload, &["surface_id", "surface_ref"]).unwrap_or_default();
+    let pane = get_string(&payload, &["pane_id", "pane_ref"]).unwrap_or_default();
+    let path = get_string(&payload, &["path"]).unwrap_or(requested_path);
+    Ok(CommandOutput::Text(format!(
+        "OK surface={surface} pane={pane} path={path}"
+    )))
+}
+
 async fn run_new_pane(client: &mut Client, args: &[String]) -> Result<Value> {
     // `pane.create` contract shared with the core dispatcher and live GTK host:
     // direction/type are validated by the server, and responses keep
@@ -17205,6 +17320,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             return run_codex_teams(client, args, client.password.clone()).await;
         }
         "__codex-teams-watch" => return run_codex_teams_watcher(client, args).await,
+        "markdown" => return run_markdown(client, args, opts.json_output).await,
         "capabilities" | "current-workspace" | "select-workspace" | "select-window" | "selectw" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
                 bail!("unsupported workspace alias: {}", command);
@@ -21111,6 +21227,68 @@ mod cli_arg_tests {
             .expect("selectw maps");
         assert_eq!(selected.0, "workspace.select");
         assert_eq!(selected.1["workspace_id"], "workspace:9");
+    }
+
+    // purpose: Verify CMUX markdown open forms build strict live-host params.
+    // inputs: Real temporary markdown file plus routing and viewer flags.
+    // returns/effects: Asserts canonical path, defaults, font-size rounding, and shorthand support.
+    #[test]
+    fn cmux_markdown_open_builds_params() {
+        let path = env::temp_dir().join(format!(
+            "limux-markdown-open-{}.md",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&path, "# Limux\n").expect("write markdown fixture");
+        let path_text = path.to_string_lossy().into_owned();
+
+        let params = build_markdown_open_params(&args(&[
+            "open",
+            &path_text,
+            "--workspace",
+            "workspace:7",
+            "--surface",
+            "surface:4:tab",
+            "--direction",
+            "down",
+            "--focus",
+            "true",
+            "--font-size",
+            "13.456",
+        ]))
+        .expect("markdown open parses");
+
+        assert_eq!(params["workspace_id"], "workspace:7");
+        assert_eq!(params["surface_id"], "surface:4:tab");
+        assert_eq!(params["direction"], "down");
+        assert_eq!(params["focus"], true);
+        assert_eq!(params["font_size"], 13.46);
+        assert!(params["url"].as_str().expect("url").starts_with("file://"));
+        let canonical_path = fs::canonicalize(&path)
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(params["path"], canonical_path);
+
+        let shorthand = build_markdown_open_params(&args(&[&path_text])).expect("shorthand");
+        assert_eq!(shorthand["direction"], "right");
+        assert_eq!(shorthand["focus"], false);
+        fs::remove_file(path).expect("remove markdown fixture");
+    }
+
+    // purpose: Verify invalid CMUX markdown CLI forms fail before socket calls.
+    // inputs: Missing path, unknown option, bad direction, and out-of-range font size.
+    // returns/effects: Asserts parser errors are returned.
+    #[test]
+    fn cmux_markdown_open_rejects_invalid_args() {
+        assert!(build_markdown_open_params(&args(&["open"])).is_err());
+        assert!(build_markdown_open_params(&args(&["open", "missing.md", "--bogus"])).is_err());
+        assert!(
+            build_markdown_open_params(&args(&["missing.md", "--direction", "diagonal"])).is_err()
+        );
+        assert!(build_markdown_open_params(&args(&["missing.md", "--font-size", "7"])).is_err());
     }
 
     #[test]
