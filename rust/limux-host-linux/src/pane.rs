@@ -208,6 +208,7 @@ type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
 /// pane is not yet attached to a workspace. Used to stamp `LIMUX_WORKSPACE_ID`
 /// onto every terminal spawned inside the pane.
 type PaneWorkspaceLookupCallback = dyn Fn(&gtk::Widget) -> Option<String>;
+type PaneWorkspaceEnvironmentCallback = dyn Fn(&gtk::Widget) -> Vec<(String, String)>;
 
 pub struct PaneCallbacks {
     pub on_split: Box<PaneSplitCallback>,
@@ -227,6 +228,8 @@ pub struct PaneCallbacks {
     /// Resolve the workspace id for a given pane widget. May be `None` while
     /// the pane is still being constructed; callers treat that as "unknown".
     pub workspace_for_pane: Box<PaneWorkspaceLookupCallback>,
+    /// Resolve user-defined workspace environment for terminals in this pane.
+    pub workspace_environment_for_pane: Box<PaneWorkspaceEnvironmentCallback>,
 }
 
 #[derive(Clone)]
@@ -1319,7 +1322,7 @@ fn add_terminal_tab_inner(
     let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
     let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
     let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
-    let mut extra_env: Vec<(String, String)> = Vec::new();
+    let mut extra_env = (internals.callbacks.workspace_environment_for_pane)(&pane_widget);
     if let Some(ws) = workspace_id_for_env {
         extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws.clone()));
         extra_env.push(("CMUX_WORKSPACE_ID".to_string(), ws));

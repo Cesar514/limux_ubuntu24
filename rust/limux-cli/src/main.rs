@@ -275,7 +275,8 @@ fn full_help_text() -> &'static str {
         "  surface-health [--workspace <id|ref>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
-        "  new-workspace [--cwd <path>] [--command <text>]\n",
+        "  new-workspace [--cwd <path>] [--command <text>] [--env KEY=VALUE] [--env-file <path>]\n",
+        "  workspace env [<workspace>] [--workspace <id|ref|name>] [--mask]\n",
         "  select-workspace --workspace <id|ref>\n",
         "  close-workspace --workspace <id|ref>\n",
         "  sidebar-state --workspace <id|ref>\n",
@@ -937,6 +938,72 @@ fn parse_opts(args: &[String], name: &str) -> Vec<String> {
 
 fn parse_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+// purpose: Validate CMUX workspace environment variable names.
+// inputs: Raw key from --env or --env-file.
+// returns/effects: Rejects malformed and managed CMUX/LIMUX keys.
+fn validate_workspace_env_key(key: &str) -> Result<()> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        bail!("workspace env keys must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("invalid workspace env key `{key}`");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        bail!("invalid workspace env key `{key}`");
+    }
+    if key.starts_with("CMUX_") || key.starts_with("LIMUX_") {
+        bail!("workspace env cannot override managed key `{key}`");
+    }
+    Ok(())
+}
+
+// purpose: Parse one KEY=VALUE workspace environment assignment.
+// inputs: Raw assignment from CLI or env-file.
+// returns/effects: Returns validated key/value or an explicit error.
+fn parse_workspace_env_assignment(raw: &str) -> Result<(String, String)> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow!("workspace env assignment must be KEY=VALUE"))?;
+    validate_workspace_env_key(key)?;
+    Ok((key.to_string(), value.to_string()))
+}
+
+// purpose: Read CMUX-compatible KEY=VALUE workspace env-file entries.
+// inputs: Env-file path.
+// returns/effects: Ignores blank/comment lines and returns validated assignments.
+fn read_workspace_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file {}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let (key, value) = parse_workspace_env_assignment(line)
+            .with_context(|| format!("invalid env file line {}", index + 1))?;
+        values.insert(key, value);
+    }
+    Ok(values)
+}
+
+// purpose: Collect workspace env-file and --env values using CMUX precedence.
+// inputs: CLI args where --env-file may repeat and --env overrides file keys.
+// returns/effects: Returns sorted workspace_env map for RPC params.
+fn parse_workspace_env_args(args: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for path in parse_opts(args, "--env-file") {
+        values.extend(read_workspace_env_file(Path::new(&path))?);
+    }
+    for raw in parse_opts(args, "--env") {
+        let (key, value) = parse_workspace_env_assignment(&raw)?;
+        values.insert(key, value);
+    }
+    Ok(values)
 }
 
 fn positional_arg(args: &[String], index: usize) -> Option<String> {
@@ -3759,6 +3826,7 @@ export default limuxSessionRestore;
 async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     let cwd = parse_opt(args, "--cwd");
     let command = parse_opt(args, "--command");
+    let environment = parse_workspace_env_args(args)?;
     let original = resolve_current_workspace(client).await?;
 
     let mut params = Map::new();
@@ -3767,6 +3835,13 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
     }
     if let Some(command) = command.clone() {
         params.insert("command".to_string(), Value::String(command));
+    }
+    if !environment.is_empty() {
+        let environment = environment
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect::<Map<_, _>>();
+        params.insert("workspace_env".to_string(), Value::Object(environment));
     }
 
     let created = client
@@ -4643,6 +4718,47 @@ fn build_workspace_alias_request(
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
     Ok(Some((method, Value::Object(params))))
+}
+
+// purpose: Build CMUX workspace namespace requests.
+// inputs: Arguments after `limux workspace`.
+// returns/effects: Supports workspace env and workspace create parity routes.
+fn build_workspace_namespace_request(args: &[String]) -> Result<Option<(&'static str, Value)>> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match subcommand {
+        "env" => {
+            let rest = &args[1..];
+            let mut params = Map::new();
+            let workspace = parse_opt(rest, "--workspace").or_else(|| first_positional(rest));
+            if let Some(workspace) = workspace {
+                params.insert("workspace_id".to_string(), Value::String(workspace));
+            }
+            if parse_flag(rest, "--mask") {
+                params.insert("mask".to_string(), Value::Bool(true));
+            }
+            Ok(Some(("workspace.env", Value::Object(params))))
+        }
+        _ => Ok(None),
+    }
+}
+
+// purpose: Render workspace env output in a shell-friendly CMUX-compatible form.
+// inputs: workspace.env response payload.
+// returns/effects: Returns KEY=VALUE lines sorted by key.
+fn render_workspace_env_text(payload: &Value) -> String {
+    let Some(environment) = payload.get("environment").and_then(Value::as_object) else {
+        return default_text_output(payload);
+    };
+    if environment.is_empty() {
+        return String::new();
+    }
+    environment
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// purpose: Build a CMUX-compatible pane surface-list request.
@@ -5942,6 +6058,28 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_workspace_group_text(group_args, &payload))
             }
         }
+        "workspace" => {
+            if args.first().map(String::as_str) == Some("create") {
+                let payload = run_new_workspace(client, &args[1..]).await?;
+                if opts.json_output {
+                    CommandOutput::Json(payload)
+                } else {
+                    let handle = handle_from_payload(&payload, "workspace_id", "workspace_ref");
+                    CommandOutput::Text(format!("OK {}", handle))
+                }
+            } else if let Some((method, params)) = build_workspace_namespace_request(args)? {
+                let payload = client.call(method, params).await?;
+                if opts.json_output {
+                    CommandOutput::Json(payload)
+                } else if method == "workspace.env" {
+                    CommandOutput::Text(render_workspace_env_text(&payload))
+                } else {
+                    CommandOutput::Text(default_text_output(&payload))
+                }
+            } else {
+                bail!("unsupported workspace command");
+            }
+        }
         "memory" => {
             let payload = run_memory(client, args).await?;
             if opts.json_output {
@@ -6488,6 +6626,47 @@ mod cli_arg_tests {
         let err = render_config_font_size_set(&path, SIDEBAR_FONT_SIZE, "large")
             .expect_err("invalid value");
         assert!(err.to_string().contains("requires a numeric point size"));
+    }
+
+    #[test]
+    fn workspace_env_args_read_files_and_cli_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspace.env");
+        fs::write(&path, "FOO=file\n# ignored\nexport BAR=baz\n").expect("write env file");
+
+        let values = parse_workspace_env_args(&args(&[
+            "--env-file",
+            path.to_str().expect("utf8 path"),
+            "--env",
+            "FOO=cli",
+        ]))
+        .expect("parse env args");
+
+        assert_eq!(values.get("FOO").map(String::as_str), Some("cli"));
+        assert_eq!(values.get("BAR").map(String::as_str), Some("baz"));
+    }
+
+    #[test]
+    fn workspace_env_rejects_managed_keys() {
+        let err = parse_workspace_env_args(&args(&["--env", "CMUX_SOCKET=/tmp/socket"]))
+            .expect_err("managed key rejected");
+        assert!(err.to_string().contains("cannot override managed key"));
+    }
+
+    #[test]
+    fn workspace_env_namespace_request_targets_workspace_and_mask() {
+        let (method, params) = build_workspace_namespace_request(&args(&[
+            "env",
+            "--workspace",
+            "workspace:abc",
+            "--mask",
+        ]))
+        .expect("workspace env request")
+        .expect("request");
+
+        assert_eq!(method, "workspace.env");
+        assert_eq!(params["workspace_id"], "workspace:abc");
+        assert_eq!(params["mask"], true);
     }
 
     #[test]

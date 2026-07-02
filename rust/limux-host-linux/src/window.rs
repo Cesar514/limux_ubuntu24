@@ -4,7 +4,7 @@
 // returns/effects: Presents the main window and persists workspace/session changes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +68,8 @@ struct Workspace {
     last_pane_id: Option<u32>,
     /// CMUX-compatible workspace-group id when this workspace belongs to a group.
     group_id: Option<String>,
+    /// User-defined workspace environment inherited by new terminal surfaces.
+    environment: BTreeMap<String, String>,
     /// Last known working directory from the terminal (via OSC 7).
     cwd: Rc<RefCell<Option<String>>>,
     /// The folder path this workspace was opened with.
@@ -1171,6 +1173,33 @@ fn workspace_row(index: usize, selected_idx: usize, workspace: &Workspace) -> se
     })
 }
 
+// purpose: Render CMUX-compatible workspace environment for one workspace.
+// inputs: Current app state, workspace selector, and masking preference.
+// returns/effects: Returns environment JSON without mutating state.
+fn workspace_env_payload(
+    state: &AppState,
+    target: &WorkspaceTarget,
+    mask: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    let Some(index) = workspace_index_for_target(state, target) else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    let workspace = &state.workspaces[index];
+    let environment = workspace
+        .environment
+        .iter()
+        .map(|(key, value)| {
+            let value = if mask { "********" } else { value };
+            (key.clone(), serde_json::Value::String(value.to_string()))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok(serde_json::json!({
+        "workspace_id": workspace.id.as_str(),
+        "workspace_ref": workspace_ref(&workspace.id),
+        "environment": environment,
+    }))
+}
+
 // purpose: Render one CMUX-compatible workspace-group row for control clients.
 // inputs: A persisted workspace group.
 // returns/effects: Returns JSON only; does not mutate GTK state.
@@ -2085,6 +2114,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 cwd,
                 folder_path,
                 group_id: workspace.group_id.clone(),
+                environment: workspace.environment.clone(),
                 layout,
             }
         })
@@ -4547,6 +4577,7 @@ fn create_workspace_for_tab_payload(
             favorite: false,
             last_pane_id: None,
             group_id: None,
+            environment: BTreeMap::new(),
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             path_label,
@@ -4999,6 +5030,7 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
         group_id: None,
+        environment: BTreeMap::new(),
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
     add_workspace_from_state(state, &workspace);
@@ -5048,6 +5080,7 @@ fn add_group_anchor_workspace(
         cwd: cwd.map(ToOwned::to_owned),
         folder_path: cwd.map(ToOwned::to_owned),
         group_id: Some(group_id.to_string()),
+        environment: BTreeMap::new(),
         layout: LayoutNodeState::Pane(PaneState::fallback(cwd)),
     };
     add_workspace_from_state_internal(state, &workspace, activate);
@@ -5515,6 +5548,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .collect::<Vec<_>>()
             };
             let _ = reply.send(Ok(serde_json::json!({ "workspaces": workspaces })));
+        }
+        ControlCommand::WorkspaceEnv {
+            target,
+            mask,
+            reply,
+        } => {
+            let result = {
+                let app_state = state.borrow();
+                workspace_env_payload(&app_state, &target, mask)
+            };
+            let _ = reply.send(result);
         }
         ControlCommand::ListWorkspaceGroups { reply } => {
             let groups = {
@@ -7277,6 +7321,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             name,
             cwd,
             command,
+            environment,
             reply,
         } => {
             let home = dirs::home_dir()
@@ -7291,7 +7336,18 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .unwrap_or_else(|| "workspace".to_string())
             });
 
-            create_workspace_with_folder(state, &title, folder_path);
+            let workspace = WorkspaceState {
+                id: None,
+                name: title,
+                favorite: false,
+                cwd: Some(folder_path.to_string()),
+                folder_path: Some(folder_path.to_string()),
+                group_id: None,
+                environment,
+                layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
+            };
+            add_workspace_from_state(state, &workspace);
+            request_session_save(state);
 
             let result = {
                 let app_state = state.borrow();
@@ -7352,6 +7408,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     cwd: Some(folder_path.to_string()),
                     folder_path: Some(folder_path.to_string()),
                     group_id: None,
+                    environment: BTreeMap::new(),
                     layout: mixed_workspace_layout(
                         panes_per_workspace,
                         terminals_per_workspace,
@@ -7844,6 +7901,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         favorite: workspace.favorite,
         last_pane_id: None,
         group_id: workspace.group_id.clone(),
+        environment: workspace.environment.clone(),
         cwd,
         folder_path: workspace.folder_path.clone(),
         path_label,
@@ -7893,8 +7951,10 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_split_with_tab = state.clone();
     let state_for_config = state.clone();
     let state_for_config_changed = state.clone();
+    let state_for_workspace_env = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
     let ws_id_for_env = ws_id.to_string();
+    let ws_id_for_workspace_env = ws_id.to_string();
 
     let callbacks = Rc::new(PaneCallbacks {
         on_split: Box::new(move |pane_widget, orientation| {
@@ -8036,6 +8096,21 @@ pub(crate) fn create_pane_for_workspace(
             },
         ),
         workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
+        workspace_environment_for_pane: Box::new(move |_pane_widget| {
+            state_for_workspace_env
+                .borrow()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == ws_id_for_workspace_env)
+                .map(|workspace| {
+                    workspace
+                        .environment
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }),
     });
 
     pane::create_pane(

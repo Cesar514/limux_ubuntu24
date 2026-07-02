@@ -3,6 +3,7 @@
 // inputs: Unix socket frames, v1/v2 protocol requests, peer credentials, and GTK command dispatch callbacks.
 // returns/effects: Sends JSON responses, mutates live host state through ControlCommand, and exits loudly on invalid requests.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +32,7 @@ const METHODS: &[&str] = &[
     "feed.exit_plan.reply",
     "workspace.current",
     "workspace.list",
+    "workspace.env",
     "workspace.create",
     "workspace.create_many",
     "workspace.select",
@@ -636,6 +638,12 @@ pub enum ControlCommand {
         name: Option<String>,
         cwd: Option<String>,
         command: Option<String>,
+        environment: BTreeMap<String, String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    WorkspaceEnv {
+        target: WorkspaceTarget,
+        mask: bool,
         reply: mpsc::Sender<BridgeResult>,
     },
     CreateWorkspaces {
@@ -749,6 +757,7 @@ impl ControlCommand {
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
+            | Self::WorkspaceEnv { reply, .. }
             | Self::CreateWorkspaces { reply, .. }
             | Self::SelectWorkspace { reply, .. }
             | Self::NavigateWorkspace { reply, .. }
@@ -1328,6 +1337,63 @@ fn required_group_id(params: &Map<String, Value>, method: &str) -> Result<String
     })
 }
 
+// purpose: Validate user-defined workspace environment variable names.
+// inputs: Candidate environment key from CLI or RPC.
+// returns/effects: Rejects empty, malformed, and managed CMUX/LIMUX keys.
+fn validate_workspace_env_key(key: &str) -> Result<(), BridgeError> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(BridgeError::invalid_params(
+            "workspace_env keys must not be empty",
+        ));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(BridgeError::invalid_params(format!(
+            "invalid workspace_env key `{key}`"
+        )));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(BridgeError::invalid_params(format!(
+            "invalid workspace_env key `{key}`"
+        )));
+    }
+    if key.starts_with("CMUX_") || key.starts_with("LIMUX_") {
+        return Err(BridgeError::invalid_params(format!(
+            "workspace_env cannot override managed key `{key}`"
+        )));
+    }
+    Ok(())
+}
+
+// purpose: Parse CMUX workspace.create environment object.
+// inputs: Request params that may contain workspace_env, workspaceEnv, or env.
+// returns/effects: Returns sorted key/value pairs or a loud validation error.
+fn parse_workspace_environment(
+    params: &Map<String, Value>,
+) -> Result<BTreeMap<String, String>, BridgeError> {
+    let Some(value) = params
+        .get("workspace_env")
+        .or_else(|| params.get("workspaceEnv"))
+        .or_else(|| params.get("env"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| BridgeError::invalid_params("workspace_env must be an object"))?;
+    let mut environment = BTreeMap::new();
+    for (key, value) in object {
+        validate_workspace_env_key(key)?;
+        let Some(value) = value.as_str() else {
+            return Err(BridgeError::invalid_params(format!(
+                "workspace_env value for `{key}` must be a string"
+            )));
+        };
+        environment.insert(key.clone(), value.to_string());
+    }
+    Ok(environment)
+}
+
 fn required_workspace_id(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
     optional_handle(params, &["workspace_id", "workspace"])?.ok_or_else(|| {
         BridgeError::invalid_params(format!("{method} requires workspace_id or --workspace"))
@@ -1530,6 +1596,25 @@ fn handle_method(
         "workspace.list" | "list-workspaces" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWorkspaces { reply }, rx)
+        }
+        "workspace.env" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let mask = match optional_bool(params, "mask") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::WorkspaceEnv {
+                    target,
+                    mask,
+                    reply,
+                },
+                rx,
+            )
         }
         "workspace.group.list" | "list-workspace-groups" => {
             let (reply, rx) = mpsc::channel();
@@ -2741,12 +2826,17 @@ fn handle_method(
             )
         }
         "workspace.create" | "new-workspace" => {
+            let environment = match parse_workspace_environment(params) {
+                Ok(environment) => environment,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreateWorkspace {
                     name: optional_string(params, &["name", "title"]),
                     cwd: optional_string(params, &["cwd"]),
                     command: optional_string(params, &["command"]),
+                    environment,
                     reply,
                 },
                 rx,
@@ -3592,6 +3682,49 @@ mod tests {
         let error = parse_required_workspace_target(&params, true, "workspace.select")
             .expect_err("workspace.select should require a target");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
+    }
+
+    #[test]
+    fn workspace_env_and_create_routes_validate_environment() {
+        let created = dispatch_request(
+            r#"{"id":1,"method":"workspace.create","params":{"workspace_env":{"FOO":"bar"}}}"#,
+            &|command| match command {
+                ControlCommand::CreateWorkspace {
+                    environment, reply, ..
+                } => {
+                    assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
+                    let _ = reply.send(Ok(json!({ "workspace_id": "workspace-a" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(created.error, None);
+
+        let env = dispatch_request(
+            r#"{"id":2,"method":"workspace.env","params":{"workspace_id":"workspace-a","mask":true}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceEnv {
+                    target,
+                    mask,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("workspace-a".to_string()));
+                    assert!(mask);
+                    let _ = reply.send(Ok(json!({ "environment": { "FOO": "********" } })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(env.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":3,"method":"workspace.create","params":{"workspace_env":{"CMUX_SOCKET":"/tmp/socket"}}}"#,
+            &|command| panic!("invalid workspace.create should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]

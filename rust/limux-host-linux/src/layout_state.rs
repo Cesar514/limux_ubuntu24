@@ -69,6 +69,8 @@ pub struct WorkspaceState {
     pub folder_path: Option<String>,
     #[serde(default)]
     pub group_id: Option<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
     pub layout: LayoutNodeState,
 }
 
@@ -566,6 +568,7 @@ impl AppSessionState {
                     cwd: workspace.cwd,
                     folder_path: workspace.folder_path,
                     group_id: None,
+                    environment: BTreeMap::new(),
                     // Legacy files only knew "workspace exists"; rehydrate a fresh terminal at the
                     // last known directory instead of pretending process state can be restored.
                     layout: LayoutNodeState::Pane(PaneState {
@@ -1110,6 +1113,7 @@ mod tests {
                 cwd: Some("/canonical".to_string()),
                 folder_path: Some("/canonical".to_string()),
                 group_id: None,
+                environment: BTreeMap::new(),
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/canonical"))),
             }],
             ..AppSessionState::default()
@@ -1239,6 +1243,7 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 folder_path: Some("/tmp".to_string()),
                 group_id: None,
+                environment: BTreeMap::new(),
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some("/tmp"))),
             }],
             ..AppSessionState::default()
@@ -1759,6 +1764,7 @@ mod tests {
                 cwd: None,
                 folder_path: None,
                 group_id: None,
+                environment: BTreeMap::new(),
                 layout: LayoutNodeState::Pane(PaneState {
                     pane_id: None,
                     active_tab_id: Some("keybinds-1".to_string()),
@@ -1803,6 +1809,7 @@ mod tests {
                 cwd: None,
                 folder_path: None,
                 group_id: Some("group-1".to_string()),
+                environment: BTreeMap::new(),
                 layout: LayoutNodeState::Pane(PaneState::fallback(None)),
             }],
             ..AppSessionState::default()
@@ -1851,6 +1858,7 @@ mod tests {
                 cwd: None,
                 folder_path: None,
                 group_id: Some("missing-group".to_string()),
+                environment: BTreeMap::new(),
                 layout: LayoutNodeState::Pane(PaneState::fallback(None)),
             }],
             ..AppSessionState::default()
