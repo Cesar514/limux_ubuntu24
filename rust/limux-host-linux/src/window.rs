@@ -5687,6 +5687,96 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(Ok(payload));
         }
+        ControlCommand::JoinPane {
+            target,
+            source_pane_id,
+            source_surface_id,
+            target_pane_id,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+            let target_pane_id =
+                parse_pane_handle(&target_pane_id).or_else(|| target_pane_id.parse::<u32>().ok());
+            let Some(target_pane_id) = target_pane_id else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.join requires a valid target_pane_id",
+                )));
+                return;
+            };
+            let source_pane_raw = source_pane_id.clone();
+            let source_pane_id = source_pane_id
+                .as_deref()
+                .and_then(parse_pane_handle)
+                .or_else(|| {
+                    source_pane_id
+                        .as_deref()
+                        .and_then(|raw| raw.parse::<u32>().ok())
+                });
+            if source_pane_raw.is_some() && source_pane_id.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.join requires a valid pane_id",
+                )));
+                return;
+            }
+            if source_pane_id.is_none() && source_surface_id.is_none() {
+                let app_state = state.borrow();
+                if app_state.active_idx != index {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                        "pane.join requires source pane or surface for inactive workspaces",
+                    )));
+                    return;
+                }
+            }
+
+            let moved = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let (_, focused_surface_id) = focused_ids_for_workspace(state, &workspace.id);
+                let source_surface = if let Some(surface_id) = source_surface_id.as_deref() {
+                    Some(surface_id.to_string())
+                } else if let Some(source_pane_id) = source_pane_id {
+                    pane::pane_widget_for_root(&workspace.root, source_pane_id)
+                        .and_then(|pane_widget| pane::active_surface_summary(&pane_widget))
+                        .map(|surface| surface.surface_id)
+                } else {
+                    focused_surface_id
+                };
+                let Some(source_surface) = source_surface else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "surface not found",
+                    )));
+                    return;
+                };
+                let moved = pane::move_surface_for_root(
+                    &workspace.root,
+                    &source_surface,
+                    target_pane_id,
+                    None,
+                );
+                moved.map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(payload) = moved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane or surface not found",
+                )));
+                return;
+            };
+            request_session_save(state);
+            let _ = reply.send(Ok(payload));
+        }
         ControlCommand::BrowserTabAction {
             target,
             surface_hint,

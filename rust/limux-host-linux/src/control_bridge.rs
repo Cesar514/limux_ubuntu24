@@ -63,6 +63,7 @@ const METHODS: &[&str] = &[
     "pane.focus",
     "pane.last",
     "pane.resize",
+    "pane.join",
     "browser.open_split",
     "browser.navigate",
     "browser.url.get",
@@ -525,6 +526,13 @@ pub enum ControlCommand {
         amount: u64,
         reply: mpsc::Sender<BridgeResult>,
     },
+    JoinPane {
+        target: WorkspaceTarget,
+        source_pane_id: Option<String>,
+        source_surface_id: Option<String>,
+        target_pane_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     BrowserAction {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -701,6 +709,7 @@ impl ControlCommand {
             | Self::FocusPane { reply, .. }
             | Self::LastPane { reply, .. }
             | Self::ResizePane { reply, .. }
+            | Self::JoinPane { reply, .. }
             | Self::BrowserAction { reply, .. }
             | Self::BrowserTabAction { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -2209,6 +2218,47 @@ fn handle_method(
                     pane_id,
                     direction,
                     amount,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "pane.join" | "join-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let target_pane_id =
+                match optional_ref_handle(params, &["target_pane_id", "target_pane"], "pane:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params("pane.join requires target_pane_id"),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let source_pane_id =
+                match optional_ref_handle(params, &["source_pane_id", "pane_id", "id"], "pane:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let source_surface_id = match optional_ref_handle(
+                params,
+                &["source_surface_id", "surface_id", "panel_id"],
+                "surface:",
+            ) {
+                Ok(value) => value,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::JoinPane {
+                    target,
+                    source_pane_id,
+                    source_surface_id,
+                    target_pane_id,
                     reply,
                 },
                 rx,
@@ -4615,6 +4665,50 @@ mod tests {
         );
         assert_eq!(
             invalid_direction.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn pane_join_route_accepts_cmux_alias_and_refs() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"join-pane","params":{"workspace_id":"codex","#,
+                r#""pane_id":"pane:11","target_pane_id":"pane:12","surface_id":"surface:11:tab"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::JoinPane {
+                    target,
+                    source_pane_id,
+                    source_surface_id,
+                    target_pane_id,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(source_pane_id, Some("11".to_string()));
+                    assert_eq!(source_surface_id, Some("11:tab".to_string()));
+                    assert_eq!(target_pane_id, "12");
+                    let _ = reply.send(Ok(json!({ "pane_ref": "pane:12" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.join result")["pane_ref"],
+            "pane:12"
+        );
+    }
+
+    #[test]
+    fn pane_join_route_rejects_missing_target() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"pane.join","params":{"pane_id":"pane:11"}}"#,
+            &|command| panic!("invalid pane.join should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }
