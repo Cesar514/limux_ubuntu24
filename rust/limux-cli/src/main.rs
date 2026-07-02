@@ -397,6 +397,7 @@ fn full_help_text() -> &'static str {
         "  themes [list|set|clear]\n",
         "  sessions list [--agent <name>] [--state-dir <path>] [--json]\n",
         "  new-window | current-window | list-windows | focus-window | close-window\n",
+        "  split-window | splitw | select-layout\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
         "  move-surface | split-off | drag-surface-to-split | reorder-surface\n",
         "  refresh-surfaces\n",
@@ -1627,6 +1628,18 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("select-workspace", "Usage: limux select-workspace"),
     ("rename-workspace", "Usage: limux rename-workspace"),
     ("rename-window", "Usage: limux rename-workspace"),
+    (
+        "split-window",
+        "Usage: limux split-window [-h|-v] [-b] [-d] [-c <cwd>] [-t <surface>] [command...]",
+    ),
+    (
+        "splitw",
+        "Usage: limux split-window [-h|-v] [-b] [-d] [-c <cwd>] [-t <surface>] [command...]",
+    ),
+    (
+        "select-layout",
+        "Usage: limux select-layout [-t <workspace>] <layout>",
+    ),
     (
         "select-window",
         "Usage: limux select-workspace -t <id|ref|index>",
@@ -10302,6 +10315,7 @@ fn canonical_tmux_command(command: &str) -> &str {
         "renamew" => "rename-window",
         "selectp" => "select-pane",
         "selectw" => "select-window",
+        "splitw" => "split-window",
         "setb" => "set-buffer",
         "pasteb" => "paste-buffer",
         "showb" => "show-buffer",
@@ -10337,6 +10351,167 @@ fn tmux_buffer_name_arg(args: &[String]) -> String {
 // returns/effects: Returns the requested format string.
 fn tmux_list_format_arg(args: &[String]) -> Option<String> {
     parse_opt(args, "-F").or_else(|| parse_opt(args, "--format"))
+}
+
+// purpose: Collect command positionals after tmux-style value and boolean flags.
+// inputs: Raw tmux args plus recognized value and boolean flag names.
+// returns/effects: Returns non-flag command tokens without option values.
+fn tmux_positionals_after_flags(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    let mut after_terminator = false;
+    for arg in args {
+        if after_terminator {
+            out.push(arg.clone());
+            continue;
+        }
+        if skip {
+            skip = false;
+            continue;
+        }
+        if arg == "--" {
+            after_terminator = true;
+            continue;
+        }
+        if value_flags.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        if bool_flags.contains(&arg.as_str()) || arg.starts_with('-') {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+// purpose: Detect single-letter tmux boolean flags, including clustered forms like -hb.
+// inputs: Raw args and a short flag such as -h.
+// returns/effects: Returns true when the flag is present as a standalone or clustered flag.
+fn tmux_has_short_flag(args: &[String], flag: &str) -> bool {
+    let Some(short) = flag
+        .strip_prefix('-')
+        .and_then(|value| value.chars().next())
+    else {
+        return false;
+    };
+    args.iter().any(|arg| {
+        arg == flag || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains(short))
+    })
+}
+
+// purpose: Resolve tmux split-window direction from horizontal, before, and default flags.
+// inputs: Raw split-window args with optional -h and -b clustered or standalone flags.
+// returns/effects: Returns a Limux split direction string.
+fn tmux_split_direction(args: &[String]) -> &'static str {
+    match (
+        tmux_has_short_flag(args, "-h"),
+        tmux_has_short_flag(args, "-b"),
+    ) {
+        (true, true) => "left",
+        (true, false) => "right",
+        (false, true) => "up",
+        (false, false) => "down",
+    }
+}
+
+// purpose: Insert optional split-window workspace and surface targets into params.
+// inputs: Mutable params and raw split-window args.
+// returns/effects: Adds non-empty workspace_id and surface_id when present.
+fn insert_tmux_split_targets(params: &mut Map<String, Value>, args: &[String]) {
+    if let Some(workspace) =
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        if !workspace.trim().is_empty() {
+            params.insert("workspace_id".to_string(), Value::String(workspace));
+        }
+    }
+    if let Some(surface) = parse_opt(args, "-t")
+        .or_else(|| parse_opt(args, "--target"))
+        .or_else(|| parse_opt(args, "--surface"))
+        .or_else(|| parse_opt(args, "--panel"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+}
+
+// purpose: Build CMUX/tmux split-window params for the live surface.split route.
+// inputs: Raw split-window args using tmux -h/-v/-b/-d/-c/-t/-P/-F/-l forms.
+// returns/effects: Returns surface.split params plus whether tmux -P output was requested.
+fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
+    if tmux_has_short_flag(args, "-d") {
+        bail!("split-window -d is not supported until surface.split can preserve focus");
+    }
+    let mut params = Map::new();
+    insert_tmux_split_targets(&mut params, args);
+    params.insert(
+        "direction".to_string(),
+        Value::String(tmux_split_direction(args).to_string()),
+    );
+    if let Some(cwd) = parse_opt(args, "-c").filter(|value| !value.trim().is_empty()) {
+        params.insert("working_directory".to_string(), Value::String(cwd));
+    }
+
+    let command = tmux_positionals_after_flags(
+        args,
+        &[
+            "-c",
+            "-F",
+            "-l",
+            "-t",
+            "--target",
+            "--surface",
+            "--panel",
+            "--workspace",
+        ],
+        &["-P", "-b", "-d", "-f", "-h", "-v"],
+    )
+    .join(" ");
+    if !command.trim().is_empty() {
+        params.insert("command".to_string(), Value::String(command));
+    }
+    Ok((Value::Object(params), tmux_has_short_flag(args, "-P")))
+}
+
+// purpose: Build CMUX/tmux select-layout params for the live equalize route.
+// inputs: Raw select-layout args with optional -t target and positional layout name.
+// returns/effects: Returns workspace.equalize_splits params.
+fn build_tmux_select_layout_request(args: &[String]) -> Result<Value> {
+    let mut params = Map::new();
+    if let Some(workspace) = parse_opt(args, "-t")
+        .or_else(|| parse_opt(args, "--target"))
+        .or_else(|| parse_opt(args, "--workspace"))
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    let layout = tmux_positionals_after_flags(args, &["-t", "--target", "--workspace"], &[])
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    match layout.as_str() {
+        "main-vertical" => {
+            params.insert(
+                "orientation".to_string(),
+                Value::String("vertical".to_string()),
+            );
+        }
+        "main-horizontal" => {
+            params.insert(
+                "orientation".to_string(),
+                Value::String("horizontal".to_string()),
+            );
+        }
+        _ => {}
+    }
+    Ok(Value::Object(params))
 }
 
 // purpose: Add workspace fields to a tmux render context from a list row.
@@ -10437,6 +10612,20 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
                 add_tmux_pane_row_context,
             );
             Ok(json!({"text": text}))
+        }
+        "split-window" => {
+            let (params, print_result) = build_tmux_split_window_request(args)?;
+            let payload = client.call("surface.split", params).await?;
+            if print_result {
+                let handle = handle_from_payload(&payload, "surface_id", "surface_ref");
+                Ok(json!({"text": handle, "result": payload}))
+            } else {
+                Ok(payload)
+            }
+        }
+        "select-layout" => {
+            let params = build_tmux_select_layout_request(args)?;
+            client.call("workspace.equalize_splits", params).await
         }
         "pipe-pane" => {
             let capture = run_read_screen(client, args).await?;
@@ -11961,10 +12150,11 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "pipe-pane" | "wait-for" | "find-window" | "last-window" | "next-window"
         | "previous-window" | "swap-pane" | "break-pane" | "join-pane" | "last-pane"
-        | "clear-history" | "set-hook" | "resize-pane" | "resizep" | "set-buffer" | "setb"
-        | "list-buffers" | "show-buffer" | "showb" | "paste-buffer" | "pasteb" | "respawn-pane"
-        | "respawnp" | "display-message" | "display" | "displayp" | "capturep" | "popup"
-        | "bind-key" | "unbind-key" | "copy-mode" => {
+        | "clear-history" | "split-window" | "splitw" | "select-layout" | "set-hook"
+        | "resize-pane" | "resizep" | "set-buffer" | "setb" | "list-buffers" | "show-buffer"
+        | "showb" | "paste-buffer" | "pasteb" | "respawn-pane" | "respawnp" | "display-message"
+        | "display" | "displayp" | "capturep" | "popup" | "bind-key" | "unbind-key"
+        | "copy-mode" => {
             let payload = run_tmux_compat(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -13244,6 +13434,7 @@ mod cli_arg_tests {
         assert_eq!(canonical_tmux_command("respawnp"), "respawn-pane");
         assert_eq!(canonical_tmux_command("selectp"), "select-pane");
         assert_eq!(canonical_tmux_command("selectw"), "select-window");
+        assert_eq!(canonical_tmux_command("splitw"), "split-window");
         assert_eq!(canonical_tmux_command("setb"), "set-buffer");
         assert_eq!(canonical_tmux_command("pasteb"), "paste-buffer");
         assert_eq!(canonical_tmux_command("showb"), "show-buffer");
@@ -13388,6 +13579,60 @@ mod cli_arg_tests {
             first_positional(&args(&["-t", "workspace:7", "build logs"])).as_deref(),
             Some("build logs")
         );
+    }
+
+    #[test]
+    fn tmux_split_window_request_maps_cmux_flags_to_surface_split() {
+        let (params, print_result) = build_tmux_split_window_request(&args(&[
+            "-h",
+            "-c",
+            "/tmp/project",
+            "-t",
+            "surface:7:tab-a",
+            "-P",
+            "echo",
+            "ready",
+        ]))
+        .expect("split-window parses");
+
+        assert!(print_result);
+        assert_eq!(params["surface_id"], "surface:7:tab-a");
+        assert_eq!(params["direction"], "right");
+        assert_eq!(params["working_directory"], "/tmp/project");
+        assert_eq!(params["command"], "echo ready");
+
+        let (left, _) = build_tmux_split_window_request(&args(&["-hb", "-t", "surface:7:tab-a"]))
+            .expect("left split parses");
+        assert_eq!(left["direction"], "left");
+
+        let (up, _) = build_tmux_split_window_request(&args(&["-b", "-t", "surface:7:tab-a"]))
+            .expect("up split parses");
+        assert_eq!(up["direction"], "up");
+    }
+
+    #[test]
+    fn tmux_split_window_rejects_detached_focus_fallback() {
+        let error = build_tmux_split_window_request(&args(&["-d"]))
+            .expect_err("detached split should fail loudly");
+        assert!(error
+            .to_string()
+            .contains("split-window -d is not supported"));
+    }
+
+    #[test]
+    fn tmux_select_layout_maps_main_layouts_to_equalize_orientation() {
+        let vertical =
+            build_tmux_select_layout_request(&args(&["-t", "workspace:7", "main-vertical"]))
+                .expect("main vertical parses");
+        assert_eq!(vertical["workspace_id"], "workspace:7");
+        assert_eq!(vertical["orientation"], "vertical");
+
+        let horizontal = build_tmux_select_layout_request(&args(&["main-horizontal"]))
+            .expect("main horizontal parses");
+        assert_eq!(horizontal["orientation"], "horizontal");
+
+        let tiled = build_tmux_select_layout_request(&args(&["tiled"])).expect("tiled parses");
+        assert!(tiled.get("orientation").is_none());
     }
 
     #[test]
