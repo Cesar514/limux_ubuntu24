@@ -44,6 +44,7 @@ const METHODS: &[&str] = &[
     "feed.exit_plan.reply",
     "workspace.current",
     "window.list",
+    "window.focus",
     "workspace.list",
     "workspace.env",
     "workspace.create",
@@ -671,6 +672,10 @@ pub enum ControlCommand {
     ListWindows {
         reply: mpsc::Sender<BridgeResult>,
     },
+    FocusWindow {
+        window_id: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -1007,6 +1012,7 @@ impl ControlCommand {
             | Self::SystemTop { reply, .. }
             | Self::SystemTree { reply, .. }
             | Self::ListWindows { reply }
+            | Self::FocusWindow { reply, .. }
             | Self::ReloadConfig { reply }
             | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
@@ -2861,6 +2867,11 @@ fn handle_method(
         "window.list" | "list-windows" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ListWindows { reply }, rx)
+        }
+        "window.focus" | "focus-window" => {
+            let window_id = optional_string(params, &["window_id", "window", "id"]);
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::FocusWindow { window_id, reply }, rx)
         }
         "workspace.list" | "list-workspaces" => {
             let (reply, rx) = mpsc::channel();
@@ -8658,6 +8669,31 @@ mod tests {
             },
         );
         assert_eq!(windows.error, None);
+    }
+
+    #[test]
+    fn window_focus_route_queues_command() {
+        assert_window_focus_route_queues_command();
+    }
+
+    // purpose: Verify window.focus queues the live host window focus command.
+    // inputs: V2 window.focus request with a CMUX window ref.
+    // returns/effects: Asserts the route reaches ControlCommand::FocusWindow.
+    fn assert_window_focus_route_queues_command() {
+        let focused = dispatch_request(
+            r#"{"id":2,"method":"window.focus","params":{"window_id":"window:1"}}"#,
+            &|command| match command {
+                ControlCommand::FocusWindow { window_id, reply } => {
+                    assert_eq!(window_id.as_deref(), Some("window:1"));
+                    let _ = reply.send(Ok(json!({
+                        "window_id": "window:1",
+                        "window_ref": "window:1",
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(focused.error, None);
     }
 
     #[test]

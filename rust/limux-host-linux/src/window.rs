@@ -2287,10 +2287,29 @@ fn window_list_payload(app_state: &AppState) -> serde_json::Value {
     })
 }
 
-// purpose: Validate a system.tree window scope against the current single GTK host window.
+// purpose: Focus the current live GTK host window in the CMUX window.focus shape.
+// inputs: Shared host state and an optional CMUX window id/ref/index.
+// returns/effects: Presents the current single host window or rejects unsupported ids.
+fn focus_window_payload(
+    state: &State,
+    window_id: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    validate_host_window_id(window_id)?;
+    let window = active_window(state).ok_or_else(|| BridgeError::not_found("window not found"))?;
+    window.present();
+    let app_state = state.borrow();
+    Ok(serde_json::json!({
+        "ok": true,
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "window": window_list_payload(&app_state)["windows"][0].clone(),
+    }))
+}
+
+// purpose: Validate a CMUX window scope against the current single GTK host window.
 // inputs: Optional CMUX window id/ref/index string.
 // returns/effects: Returns not_found for unsupported live host windows.
-fn validate_system_tree_window(window_id: Option<&str>) -> Result<(), BridgeError> {
+fn validate_host_window_id(window_id: Option<&str>) -> Result<(), BridgeError> {
     let Some(window_id) = window_id else {
         return Ok(());
     };
@@ -2298,6 +2317,13 @@ fn validate_system_tree_window(window_id: Option<&str>) -> Result<(), BridgeErro
         "1" => Ok(()),
         _ => Err(BridgeError::not_found("window not found")),
     }
+}
+
+// purpose: Validate a system.tree window scope against the current single GTK host window.
+// inputs: Optional CMUX window id/ref/index string.
+// returns/effects: Returns not_found for unsupported live host windows.
+fn validate_system_tree_window(window_id: Option<&str>) -> Result<(), BridgeError> {
+    validate_host_window_id(window_id)
 }
 
 // purpose: Build one workspace node for system.tree from live host state.
@@ -4451,6 +4477,9 @@ fn custom_sidebar_dispatcher_action(
             ensure_custom_sidebar_no_params(action)?;
             Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
         }
+        "window.focus" | "focus-window" => Ok(Some(CustomSidebarDispatcherAction::WindowFocus(
+            custom_sidebar_action_optional_window_id(action)?,
+        ))),
         "workspace.select" | "workspace.focus" | "selectWorkspace" | "select-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
                 custom_sidebar_action_workspace_id(action)?,
@@ -4535,6 +4564,20 @@ fn custom_sidebar_action_optional_surface_id(
     action: &CustomSidebarNodeAction,
 ) -> Result<Option<String>, String> {
     for key in ["surface_id", "tab_id"] {
+        if action.params.contains_key(key) {
+            return custom_sidebar_action_param_string(action, key).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// purpose: Read an optional CMUX window id from sidebar action params.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the window id when present or validates malformed aliases loudly.
+fn custom_sidebar_action_optional_window_id(
+    action: &CustomSidebarNodeAction,
+) -> Result<Option<String>, String> {
+    for key in ["window_id", "window", "id", "param", "value"] {
         if action.params.contains_key(key) {
             return custom_sidebar_action_param_string(action, key).map(Some);
         }
@@ -4692,6 +4735,7 @@ enum CustomSidebarDispatcherAction {
     WorkspacePrevious,
     WorkspaceLast,
     JumpToUnread,
+    WindowFocus(Option<String>),
     WorkspaceSelect(String),
     SurfaceFocus(String),
     SurfaceRun {
@@ -4753,6 +4797,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspacePrevious => "workspace.previous",
             CustomSidebarDispatcherAction::WorkspaceLast => "workspace.last",
             CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
+            CustomSidebarDispatcherAction::WindowFocus(_) => "window.focus",
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
             CustomSidebarDispatcherAction::SurfaceRun { .. } => "surface.run",
@@ -4785,6 +4830,9 @@ fn apply_custom_sidebar_dispatcher_action(
             select_relative_workspace_for_custom_sidebar(state, WorkspaceNavigation::Last)
         }
         CustomSidebarDispatcherAction::JumpToUnread => jump_to_unread_notification(state),
+        CustomSidebarDispatcherAction::WindowFocus(window_id) => {
+            focus_window_payload(state, window_id.as_deref())
+        }
         CustomSidebarDispatcherAction::WorkspaceSelect(workspace_id) => {
             select_workspace_for_custom_sidebar(state, &workspace_id)
         }
@@ -12471,6 +12519,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::FocusWindow { window_id, reply } => {
+            let result = focus_window_payload(state, window_id.as_deref());
+            let _ = reply.send(result);
+        }
         ControlCommand::WorkspaceEnv {
             target,
             mask,
@@ -18728,6 +18780,13 @@ mod tests {
             message: None,
             params: workspace_param_alias,
         };
+        let mut window_params = serde_json::Map::new();
+        window_params.insert("window_id".to_string(), json!("window:1"));
+        let window_focus = CustomSidebarNodeAction {
+            action_type: "window.focus".to_string(),
+            message: None,
+            params: window_params,
+        };
         let mut url_param = serde_json::Map::new();
         url_param.insert("url".to_string(), json!("https://example.test/pr/1"));
         let open_url_dot = CustomSidebarNodeAction {
@@ -18860,6 +18919,20 @@ mod tests {
         assert_eq!(
             custom_sidebar_dispatcher_action(&no_param_action("notification.jump_to_unread")),
             Ok(Some(CustomSidebarDispatcherAction::JumpToUnread))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&no_param_action("window.focus")),
+            Ok(Some(CustomSidebarDispatcherAction::WindowFocus(None)))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&window_focus),
+            Ok(Some(CustomSidebarDispatcherAction::WindowFocus(Some(
+                "window:1".to_string()
+            ))))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&window_focus),
+            "cmux dispatcher: window.focus"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_select),
