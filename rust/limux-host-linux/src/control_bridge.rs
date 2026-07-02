@@ -125,6 +125,7 @@ const METHODS: &[&str] = &[
     "browser.tab.new",
     "browser.tab.switch",
     "browser.tab.close",
+    "surface.split",
     "surface.create",
     "surface.create_many",
     "surface.list",
@@ -2105,6 +2106,41 @@ fn handle_method(
                 ControlCommand::FocusPane {
                     target,
                     pane_id,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.split" | "new-split" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let direction = match parse_pane_create_direction(
+                optional_string(params, &["direction"])
+                    .unwrap_or_else(|| "right".to_string())
+                    .as_str(),
+            ) {
+                Ok(direction) => direction,
+                Err(error) => return error_response(id, error),
+            };
+            let source_surface_id =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CreatePane {
+                    request: CreatePaneRequest {
+                        target,
+                        source_pane_id: None,
+                        source_surface_id,
+                        direction,
+                        pane_type: PaneCreateType::Terminal,
+                        command: optional_string(params, &["command"]),
+                        url: None,
+                    },
                     reply,
                 },
                 rx,
@@ -4292,6 +4328,38 @@ mod tests {
         assert_eq!(
             response.result.expect("pane.focus result")["pane_ref"],
             "pane:11"
+        );
+    }
+
+    #[test]
+    fn surface_split_route_queues_terminal_pane_create() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"new-split","params":{"workspace_id":"codex","#,
+                r#""surface_id":"surface:4:tab","direction":"down","command":"top"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::CreatePane { request, reply } => {
+                    assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(request.source_surface_id, Some("4:tab".to_string()));
+                    assert_eq!(request.source_pane_id, None);
+                    assert_eq!(request.direction, PaneCreateDirection::Down);
+                    assert_eq!(request.pane_type, PaneCreateType::Terminal);
+                    assert_eq!(request.command, Some("top".to_string()));
+                    assert_eq!(request.url, None);
+                    let _ = reply.send(Ok(json!({
+                        "pane_ref": "pane:12",
+                        "surface_ref": "surface:12:tab"
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.split result")["surface_ref"],
+            "surface:12:tab"
         );
     }
 
