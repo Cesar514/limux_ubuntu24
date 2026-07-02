@@ -129,6 +129,23 @@ struct WorkspaceGroupFolderTarget {
     placement: app_config::WorkspaceGroupNewPlacement,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceSidebarRenderItem {
+    GroupHeader {
+        group_id: String,
+        anchor_workspace_id: String,
+        member_workspace_ids: Vec<String>,
+    },
+    Workspace {
+        workspace_id: String,
+    },
+}
+
+struct WorkspaceSidebarRenderSource<'a> {
+    workspace_id: &'a str,
+    group_id: Option<&'a str>,
+}
+
 struct WorkspaceFolderTarget {
     group: Option<WorkspaceGroupFolderTarget>,
     reference_workspace_id: Option<String>,
@@ -190,6 +207,7 @@ pub(crate) struct AppState {
     system_prefers_dark: Rc<Cell<Option<bool>>>,
     workspaces: Vec<Workspace>,
     workspace_groups: Vec<WorkspaceGroupState>,
+    workspace_group_sidebar_rows: BTreeMap<String, gtk::ListBoxRow>,
     active_idx: usize,
     previous_workspace_id: Option<String>,
     shortcuts: Rc<ResolvedShortcutConfig>,
@@ -1793,10 +1811,7 @@ fn select_workspace_for_control(
 ) -> Result<serde_json::Value, BridgeError> {
     let row = {
         let app_state = state.borrow();
-        app_state
-            .workspaces
-            .get(index)
-            .map(|workspace| workspace.sidebar_row.clone())
+        sidebar_row_for_workspace_index(&app_state, index)
             .ok_or_else(|| BridgeError::not_found("workspace not found"))?
     };
     let sidebar_list = state.borrow().sidebar_list.clone();
@@ -3213,11 +3228,8 @@ fn restore_active_workspace(state: &State, index: usize) {
             None
         } else {
             let clamped = index.min(s.workspaces.len() - 1);
-            Some((
-                clamped,
-                s.workspaces[clamped].sidebar_row.clone(),
-                s.sidebar_list.clone(),
-            ))
+            sidebar_row_for_workspace_index(&s, clamped)
+                .map(|row| (clamped, row, s.sidebar_list.clone()))
         }
     };
 
@@ -4968,6 +4980,36 @@ const BASE_CSS: &str = r#"
     border-radius: 6px;
     margin: 2px 3px 2px 1px;
 }
+.limux-ws-group-row {
+    padding: 7px 6px 7px 3px;
+    border-radius: 6px;
+    margin: 5px 3px 2px 1px;
+}
+.limux-ws-group-chevron,
+.limux-ws-group-icon,
+.limux-ws-group-pin,
+.limux-ws-group-plus {
+    color: alpha(@window_fg_color, 0.48);
+    font-size: 12px;
+}
+.limux-ws-group-name {
+    color: alpha(@window_fg_color, 0.78);
+    font-size: 13px;
+    font-weight: 700;
+}
+.limux-ws-group-count {
+    color: alpha(@window_fg_color, 0.58);
+    font-size: 11px;
+    background: alpha(@window_fg_color, 0.08);
+    border-radius: 999px;
+    padding: 1px 6px;
+}
+row:selected .limux-ws-group-row {
+    background-color: alpha(@accent_bg_color, 0.12);
+}
+row:selected .limux-ws-group-name {
+    color: @window_fg_color;
+}
 .limux-ws-name {
     color: alpha(@window_fg_color, 0.72);
     font-size: 15px;
@@ -5313,6 +5355,7 @@ pub fn build_window(app: &adw::Application) {
         system_prefers_dark: system_prefers_dark.clone(),
         workspaces: Vec::new(),
         workspace_groups: Vec::new(),
+        workspace_group_sidebar_rows: BTreeMap::new(),
         active_idx: 0,
         previous_workspace_id: None,
         shortcuts,
@@ -5434,8 +5477,13 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         sidebar_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
-                let idx = row.index() as usize;
-                switch_workspace(&state, idx);
+                let idx = {
+                    let app_state = state.borrow();
+                    workspace_index_for_sidebar_row(&app_state, row)
+                };
+                if let Some(idx) = idx {
+                    switch_workspace(&state, idx);
+                }
             }
         });
     }
@@ -6564,7 +6612,7 @@ fn activate_desktop_notification_target(
 ) {
     let (workspace_idx, row, sidebar_list, window, workspace_changed) = {
         let s = state.borrow();
-        let Some((idx, workspace)) = s
+        let Some((idx, _)) = s
             .workspaces
             .iter()
             .enumerate()
@@ -6573,9 +6621,12 @@ fn activate_desktop_notification_target(
             return;
         };
 
+        let Some(row) = sidebar_row_for_workspace_index(&s, idx) else {
+            return;
+        };
         (
             idx,
-            workspace.sidebar_row.clone(),
+            row,
             s.sidebar_list.clone(),
             s.window.clone(),
             idx != s.active_idx,
@@ -6864,9 +6915,7 @@ fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
 fn activate_workspace_shortcut(state: &State, idx: usize) {
     let row_and_list = {
         let s = state.borrow();
-        s.workspaces
-            .get(idx)
-            .map(|ws| (idx, ws.sidebar_row.clone(), s.sidebar_list.clone()))
+        sidebar_row_for_workspace_index(&s, idx).map(|row| (idx, row, s.sidebar_list.clone()))
     };
 
     if let Some((idx, row, list)) = row_and_list {
@@ -7000,6 +7049,150 @@ fn build_sidebar_row(
         pull_request_links_box,
         port_links_box,
     )
+}
+
+// purpose: Project workspaces/groups into CMUX sidebar render rows.
+// inputs: Ordered workspace sources plus group metadata.
+// returns/effects: Returns group headers and workspace rows without touching GTK state.
+fn workspace_sidebar_render_items(
+    workspaces: &[WorkspaceSidebarRenderSource<'_>],
+    groups: &[WorkspaceGroupState],
+) -> Vec<WorkspaceSidebarRenderItem> {
+    let groups_by_id = groups
+        .iter()
+        .map(|group| (group.id.as_str(), group))
+        .collect::<HashMap<_, _>>();
+    let mut member_workspace_ids_by_group_id: HashMap<&str, Vec<String>> = HashMap::new();
+    for workspace in workspaces {
+        if let Some(group_id) = workspace.group_id {
+            member_workspace_ids_by_group_id
+                .entry(group_id)
+                .or_default()
+                .push(workspace.workspace_id.to_string());
+        }
+    }
+
+    let mut items = Vec::with_capacity(workspaces.len() + groups.len());
+    let mut emitted_group_ids = HashSet::new();
+    let mut collapsed_by_group_id: HashMap<&str, bool> = HashMap::new();
+    let mut last_group_id: Option<&str> = None;
+    let mut skip_children_until_next_group = false;
+    for workspace in workspaces {
+        if workspace.group_id != last_group_id {
+            last_group_id = workspace.group_id;
+            skip_children_until_next_group = false;
+            if let Some(group_id) = workspace.group_id {
+                if let Some(group) = groups_by_id.get(group_id) {
+                    let Some(anchor_workspace_id) = group.anchor_workspace_id.as_deref() else {
+                        items.push(WorkspaceSidebarRenderItem::Workspace {
+                            workspace_id: workspace.workspace_id.to_string(),
+                        });
+                        continue;
+                    };
+                    if emitted_group_ids.insert(group_id) {
+                        items.push(WorkspaceSidebarRenderItem::GroupHeader {
+                            group_id: group.id.clone(),
+                            anchor_workspace_id: anchor_workspace_id.to_string(),
+                            member_workspace_ids: member_workspace_ids_by_group_id
+                                .get(group_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        });
+                        collapsed_by_group_id.insert(group_id, group.is_collapsed);
+                    }
+                    skip_children_until_next_group = collapsed_by_group_id
+                        .get(group_id)
+                        .copied()
+                        .unwrap_or(false);
+                }
+            }
+        }
+
+        let is_anchor = workspace.group_id.and_then(|group_id| {
+            groups_by_id
+                .get(group_id)
+                .and_then(|group| group.anchor_workspace_id.as_deref())
+        }) == Some(workspace.workspace_id);
+        if is_anchor {
+            continue;
+        }
+        if workspace.group_id.is_none() || !skip_children_until_next_group {
+            items.push(WorkspaceSidebarRenderItem::Workspace {
+                workspace_id: workspace.workspace_id.to_string(),
+            });
+        }
+    }
+    items
+}
+
+// purpose: Build one CMUX-style workspace-group header row.
+// inputs: Group metadata and number of member workspaces.
+// returns/effects: Returns a GTK ListBoxRow for the sidebar.
+fn build_workspace_group_sidebar_row(
+    group: &WorkspaceGroupState,
+    member_workspace_count: usize,
+) -> gtk::ListBoxRow {
+    let chevron = gtk::Label::builder()
+        .label(if group.is_collapsed {
+            "\u{25B8}"
+        } else {
+            "\u{25BE}"
+        })
+        .xalign(0.5)
+        .build();
+    chevron.add_css_class("limux-ws-group-chevron");
+
+    let icon = gtk::Label::builder()
+        .label(group.icon_symbol.as_deref().unwrap_or("\u{1F5C0}"))
+        .xalign(0.5)
+        .build();
+    icon.add_css_class("limux-ws-group-icon");
+
+    let name = gtk::Label::builder()
+        .label(&group.name)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    name.add_css_class("limux-ws-group-name");
+
+    let count = gtk::Label::builder()
+        .label(member_workspace_count.to_string())
+        .xalign(0.5)
+        .build();
+    count.add_css_class("limux-ws-group-count");
+
+    let plus = gtk::Label::builder().label("+").xalign(0.5).build();
+    plus.add_css_class("limux-ws-group-plus");
+
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(5)
+        .build();
+    row_box.add_css_class("limux-ws-group-row");
+    if group.is_pinned {
+        row_box.add_css_class("limux-ws-group-row-pinned");
+    }
+    if let Some(color) = group.custom_color.as_deref() {
+        row_box.set_tooltip_text(Some(&format!("{color} - {}", group.name)));
+    } else {
+        row_box.set_tooltip_text(Some(&group.name));
+    }
+    row_box.append(&chevron);
+    row_box.append(&icon);
+    row_box.append(&name);
+    if group.is_pinned {
+        let pin = gtk::Label::builder().label("\u{2691}").xalign(0.5).build();
+        pin.add_css_class("limux-ws-group-pin");
+        row_box.append(&pin);
+    }
+    row_box.append(&count);
+    row_box.append(&plus);
+
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("limux-ws-group-list-row");
+    row.set_child(Some(&row_box));
+    row
 }
 
 // purpose: Apply CMUX title wrapping policy to a workspace sidebar row label.
@@ -7474,40 +7667,100 @@ fn sync_sidebar_row_order(state: &mut AppState) {
     while let Some(child) = state.sidebar_list.first_child() {
         state.sidebar_list.remove(&child);
     }
-    for (index, workspace) in state.workspaces.iter().enumerate() {
-        if workspace_hidden_by_collapsed_group_id(
-            &workspace.id,
-            workspace.group_id.as_deref(),
-            index == state.active_idx,
-            &state.workspace_groups,
-        ) {
-            continue;
+    state.workspace_group_sidebar_rows.retain(|group_id, _| {
+        state
+            .workspace_groups
+            .iter()
+            .any(|group| &group.id == group_id)
+    });
+    let sources = state
+        .workspaces
+        .iter()
+        .map(|workspace| WorkspaceSidebarRenderSource {
+            workspace_id: &workspace.id,
+            group_id: workspace.group_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let render_items = workspace_sidebar_render_items(&sources, &state.workspace_groups);
+    for item in render_items {
+        match item {
+            WorkspaceSidebarRenderItem::GroupHeader {
+                group_id,
+                member_workspace_ids,
+                ..
+            } => {
+                let Some(group) = state
+                    .workspace_groups
+                    .iter()
+                    .find(|group| group.id == group_id)
+                else {
+                    continue;
+                };
+                let row = build_workspace_group_sidebar_row(group, member_workspace_ids.len());
+                state
+                    .workspace_group_sidebar_rows
+                    .insert(group_id.clone(), row);
+                if let Some(row) = state.workspace_group_sidebar_rows.get(&group_id) {
+                    state.sidebar_list.append(row);
+                }
+            }
+            WorkspaceSidebarRenderItem::Workspace { workspace_id } => {
+                if let Some(workspace) = state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                {
+                    state.sidebar_list.append(&workspace.sidebar_row);
+                }
+            }
         }
-        state.sidebar_list.append(&workspace.sidebar_row);
     }
 }
 
-/// purpose: Decide whether a workspace row is hidden by collapsed group state.
-/// inputs: Workspace id, optional group id, active selection flag, and known groups.
-/// returns/effects: Returns true for non-active non-anchor members of collapsed groups.
-fn workspace_hidden_by_collapsed_group_id(
-    workspace_id: &str,
-    group_id: Option<&str>,
-    active: bool,
-    groups: &[WorkspaceGroupState],
-) -> bool {
-    if active {
-        return false;
-    }
-    let Some(group_id) = group_id else {
-        return false;
-    };
-    groups
+// purpose: Resolve a rendered sidebar row to its selected workspace index.
+// inputs: Host state and a GTK ListBoxRow selected by the sidebar.
+// returns/effects: Returns a workspace index, mapping group headers to anchors.
+fn workspace_index_for_sidebar_row(state: &AppState, row: &gtk::ListBoxRow) -> Option<usize> {
+    if let Some(index) = state
+        .workspaces
         .iter()
-        .find(|group| group.id == group_id)
-        .is_some_and(|group| {
-            group.is_collapsed && group.anchor_workspace_id.as_deref() != Some(workspace_id)
-        })
+        .position(|workspace| workspace.sidebar_row == *row)
+    {
+        return Some(index);
+    }
+    let group = state
+        .workspace_group_sidebar_rows
+        .iter()
+        .find(|(_, group_row)| *group_row == row)
+        .and_then(|(group_id, _)| {
+            state
+                .workspace_groups
+                .iter()
+                .find(|group| group.id == *group_id)
+        })?;
+    let anchor_workspace_id = group.anchor_workspace_id.as_deref()?;
+    state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == anchor_workspace_id)
+}
+
+// purpose: Return the rendered sidebar row that should be selected for a workspace.
+// inputs: Host state and workspace index.
+// returns/effects: Maps group anchors to their visible group header row.
+fn sidebar_row_for_workspace_index(state: &AppState, index: usize) -> Option<gtk::ListBoxRow> {
+    let workspace = state.workspaces.get(index)?;
+    if let Some(group_id) = workspace.group_id.as_deref() {
+        if state.workspace_groups.iter().any(|group| {
+            group.id == group_id
+                && group.anchor_workspace_id.as_deref() == Some(workspace.id.as_str())
+        }) {
+            if let Some(row) = state.workspace_group_sidebar_rows.get(group_id) {
+                return Some(row.clone());
+            }
+        }
+    }
+    Some(workspace.sidebar_row.clone())
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
@@ -7752,10 +8005,7 @@ fn reorder_workspace_by_id(
         }
 
         sync_sidebar_row_order(&mut s);
-        let row_to_select = s
-            .workspaces
-            .get(s.active_idx)
-            .map(|workspace| workspace.sidebar_row.clone());
+        let row_to_select = sidebar_row_for_workspace_index(&s, s.active_idx);
         let ordered_ids = s
             .workspaces
             .iter()
@@ -7831,10 +8081,7 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
         }
 
         sync_sidebar_row_order(&mut s);
-        let row_to_select = s
-            .workspaces
-            .get(s.active_idx)
-            .map(|workspace| workspace.sidebar_row.clone());
+        let row_to_select = sidebar_row_for_workspace_index(&s, s.active_idx);
         let ordered_ids = s
             .workspaces
             .iter()
@@ -12024,17 +12271,21 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let activation = {
                 let mut app_state = state.borrow_mut();
-                app_state.workspaces.len().checked_sub(1).map(|last_index| {
-                    app_state.active_idx = last_index;
-                    sync_right_sidebar_panel(&mut app_state);
-                    let workspace = &app_state.workspaces[last_index];
-                    (
-                        app_state.stack.clone(),
-                        app_state.sidebar_list.clone(),
-                        format!("ws-{}", workspace.id),
-                        workspace.sidebar_row.clone(),
-                    )
-                })
+                app_state
+                    .workspaces
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|last_index| {
+                        app_state.active_idx = last_index;
+                        sync_right_sidebar_panel(&mut app_state);
+                        let workspace = &app_state.workspaces[last_index];
+                        Some((
+                            app_state.stack.clone(),
+                            app_state.sidebar_list.clone(),
+                            format!("ws-{}", workspace.id),
+                            sidebar_row_for_workspace_index(&app_state, last_index)?,
+                        ))
+                    })
             };
             if let Some((stack, sidebar_list, stack_name, row)) = activation {
                 stack.set_visible_child_name(&stack_name);
@@ -12687,7 +12938,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         set_workspace_favorite_visual(&ws);
     }
 
-    let (snapshot, selected_snapshot, previous_workspace_id) = {
+    let (snapshot, selected_snapshot, previous_workspace_id, row_to_select) = {
         let mut s = state.borrow_mut();
         let was_empty = s.workspaces.is_empty();
         let previous_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
@@ -12696,12 +12947,19 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
             s.active_idx = s.workspaces.len() - 1;
             sync_right_sidebar_panel(&mut s);
         }
+        sync_sidebar_row_order(&mut s);
         let index = s.workspaces.len() - 1;
         let snapshot = workspace_event_snapshot(&s, index);
         let selected_snapshot = (activate || was_empty)
             .then(|| workspace_event_snapshot(&s, s.active_idx))
             .flatten();
-        (snapshot, selected_snapshot, previous_workspace_id)
+        let row_to_select = sidebar_row_for_workspace_index(&s, s.active_idx);
+        (
+            snapshot,
+            selected_snapshot,
+            previous_workspace_id,
+            row_to_select,
+        )
     };
     if let Some(snapshot) = snapshot {
         publish_workspace_lifecycle_event(
@@ -12722,7 +12980,9 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
 
     if activate {
         stack.set_visible_child_name(&stack_name);
-        sidebar_list.select_row(Some(&row));
+        if let Some(row) = row_to_select {
+            sidebar_list.select_row(Some(&row));
+        }
     }
 }
 
@@ -12988,7 +13248,7 @@ fn close_workspace_by_id_internal(
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     s.stack.set_visible_child_name(&stack_name);
 
-    let row = s.workspaces[new_idx].sidebar_row.clone();
+    let row = sidebar_row_for_workspace_index(&s, new_idx);
     let sidebar_list = s.sidebar_list.clone();
     let selected_snapshot = closed_was_active
         .then(|| workspace_event_snapshot(&s, new_idx))
@@ -13011,7 +13271,9 @@ fn close_workspace_by_id_internal(
             serde_json::json!({ "origin": "model" }),
         );
     }
-    sidebar_list.select_row(Some(&row));
+    if let Some(row) = row {
+        sidebar_list.select_row(Some(&row));
+    }
     if persist {
         request_session_save(state);
     }
@@ -13098,11 +13360,10 @@ fn cycle_workspace(state: &State, direction: i32) {
             return;
         }
         let new_idx = ((s.active_idx as i32 + direction).rem_euclid(len as i32)) as usize;
-        (
-            new_idx,
-            s.workspaces[new_idx].sidebar_row.clone(),
-            s.sidebar_list.clone(),
-        )
+        let Some(row) = sidebar_row_for_workspace_index(&s, new_idx) else {
+            return;
+        };
+        (new_idx, row, s.sidebar_list.clone())
     };
     switch_workspace(state, new_idx);
     sidebar_list.select_row(Some(&row));
@@ -15016,15 +15277,16 @@ mod tests {
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
         workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
-        workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
-        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
-        workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
-        HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
-        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
-        SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
-        SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        workspace_insert_index_for_placement, workspace_lifecycle_payload,
+        workspace_notification_message, workspace_reordered_payload,
+        workspace_sidebar_render_items, workspace_title_from_directory, BrowserEvent, Direction,
+        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
+        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
+        SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport,
+        WorkspaceEventSnapshot, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
+        WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
@@ -15244,8 +15506,59 @@ mod tests {
         );
     }
 
+    // purpose: Build shared workspace-group metadata for sidebar render tests.
+    // inputs: None.
+    // returns/effects: Returns an expanded group anchored to ws-anchor.
+    fn test_workspace_group() -> WorkspaceGroupState {
+        WorkspaceGroupState {
+            id: "group-1".to_string(),
+            name: "Agents".to_string(),
+            is_collapsed: false,
+            is_pinned: false,
+            anchor_workspace_id: Some("ws-anchor".to_string()),
+            custom_color: None,
+            icon_symbol: None,
+        }
+    }
+
     #[test]
-    fn collapsed_workspace_groups_hide_only_inactive_non_anchor_members() {
+    fn workspace_sidebar_render_items_use_group_header_for_anchor() {
+        let groups = [test_workspace_group()];
+        let workspaces = [
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-free",
+                group_id: None,
+            },
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-anchor",
+                group_id: Some("group-1"),
+            },
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-member",
+                group_id: Some("group-1"),
+            },
+        ];
+
+        assert_eq!(
+            workspace_sidebar_render_items(&workspaces, &groups),
+            vec![
+                WorkspaceSidebarRenderItem::Workspace {
+                    workspace_id: "ws-free".to_string(),
+                },
+                WorkspaceSidebarRenderItem::GroupHeader {
+                    group_id: "group-1".to_string(),
+                    anchor_workspace_id: "ws-anchor".to_string(),
+                    member_workspace_ids: vec!["ws-anchor".to_string(), "ws-member".to_string(),],
+                },
+                WorkspaceSidebarRenderItem::Workspace {
+                    workspace_id: "ws-member".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_sidebar_render_items_skip_collapsed_group_children() {
         let groups = [WorkspaceGroupState {
             id: "group-1".to_string(),
             name: "Agents".to_string(),
@@ -15255,28 +15568,34 @@ mod tests {
             custom_color: None,
             icon_symbol: None,
         }];
+        let workspaces = [
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-anchor",
+                group_id: Some("group-1"),
+            },
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-member",
+                group_id: Some("group-1"),
+            },
+            WorkspaceSidebarRenderSource {
+                workspace_id: "ws-free",
+                group_id: None,
+            },
+        ];
 
-        assert!(!workspace_hidden_by_collapsed_group_id(
-            "ws-anchor",
-            Some("group-1"),
-            false,
-            &groups
-        ));
-        assert!(!workspace_hidden_by_collapsed_group_id(
-            "ws-member",
-            Some("group-1"),
-            true,
-            &groups
-        ));
-        assert!(workspace_hidden_by_collapsed_group_id(
-            "ws-member",
-            Some("group-1"),
-            false,
-            &groups
-        ));
-        assert!(!workspace_hidden_by_collapsed_group_id(
-            "ws-free", None, false, &groups
-        ));
+        assert_eq!(
+            workspace_sidebar_render_items(&workspaces, &groups),
+            vec![
+                WorkspaceSidebarRenderItem::GroupHeader {
+                    group_id: "group-1".to_string(),
+                    anchor_workspace_id: "ws-anchor".to_string(),
+                    member_workspace_ids: vec!["ws-anchor".to_string(), "ws-member".to_string(),],
+                },
+                WorkspaceSidebarRenderItem::Workspace {
+                    workspace_id: "ws-free".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
