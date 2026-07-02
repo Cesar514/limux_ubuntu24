@@ -15,6 +15,7 @@ struct ProcStats {
     ppid: u32,
     name: String,
     resident_bytes: u64,
+    cpu_ticks: u64,
     command: String,
     attribution: ProcessAttribution,
 }
@@ -31,6 +32,7 @@ struct ProcessGroup {
     root: ProcStats,
     process_count: usize,
     rss_bytes: u64,
+    cpu_ticks: u64,
 }
 
 /// purpose: Build the CMUX-style memory diagnostic payload for the current host.
@@ -157,9 +159,11 @@ fn group_processes_by_direct_child(pairs: Vec<(u32, ProcStats)>) -> Vec<ProcessG
             root: stats.clone(),
             process_count: 0,
             rss_bytes: 0,
+            cpu_ticks: 0,
         });
         group.process_count += 1;
         group.rss_bytes += stats.resident_bytes;
+        group.cpu_ticks += stats.cpu_ticks;
     }
     groups.into_values().collect()
 }
@@ -189,7 +193,7 @@ fn process_child_map() -> Result<BTreeMap<u32, Vec<u32>>, String> {
 fn read_process_parent_if_alive(pid: u32) -> Result<Option<u32>, String> {
     let stat_path = format!("/proc/{pid}/stat");
     match fs::read_to_string(&stat_path) {
-        Ok(stat) => parse_stat(&stat).map(|(_, ppid)| Some(ppid)),
+        Ok(stat) => parse_stat(&stat).map(|(_, ppid, _)| Some(ppid)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("failed to read {stat_path}: {error}")),
     }
@@ -215,12 +219,13 @@ fn read_process_stats(pid: u32) -> Result<ProcStats, String> {
     let stat = read_required(&stat_path)?;
     let status = read_required(&status_path)?;
 
-    let (name, ppid) = parse_stat(&stat)?;
+    let (name, ppid, cpu_ticks) = parse_stat(&stat)?;
     Ok(ProcStats {
         pid,
         ppid,
         name,
         resident_bytes: parse_rss_bytes(&status)?,
+        cpu_ticks,
         command: read_command(pid),
         attribution: read_attribution(pid),
     })
@@ -241,8 +246,8 @@ fn read_required(path: &str) -> Result<String, String> {
 
 /// purpose: Parse process name and parent pid from /proc/<pid>/stat.
 /// inputs: raw stat file contents.
-/// returns/effects: Returns name and ppid or an explicit malformed-stat error.
-fn parse_stat(raw: &str) -> Result<(String, u32), String> {
+/// returns/effects: Returns name, ppid, CPU ticks, or an explicit malformed-stat error.
+fn parse_stat(raw: &str) -> Result<(String, u32, u64), String> {
     let open = raw.find('(').ok_or("malformed stat: missing name start")?;
     let close = raw.rfind(')').ok_or("malformed stat: missing name end")?;
     let name = raw[open + 1..close].to_string();
@@ -255,7 +260,21 @@ fn parse_stat(raw: &str) -> Result<(String, u32), String> {
         .ok_or("malformed stat: missing ppid")?
         .parse::<u32>()
         .map_err(|error| format!("malformed stat ppid: {error}"))?;
-    Ok((name, ppid))
+    let utime = parse_stat_u64_field(rest, 11, "utime")?;
+    let stime = parse_stat_u64_field(rest, 12, "stime")?;
+    Ok((name, ppid, utime + stime))
+}
+
+/// purpose: Parse one numeric field from the post-name /proc stat segment.
+/// inputs: Post-name stat fields, zero-based index, and field label.
+/// returns/effects: Returns parsed value or a malformed-stat error.
+fn parse_stat_u64_field(raw_fields: &str, index: usize, label: &str) -> Result<u64, String> {
+    raw_fields
+        .split_whitespace()
+        .nth(index)
+        .ok_or_else(|| format!("malformed stat: missing {label}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("malformed stat {label}: {error}"))
 }
 
 /// purpose: Parse resident memory from /proc/<pid>/status.
@@ -335,6 +354,7 @@ fn group_to_json(group: ProcessGroup) -> Value {
         "name": group.root.name,
         "command": group.root.command,
         "rss_bytes": group.rss_bytes,
+        "cpu_ticks": group.cpu_ticks,
         "process_count": group.process_count,
         "top_attribution": attribution_to_json(&group.root.attribution),
     })
@@ -349,6 +369,7 @@ fn process_to_json(stats: &ProcStats) -> Value {
         "name": stats.name,
         "command": stats.command,
         "resident_bytes": stats.resident_bytes,
+        "cpu_ticks": stats.cpu_ticks,
     })
 }
 
@@ -413,8 +434,9 @@ mod tests {
 
     #[test]
     fn parse_stat_handles_process_names_with_spaces() {
-        let parsed = parse_stat("42 (name with spaces) S 7 8 9").expect("stat parses");
-        assert_eq!(parsed, ("name with spaces".to_string(), 7));
+        let raw = "42 (name with spaces) S 7 8 9 10 11 12 13 14 15 16 17 18 19";
+        let parsed = parse_stat(raw).expect("stat parses");
+        assert_eq!(parsed, ("name with spaces".to_string(), 7, 35));
     }
 
     #[test]

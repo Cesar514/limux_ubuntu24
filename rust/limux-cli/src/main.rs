@@ -3936,6 +3936,7 @@ fn append_tree_pane_text(lines: &mut Vec<String>, pane: &Value) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TopSortKey {
+    Cpu,
     Memory,
     ProcessCount,
 }
@@ -4066,11 +4067,9 @@ fn parse_top_sort_arg(args: &[String], index: usize) -> Result<(Option<TopSortKe
         .get(index + 1)
         .ok_or_else(|| anyhow!("top requires {flag} <value>"))?;
     let key = match value.as_str() {
+        "cpu" | "cpu%" => TopSortKey::Cpu,
         "rss" | "mem" | "memory" | "ram" => TopSortKey::Memory,
         "proc" | "process" | "processes" | "count" => TopSortKey::ProcessCount,
-        "cpu" | "cpu%" => bail!(
-            "top: --sort cpu requires CMUX system.top CPU diagnostics, which Limux does not implement yet"
-        ),
         _ => bail!("top: invalid --sort value '{value}'. Use cpu, mem, or proc"),
     };
     Ok((Some(key), index + 2))
@@ -4115,6 +4114,7 @@ fn sort_top_payload(payload: &mut Value, sort_key: Option<TopSortKey>) {
 // returns/effects: Returns zero when the metric is absent.
 fn top_sort_value(group: &Value, sort_key: TopSortKey) -> u64 {
     match sort_key {
+        TopSortKey::Cpu => group.get("cpu_ticks").and_then(Value::as_u64).unwrap_or(0),
         TopSortKey::Memory => group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0),
         TopSortKey::ProcessCount => group
             .get("process_count")
@@ -4252,6 +4252,7 @@ fn top_group_rows(payload: &Value) -> Vec<Value> {
 // inputs: Process group row and requested id format.
 // returns/effects: Returns escaped TSV fields without a trailing newline.
 fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
+    let cpu_ticks = group.get("cpu_ticks").and_then(Value::as_u64).unwrap_or(0);
     let rss = group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0);
     let process_count = group
         .get("process_count")
@@ -4264,7 +4265,7 @@ fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
         .unwrap_or("process");
     let parent = memory_attribution_text(group.get("top_attribution"), id_format);
     [
-        "0.0".to_string(),
+        cpu_ticks.to_string(),
         rss.to_string(),
         process_count.to_string(),
         "process_group".to_string(),
@@ -15147,8 +15148,8 @@ mod cli_arg_tests {
             .expect("process sort parses");
         assert_eq!(proc_sort.sort_key, Some(TopSortKey::ProcessCount));
 
-        let cpu = parse_top_options(&args(&["--sort", "cpu"])).expect_err("cpu needs real top");
-        assert!(cpu.to_string().contains("CPU diagnostics"));
+        let cpu_sort = parse_top_options(&args(&["--sort", "cpu"])).expect("cpu sort parses");
+        assert_eq!(cpu_sort.sort_key, Some(TopSortKey::Cpu));
 
         let scoped = parse_top_options(&args(&[
             "--workspace",
@@ -15171,8 +15172,8 @@ mod cli_arg_tests {
             "memory_diagnostic": {
                 "children": {
                     "groups": [
-                        {"pid": 10, "name": "small", "rss_bytes": 50, "process_count": 9},
-                        {"pid": 11, "name": "large", "rss_bytes": 500, "process_count": 1}
+                        {"pid": 10, "name": "small", "rss_bytes": 50, "cpu_ticks": 900, "process_count": 9},
+                        {"pid": 11, "name": "large", "rss_bytes": 500, "cpu_ticks": 10, "process_count": 1}
                     ]
                 }
             }
@@ -15185,6 +15186,11 @@ mod cli_arg_tests {
         let tsv = render_top_tsv(&payload, IdFormat::Refs);
         assert!(tsv.starts_with("cpu\tmemory_bytes\tprocess_count"));
         assert!(tsv.contains("process:11"));
+
+        sort_top_payload(&mut payload, Some(TopSortKey::Cpu));
+        let cpu_groups = top_group_rows(&payload);
+        assert_eq!(cpu_groups[0]["name"], "small");
+        assert!(render_top_tsv(&payload, IdFormat::Refs).contains("900\t50\t9"));
     }
 
     #[test]
