@@ -4462,6 +4462,10 @@ fn custom_sidebar_dispatcher_action(
         "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
             custom_sidebar_action_surface_id(action)?,
         ))),
+        "surface.run" | "run-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceRun {
+            surface_id: custom_sidebar_action_optional_surface_id(action)?,
+            command: custom_sidebar_action_command(action)?,
+        })),
         "workspace.close" | "close-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceClose(
                 custom_sidebar_action_workspace_id(action)?,
@@ -4524,6 +4528,20 @@ fn custom_sidebar_action_surface_id(action: &CustomSidebarNodeAction) -> Result<
     custom_sidebar_action_param_string_any(action, &["surface_id", "tab_id", "param", "value"])
 }
 
+/// purpose: Read an optional CMUX surface id from sidebar action params.
+/// inputs: Parsed custom-sidebar action.
+/// returns/effects: Returns the surface id when present or validates malformed aliases loudly.
+fn custom_sidebar_action_optional_surface_id(
+    action: &CustomSidebarNodeAction,
+) -> Result<Option<String>, String> {
+    for key in ["surface_id", "tab_id"] {
+        if action.params.contains_key(key) {
+            return custom_sidebar_action_param_string(action, key).map(Some);
+        }
+    }
+    Ok(None)
+}
+
 /// purpose: Read a CMUX tab id from documented or corpus-observed parameter names.
 /// inputs: Parsed custom-sidebar action.
 /// returns/effects: Returns the tab/surface id or a loud validation error.
@@ -4559,6 +4577,21 @@ fn custom_sidebar_action_text(action: &CustomSidebarNodeAction) -> Result<String
         return Ok(message.to_string());
     }
     custom_sidebar_action_param_string_any(action, &["text", "param", "value"])
+}
+
+/// purpose: Read a shell command from CMUX custom-sidebar command action aliases.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns command/message text or a loud validation error.
+fn custom_sidebar_action_command(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    if let Some(message) = action
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(message.to_string());
+    }
+    custom_sidebar_action_param_string_any(action, &["command", "text", "param", "value"])
 }
 
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
@@ -4661,6 +4694,10 @@ enum CustomSidebarDispatcherAction {
     JumpToUnread,
     WorkspaceSelect(String),
     SurfaceFocus(String),
+    SurfaceRun {
+        surface_id: Option<String>,
+        command: String,
+    },
     WorkspaceClose(String),
     SurfaceClose(String),
     WorkspaceTogglePin(String),
@@ -4718,6 +4755,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
+            CustomSidebarDispatcherAction::SurfaceRun { .. } => "surface.run",
             CustomSidebarDispatcherAction::WorkspaceClose(_) => "workspace.close",
             CustomSidebarDispatcherAction::SurfaceClose(_) => "surface.close",
             CustomSidebarDispatcherAction::WorkspaceTogglePin(_) => "workspace.togglePin",
@@ -4753,6 +4791,10 @@ fn apply_custom_sidebar_dispatcher_action(
         CustomSidebarDispatcherAction::SurfaceFocus(surface_id) => {
             focus_surface_for_custom_sidebar(state, &surface_id)
         }
+        CustomSidebarDispatcherAction::SurfaceRun {
+            surface_id,
+            command,
+        } => run_surface_command_for_custom_sidebar(state, surface_id.as_deref(), &command),
         CustomSidebarDispatcherAction::WorkspaceClose(workspace_id) => {
             close_workspace_for_custom_sidebar(state, &workspace_id)
         }
@@ -4892,6 +4934,53 @@ fn focus_surface_in_workspace_for_custom_sidebar(
         })
     };
     result.ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
+/// purpose: Run a command in a terminal surface from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state, optional surface/tab id, and command text.
+/// returns/effects: Sends command plus newline to the addressed or focused terminal surface.
+fn run_surface_command_for_custom_sidebar(
+    state: &State,
+    surface_id: Option<&str>,
+    command: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let target = {
+        let app_state = state.borrow();
+        if let Some(surface_id) = surface_id {
+            let requested = normalize_surface_handle(surface_id);
+            app_state.workspaces.iter().find_map(|workspace| {
+                pane::terminal_handle_for_root(&workspace.root, Some(requested)).map(
+                    |(resolved_surface_id, handle)| {
+                        (workspace.id.clone(), resolved_surface_id, handle)
+                    },
+                )
+            })
+        } else {
+            let workspace = app_state
+                .workspaces
+                .get(app_state.active_idx)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+            let (_focused_pane_id, focused_surface_id) =
+                focused_ids_for_workspace(state, &workspace.id);
+            let resolved_surface_hint = focused_surface_id.as_deref();
+            pane::terminal_handle_for_root(&workspace.root, resolved_surface_hint)
+                .map(|(surface_id, handle)| (workspace.id.clone(), surface_id, handle))
+        }
+    };
+    let Some((workspace_id, surface_id, handle)) = target else {
+        return Err(BridgeError::not_found("terminal surface not found"));
+    };
+    let text = format!("{command}\n");
+    handle.send_text(&text);
+    publish_surface_input_sent_event(&workspace_id, &surface_id, text.len());
+    Ok(serde_json::json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(&workspace_id),
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(&surface_id),
+        "text_length": text.len(),
+    }))
 }
 
 /// purpose: Close a workspace from a parameterized JSON custom-sidebar action.
@@ -18696,6 +18785,21 @@ mod tests {
             message: None,
             params: surface_params,
         };
+        let mut surface_run_params = serde_json::Map::new();
+        surface_run_params.insert("surface_id".to_string(), json!("surface:7:tab-a"));
+        surface_run_params.insert("command".to_string(), json!("npm run tokens:build"));
+        let surface_run = CustomSidebarNodeAction {
+            action_type: "surface.run".to_string(),
+            message: None,
+            params: surface_run_params,
+        };
+        let mut focused_surface_run_params = serde_json::Map::new();
+        focused_surface_run_params.insert("command".to_string(), json!("pytest -q"));
+        let focused_surface_run = CustomSidebarNodeAction {
+            action_type: "surface.run".to_string(),
+            message: None,
+            params: focused_surface_run_params,
+        };
         let mut workspace_close_params = serde_json::Map::new();
         workspace_close_params.insert("workspace_id".to_string(), json!("workspace:build"));
         let workspace_close = CustomSidebarNodeAction {
@@ -18784,6 +18888,24 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&surface_focus),
             "cmux dispatcher: surface.focus"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&surface_run),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceRun {
+                surface_id: Some("surface:7:tab-a".to_string()),
+                command: "npm run tokens:build".to_string(),
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&focused_surface_run),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceRun {
+                surface_id: None,
+                command: "pytest -q".to_string(),
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&surface_run),
+            "cmux dispatcher: surface.run"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_close),
@@ -18941,6 +19063,11 @@ mod tests {
             custom_sidebar_dispatcher_action(&no_param_action("surface.close"))
                 .expect_err("missing close surface id is invalid")
                 .contains("surface_id")
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("surface.run"))
+                .expect_err("missing surface.run command is invalid")
+                .contains("command")
         );
         assert!(
             custom_sidebar_dispatcher_action(&no_param_action("tab.togglePin"))
