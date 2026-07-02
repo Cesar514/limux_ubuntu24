@@ -6807,6 +6807,48 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "surfaces": surfaces,
             })));
         }
+        ControlCommand::ClearSurfaceHistory {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let cleared = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let (_focused_pane_id, focused_surface_id) =
+                    focused_ids_for_workspace(state, &workspace.id);
+                let resolved_surface_hint =
+                    surface_hint.as_deref().or(focused_surface_id.as_deref());
+                let surface =
+                    pane::clear_terminal_history_for_root(&workspace.root, resolved_surface_hint);
+                surface.map(|surface| {
+                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
+                })
+            };
+
+            let Some(mut payload) = cleared else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("cleared".to_string(), serde_json::Value::Bool(true));
+            }
+            let _ = reply.send(Ok(payload));
+        }
         ControlCommand::SurfaceHealth {
             target,
             surface_hint,

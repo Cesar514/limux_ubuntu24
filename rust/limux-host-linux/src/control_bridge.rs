@@ -139,6 +139,7 @@ const METHODS: &[&str] = &[
     "surface.reorder",
     "surface.drag_to_split",
     "surface.refresh",
+    "surface.clear_history",
     "surface.health",
     "surface.read_text",
     "surface.send_text",
@@ -580,6 +581,11 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ClearSurfaceHistory {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfaceHealth {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -697,6 +703,7 @@ impl ControlCommand {
             | Self::ReorderSurface { reply, .. }
             | Self::DragSurfaceToSplit { reply, .. }
             | Self::RefreshSurfaces { reply, .. }
+            | Self::ClearSurfaceHistory { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
@@ -2430,6 +2437,26 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::RefreshSurfaces {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.clear_history" | "clear-history" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(value) => value,
+                    Err(error) => return error_response(id, error),
+                };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ClearSurfaceHistory {
                     target,
                     surface_hint,
                     reply,
@@ -4787,6 +4814,54 @@ mod tests {
         );
         assert_eq!(all.error, None);
         assert_eq!(all.result.expect("surface.refresh result")["refreshed"], 2);
+    }
+
+    #[test]
+    fn surface_clear_history_route_accepts_surface_refs_and_context_defaults() {
+        let explicit = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"clear-history","params":{"workspace_id":"codex","#,
+                r#""panel_id":"surface:4:tab"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::ClearSurfaceHistory {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "cleared": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(explicit.error, None);
+        assert_eq!(
+            explicit.result.expect("surface.clear_history result")["cleared"],
+            true
+        );
+
+        let active = dispatch_request(
+            r#"{"id":1,"method":"surface.clear_history","params":{"workspace_id":"codex"}}"#,
+            &|command| match command {
+                ControlCommand::ClearSurfaceHistory {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, None);
+                    let _ = reply.send(Ok(json!({ "cleared": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(active.error, None);
+        assert_eq!(
+            active.result.expect("surface.clear_history result")["cleared"],
+            true
+        );
     }
 
     #[test]

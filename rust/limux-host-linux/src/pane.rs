@@ -2460,6 +2460,67 @@ pub fn refresh_terminal_surfaces_for_root(
     refreshed
 }
 
+// purpose: Clear one terminal surface's scrollback and visible buffer.
+// inputs: Workspace root and an optional raw or `surface:` surface handle.
+// returns/effects: Invokes Ghostty's clear_screen binding on the addressed terminal.
+pub fn clear_terminal_history_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<SurfaceSummary> {
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+
+    for internals in pane_internals_for_root(root) {
+        let target = {
+            let tab_state = internals.tab_state.borrow();
+            let active_tab = tab_state.active_tab.as_deref();
+            let mut fallback = None;
+            for entry in &tab_state.tabs {
+                let TabKind::Terminal { state } = &entry.kind else {
+                    continue;
+                };
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                if requested.is_some_and(|hint| surface_hint_matches(&surface_id, &entry.id, hint))
+                {
+                    fallback = Some((entry.id.clone(), state.handle.clone()));
+                    break;
+                }
+                if requested.is_some() {
+                    continue;
+                }
+                if active_tab == Some(entry.id.as_str()) {
+                    fallback = Some((entry.id.clone(), state.handle.clone()));
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some((entry.id.clone(), state.handle.clone()));
+                }
+            }
+            fallback
+        };
+
+        if let Some((tab_id, handle)) = target {
+            return clear_terminal_tab(&internals, &tab_id, &handle);
+        }
+    }
+    None
+}
+
+// purpose: Execute the terminal clear action and summarize the affected tab.
+// inputs: Pane internals, terminal tab id, and terminal handle.
+// returns/effects: Returns the surface summary only when Ghostty accepted the action.
+fn clear_terminal_tab(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    handle: &terminal::TerminalHandle,
+) -> Option<SurfaceSummary> {
+    handle
+        .perform_binding_action("clear_screen")
+        .then(|| surface_summary_for_tab(internals, tab_id))
+        .flatten()
+}
+
 pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarget {
     let Some(internals) = find_pane_internals(pane_widget) else {
         return FocusedShortcutTarget::None;
