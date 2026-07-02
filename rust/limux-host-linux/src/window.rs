@@ -4,7 +4,7 @@
 // returns/effects: Presents the main window and persists workspace/session changes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -159,6 +159,12 @@ struct WorkspaceEventSnapshot {
     tab_count: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SurfaceShellReport {
+    tty: Option<String>,
+    ports: Vec<u16>,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -190,6 +196,7 @@ pub(crate) struct AppState {
     workspace_dragging: Option<String>,
     next_notification_id: u64,
     next_sidebar_log_id: u64,
+    surface_shell_reports: HashMap<(String, String), SurfaceShellReport>,
     notifications: Vec<HostNotification>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
@@ -2592,6 +2599,77 @@ fn surface_ports_kick_payload(
     }))
 }
 
+/// purpose: Record a CMUX shell-reported TTY for one terminal surface.
+/// inputs: Host state, workspace, optional surface hint, and TTY name.
+/// returns/effects: Updates in-memory shell metadata and returns CMUX-shaped JSON.
+fn surface_report_tty_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+    tty: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    prune_surface_shell_reports(app_state, workspace_index);
+    let key = shell_report_key(
+        &app_state.workspaces[workspace_index].id,
+        &surface.surface_id,
+    );
+    app_state.surface_shell_reports.entry(key).or_default().tty = Some(tty.to_string());
+    Ok(shell_report_payload(
+        &app_state.workspaces[workspace_index],
+        &surface,
+    ))
+}
+
+/// purpose: Record CMUX shell-reported listening ports for one terminal surface.
+/// inputs: Host state, workspace, optional surface hint, and validated ports.
+/// returns/effects: Updates in-memory shell metadata and returns CMUX-shaped JSON.
+fn surface_report_ports_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+    ports: Vec<u16>,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    prune_surface_shell_reports(app_state, workspace_index);
+    let key = shell_report_key(
+        &app_state.workspaces[workspace_index].id,
+        &surface.surface_id,
+    );
+    app_state
+        .surface_shell_reports
+        .entry(key)
+        .or_default()
+        .ports = ports;
+    Ok(shell_report_payload(
+        &app_state.workspaces[workspace_index],
+        &surface,
+    ))
+}
+
+/// purpose: Clear CMUX shell-reported listening ports for one terminal surface.
+/// inputs: Host state, workspace, and optional surface hint.
+/// returns/effects: Removes only reported ports, preserving any reported TTY.
+fn surface_clear_ports_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    let key = shell_report_key(
+        &app_state.workspaces[workspace_index].id,
+        &surface.surface_id,
+    );
+    if let Some(report) = app_state.surface_shell_reports.get_mut(&key) {
+        report.ports.clear();
+    }
+    prune_surface_shell_reports(app_state, workspace_index);
+    Ok(shell_report_payload(
+        &app_state.workspaces[workspace_index],
+        &surface,
+    ))
+}
+
 /// purpose: Resolve the surface targeted by `surface.ports_kick`.
 /// inputs: Workspace surface summaries plus optional explicit surface/tab hint.
 /// returns/effects: Returns explicit not_found for unknown requested surfaces.
@@ -2623,6 +2701,72 @@ fn resolve_ports_kick_surface(
         .or_else(|| surfaces.first())
         .cloned()
         .ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
+/// purpose: Resolve a shell report target to a terminal surface.
+/// inputs: Workspace and optional CMUX surface/panel hint.
+/// returns/effects: Returns not_found when the target is absent or not terminal.
+fn resolve_report_surface(
+    workspace: &Workspace,
+    surface_hint: Option<&str>,
+) -> Result<pane::SurfaceSummary, BridgeError> {
+    let surfaces = pane::surface_summaries_for_root(&workspace.root);
+    let surface = if let Some(hint) = surface_hint {
+        surfaces
+            .into_iter()
+            .find(|surface| surface_hint_matches(&surface.surface_id, hint))
+    } else {
+        surfaces
+            .iter()
+            .find(|surface| surface.selected && surface.kind == "terminal")
+            .or_else(|| surfaces.iter().find(|surface| surface.kind == "terminal"))
+            .cloned()
+    };
+    surface
+        .filter(|surface| surface.kind == "terminal")
+        .ok_or_else(|| BridgeError::not_found("terminal surface not found"))
+}
+
+/// purpose: Build the key used for in-memory CMUX shell report metadata.
+/// inputs: Workspace id and surface id.
+/// returns/effects: Returns a stable tuple key without filesystem writes.
+fn shell_report_key(workspace_id: &str, surface_id: &str) -> (String, String) {
+    (workspace_id.to_string(), surface_id.to_string())
+}
+
+/// purpose: Drop shell report entries whose surfaces no longer exist.
+/// inputs: Host state and workspace index.
+/// returns/effects: Mutates only the in-memory shell report map.
+fn prune_surface_shell_reports(app_state: &mut AppState, workspace_index: usize) {
+    let workspace = &app_state.workspaces[workspace_index];
+    let live = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<HashSet<_>>();
+    let workspace_id = workspace.id.clone();
+    app_state
+        .surface_shell_reports
+        .retain(|(stored_workspace, surface_id), _| {
+            stored_workspace != &workspace_id || live.contains(surface_id)
+        });
+}
+
+/// purpose: Return CMUX-shaped shell report metadata for one surface.
+/// inputs: Workspace and resolved surface.
+/// returns/effects: Builds JSON without mutating state.
+fn shell_report_payload(
+    workspace: &Workspace,
+    surface: &pane::SurfaceSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "workspace_id": workspace.id,
+        "workspace_ref": workspace_ref(&workspace.id),
+        "surface_id": surface.surface_id,
+        "surface_ref": surface_ref(&surface.surface_id),
+        "pane_id": surface.pane_id.to_string(),
+        "pane_ref": pane_ref(surface.pane_id),
+    })
 }
 
 #[derive(Clone)]
@@ -4064,23 +4208,75 @@ fn sidebar_git_branch_from_dotgit(dotgit: &Path) -> Option<String> {
 /// inputs: Sidebar config for the workspace row.
 /// returns/effects: Returns hidden or currently detected ports without mutating state.
 fn sidebar_ports_rows(
+    shell_reports: &HashMap<(String, String), SurfaceShellReport>,
     workspace_id: &str,
     sidebar: &app_config::SidebarConfig,
 ) -> Result<Vec<serde_json::Value>, String> {
     if sidebar.hide_all_details || !sidebar.show_ports {
         return Ok(Vec::new());
     }
-    crate::port_discovery::workspace_port_rows(
+    let mut rows = crate::port_discovery::workspace_port_rows(
         workspace_id,
         20,
         sidebar.open_port_links_in_cmux_browser,
-    )
+    )?;
+    append_reported_port_rows(
+        shell_reports,
+        workspace_id,
+        sidebar.open_port_links_in_cmux_browser,
+        &mut rows,
+    );
+    Ok(rows)
+}
+
+/// purpose: Merge CMUX shell-reported ports into sidebar rows without duplicates.
+/// inputs: Host shell metadata, workspace id, browser-open policy, and discovered rows.
+/// returns/effects: Appends missing reported port rows and sorts rows by port.
+fn append_reported_port_rows(
+    shell_reports: &HashMap<(String, String), SurfaceShellReport>,
+    workspace_id: &str,
+    open_in_cmux_browser: bool,
+    rows: &mut Vec<serde_json::Value>,
+) {
+    let mut seen = rows
+        .iter()
+        .filter_map(|row| row.get("port").and_then(serde_json::Value::as_u64))
+        .collect::<HashSet<_>>();
+    for ((stored_workspace, surface_id), report) in shell_reports {
+        if stored_workspace != workspace_id {
+            continue;
+        }
+        for port in &report.ports {
+            if seen.insert(*port as u64) {
+                rows.push(reported_port_row(surface_id, *port, open_in_cmux_browser));
+            }
+        }
+    }
+    rows.sort_by_key(|row| row.get("port").and_then(serde_json::Value::as_u64));
+}
+
+/// purpose: Build one CMUX-compatible row for a shell-reported listening port.
+/// inputs: Surface id, port number, and browser-open policy.
+/// returns/effects: Returns JSON only; no network or filesystem access.
+fn reported_port_row(surface_id: &str, port: u16, open_in_cmux_browser: bool) -> serde_json::Value {
+    serde_json::json!({
+        "port": port,
+        "address": "127.0.0.1",
+        "protocol": "tcp",
+        "url": format!("http://127.0.0.1:{port}"),
+        "source": "report_ports",
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(surface_id),
+        "open_in_cmux_browser": open_in_cmux_browser,
+        "openInCmuxBrowser": open_in_cmux_browser,
+    })
 }
 
 /// purpose: Render all retained CMUX sidebar metadata for one workspace.
 /// inputs: Workspace with status/progress/log state plus current sidebar settings.
 /// returns/effects: Returns aggregate JSON without mutating state.
 fn sidebar_state_payload(
+    app_state: &AppState,
     workspace: &Workspace,
     sidebar: &app_config::SidebarConfig,
 ) -> Result<serde_json::Value, String> {
@@ -4100,7 +4296,7 @@ fn sidebar_state_payload(
         "workspace_ref": workspace_ref(&workspace.id),
         "cwd": cwd,
         "git_branch": git_branch,
-        "ports": sidebar_ports_rows(&workspace.id, sidebar)?,
+        "ports": sidebar_ports_rows(&app_state.surface_shell_reports, &workspace.id, sidebar)?,
         "status": sidebar_status_rows(workspace),
         "progress": sidebar_progress_row(workspace),
         "log": sidebar_log_rows(workspace, None),
@@ -4160,7 +4356,8 @@ fn apply_sidebar_action(
         })),
         SidebarAction::State => {
             let sidebar_config = app_state.config.borrow().sidebar.clone();
-            sidebar_state_payload(&app_state.workspaces[index], &sidebar_config)
+            prune_surface_shell_reports(&mut app_state, index);
+            sidebar_state_payload(&app_state, &app_state.workspaces[index], &sidebar_config)
                 .map_err(BridgeError::internal)
         }
     };
@@ -4874,6 +5071,7 @@ pub fn build_window(app: &adw::Application) {
         workspace_dragging: None,
         next_notification_id: 1,
         next_sidebar_log_id: 1,
+        surface_shell_reports: HashMap::new(),
         notifications: Vec::new(),
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
@@ -11014,6 +11212,61 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
             let _ = reply.send(result);
         }
+        ControlCommand::SurfaceReportTTY {
+            target,
+            surface_hint,
+            tty,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_report_tty_payload(&mut app_state, index, surface_hint.as_deref(), &tty)
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
+        ControlCommand::SurfaceReportPorts {
+            target,
+            surface_hint,
+            ports,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_report_ports_payload(
+                        &mut app_state,
+                        index,
+                        surface_hint.as_deref(),
+                        ports,
+                    )
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
+        ControlCommand::SurfaceClearPorts {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_clear_ports_payload(&mut app_state, index, surface_hint.as_deref())
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
         ControlCommand::CreateWorkspace {
             name,
             description,
@@ -14109,6 +14362,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
@@ -14120,12 +14374,12 @@ mod tests {
     use super::gtk::gdk;
     use super::ToVariant;
     use super::{
-        browser_count_script, browser_element_action_script, browser_find_script,
-        browser_required_element_script, browser_scroll_script, browser_snapshot_script,
-        browser_styles_script, build_window_css, clamp_workspace_insert_index_for_pinning,
-        clamped_right_sidebar_width, desktop_notification_action_entries,
-        desktop_notification_action_from_signal, desktop_notification_actions,
-        desktop_notification_activation_token_from_signal,
+        append_reported_port_rows, browser_count_script, browser_element_action_script,
+        browser_find_script, browser_required_element_script, browser_scroll_script,
+        browser_snapshot_script, browser_styles_script, build_window_css,
+        clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
+        desktop_notification_action_entries, desktop_notification_action_from_signal,
+        desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -14139,7 +14393,7 @@ mod tests {
         resolve_pane_create_source_id, resolve_workspace_creation_directory,
         resolved_system_prefers_dark, right_sidebar_metadata_sections,
         right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
-        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        sanitize_background_opacity, shell_report_key, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
         should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
@@ -14157,8 +14411,9 @@ mod tests {
         HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
         PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
         SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
-        SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
-        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        SidebarStatusEntry, SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceSeedSource,
+        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
@@ -14552,22 +14807,54 @@ mod tests {
     // returns/effects: Asserts hidden configs bypass discovery and expose no port rows.
     #[test]
     fn sidebar_ports_rows_follow_sidebar_visibility_config() {
+        let shell_reports = HashMap::new();
         let ports_hidden = crate::app_config::SidebarConfig {
             show_ports: false,
             ..crate::app_config::SidebarConfig::default()
         };
-        assert!(sidebar_ports_rows("workspace-test", &ports_hidden)
-            .expect("hidden ports")
-            .is_empty());
+        assert!(
+            sidebar_ports_rows(&shell_reports, "workspace-test", &ports_hidden)
+                .expect("hidden ports")
+                .is_empty()
+        );
 
         let all_details_hidden = crate::app_config::SidebarConfig {
             hide_all_details: true,
             show_ports: true,
             ..crate::app_config::SidebarConfig::default()
         };
-        assert!(sidebar_ports_rows("workspace-test", &all_details_hidden)
-            .expect("hidden details")
-            .is_empty());
+        assert!(
+            sidebar_ports_rows(&shell_reports, "workspace-test", &all_details_hidden)
+                .expect("hidden details")
+                .is_empty()
+        );
+    }
+
+    // purpose: Verify CMUX report_ports rows merge into sidebar port metadata.
+    // inputs: In-memory shell report metadata and one preexisting discovered port.
+    // returns/effects: Asserts duplicate ports are skipped and rows stay sorted.
+    #[test]
+    fn reported_ports_merge_without_duplicate_sidebar_rows() {
+        let mut reports = HashMap::new();
+        reports.insert(
+            shell_report_key("workspace-test", "1:tab"),
+            SurfaceShellReport {
+                tty: Some("pts/1".to_string()),
+                ports: vec![3000, 5173],
+            },
+        );
+        let mut rows = vec![serde_json::json!({
+            "port": 3000,
+            "address": "127.0.0.1",
+            "protocol": "tcp"
+        })];
+        append_reported_port_rows(&reports, "workspace-test", true, &mut rows);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["port"], json!(3000));
+        assert_eq!(rows[1]["port"], json!(5173));
+        assert_eq!(rows[1]["source"], json!("report_ports"));
+        assert_eq!(rows[1]["openInCmuxBrowser"], json!(true));
     }
 
     // purpose: Verify Limux clamps right-sidebar widths using CMUX policy values.

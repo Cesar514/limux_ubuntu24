@@ -169,6 +169,9 @@ const METHODS: &[&str] = &[
     "surface.clear_history",
     "surface.respawn",
     "surface.health",
+    "surface.report_ports",
+    "surface.clear_ports",
+    "surface.report_tty",
     "surface.ports_kick",
     "surface.read_text",
     "surface.send_text",
@@ -805,6 +808,23 @@ pub enum ControlCommand {
         reason: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfaceReportTTY {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        tty: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SurfaceReportPorts {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        ports: Vec<u16>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SurfaceClearPorts {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -960,6 +980,9 @@ impl ControlCommand {
             | Self::RespawnSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::SurfacePortsKick { reply, .. }
+            | Self::SurfaceReportTTY { reply, .. }
+            | Self::SurfaceReportPorts { reply, .. }
+            | Self::SurfaceClearPorts { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::WorkspaceEnv { reply, .. }
@@ -1057,6 +1080,47 @@ fn optional_string(params: &Map<String, Value>, keys: &[&str]) -> Option<String>
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     })
+}
+
+/// purpose: Parse CMUX report_ports parameters into validated TCP port numbers.
+/// inputs: JSON params containing `ports`, `port`, or `values` as numbers/strings.
+/// returns/effects: Returns non-empty port list or invalid_params for malformed values.
+fn required_report_ports(params: &Map<String, Value>) -> Result<Vec<u16>, BridgeError> {
+    let value = params
+        .get("ports")
+        .or_else(|| params.get("port"))
+        .or_else(|| params.get("values"))
+        .ok_or_else(|| BridgeError::invalid_params("surface.report_ports requires ports"))?;
+    let values = match value {
+        Value::Array(items) => items
+            .iter()
+            .map(parse_report_port_value)
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => vec![parse_report_port_value(value)?],
+    };
+    if values.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "surface.report_ports requires at least one port",
+        ));
+    }
+    Ok(values)
+}
+
+/// purpose: Parse one CMUX report_ports value.
+/// inputs: JSON number or string.
+/// returns/effects: Returns a u16 TCP port or invalid_params for out-of-range input.
+fn parse_report_port_value(value: &Value) -> Result<u16, BridgeError> {
+    let parsed = value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    });
+    let Some(port) = parsed.filter(|port| (1..=u16::MAX as u64).contains(port)) else {
+        return Err(BridgeError::invalid_params(
+            "surface.report_ports ports must be integers from 1 to 65535",
+        ));
+    };
+    Ok(port as u16)
 }
 
 fn required_browser_selector(
@@ -3976,6 +4040,87 @@ fn handle_method(
                 rx,
             )
         }
+        "surface.report_tty" | "report_tty" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let Some(tty) = optional_string(params, &["tty", "tty_name", "value"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.report_tty requires tty"),
+                );
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceReportTTY {
+                    target,
+                    surface_hint,
+                    tty,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.report_ports" | "report_ports" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let ports = match required_report_ports(params) {
+                Ok(ports) => ports,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceReportPorts {
+                    target,
+                    surface_hint,
+                    ports,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.clear_ports" | "clear_ports" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceClearPorts {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.read_text" | "read-screen" | "capture-pane" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -4855,6 +5000,9 @@ mod tests {
     #[test]
     fn capabilities_include_surface_ports_kick_method() {
         assert!(METHODS.contains(&"surface.ports_kick"));
+        assert!(METHODS.contains(&"surface.report_tty"));
+        assert!(METHODS.contains(&"surface.report_ports"));
+        assert!(METHODS.contains(&"surface.clear_ports"));
     }
 
     #[test]
@@ -8250,6 +8398,47 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn surface_report_routes_accept_cmux_shell_metadata() {
+        let tty_response = dispatch_request(
+            r#"{"id":1,"method":"surface.report_tty","params":{"workspace_id":"codex","panel_id":"surface:4:tab","tty":"pts/3"}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceReportTTY {
+                    target,
+                    surface_hint,
+                    tty,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(tty, "pts/3");
+                    let _ = reply.send(Ok(json!({ "tty": "pts/3" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(tty_response.error, None);
+
+        let ports_response = dispatch_request(
+            r#"{"id":2,"method":"report_ports","params":{"workspace_id":"codex","panel":"4:tab","ports":[3000,"5173"]}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceReportPorts {
+                    target,
+                    surface_hint,
+                    ports,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(ports, vec![3000, 5173]);
+                    let _ = reply.send(Ok(json!({ "ports": ports })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(ports_response.error, None);
     }
 
     #[test]

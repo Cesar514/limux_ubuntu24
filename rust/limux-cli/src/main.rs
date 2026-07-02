@@ -356,6 +356,9 @@ fn full_help_text() -> &'static str {
         "  current-workspace\n",
         "  memory [--groups <count>]\n",
         "  surface-health [--workspace <id|ref>]\n",
+        "  report_tty <tty> [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  report_ports <port...> [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  clear_ports [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
@@ -2880,6 +2883,18 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("reload-config", "Usage: limux reload-config"),
     ("surface-health", "Usage: limux surface-health"),
     (
+        "report_tty",
+        "Usage: limux report_tty <tty> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
+        "report_ports",
+        "Usage: limux report_ports <port...> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
+        "clear_ports",
+        "Usage: limux clear_ports [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
         "ports-kick",
         "Usage: limux ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]",
     ),
@@ -4776,6 +4791,113 @@ async fn run_ports_kick(client: &mut Client, args: &[String]) -> Result<Value> {
     client
         .call("surface.ports_kick", Value::Object(params))
         .await
+}
+
+/// purpose: Run CMUX-compatible shell metadata report commands through the live host.
+/// inputs: Method name and CLI args for report_tty/report_ports/clear_ports.
+/// returns/effects: Sends one surface metadata request or fails on malformed flags.
+async fn run_surface_shell_report(
+    client: &mut Client,
+    method: &str,
+    args: &[String],
+) -> Result<Value> {
+    let params = build_surface_shell_report_params(method, args)?;
+    client.call(method, Value::Object(params)).await
+}
+
+/// purpose: Build params for CMUX shell report command aliases.
+/// inputs: Method name plus raw CLI args.
+/// returns/effects: Returns normalized JSON params and rejects invalid ports/flags.
+fn build_surface_shell_report_params(method: &str, args: &[String]) -> Result<Map<String, Value>> {
+    let mut params = Map::new();
+    let mut ports = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let raw = args[index].as_str();
+        if raw.starts_with("--") {
+            insert_surface_shell_report_flag(&mut params, args, &mut index)?;
+            continue;
+        } else if method == "surface.report_tty" {
+            if params.contains_key("tty") {
+                bail!("report_tty accepts exactly one tty value");
+            }
+            params.insert("tty".to_string(), Value::String(raw.to_string()));
+        } else if method == "surface.report_ports" {
+            ports.push(parse_report_port_arg(raw)?);
+        } else {
+            bail!("clear_ports accepts only --workspace, --surface, and --panel");
+        }
+        index += 1;
+    }
+    if method == "surface.report_ports" {
+        if ports.is_empty() {
+            bail!("report_ports requires at least one port");
+        }
+        params.insert("ports".to_string(), json!(ports));
+    }
+    if method == "surface.report_tty" && !params.contains_key("tty") {
+        bail!("report_tty requires tty");
+    }
+    insert_context_surface_shell_report_params(&mut params);
+    Ok(params)
+}
+
+/// purpose: Insert one supported shell-report flag into a params map.
+/// inputs: Params map, raw args, and mutable parser index.
+/// returns/effects: Adds workspace/surface/panel/tty/ports params or fails on unknown flags.
+fn insert_surface_shell_report_flag(
+    params: &mut Map<String, Value>,
+    args: &[String],
+    index: &mut usize,
+) -> Result<()> {
+    let raw = args[*index].as_str();
+    let (name, inline) = raw
+        .trim_start_matches("--")
+        .split_once('=')
+        .map(|(name, value)| (format!("--{name}"), Some(value.to_string())))
+        .unwrap_or_else(|| (raw.to_string(), None));
+    let value = sidebar_option_value(args, index, &name, inline)?;
+    match name.as_str() {
+        "--workspace" => params.insert("workspace_id".to_string(), Value::String(value)),
+        "--surface" | "--tab" => params.insert("surface_id".to_string(), Value::String(value)),
+        "--panel" => params.insert("panel_id".to_string(), Value::String(value)),
+        "--tty" => params.insert("tty".to_string(), Value::String(value)),
+        _ => bail!("Unknown shell report option {name}"),
+    };
+    Ok(())
+}
+
+/// purpose: Parse one report_ports CLI argument.
+/// inputs: Raw string from CLI.
+/// returns/effects: Returns a valid TCP port or fails loudly for bad ranges.
+fn parse_report_port_arg(raw: &str) -> Result<u16> {
+    let port = raw
+        .parse::<u64>()
+        .with_context(|| format!("invalid report_ports value `{raw}`"))?;
+    if !(1..=u16::MAX as u64).contains(&port) {
+        bail!("report_ports values must be from 1 to 65535");
+    }
+    Ok(port as u16)
+}
+
+/// purpose: Add Limux/CMUX workspace and surface context fallbacks.
+/// inputs: Params map possibly missing explicit workspace/surface fields.
+/// returns/effects: Mutates params only when matching environment variables are present.
+fn insert_context_surface_shell_report_params(params: &mut Map<String, Value>) {
+    if !params.contains_key("workspace_id") {
+        if let Some(workspace) = context_env_value("LIMUX_WORKSPACE_ID")
+            .or_else(|| context_env_value("CMUX_WORKSPACE_ID"))
+        {
+            params.insert("workspace_id".to_string(), Value::String(workspace));
+        }
+    }
+    if !params.contains_key("surface_id") && !params.contains_key("panel_id") {
+        if let Some(surface) =
+            context_env_value("LIMUX_SURFACE_ID").or_else(|| context_env_value("CMUX_SURFACE_ID"))
+        {
+            params.insert("surface_id".to_string(), Value::String(surface));
+        }
+    }
 }
 
 /// purpose: Build params for `ports-kick`/`ports_kick` CLI aliases.
@@ -14663,6 +14785,30 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
+        "report_tty" | "report-tty" => {
+            let payload = run_surface_shell_report(client, "surface.report_tty", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "report_ports" | "report-ports" => {
+            let payload = run_surface_shell_report(client, "surface.report_ports", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "clear_ports" | "clear-ports" => {
+            let payload = run_surface_shell_report(client, "surface.clear_ports", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "list-panels"
         | "list-panes"
         | "list-workspaces"
@@ -15581,6 +15727,40 @@ mod cli_arg_tests {
         let panel_params =
             build_ports_kick_params(&args(&["--panel", "panel-1"])).expect("panel alias parses");
         assert_eq!(panel_params["panel_id"], json!("panel-1"));
+    }
+
+    #[test]
+    fn shell_report_params_accept_tty_ports_and_clear_targets() {
+        let tty_params = build_surface_shell_report_params(
+            "surface.report_tty",
+            &args(&[
+                "pts/4",
+                "--workspace",
+                "workspace:abc",
+                "--panel",
+                "panel-1",
+            ]),
+        )
+        .expect("report tty parses");
+        assert_eq!(tty_params["tty"], json!("pts/4"));
+        assert_eq!(tty_params["workspace_id"], json!("workspace:abc"));
+        assert_eq!(tty_params["panel_id"], json!("panel-1"));
+
+        let port_params = build_surface_shell_report_params(
+            "surface.report_ports",
+            &args(&["3000", "5173", "--surface=surface:1:tab"]),
+        )
+        .expect("report ports parses");
+        assert_eq!(port_params["ports"], json!([3000, 5173]));
+        assert_eq!(port_params["surface_id"], json!("surface:1:tab"));
+
+        let clear_params = build_surface_shell_report_params(
+            "surface.clear_ports",
+            &args(&["--workspace=workspace:abc", "--surface", "surface:1:tab"]),
+        )
+        .expect("clear ports parses");
+        assert_eq!(clear_params["workspace_id"], json!("workspace:abc"));
+        assert_eq!(clear_params["surface_id"], json!("surface:1:tab"));
     }
 
     #[test]
