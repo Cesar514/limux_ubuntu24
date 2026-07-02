@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T12:31:12Z Implement and verify additional local CMUX `top` parity in `limux-cli`: `top --sort mem|proc` now reorders local process groups, and `top --flat` / `top --format tsv` render CMUX-shaped TSV rows from Limux's current process-group diagnostics while scoped top and CPU sorting remain explicit unsupported paths. \
 [x] 2026-07-02T12:24:13Z Implement and verify native CMUX topology parity in the live GTK bridge: `window.list` and `system.tree` are now advertised/routed by the bridge, `system.tree` returns a live window/workspace/pane/surface tree tagged `limux_live_system_tree`, and top-level `tree` now calls the native method instead of rebuilding topology client-side. \
 [x] 2026-07-02T12:15:50Z Implement and verify CMUX `docs dock` parity in `limux-cli`: the docs index now lists `dock`, `docs dock` prints dock/right-sidebar custom-control guidance, and `doc`/`controls`/`right-sidebar`/`dock-json` aliases normalize like CMUX. \
 [x] 2026-07-02T12:11:05Z Implement and verify CMUX-compatible top-level `tree` and partial `top` routing in `limux-cli`: `tree` now assembles window/workspace/pane/surface topology from existing list APIs with text/JSON output, and `top` routes to Limux `system.memory` diagnostics while failing loudly for scoped/sorted/TSV CMUX `system.top` behavior that is not implemented yet. \

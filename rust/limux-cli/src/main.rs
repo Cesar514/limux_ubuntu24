@@ -3934,12 +3934,30 @@ fn append_tree_pane_text(lines: &mut Vec<String>, pane: &Value) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopSortKey {
+    Memory,
+    ProcessCount,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopTextFormat {
+    Tree,
+    Tsv,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopOptions {
+    sort_key: Option<TopSortKey>,
+    text_format: TopTextFormat,
+}
+
 // purpose: Run CMUX `top` through Limux process diagnostics.
-// inputs: Raw top arguments.
+// inputs: Socket client and parsed top options.
 // returns/effects: Returns system.memory payload tagged with top compatibility metadata.
-async fn run_top(client: &mut Client, args: &[String]) -> Result<Value> {
-    parse_top_options(args)?;
+async fn run_top(client: &mut Client, options: TopOptions) -> Result<Value> {
     let mut payload = run_memory(client, &[]).await?;
+    sort_top_payload(&mut payload, options.sort_key);
     if let Some(map) = payload.as_object_mut() {
         map.insert("source".to_string(), json!("limux_system_memory"));
         map.insert("cmux_command".to_string(), json!("top"));
@@ -3949,20 +3967,34 @@ async fn run_top(client: &mut Client, args: &[String]) -> Result<Value> {
 
 // purpose: Validate CMUX-compatible `top` flags Limux can safely accept.
 // inputs: Raw top command arguments.
-// returns/effects: Fails loudly for unsupported or malformed flags.
-fn parse_top_options(args: &[String]) -> Result<()> {
+// returns/effects: Returns local render options or fails loudly for unsupported scoped flags.
+fn parse_top_options(args: &[String]) -> Result<TopOptions> {
+    let mut sort_key = None;
+    let mut text_format = TopTextFormat::Tree;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--json" | "--processes" => index += 1,
-            "--format" => index = validate_top_format_arg(args, index)?,
-            "--all" | "--workspace" | "--window" | "--sort" => {
+            "--sort" => {
+                let (parsed, next) = parse_top_sort_arg(args, index)?;
+                sort_key = parsed;
+                index = next;
+            }
+            "--format" => {
+                let (parsed, next) = parse_top_format_arg(args, index)?;
+                text_format = parsed;
+                index = next;
+            }
+            "--flat" => {
+                text_format = TopTextFormat::Tsv;
+                index += 1;
+            }
+            "--all" | "--workspace" | "--window" => {
                 let flag = args[index].as_str();
                 bail!(
                     "top: {flag} requires CMUX system.top scoped diagnostics, which Limux does not implement yet"
                 );
             }
-            "--flat" => bail!("top: --flat requires CMUX system.top TSV output, which Limux does not implement yet"),
             unknown if unknown.starts_with("--") => {
                 let known = concat!(
                     "--all --workspace <id|ref|index> --window <id|ref|index> ",
@@ -3973,26 +4005,76 @@ fn parse_top_options(args: &[String]) -> Result<()> {
             extra => bail!("top: unexpected argument '{extra}'"),
         }
     }
-    Ok(())
+    Ok(TopOptions {
+        sort_key,
+        text_format,
+    })
 }
 
-// purpose: Validate the CMUX top format flag.
+// purpose: Parse a CMUX-compatible top sort flag for local process groups.
 // inputs: Raw args and current flag index.
-// returns/effects: Returns the next parse index or a usage error.
-fn validate_top_format_arg(args: &[String], index: usize) -> Result<usize> {
+// returns/effects: Returns a supported sort key and next parse index.
+fn parse_top_sort_arg(args: &[String], index: usize) -> Result<(Option<TopSortKey>, usize)> {
     let flag = args[index].as_str();
     let value = args
         .get(index + 1)
         .ok_or_else(|| anyhow!("top requires {flag} <value>"))?;
-    if matches!(value.as_str(), "tree") {
-        return Ok(index + 2);
+    let key = match value.as_str() {
+        "rss" | "mem" | "memory" | "ram" => TopSortKey::Memory,
+        "proc" | "process" | "processes" | "count" => TopSortKey::ProcessCount,
+        "cpu" | "cpu%" => bail!(
+            "top: --sort cpu requires CMUX system.top CPU diagnostics, which Limux does not implement yet"
+        ),
+        _ => bail!("top: invalid --sort value '{value}'. Use cpu, mem, or proc"),
+    };
+    Ok((Some(key), index + 2))
+}
+
+// purpose: Parse the CMUX top text format flag.
+// inputs: Raw args and current flag index.
+// returns/effects: Returns the selected text format and next parse index.
+fn parse_top_format_arg(args: &[String], index: usize) -> Result<(TopTextFormat, usize)> {
+    let flag = args[index].as_str();
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| anyhow!("top requires {flag} <value>"))?;
+    let format = match value.as_str() {
+        "tree" => TopTextFormat::Tree,
+        "tsv" | "tab" | "tabs" => TopTextFormat::Tsv,
+        _ => bail!("top: invalid --format value '{value}'. Use tree or tsv"),
+    };
+    Ok((format, index + 2))
+}
+
+// purpose: Sort top process-group rows in-place for supported local metrics.
+// inputs: Mutable top/memory payload and optional sort key.
+// returns/effects: Reorders child process groups for text/JSON output.
+fn sort_top_payload(payload: &mut Value, sort_key: Option<TopSortKey>) {
+    let Some(sort_key) = sort_key else {
+        return;
+    };
+    let Some(groups) = payload
+        .get_mut("memory_diagnostic")
+        .and_then(|value| value.get_mut("children"))
+        .and_then(|value| value.get_mut("groups"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    groups.sort_by_key(|group| std::cmp::Reverse(top_sort_value(group, sort_key)));
+}
+
+// purpose: Read a sortable local top metric from one process-group row.
+// inputs: Process group JSON and selected local sort key.
+// returns/effects: Returns zero when the metric is absent.
+fn top_sort_value(group: &Value, sort_key: TopSortKey) -> u64 {
+    match sort_key {
+        TopSortKey::Memory => group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0),
+        TopSortKey::ProcessCount => group
+            .get("process_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }
-    if matches!(value.as_str(), "tsv" | "tab" | "tabs") {
-        bail!(
-            "top: --format tsv requires CMUX system.top TSV output, which Limux does not implement yet"
-        );
-    }
-    bail!("top: invalid --format value '{value}'. Use tree or tsv")
 }
 
 async fn run_memory(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -4090,6 +4172,82 @@ fn render_memory_text(payload: &Value, id_format: IdFormat) -> String {
         ));
     }
     lines.join("\n")
+}
+
+// purpose: Render local top process-group diagnostics as CMUX-compatible TSV rows.
+// inputs: Top/memory payload and requested id format.
+// returns/effects: Returns tab-delimited cpu/rss/proc/kind/ref/parent/title rows.
+fn render_top_tsv(payload: &Value, id_format: IdFormat) -> String {
+    let groups = top_group_rows(payload);
+    let mut rows =
+        vec!["cpu\tmemory_bytes\tprocess_count\tkind\tref\tparent_ref\ttitle".to_string()];
+    rows.extend(
+        groups
+            .iter()
+            .map(|group| top_group_tsv_line(group, id_format)),
+    );
+    rows.join("\n")
+}
+
+// purpose: Read process-group rows from a top/memory payload.
+// inputs: JSON payload returned by run_top/run_memory.
+// returns/effects: Returns cloned group rows or an empty list when none exist.
+fn top_group_rows(payload: &Value) -> Vec<Value> {
+    payload
+        .get("memory_diagnostic")
+        .and_then(|value| value.get("children"))
+        .and_then(|value| value.get("groups"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+// purpose: Render one local top process-group as a TSV data line.
+// inputs: Process group row and requested id format.
+// returns/effects: Returns escaped TSV fields without a trailing newline.
+fn top_group_tsv_line(group: &Value, id_format: IdFormat) -> String {
+    let rss = group.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0);
+    let process_count = group
+        .get("process_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reference = top_process_ref(group);
+    let title = group
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("process");
+    let parent = memory_attribution_text(group.get("top_attribution"), id_format);
+    [
+        "0.0".to_string(),
+        rss.to_string(),
+        process_count.to_string(),
+        "process_group".to_string(),
+        reference,
+        parent,
+        title.to_string(),
+    ]
+    .into_iter()
+    .map(|field| top_tsv_field(&field))
+    .collect::<Vec<_>>()
+    .join("\t")
+}
+
+// purpose: Build a stable ref for a local process group row.
+// inputs: Process group JSON with optional pid.
+// returns/effects: Returns process:<pid> or process:unknown.
+fn top_process_ref(group: &Value) -> String {
+    group
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|pid| format!("process:{pid}"))
+        .unwrap_or_else(|| "process:unknown".to_string())
+}
+
+// purpose: Escape one field for a single-line TSV output row.
+// inputs: Raw display field.
+// returns/effects: Replaces tabs and line breaks with spaces.
+fn top_tsv_field(raw: &str) -> String {
+    raw.replace(['\t', '\n', '\r'], " ")
 }
 
 fn memory_attribution_text(raw: Option<&Value>, id_format: IdFormat) -> String {
@@ -12745,9 +12903,12 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "top" => {
-            let payload = run_top(client, args).await?;
+            let top_options = parse_top_options(args)?;
+            let payload = run_top(client, top_options).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
+            } else if top_options.text_format == TopTextFormat::Tsv {
+                CommandOutput::Text(render_top_tsv(&payload, opts.id_format))
             } else {
                 CommandOutput::Text(render_memory_text(&payload, opts.id_format))
             }
@@ -14927,16 +15088,47 @@ mod cli_arg_tests {
 
     #[test]
     fn cmux_top_options_accept_safe_flags_and_reject_unimplemented_scopes() {
-        parse_top_options(&args(&["--processes", "--format", "tree"]))
+        let tree = parse_top_options(&args(&["--processes", "--format", "tree"]))
             .expect("safe top flags parse");
+        assert_eq!(tree.text_format, TopTextFormat::Tree);
 
-        let err = parse_top_options(&args(&["--format", "tsv"]))
-            .expect_err("tsv output is not silently faked");
-        assert!(err.to_string().contains("system.top TSV output"));
+        let tsv =
+            parse_top_options(&args(&["--flat", "--sort", "mem"])).expect("tsv sort flags parse");
+        assert_eq!(tsv.text_format, TopTextFormat::Tsv);
+        assert_eq!(tsv.sort_key, Some(TopSortKey::Memory));
+
+        let proc_sort = parse_top_options(&args(&["--format", "tsv", "--sort", "proc"]))
+            .expect("process sort parses");
+        assert_eq!(proc_sort.sort_key, Some(TopSortKey::ProcessCount));
+
+        let cpu = parse_top_options(&args(&["--sort", "cpu"])).expect_err("cpu needs real top");
+        assert!(cpu.to_string().contains("CPU diagnostics"));
 
         let scoped =
             parse_top_options(&args(&["--workspace", "workspace:7"])).expect_err("scope fails");
         assert!(scoped.to_string().contains("system.top scoped diagnostics"));
+    }
+
+    #[test]
+    fn cmux_top_sorts_local_groups_and_renders_tsv() {
+        let mut payload = json!({
+            "memory_diagnostic": {
+                "children": {
+                    "groups": [
+                        {"pid": 10, "name": "small", "rss_bytes": 50, "process_count": 9},
+                        {"pid": 11, "name": "large", "rss_bytes": 500, "process_count": 1}
+                    ]
+                }
+            }
+        });
+
+        sort_top_payload(&mut payload, Some(TopSortKey::Memory));
+        let groups = top_group_rows(&payload);
+        assert_eq!(groups[0]["name"], "large");
+
+        let tsv = render_top_tsv(&payload, IdFormat::Refs);
+        assert!(tsv.starts_with("cpu\tmemory_bytes\tprocess_count"));
+        assert!(tsv.contains("process:11"));
     }
 
     #[test]
