@@ -62,6 +62,7 @@ const METHODS: &[&str] = &[
     "pane.create_many",
     "pane.focus",
     "pane.last",
+    "pane.resize",
     "browser.open_split",
     "browser.navigate",
     "browser.url.get",
@@ -517,6 +518,13 @@ pub enum ControlCommand {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ResizePane {
+        target: WorkspaceTarget,
+        pane_id: String,
+        direction: String,
+        amount: u64,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     BrowserAction {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -692,6 +700,7 @@ impl ControlCommand {
             | Self::CreatePanes { reply, .. }
             | Self::FocusPane { reply, .. }
             | Self::LastPane { reply, .. }
+            | Self::ResizePane { reply, .. }
             | Self::BrowserAction { reply, .. }
             | Self::BrowserTabAction { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -1146,6 +1155,18 @@ fn parse_pane_create_direction(raw: &str) -> Result<PaneCreateDirection, BridgeE
         "down" => Ok(PaneCreateDirection::Down),
         _ => Err(BridgeError::invalid_params(
             "pane.create direction must be one of left|right|up|down",
+        )),
+    }
+}
+
+// purpose: Parse a live pane resize direction.
+// inputs: Raw direction string from `pane.resize` or tmux-compatible `resize-pane`.
+// returns/effects: Returns the normalized direction or invalid_params for unknown values.
+fn parse_pane_resize_direction(raw: &str) -> Result<String, BridgeError> {
+    match raw {
+        "left" | "right" | "up" | "down" => Ok(raw.to_string()),
+        _ => Err(BridgeError::invalid_params(
+            "pane.resize direction must be one of left|right|up|down",
         )),
     }
 }
@@ -2154,6 +2175,44 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::LastPane { target, reply }, rx)
+        }
+        "pane.resize" | "resize-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let pane_id = match optional_ref_handle(params, &["pane_id", "id"], "pane:") {
+                Ok(Some(value)) if !value.trim().is_empty() => value,
+                Ok(_) => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("pane.resize requires pane_id"),
+                    );
+                }
+                Err(error) => return error_response(id, error),
+            };
+            let direction = match optional_string(params, &["direction"]) {
+                Some(raw) => match parse_pane_resize_direction(raw.as_str()) {
+                    Ok(direction) => direction,
+                    Err(error) => return error_response(id, error),
+                },
+                None => "right".to_string(),
+            };
+            let amount = match optional_u64(params, &["amount"]) {
+                Ok(amount) => amount.unwrap_or(1),
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ResizePane {
+                    target,
+                    pane_id,
+                    direction,
+                    amount,
+                    reply,
+                },
+                rx,
+            )
         }
         "surface.split" | "new-split" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -4504,6 +4563,59 @@ mod tests {
         assert_eq!(
             response.result.expect("pane.last result")["pane_ref"],
             "pane:10"
+        );
+    }
+
+    #[test]
+    fn pane_resize_route_accepts_cmux_alias_and_pane_refs() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"resize-pane","params":{"workspace_id":"codex","#,
+                r#""pane_id":"pane:11","direction":"left","amount":3}}"#
+            ),
+            &|command| match command {
+                ControlCommand::ResizePane {
+                    target,
+                    pane_id,
+                    direction,
+                    amount,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(pane_id, "11");
+                    assert_eq!(direction, "left");
+                    assert_eq!(amount, 3);
+                    let _ = reply.send(Ok(json!({ "pane_ref": "pane:11", "ratio": 0.44 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.resize result")["pane_ref"],
+            "pane:11"
+        );
+    }
+
+    #[test]
+    fn pane_resize_route_rejects_missing_pane_and_invalid_direction() {
+        let missing = dispatch_request(
+            r#"{"id":1,"method":"pane.resize","params":{"direction":"right"}}"#,
+            &|command| panic!("invalid pane.resize should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            missing.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+
+        let invalid_direction = dispatch_request(
+            r#"{"id":1,"method":"pane.resize","params":{"pane_id":"pane:11","direction":"wide"}}"#,
+            &|command| panic!("invalid pane.resize should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid_direction.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
         );
     }
 

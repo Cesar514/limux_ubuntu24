@@ -5619,6 +5619,74 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let _ = reply.send(focus_pane_for_control(state, index, last_pane_id));
         }
+        ControlCommand::ResizePane {
+            target,
+            pane_id,
+            direction,
+            amount,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+            let pane_id = parse_pane_handle(&pane_id).or_else(|| pane_id.parse::<u32>().ok());
+            let Some(pane_id) = pane_id else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "pane.resize requires a valid pane_id",
+                )));
+                return;
+            };
+
+            let resize_target = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let Some(pane_widget) = pane::pane_widget_for_root(&workspace.root, pane_id) else {
+                    let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                        "pane not found",
+                    )));
+                    return;
+                };
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.split_container.clone(),
+                    pane_widget,
+                )
+            };
+            let (workspace_id, workspace_name, split_container, pane_widget) = resize_target;
+            let Some(ratio) = split_container.resize_pane(&pane_widget, &direction, amount) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::conflict(
+                    "pane cannot resize in that direction",
+                )));
+                return;
+            };
+            request_session_save(state);
+
+            let Some(surface) = pane::active_surface_summary(&pane_widget) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "pane not found",
+                )));
+                return;
+            };
+            let mut payload = pane_create_response_payload(&workspace_id, &workspace_name, surface);
+            if let Some(map) = payload.as_object_mut() {
+                map.insert(
+                    "direction".to_string(),
+                    serde_json::Value::String(direction),
+                );
+                map.insert("amount".to_string(), serde_json::json!(amount));
+                map.insert("ratio".to_string(), serde_json::json!(ratio));
+            }
+            let _ = reply.send(Ok(payload));
+        }
         ControlCommand::BrowserTabAction {
             target,
             surface_hint,

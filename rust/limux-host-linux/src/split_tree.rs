@@ -12,6 +12,9 @@ use crate::window::{
     State,
 };
 
+const PANE_RESIZE_RATIO_STEP: f64 = 0.02;
+const PANE_RESIZE_MAX_RATIO_DELTA: f64 = 0.40;
+
 // ---------------------------------------------------------------------------
 // SplitNode — runtime data model for the split tree
 // ---------------------------------------------------------------------------
@@ -293,6 +296,25 @@ impl SplitTreeContainer {
         removed
     }
 
+    /// Resize the nearest matching split around a pane.
+    pub(crate) fn resize_pane(
+        self: &Rc<Self>,
+        target: &gtk::Widget,
+        direction: &str,
+        amount: u64,
+    ) -> Option<f64> {
+        let direction = PaneResizeDirection::from_str(direction)?;
+        let delta = resize_ratio_delta(amount);
+        let ratio = {
+            let mut tree = self.tree.borrow_mut();
+            resize_node_for_pane(&mut tree, target, direction, delta)
+        }?;
+        self.save_focus();
+        *self.last_focused.borrow_mut() = Some(target.clone());
+        self.trigger_rebuild();
+        Some(ratio)
+    }
+
     /// Tear down the old widget tree and schedule a rebuild on the next idle
     /// tick. The one-tick separation between unrealize (teardown) and realize
     /// (rebuild) is what prevents GLArea breakage.
@@ -377,6 +399,99 @@ impl Drop for SplitTreeContainer {
             source.remove();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl PaneResizeDirection {
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "up" => Some(Self::Up),
+            "down" => Some(Self::Down),
+            _ => None,
+        }
+    }
+
+    fn orientation(self) -> gtk::Orientation {
+        match self {
+            Self::Left | Self::Right => gtk::Orientation::Horizontal,
+            Self::Up | Self::Down => gtk::Orientation::Vertical,
+        }
+    }
+}
+
+// purpose: Convert tmux resize amount units into a bounded split-ratio delta.
+// inputs: Resize amount supplied by the CLI or bridge.
+// returns/effects: Returns a non-zero ratio delta clamped to avoid pane collapse.
+fn resize_ratio_delta(amount: u64) -> f64 {
+    ((amount.max(1) as f64) * PANE_RESIZE_RATIO_STEP).min(PANE_RESIZE_MAX_RATIO_DELTA)
+}
+
+// purpose: Adjust a split ratio when a pane border is moved in a direction.
+// inputs: Current ratio, whether the pane is in the start child, movement direction, and delta.
+// returns/effects: Returns the clamped ratio after applying the movement.
+fn resized_ratio(
+    ratio: f64,
+    pane_in_start_child: bool,
+    direction: PaneResizeDirection,
+    delta: f64,
+) -> f64 {
+    let grows_start = match direction {
+        PaneResizeDirection::Right | PaneResizeDirection::Down => pane_in_start_child,
+        PaneResizeDirection::Left | PaneResizeDirection::Up => !pane_in_start_child,
+    };
+    let next = if grows_start {
+        ratio + delta
+    } else {
+        ratio - delta
+    };
+    layout_state::clamp_split_ratio(next)
+}
+
+// purpose: Resize the deepest split with a matching orientation around a pane.
+// inputs: Split tree node, target pane widget, resize direction, and ratio delta.
+// returns/effects: Mutates the selected split ratio and returns its new value.
+fn resize_node_for_pane(
+    node: &mut SplitNode,
+    target: &gtk::Widget,
+    direction: PaneResizeDirection,
+    delta: f64,
+) -> Option<f64> {
+    let SplitNode::Split {
+        orientation,
+        ratio,
+        left,
+        right,
+    } = node
+    else {
+        return None;
+    };
+
+    if let Some(updated) = resize_node_for_pane(left, target, direction, delta) {
+        return Some(updated);
+    }
+    if let Some(updated) = resize_node_for_pane(right, target, direction, delta) {
+        return Some(updated);
+    }
+    if *orientation != direction.orientation() {
+        return None;
+    }
+
+    let pane_in_start_child = left.contains_pane(target);
+    if !pane_in_start_child && !right.contains_pane(target) {
+        return None;
+    }
+    let updated = resized_ratio(*ratio.borrow(), pane_in_start_child, direction, delta);
+    *ratio.borrow_mut() = updated;
+    Some(updated)
 }
 
 // ---------------------------------------------------------------------------
@@ -619,5 +734,22 @@ mod tests {
             pane::MIN_PANE_HEIGHT * 2,
             gtk::Orientation::Vertical
         ));
+    }
+
+    #[test]
+    fn resized_ratio_moves_border_relative_to_target_child() {
+        assert!(resized_ratio(0.5, true, PaneResizeDirection::Right, 0.1) > 0.5);
+        assert!(resized_ratio(0.5, false, PaneResizeDirection::Right, 0.1) < 0.5);
+        assert!(resized_ratio(0.5, true, PaneResizeDirection::Left, 0.1) < 0.5);
+        assert!(resized_ratio(0.5, false, PaneResizeDirection::Left, 0.1) > 0.5);
+        assert!(resized_ratio(0.5, true, PaneResizeDirection::Down, 0.1) > 0.5);
+        assert!(resized_ratio(0.5, false, PaneResizeDirection::Up, 0.1) > 0.5);
+    }
+
+    #[test]
+    fn resize_ratio_delta_is_bounded_and_nonzero() {
+        assert_eq!(resize_ratio_delta(0), PANE_RESIZE_RATIO_STEP);
+        assert_eq!(resize_ratio_delta(1), PANE_RESIZE_RATIO_STEP);
+        assert_eq!(resize_ratio_delta(100), PANE_RESIZE_MAX_RATIO_DELTA);
     }
 }
