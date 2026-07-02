@@ -4552,6 +4552,15 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             antigravity_feed_hook_events(),
         ),
+        agent_hooks::AgentKind::RovoDev => install_rovodev_hooks(
+            &rovodev_config_path(),
+            agent,
+            &[
+                ("on_complete", "stop"),
+                ("on_error", "stop"),
+                ("on_tool_permission", "prompt-submit"),
+            ],
+        ),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4627,6 +4636,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::Antigravity => {
             uninstall_antigravity_hooks(&antigravity_hooks_path(), agent)
         }
+        agent_hooks::AgentKind::RovoDev => uninstall_rovodev_hooks(&rovodev_config_path()),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -4945,6 +4955,213 @@ fn uninstall_antigravity_hooks(path: &Path, agent: agent_hooks::AgentKind) -> Re
     write_json_object(path, &root)
 }
 
+// purpose: Install Rovo Dev lifecycle hooks into config.yml using CMUX's marked YAML block.
+// inputs: Rovo config path, agent kind, and event-to-Limux hook mappings.
+// returns/effects: Preserves unrelated YAML text and rewrites only the owned marked block.
+fn install_rovodev_hooks(
+    path: &Path,
+    agent: agent_hooks::AgentKind,
+    events: &[(&str, &str)],
+) -> Result<()> {
+    let existing = read_optional_text(path)?;
+    let entries = events
+        .iter()
+        .map(|(event_name, limux_event)| Ok((*event_name, hook_command(agent, limux_event)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let updated = rovodev_installing(&existing, &entries);
+    write_text_file(path, &updated)
+}
+
+// purpose: Remove Limux's Rovo Dev marked block from config.yml.
+// inputs: Rovo config path.
+// returns/effects: Leaves missing files and dangling begin markers untouched.
+fn uninstall_rovodev_hooks(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing = read_optional_text(path)?;
+    let updated = rovodev_uninstalling(&existing);
+    write_text_file(path, &updated)
+}
+
+// purpose: Build Rovo Dev config text with an idempotent CMUX-compatible marked hook block.
+// inputs: Existing config text and event command pairs.
+// returns/effects: Returns complete config text without filesystem changes.
+fn rovodev_installing(existing: &str, events: &[(&str, String)]) -> String {
+    let mut lines = normalized_text_lines(existing);
+    lines = rovodev_removing_marked_block(lines);
+
+    if let Some(events_index) = rovodev_events_line_index(&lines) {
+        let item_indent = format!("{}  ", leading_whitespace(&lines[events_index]));
+        let block = rovodev_event_hooks_block(events, &item_indent, true);
+        lines.splice(events_index + 1..events_index + 1, block);
+    } else if let Some(event_hooks_index) = rovodev_event_hooks_line_index(&lines) {
+        let child_indent = format!("{}  ", leading_whitespace(&lines[event_hooks_index]));
+        let mut block = vec![
+            format!("{child_indent}# cmux hooks rovodev begin"),
+            format!("{child_indent}events:"),
+        ];
+        block.extend(rovodev_event_hooks_block(
+            events,
+            &format!("{child_indent}  "),
+            false,
+        ));
+        block.push(format!("{child_indent}# cmux hooks rovodev end"));
+        lines.splice(event_hooks_index + 1..event_hooks_index + 1, block);
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("# cmux hooks rovodev begin".to_string());
+        lines.push("eventHooks:".to_string());
+        lines.push("  events:".to_string());
+        lines.extend(rovodev_event_hooks_block(events, "    ", false));
+        lines.push("# cmux hooks rovodev end".to_string());
+    }
+
+    serialize_text_lines(&lines)
+}
+
+// purpose: Remove the complete Rovo Dev marked block if both markers are present.
+// inputs: Existing config text.
+// returns/effects: Returns config text without a complete owned block.
+fn rovodev_uninstalling(existing: &str) -> String {
+    serialize_text_lines(&rovodev_removing_marked_block(normalized_text_lines(
+        existing,
+    )))
+}
+
+// purpose: Render Rovo Dev event hook YAML lines with optional markers.
+// inputs: Event command pairs, item indentation, and marker flag.
+// returns/effects: Returns YAML text lines without filesystem changes.
+fn rovodev_event_hooks_block(
+    events: &[(&str, String)],
+    item_indent: &str,
+    include_markers: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if include_markers {
+        lines.push(format!("{item_indent}# cmux hooks rovodev begin"));
+    }
+    for (event_name, command) in events {
+        lines.push(format!("{item_indent}- name: {event_name}"));
+        lines.push(format!("{item_indent}  commands:"));
+        lines.push(format!(
+            "{item_indent}    - command: {}",
+            yaml_double_quoted(command)
+        ));
+    }
+    if include_markers {
+        lines.push(format!("{item_indent}# cmux hooks rovodev end"));
+    }
+    lines
+}
+
+// purpose: Remove complete Rovo Dev marker blocks from normalized lines.
+// inputs: Config lines without a final empty line for trailing newline.
+// returns/effects: Returns remaining lines; dangling begin markers are preserved.
+fn rovodev_removing_marked_block(mut lines: Vec<String>) -> Vec<String> {
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim() != "# cmux hooks rovodev begin" {
+            index += 1;
+            continue;
+        }
+        let Some(relative_end) = lines[index + 1..]
+            .iter()
+            .position(|line| line.trim() == "# cmux hooks rovodev end")
+        else {
+            index += 1;
+            continue;
+        };
+        let end_index = index + 1 + relative_end;
+        let start_index = if index > 0 && lines[index - 1].trim().is_empty() {
+            index - 1
+        } else {
+            index
+        };
+        lines.drain(start_index..=end_index);
+        index = start_index;
+    }
+    lines
+}
+
+// purpose: Find the top-level Rovo Dev eventHooks line.
+// inputs: Normalized YAML lines.
+// returns/effects: Returns the line index when present.
+fn rovodev_event_hooks_line_index(lines: &[String]) -> Option<usize> {
+    lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed == "eventHooks:" || trimmed.starts_with("eventHooks: #")
+    })
+}
+
+// purpose: Find the direct events child under eventHooks, ignoring nested events keys.
+// inputs: Normalized YAML lines.
+// returns/effects: Returns the direct child line index when present.
+fn rovodev_events_line_index(lines: &[String]) -> Option<usize> {
+    let event_hooks_index = rovodev_event_hooks_line_index(lines)?;
+    let child_indent = format!("{}  ", leading_whitespace(&lines[event_hooks_index]));
+    for (index, line) in lines.iter().enumerate().skip(event_hooks_index + 1) {
+        if !line.trim().is_empty() && !line.starts_with(&child_indent) {
+            return None;
+        }
+        if !line.starts_with(&child_indent) {
+            continue;
+        }
+        let suffix = &line[child_indent.len()..];
+        if suffix == "events:" || suffix.starts_with("events: #") {
+            return Some(index);
+        }
+    }
+    None
+}
+
+// purpose: Split optional text content into CMUX-compatible normalized lines.
+// inputs: Raw text.
+// returns/effects: Drops only the synthetic final empty line from a trailing newline.
+fn normalized_text_lines(content: &str) -> Vec<String> {
+    let mut lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+// purpose: Serialize normalized text lines using CMUX's trailing newline convention.
+// inputs: Normalized text lines.
+// returns/effects: Returns empty text for no lines, otherwise line-joined text plus newline.
+fn serialize_text_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+// purpose: Extract leading spaces and tabs from one line.
+// inputs: Text line.
+// returns/effects: Returns the indentation prefix.
+fn leading_whitespace(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &line[..end]
+}
+
+// purpose: Escape a string as a YAML double-quoted scalar for Rovo Dev config.
+// inputs: Raw command string.
+// returns/effects: Returns an escaped scalar without validating YAML semantics elsewhere.
+fn yaml_double_quoted(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
 // purpose: List the Claude hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Claude hook event names without side effects.
@@ -5021,7 +5238,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::CodeBuddy
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 5000,
-        agent_hooks::AgentKind::OpenCode => 0,
+        agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
     }
 }
 
@@ -5041,7 +5258,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::CodeBuddy
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 120_000,
-        agent_hooks::AgentKind::OpenCode => 0,
+        agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
     }
 }
 
@@ -5182,6 +5399,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Cursor => "hooks cursor",
         agent_hooks::AgentKind::Kiro => "hooks kiro",
         agent_hooks::AgentKind::Antigravity => "hooks antigravity",
+        agent_hooks::AgentKind::RovoDev => "hooks rovodev",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5212,6 +5430,21 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>> {
         .as_object()
         .cloned()
         .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))
+}
+
+fn read_optional_text(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn write_text_file(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn write_json_object(path: &Path, object: &Map<String, Value>) -> Result<()> {
@@ -5279,6 +5512,12 @@ fn antigravity_hooks_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".gemini/config/hooks.json")
+}
+
+fn rovodev_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rovodev/config.yml")
 }
 
 fn gemini_settings_path() -> PathBuf {
@@ -10338,6 +10577,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Antigravity)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("rovo"),
+            Some(agent_hooks::AgentKind::RovoDev)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -10354,6 +10597,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Cursor));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Antigravity));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::RovoDev));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -10680,6 +10924,89 @@ mod cli_arg_tests {
             serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
         assert!(root.get("cmux").is_none());
         assert_eq!(root["other"]["Stop"][0]["command"], "keep");
+    }
+
+    /// purpose: Verify Rovo Dev setup writes CMUX's marked lifecycle hook YAML block.
+    /// inputs: Temporary config.yml and the Rovo Dev installer/uninstaller.
+    /// returns/effects: Asserts root block shape, lifecycle commands, idempotence, and uninstall.
+    #[test]
+    fn rovodev_hook_install_writes_lifecycle_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yml");
+        fs::write(&path, "sessions:\n  persistenceDir: /tmp/rovo\n").expect("seed config");
+
+        install_rovodev_hooks(
+            &path,
+            agent_hooks::AgentKind::RovoDev,
+            &[
+                ("on_complete", "stop"),
+                ("on_error", "stop"),
+                ("on_tool_permission", "prompt-submit"),
+            ],
+        )
+        .expect("install hooks");
+        let installed = fs::read_to_string(&path).expect("read config");
+
+        assert!(installed.contains("# cmux hooks rovodev begin"));
+        assert!(installed.contains("eventHooks:\n  events:"));
+        assert!(installed.contains("    - name: on_complete"));
+        assert!(installed.contains("hooks rovodev stop"));
+        assert!(installed.contains("    - name: on_tool_permission"));
+        assert!(installed.contains("hooks rovodev prompt-submit"));
+        assert!(installed.contains("sessions:\n  persistenceDir: /tmp/rovo"));
+
+        install_rovodev_hooks(
+            &path,
+            agent_hooks::AgentKind::RovoDev,
+            &[
+                ("on_complete", "stop"),
+                ("on_error", "stop"),
+                ("on_tool_permission", "prompt-submit"),
+            ],
+        )
+        .expect("reinstall hooks");
+        assert_eq!(fs::read_to_string(&path).expect("read config"), installed);
+
+        uninstall_rovodev_hooks(&path).expect("uninstall hooks");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read config"),
+            "sessions:\n  persistenceDir: /tmp/rovo\n"
+        );
+    }
+
+    /// purpose: Verify Rovo Dev block insertion respects existing direct eventHooks.events.
+    /// inputs: Existing Rovo Dev YAML with user hooks and one command requiring escaping.
+    /// returns/effects: Asserts user hooks survive and command strings are YAML-escaped.
+    #[test]
+    fn rovodev_hook_install_merges_and_escapes_commands() {
+        let existing = "\
+eventHooks:\n  events:\n    - name: user_hook\n      commands:\n        - command: \"echo user\"\n";
+        let installed = rovodev_installing(
+            existing,
+            &[(
+                "on_complete",
+                "limux hooks rovodev stop --message \"done\" \\ next\nline".to_string(),
+            )],
+        );
+
+        assert!(installed.contains("    # cmux hooks rovodev begin"));
+        assert!(installed.contains("    - name: user_hook"));
+        assert!(installed.contains("        - command: \"echo user\""));
+        assert!(installed.contains(
+            "command: \"limux hooks rovodev stop --message \\\"done\\\" \\\\ next\\nline\""
+        ));
+        assert_eq!(rovodev_uninstalling(&installed), existing);
+    }
+
+    /// purpose: Verify Rovo Dev uninstall leaves dangling begin markers untouched.
+    /// inputs: Malformed YAML block missing the CMUX end marker.
+    /// returns/effects: Asserts no content is dropped without a complete marker pair.
+    #[test]
+    fn rovodev_hook_uninstall_preserves_dangling_marker() {
+        let existing = "\
+eventHooks:\n  events:\n    # cmux hooks rovodev begin\nsessions:\n  persistenceDir: /tmp/rovo\n";
+
+        assert_eq!(rovodev_uninstalling(existing), existing);
     }
 
     /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.

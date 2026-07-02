@@ -16,6 +16,7 @@ pub(crate) enum AgentKind {
     Cursor,
     Kiro,
     Antigravity,
+    RovoDev,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -24,7 +25,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 12] {
+    pub(crate) fn all() -> [Self; 13] {
         [
             Self::Claude,
             Self::Codex,
@@ -33,6 +34,7 @@ impl AgentKind {
             Self::Cursor,
             Self::Kiro,
             Self::Antigravity,
+            Self::RovoDev,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -50,6 +52,7 @@ impl AgentKind {
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "antigravity" | "agy" => Some(Self::Antigravity),
+            "rovodev" | "rovo" | "acli" => Some(Self::RovoDev),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -68,6 +71,7 @@ impl AgentKind {
             Self::Cursor => "cursor",
             Self::Kiro => "kiro",
             Self::Antigravity => "antigravity",
+            Self::RovoDev => "rovodev",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -85,6 +89,7 @@ impl AgentKind {
             Self::Cursor => "Cursor",
             Self::Kiro => "Kiro",
             Self::Antigravity => "Antigravity",
+            Self::RovoDev => "Rovo Dev",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -102,6 +107,7 @@ impl AgentKind {
             Self::Cursor => "cursor-agent",
             Self::Kiro => "kiro-cli",
             Self::Antigravity => "agy",
+            Self::RovoDev => "acli",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -286,6 +292,10 @@ pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -
             index += 1;
             continue;
         }
+        if kind == AgentKind::RovoDev && matches!(arg.as_str(), "rovodev" | "run") {
+            index += 1;
+            continue;
+        }
         if option_takes_secret_value(arg) {
             index += 1;
             if index < arguments.len() && !arguments[index].starts_with('-') {
@@ -373,6 +383,13 @@ pub(crate) fn build_resume_command(
             parts.extend(preserved_tail);
         }
         AgentKind::Antigravity => {
+            parts.extend(preserved_tail);
+        }
+        AgentKind::RovoDev => {
+            parts.push("rovodev".to_string());
+            parts.push("run".to_string());
+            parts.push("--restore".to_string());
+            parts.push(session_id);
             parts.extend(preserved_tail);
         }
         AgentKind::Claude
@@ -483,6 +500,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::Kiro => arg == "--resume-id" || arg.starts_with("--resume-id="),
         AgentKind::Antigravity => false,
+        AgentKind::RovoDev => arg == "--restore" || arg.starts_with("--restore="),
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -774,5 +792,32 @@ mod tests {
             .expect("resume");
 
         assert_eq!(command, "'agy' '--model' 'fast'");
+    }
+
+    #[test]
+    fn rovodev_resume_command_uses_restore_subcommand() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "acli".to_string(),
+            arguments: vec![
+                "acli".to_string(),
+                "rovodev".to_string(),
+                "run".to_string(),
+                "--restore".to_string(),
+                "old".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 70.0,
+        };
+
+        let command =
+            build_resume_command(AgentKind::RovoDev, "new", Some(&launch), None).expect("resume");
+
+        assert_eq!(
+            command,
+            "'acli' 'rovodev' 'run' '--restore' 'new' '--profile' 'work'"
+        );
     }
 }
