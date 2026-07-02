@@ -342,20 +342,65 @@ fn send_browser_screenshot_response(
     }
 }
 
+const BROWSER_ELEMENT_REF_SCRIPT: &str = r#"
+function limuxElementRefStore() {
+  if (!(window.__limuxElementRefs instanceof Map)) {
+    window.__limuxElementRefs = new Map();
+  }
+  if (!Number.isInteger(window.__limuxNextElementRef) || window.__limuxNextElementRef < 1) {
+    window.__limuxNextElementRef = 1;
+  }
+  return window.__limuxElementRefs;
+}
+function limuxResetElementRefs() {
+  window.__limuxElementRefs = new Map();
+  window.__limuxNextElementRef = 1;
+}
+function limuxNormalizeElementRef(value) {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  const match = raw.match(/^@?e([0-9]+)$/);
+  return match ? '@e' + match[1] : null;
+}
+function limuxStoreElementRef(node) {
+  const store = limuxElementRefStore();
+  const ref = '@e' + window.__limuxNextElementRef++;
+  store.set(ref, node);
+  return ref;
+}
+function limuxResolveElement(target) {
+  const ref = limuxNormalizeElementRef(target);
+  if (ref !== null) {
+    const node = limuxElementRefStore().get(ref);
+    if (!node || !node.isConnected) {
+      throw new Error('stale element ref: ' + ref);
+    }
+    return { node, selector: ref, element_ref: ref };
+  }
+  const node = document.querySelector(target);
+  if (!node) {
+    throw new Error('selector not found: ' + target);
+  }
+  return { node, selector: target, element_ref: null };
+}
+"#;
+
 // purpose: Build JavaScript that targets one required DOM element and fails loudly when it cannot be resolved.
-// inputs: CSS selector and JavaScript expression that receives `node`.
+// inputs: CSS selector or CMUX element ref plus JavaScript expression that receives `node`.
 // returns/effects: Returns an immediately-invoked JavaScript snippet for WebKit evaluation.
 fn browser_required_element_script(selector: &str, expression: &str) -> String {
     let selector = serde_json::to_string(selector).expect("json selector");
     format!(
         r#"(function() {{
-const selector = {selector};
-const node = document.querySelector(selector);
-if (!node) {{
-  throw new Error('selector not found: ' + selector);
-}}
+{ref_script}
+const target = {selector};
+const resolved = limuxResolveElement(target);
+const node = resolved.node;
+const selector = resolved.selector;
+const element_ref = resolved.element_ref;
 return {expression};
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
     )
 }
 
@@ -374,11 +419,22 @@ fn browser_optional_element_script(
 }
 
 // purpose: Build JavaScript that counts all DOM elements matching a required CSS selector.
-// inputs: CSS selector.
+// inputs: CSS selector or CMUX element ref.
 // returns/effects: Returns a JavaScript snippet that fails on invalid selectors and returns a number.
 fn browser_count_script(selector: &str) -> String {
     let selector = serde_json::to_string(selector).expect("json selector");
-    format!("(function() {{ const selector = {selector}; return document.querySelectorAll(selector).length; }})()")
+    format!(
+        r#"(function() {{
+{ref_script}
+const target = {selector};
+if (limuxNormalizeElementRef(target) !== null) {{
+  limuxResolveElement(target);
+  return 1;
+}}
+return document.querySelectorAll(target).length;
+}})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
+    )
 }
 
 // purpose: Build JavaScript that injects a CSS style block into the active document.
@@ -475,9 +531,10 @@ if (locator === 'first' || locator === 'last' || locator === 'nth') {
 }
 const node = nodes[0];
 if (!node) throw new Error('locator not found: ' + locator);
+const elementRef = limuxStoreElementRef(node);
 const resolvedSelector = selectorFor(node);
 return {
-  element_ref: '@e1',
+  element_ref: elementRef,
   selector: resolvedSelector,
   matches: nodes.slice(0, 25).map((node) => ({
     selector: selectorFor(node),
@@ -516,8 +573,10 @@ const query = {query};
 const role = {role};
 const name = {name};
 const index = {index};
+{ref_script}
 {body}
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
         body = BROWSER_FIND_SCRIPT_BODY,
     )
 }
@@ -688,12 +747,11 @@ fn browser_styles_script(selector: &str, property: Option<&str>) -> String {
     let property = serde_json::to_string(&property).expect("json property");
     format!(
         r#"(function() {{
-const selector = {selector};
+{ref_script}
+const target = {selector};
 const property = {property};
-const node = document.querySelector(selector);
-if (!node) {{
-  throw new Error('selector not found: ' + selector);
-}}
+const resolved = limuxResolveElement(target);
+const node = resolved.node;
 const styles = window.getComputedStyle(node);
 if (property !== null) {{
   return styles.getPropertyValue(property);
@@ -704,6 +762,7 @@ for (const name of styles) {{
 }}
 return result;
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
     )
 }
 
@@ -743,13 +802,15 @@ fn browser_element_action_script(selector: &str, body: &str) -> String {
     let selector = serde_json::to_string(selector).expect("json selector");
     format!(
         r#"(function() {{
-const selector = {selector};
-const node = document.querySelector(selector);
-if (!node) {{
-  throw new Error('selector not found: ' + selector);
-}}
+{ref_script}
+const target = {selector};
+const resolved = limuxResolveElement(target);
+const node = resolved.node;
+const selector = resolved.selector;
+const element_ref = resolved.element_ref;
 {body}
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
     )
 }
 
@@ -776,16 +837,18 @@ fn browser_scroll_script(selector: Option<&str>, dx: i64, dy: i64) -> String {
     let selector = serde_json::to_string(&selector).expect("json selector");
     format!(
         r#"(function() {{
+{ref_script}
 const selector = {selector};
 if (selector !== null) {{
-  const node = document.querySelector(selector);
-  if (!node) throw new Error('selector not found: ' + selector);
+  const resolved = limuxResolveElement(selector);
+  const node = resolved.node;
   node.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
-  return {{ action: 'scroll', selector, dx: {dx}, dy: {dy}, ok: true }};
+  return {{ action: 'scroll', selector: resolved.selector, dx: {dx}, dy: {dy}, ok: true }};
 }}
 window.scrollBy({{ left: {dx}, top: {dy}, behavior: 'instant' }});
 return {{ action: 'scroll', selector: null, dx: {dx}, dy: {dy}, ok: true }};
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
     )
 }
 
@@ -879,11 +942,12 @@ fn browser_snapshot_script(interactive: bool, compact: bool, max_depth: Option<u
     let max_depth = max_depth.unwrap_or(4).min(12);
     format!(
         r#"(function() {{
+{ref_script}
 const maxDepth = {max_depth};
 const interactiveOnly = {interactive};
 const compact = {compact};
 const refs = {{}};
-let nextRef = 1;
+limuxResetElementRefs();
 function labelFor(node) {{
   const tag = (node.tagName || '').toLowerCase();
   const id = node.id ? '#' + node.id : '';
@@ -908,7 +972,7 @@ function walk(node, depth, lines) {{
   if (node.nodeType !== Node.ELEMENT_NODE) return;
   const include = !interactiveOnly || isInteractive(node);
   if (include) {{
-    const ref = isInteractive(node) ? '@e' + nextRef++ : null;
+    const ref = isInteractive(node) ? limuxStoreElementRef(node) : null;
     if (ref) refs[ref] = {{ selector: node.id ? '#' + node.id : null, tag: (node.tagName || '').toLowerCase() }};
     lines.push('  '.repeat(depth) + (ref ? '[' + ref + '] ' : '') + labelFor(node));
   }}
@@ -926,6 +990,7 @@ return {{
   interactive
 }};
 }})()"#,
+        ref_script = BROWSER_ELEMENT_REF_SCRIPT,
     )
 }
 
@@ -9898,7 +9963,9 @@ mod tests {
     use super::gtk::gdk;
     use super::ToVariant;
     use super::{
-        build_window_css, clamp_workspace_insert_index_for_pinning,
+        browser_count_script, browser_element_action_script, browser_find_script,
+        browser_required_element_script, browser_scroll_script, browser_snapshot_script,
+        browser_styles_script, build_window_css, clamp_workspace_insert_index_for_pinning,
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
@@ -9916,6 +9983,7 @@ mod tests {
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
+    use crate::control_bridge::BrowserAction;
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
@@ -10632,6 +10700,41 @@ mod tests {
         assert!(!shortcut_allowed_while_browser_find_active(
             ShortcutCommand::SurfaceFind
         ));
+    }
+
+    #[test]
+    fn browser_element_ref_scripts_store_and_resolve_refs() {
+        let snapshot = browser_snapshot_script(true, false, Some(2));
+        assert!(snapshot.contains("limuxResetElementRefs();"));
+        assert!(snapshot.contains("limuxStoreElementRef(node)"));
+
+        let find = browser_find_script(&BrowserAction::Find {
+            locator: "text".to_string(),
+            selector: None,
+            query: Some("Save".to_string()),
+            role: None,
+            name: None,
+            index: None,
+        });
+        assert!(find.contains("const elementRef = limuxStoreElementRef(node);"));
+        assert!(find.contains("element_ref: elementRef"));
+
+        let action = browser_element_action_script("e1", "return { ok: true, selector };");
+        assert!(action.contains("limuxResolveElement(target)"));
+        assert!(action.contains("const element_ref = resolved.element_ref;"));
+
+        let getter = browser_required_element_script("@e2", "node.textContent");
+        assert!(getter.contains("const resolved = limuxResolveElement(target);"));
+
+        let count = browser_count_script("@e3");
+        assert!(count.contains("limuxNormalizeElementRef(target) !== null"));
+        assert!(count.contains("return 1;"));
+
+        let styles = browser_styles_script("e4", Some("color"));
+        assert!(styles.contains("const resolved = limuxResolveElement(target);"));
+
+        let scroll = browser_scroll_script(Some("e5"), 0, 10);
+        assert!(scroll.contains("const resolved = limuxResolveElement(selector);"));
     }
 
     #[test]
