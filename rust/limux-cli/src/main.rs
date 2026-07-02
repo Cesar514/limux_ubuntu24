@@ -6159,6 +6159,8 @@ fn canonical_tmux_command(command: &str) -> &str {
         "setb" => "set-buffer",
         "pasteb" => "paste-buffer",
         "showb" => "show-buffer",
+        "lsw" => "list-windows",
+        "lsp" => "list-panes",
         _ => command,
     }
 }
@@ -6172,6 +6174,77 @@ fn tmux_buffer_name_arg(args: &[String]) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+// purpose: Resolve tmux list command format flags.
+// inputs: Raw args with optional -F or --format value.
+// returns/effects: Returns the requested format string.
+fn tmux_list_format_arg(args: &[String]) -> Option<String> {
+    parse_opt(args, "-F").or_else(|| parse_opt(args, "--format"))
+}
+
+// purpose: Add workspace fields to a tmux render context from a list row.
+// inputs: Mutable render context and one workspace.list row.
+// returns/effects: Updates window/session keys and returns fallback text.
+fn add_tmux_workspace_row_context(context: &mut BTreeMap<String, String>, row: &Value) -> String {
+    let id = get_string(row, &["workspace_id", "id"]).unwrap_or_default();
+    if !id.is_empty() {
+        context.insert(
+            "session_id".to_string(),
+            format!("${}", tmux_stable_numeric_id(&id)),
+        );
+        context.insert(
+            "window_id".to_string(),
+            format!("@{}", tmux_stable_numeric_id(&id)),
+        );
+        context.insert("window_uuid".to_string(), id.clone());
+    }
+    if let Some(index) = row.get("index").and_then(Value::as_u64) {
+        context.insert("window_index".to_string(), index.to_string());
+    }
+    if let Some(title) = nonempty_row_title(row) {
+        context.insert("window_name".to_string(), title);
+    }
+    let index = context
+        .get("window_index")
+        .map(String::as_str)
+        .unwrap_or("?");
+    let name = context
+        .get("window_name")
+        .map(String::as_str)
+        .unwrap_or(id.as_str());
+    format!("{index} {name}")
+}
+
+// purpose: Add pane fields to a tmux render context from a pane.list row.
+// inputs: Mutable render context and one pane.list row.
+// returns/effects: Updates pane id/index/active keys and returns fallback text.
+fn add_tmux_pane_row_context(context: &mut BTreeMap<String, String>, row: &Value) -> String {
+    insert_tmux_pane_row(context, row);
+    let raw_id = get_string(row, &["pane_id", "id"]).unwrap_or_default();
+    let fallback = context.get("pane_id").cloned().unwrap_or(raw_id);
+    if let Some(count) = row.get("surface_count").and_then(Value::as_u64) {
+        context.insert("pane_tabs".to_string(), count.to_string());
+    }
+    fallback
+}
+
+// purpose: Render rows with CMUX/tmux format semantics.
+// inputs: Rows, optional -F format, and a row-specific context filler.
+// returns/effects: Returns newline-delimited tmux-compatible list output.
+fn render_tmux_rows(
+    rows: &[Value],
+    format: Option<&str>,
+    add_context: fn(&mut BTreeMap<String, String>, &Value) -> String,
+) -> String {
+    rows.iter()
+        .map(|row| {
+            let mut context = base_tmux_format_context();
+            let fallback = add_context(&mut context, row);
+            tmux_render_format(format, &context, &fallback)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
     let command = canonical_tmux_command(command);
     if is_unsupported_tmux_cmd(command) {
@@ -6180,6 +6253,33 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
 
     match command {
         "capture-pane" => run_read_screen(client, args).await,
+        "list-windows" => {
+            let payload = client.call("workspace.list", json!({})).await?;
+            let rows = payload_array(&payload, "workspaces");
+            let text = render_tmux_rows(
+                &rows,
+                tmux_list_format_arg(args).as_deref(),
+                add_tmux_workspace_row_context,
+            );
+            Ok(json!({"text": text}))
+        }
+        "list-panes" => {
+            let workspace = parse_opt(args, "-t")
+                .or_else(|| parse_opt(args, "--workspace"))
+                .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"));
+            let params = workspace
+                .as_ref()
+                .map(|id| json!({"workspace_id": id}))
+                .unwrap_or_else(|| json!({}));
+            let payload = client.call("pane.list", params).await?;
+            let rows = payload_array(&payload, "panes");
+            let text = render_tmux_rows(
+                &rows,
+                tmux_list_format_arg(args).as_deref(),
+                add_tmux_pane_row_context,
+            );
+            Ok(json!({"text": text}))
+        }
         "pipe-pane" => {
             let capture = run_read_screen(client, args).await?;
             let text = get_string(&capture, &["text"]).unwrap_or_default();
@@ -6468,6 +6568,17 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         if let Some(raw) = parse_opt(args, "--id-format") {
             effective_id_format = IdFormat::parse(&raw)?;
         }
+    }
+    if matches!(command, "lsw" | "lsp")
+        || (matches!(command, "list-windows" | "list-panes")
+            && (parse_opt(args, "-F").is_some() || parse_opt(args, "--format").is_some()))
+    {
+        let payload = run_tmux_compat(client, command, args).await?;
+        if opts.json_output {
+            return Ok(CommandOutput::Json(payload));
+        }
+        let text = get_string(&payload, &["text"]).unwrap_or_default();
+        return Ok(CommandOutput::Text(text));
     }
 
     let mut out = match command {
@@ -7339,6 +7450,8 @@ mod cli_arg_tests {
         assert_eq!(canonical_tmux_command("setb"), "set-buffer");
         assert_eq!(canonical_tmux_command("pasteb"), "paste-buffer");
         assert_eq!(canonical_tmux_command("showb"), "show-buffer");
+        assert_eq!(canonical_tmux_command("lsw"), "list-windows");
+        assert_eq!(canonical_tmux_command("lsp"), "list-panes");
     }
 
     // purpose: Verify buffer commands accept CMUX/tmux buffer-name spellings.
@@ -7397,6 +7510,33 @@ mod cli_arg_tests {
             "fallback"
         );
         assert_eq!(tmux_render_format(None, &context, "fallback"), "fallback");
+    }
+
+    // purpose: Verify CMUX/tmux list row format rendering.
+    // inputs: Workspace and pane rows plus -F-style format strings.
+    // returns/effects: Asserts known keys render and unknown keys strip.
+    #[test]
+    fn tmux_list_rows_render_format_strings() {
+        let windows = vec![json!({"id": "workspace:alpha", "index": 2, "title": "Build"})];
+        let panes =
+            vec![json!({"id": "pane:one", "index": 1, "focused": true, "surface_count": 3})];
+
+        assert_eq!(
+            render_tmux_rows(
+                &windows,
+                Some("#{window_index}:#{window_name}:#{missing}"),
+                add_tmux_workspace_row_context,
+            ),
+            "2:Build:"
+        );
+        assert_eq!(
+            render_tmux_rows(
+                &panes,
+                Some("#{pane_index}:#{pane_active}:#{pane_tabs}"),
+                add_tmux_pane_row_context,
+            ),
+            "1:1:3"
+        );
     }
 
     // purpose: Verify respawn-pane builds CMUX-compatible surface.respawn params.

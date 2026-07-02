@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T03:50:01Z Implement and verify CMUX tmux `list-windows`/`list-panes` format output parity plus `lsw`/`lsp` aliases. \
 [x] 2026-07-02T03:45:39Z Implement and verify CMUX tmux short alias parity for `capturep`, `display/displayp`, `resizep`, `respawnp`, `setb`, `pasteb`, and `show-buffer/showb` with `-b` buffer names. \
 [x] 2026-07-02T03:41:46Z Implement and verify CMUX tmux `display-message -p/-F/-t` format expansion parity with live Limux context, unknown-key stripping, trim, and fallback behavior. \
 [x] 2026-07-02T02:00:00Z Implement and verify live bridge CMUX browser frame selection/main reset plus download wait CLI/API parity. \
