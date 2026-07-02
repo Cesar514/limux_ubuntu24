@@ -31,6 +31,7 @@
 [x] 2026-07-02T03:53:00Z Implement and verify CMUX browser persisted element-ref parity for snapshot/find refs used by later actions and getters. \
 [x] 2026-07-02T03:37:00Z Implement and verify retained CMUX browser console/error diagnostic buffers for live WebKit browser surfaces. \
 [x] 2026-07-02T03:21:00Z Implement and verify live bridge CMUX browser dialog accept/dismiss CLI/API parity for WebKit JavaScript dialogs. \
+[x] 2026-07-02T02:30:56Z Implement and verify CMUX notification hook policy effects for record, unread, desktop, and sound delivery decisions. \
 [x] 2026-07-01T23:30:01Z Implement and verify live bridge CMUX browser state save and load parity for WebKit browser surfaces. \
 [x] 2026-07-01T23:25:27Z Implement and verify live bridge CMUX browser tab list, new, switch, and close parity for WebKit browser surfaces. \
 [x] 2026-07-01T23:14:21Z Implement and verify live bridge CMUX browser screenshot capture for WebKit browser surfaces. \

@@ -5,9 +5,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::gdk::prelude::ToplevelExt;
@@ -1968,6 +1970,37 @@ struct DesktopNotificationRequest {
     body: String,
     sound: app_config::NotificationSound,
     target: DesktopNotificationTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NotificationPolicyEffects {
+    record: bool,
+    mark_unread: bool,
+    desktop: bool,
+    sound: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotificationPolicyContext {
+    workspace_id: String,
+    surface_id: Option<String>,
+    cwd: Option<String>,
+    title: String,
+    subtitle: String,
+    body: String,
+    app_focused: bool,
+    focused_panel: bool,
+}
+
+impl Default for NotificationPolicyEffects {
+    fn default() -> Self {
+        Self {
+            record: true,
+            mark_unread: true,
+            desktop: true,
+            sound: true,
+        }
+    }
 }
 
 impl PortalColorSchemePreference {
@@ -7907,7 +7940,22 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let ws_id = state.borrow().workspaces[index].id.clone();
+            let (ws_id, cwd, workspace_name, app_focused, workspace_is_active, notification_config) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                let notification_config = app_state.config.borrow().notifications.clone();
+                (
+                    workspace.id.clone(),
+                    workspace
+                        .folder_path
+                        .clone()
+                        .or_else(|| workspace.cwd.borrow().clone()),
+                    workspace.name.clone(),
+                    app_state.window.is_active(),
+                    index == app_state.active_idx,
+                    notification_config,
+                )
+            };
             let surface = {
                 let app_state = state.borrow();
                 notification_surface_metadata(&app_state.workspaces[index], surface_hint.as_deref())
@@ -7929,7 +7977,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 (false, false) => format!("{subtitle} — {body}"),
             };
             let message = workspace_notification_message(&title, &combined_body);
-            let target = DesktopNotificationTarget {
+            let desktop_target = DesktopNotificationTarget {
                 workspace_id: ws_id.clone(),
                 pane_id: surface.as_ref().map(|surface| surface.pane_id),
                 tab_id: surface
@@ -7937,21 +7985,74 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .and_then(|surface| surface.surface_id.rsplit_once(':'))
                     .map(|(_, tab_id)| tab_id.to_string()),
             };
-            if let Some(request) =
-                mark_workspace_unread_with_message(state, &ws_id, &message, false, target)
+            let effects = match notification_policy_effects(
+                &notification_config,
+                &NotificationPolicyContext {
+                    workspace_id: ws_id.clone(),
+                    surface_id: surface.as_ref().map(|surface| surface.surface_id.clone()),
+                    cwd,
+                    title: title.clone(),
+                    subtitle: subtitle.clone(),
+                    body: body.clone(),
+                    app_focused,
+                    focused_panel: workspace_is_active,
+                },
+            ) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            if effects.mark_unread {
+                if let Some(mut request) = mark_workspace_unread_with_message(
+                    state,
+                    &ws_id,
+                    &message,
+                    false,
+                    desktop_target.clone(),
+                ) {
+                    if !effects.sound {
+                        request.sound = app_config::NotificationSound::None;
+                    }
+                    if effects.desktop {
+                        show_desktop_notification(state, request);
+                    }
+                }
+            } else if effects.desktop
+                && should_emit_desktop_notification(
+                    notification_config.enabled,
+                    app_focused,
+                    workspace_is_active,
+                    false,
+                )
             {
-                show_desktop_notification(state, request);
+                show_desktop_notification(
+                    state,
+                    DesktopNotificationRequest {
+                        summary: workspace_name,
+                        body: message.clone(),
+                        sound: if effects.sound {
+                            notification_config.sound
+                        } else {
+                            app_config::NotificationSound::None
+                        },
+                        target: desktop_target,
+                    },
+                );
             }
 
-            let notification = push_host_notification(
-                state,
-                ws_id.clone(),
-                surface,
-                title.clone(),
-                subtitle.clone(),
-                body.clone(),
-                message.clone(),
-            );
+            let notification = effects.record.then(|| {
+                push_host_notification(
+                    state,
+                    ws_id.clone(),
+                    surface,
+                    title.clone(),
+                    subtitle.clone(),
+                    body.clone(),
+                    message.clone(),
+                )
+            });
             let payload = serde_json::json!({
                 "ok": true,
                 "workspace_id": ws_id,
@@ -7959,8 +8060,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 "title": title,
                 "subtitle": subtitle,
                 "body": body,
-                "notification_id": notification.id,
-                "notification": host_notification_row(&notification),
+                "notification_id": notification.as_ref().map(|notification| notification.id),
+                "notification": notification.as_ref().map(host_notification_row),
+                "effects": {
+                    "record": effects.record,
+                    "markUnread": effects.mark_unread,
+                    "desktop": effects.desktop,
+                    "sound": effects.sound,
+                },
             });
             let _ = reply.send(Ok(payload));
         }
@@ -9415,6 +9522,169 @@ fn notification_surface_metadata(
         .ok_or_else(|| BridgeError::not_found("surface not found"))
 }
 
+// purpose: Build CMUX-shaped notification policy JSON for configured hooks.
+// inputs: Workspace/surface context, notification fields, current effects, and hook id.
+// returns/effects: Returns JSON passed to a notification hook on stdin.
+fn notification_hook_policy_payload(
+    hook_id: &str,
+    context: &NotificationPolicyContext,
+    effects: NotificationPolicyEffects,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "notification": {
+            "workspaceId": context.workspace_id,
+            "surfaceId": context.surface_id,
+            "title": context.title,
+            "subtitle": context.subtitle,
+            "body": context.body,
+        },
+        "context": {
+            "cwd": context.cwd,
+            "configPath": app_config::settings_path().map(|path| path.display().to_string()),
+            "hookId": hook_id,
+            "appFocused": context.app_focused,
+            "focusedPanel": context.focused_panel,
+        },
+        "effects": {
+            "record": effects.record,
+            "markUnread": effects.mark_unread,
+            "reorderWorkspace": true,
+            "desktop": effects.desktop,
+            "sound": effects.sound,
+            "command": true,
+            "paneFlash": true,
+        }
+    })
+}
+
+// purpose: Parse a hook-returned CMUX notification effects object.
+// inputs: Previous effects and hook output JSON.
+// returns/effects: Returns updated effects, preserving previous values for omitted fields.
+fn notification_policy_effects_from_value(
+    previous: NotificationPolicyEffects,
+    value: &serde_json::Value,
+) -> Result<NotificationPolicyEffects, BridgeError> {
+    let effects = value
+        .get("effects")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| BridgeError::internal("notification hook output missing effects object"))?;
+    Ok(NotificationPolicyEffects {
+        record: effects
+            .get("record")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.record),
+        mark_unread: effects
+            .get("markUnread")
+            .or_else(|| effects.get("mark_unread"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.mark_unread),
+        desktop: effects
+            .get("desktop")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.desktop),
+        sound: effects
+            .get("sound")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.sound),
+    })
+}
+
+// purpose: Run one configured notification hook with bounded runtime.
+// inputs: Hook config and policy JSON.
+// returns/effects: Feeds JSON on stdin and returns parsed stdout JSON or a bridge error.
+fn run_notification_hook_command(
+    hook: &app_config::NotificationHookConfig,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, BridgeError> {
+    let input = serde_json::to_vec(payload)
+        .map_err(|err| BridgeError::internal(format!("notification hook payload failed: {err}")))?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&hook.command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            BridgeError::internal(format!(
+                "notification hook `{}` failed to start: {err}",
+                hook.id
+            ))
+        })?;
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            BridgeError::internal(format!("notification hook `{}` stdin unavailable", hook.id))
+        })?;
+        stdin.write_all(&input).map_err(|err| {
+            BridgeError::internal(format!(
+                "notification hook `{}` stdin write failed: {err}",
+                hook.id
+            ))
+        })?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(hook.timeout_seconds.max(1));
+    loop {
+        if child
+            .try_wait()
+            .map_err(|err| {
+                BridgeError::internal(format!(
+                    "notification hook `{}` wait failed: {err}",
+                    hook.id
+                ))
+            })?
+            .is_some()
+        {
+            let output = child.wait_with_output().map_err(|err| {
+                BridgeError::internal(format!(
+                    "notification hook `{}` output failed: {err}",
+                    hook.id
+                ))
+            })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(BridgeError::internal(format!(
+                    "notification hook `{}` exited with status {}: {}",
+                    hook.id,
+                    output.status,
+                    stderr.trim()
+                )));
+            }
+            return serde_json::from_slice(&output.stdout).map_err(|err| {
+                BridgeError::internal(format!(
+                    "notification hook `{}` returned invalid JSON: {err}",
+                    hook.id
+                ))
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BridgeError::internal(format!(
+                "notification hook `{}` timed out after {}s",
+                hook.id, hook.timeout_seconds
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// purpose: Run configured notification hooks and collect final delivery effects.
+// inputs: App config, workspace/surface context, and notification fields.
+// returns/effects: Executes enabled hooks in order and returns final delivery policy.
+fn notification_policy_effects(
+    config: &app_config::NotificationConfig,
+    context: &NotificationPolicyContext,
+) -> Result<NotificationPolicyEffects, BridgeError> {
+    let mut effects = NotificationPolicyEffects::default();
+    for hook in config.hooks.iter().filter(|hook| hook.enabled) {
+        let payload = notification_hook_policy_payload(&hook.id, context, effects);
+        let output = run_notification_hook_command(hook, &payload)?;
+        effects = notification_policy_effects_from_value(effects, &output)?;
+    }
+    Ok(effects)
+}
+
 /// purpose: Render one live-host notification in the public control API shape.
 /// inputs: notification is a stored host notification.
 /// returns/effects: Returns JSON without mutating state.
@@ -9830,7 +10100,7 @@ fn mark_workspace_unread_with_message(
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
     let window_active = s.window.is_active();
-    let notifications = s.config.borrow().notifications;
+    let notifications = s.config.borrow().notifications.clone();
     if let Some((idx, ws)) = s
         .workspaces
         .iter_mut()
@@ -9971,16 +10241,19 @@ mod tests {
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        next_active_workspace_index, pane_create_split_placement, queue_session_save_request,
-        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
+        next_active_workspace_index, notification_hook_policy_payload,
+        notification_policy_effects_from_value, pane_create_split_placement,
+        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
+        run_notification_hook_command, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
         workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, HostNotification, NeighborScore, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
+        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
+        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::control_bridge::BrowserAction;
@@ -10451,6 +10724,98 @@ mod tests {
             false, false, false, false
         ));
         assert!(!should_emit_desktop_notification(true, true, true, true));
+    }
+
+    #[test]
+    fn notification_policy_payload_includes_current_effects_and_context() {
+        let payload = notification_hook_policy_payload(
+            "agent-filter",
+            &NotificationPolicyContext {
+                workspace_id: "workspace-a".to_string(),
+                surface_id: Some("3:tab-a".to_string()),
+                cwd: Some("/project".to_string()),
+                title: "Codex".to_string(),
+                subtitle: "Done".to_string(),
+                body: "Turn complete".to_string(),
+                app_focused: true,
+                focused_panel: false,
+            },
+            NotificationPolicyEffects {
+                record: false,
+                mark_unread: true,
+                desktop: false,
+                sound: true,
+            },
+        );
+
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["notification"]["workspaceId"], "workspace-a");
+        assert_eq!(payload["notification"]["surfaceId"], "3:tab-a");
+        assert_eq!(payload["context"]["cwd"], "/project");
+        assert_eq!(payload["context"]["hookId"], "agent-filter");
+        assert_eq!(payload["context"]["appFocused"], true);
+        assert_eq!(payload["context"]["focusedPanel"], false);
+        assert_eq!(payload["effects"]["record"], false);
+        assert_eq!(payload["effects"]["markUnread"], true);
+        assert_eq!(payload["effects"]["desktop"], false);
+        assert_eq!(payload["effects"]["sound"], true);
+    }
+
+    #[test]
+    fn notification_policy_effects_update_only_returned_fields() {
+        let previous = NotificationPolicyEffects {
+            record: true,
+            mark_unread: true,
+            desktop: true,
+            sound: true,
+        };
+
+        let updated = notification_policy_effects_from_value(
+            previous,
+            &serde_json::json!({
+                "effects": {
+                    "record": false,
+                    "markUnread": false,
+                    "sound": false
+                }
+            }),
+        )
+        .expect("policy effects");
+
+        assert_eq!(
+            updated,
+            NotificationPolicyEffects {
+                record: false,
+                mark_unread: false,
+                desktop: true,
+                sound: false,
+            }
+        );
+    }
+
+    #[test]
+    fn notification_policy_effects_reject_missing_effects_object() {
+        let result = notification_policy_effects_from_value(
+            NotificationPolicyEffects::default(),
+            &serde_json::json!({ "ok": true }),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn notification_hook_command_closes_stdin_after_payload_write() {
+        let hook = crate::app_config::NotificationHookConfig {
+            id: "stdin-reader".to_string(),
+            command: "cat >/dev/null; printf '{\"effects\":{\"desktop\":false}}'".to_string(),
+            enabled: true,
+            timeout_seconds: 1,
+        };
+
+        let output = run_notification_hook_command(&hook, &serde_json::json!({ "ok": true }))
+            .expect("hook output");
+
+        assert_eq!(output["effects"]["desktop"], false);
     }
 
     #[test]

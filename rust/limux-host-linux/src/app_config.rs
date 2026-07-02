@@ -137,10 +137,19 @@ impl NotificationSound {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationConfig {
     pub enabled: bool,
     pub sound: NotificationSound,
+    pub hooks: Vec<NotificationHookConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationHookConfig {
+    pub id: String,
+    pub command: String,
+    pub enabled: bool,
+    pub timeout_seconds: u64,
 }
 
 impl Default for NotificationConfig {
@@ -148,6 +157,7 @@ impl Default for NotificationConfig {
         Self {
             enabled: true,
             sound: NotificationSound::Default,
+            hooks: Vec::new(),
         }
     }
 }
@@ -238,6 +248,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_str)
         .and_then(NotificationSound::from_str)
         .unwrap_or(notification_defaults.sound);
+    let notification_hooks = notifications
+        .and_then(|notifications| notifications.get("hooks"))
+        .map(parse_notification_hooks)
+        .unwrap_or_default();
 
     let font_size = root
         .get("font_size")
@@ -256,9 +270,55 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         notifications: NotificationConfig {
             enabled: notifications_enabled,
             sound: notification_sound,
+            hooks: notification_hooks,
         },
         font_size,
     }
+}
+
+// purpose: Parse CMUX-style notification hook definitions from settings JSON.
+// inputs: Value from notifications.hooks.
+// returns/effects: Returns enabled/disabled hooks or panics on malformed hook objects.
+fn parse_notification_hooks(value: &Value) -> Vec<NotificationHookConfig> {
+    let hooks = value
+        .as_array()
+        .unwrap_or_else(|| panic!("notifications.hooks must be an array"));
+    hooks
+        .iter()
+        .enumerate()
+        .map(|(index, hook)| {
+            let object = hook
+                .as_object()
+                .unwrap_or_else(|| panic!("notifications.hooks[{index}] must be an object"));
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| panic!("notifications.hooks[{index}].id is required"))
+                .to_string();
+            let command = object
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .unwrap_or_else(|| panic!("notifications.hooks[{index}].command is required"))
+                .to_string();
+            let enabled = object
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let timeout_seconds = object
+                .get("timeoutSeconds")
+                .or_else(|| object.get("timeout_seconds"))
+                .and_then(Value::as_u64)
+                .unwrap_or(20);
+            NotificationHookConfig {
+                id,
+                command,
+                enabled,
+                timeout_seconds,
+            }
+        })
+        .collect()
 }
 
 pub fn save(config: &AppConfig) -> Result<(), String> {
@@ -289,6 +349,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!({
             "enabled": config.notifications.enabled,
             "sound": config.notifications.sound.as_str(),
+            "hooks": config.notifications.hooks.iter().map(|hook| json!({
+                "id": hook.id,
+                "command": hook.command,
+                "enabled": hook.enabled,
+                "timeoutSeconds": hook.timeout_seconds,
+            })).collect::<Vec<_>>(),
         }),
     );
 
@@ -543,6 +609,61 @@ mod tests {
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.config.notifications.enabled);
         assert_eq!(loaded.config.notifications.sound, NotificationSound::Bell);
+    }
+
+    #[test]
+    fn load_from_path_reads_notification_hooks() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "notifications": {
+    "hooks": [
+      {
+        "id": "agent-filter",
+        "command": "sed 's/true/false/'",
+        "enabled": false,
+        "timeoutSeconds": 7
+      }
+    ]
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.config.notifications.hooks.len(), 1);
+        let hook = &loaded.config.notifications.hooks[0];
+        assert_eq!(hook.id, "agent-filter");
+        assert_eq!(hook.command, "sed 's/true/false/'");
+        assert!(!hook.enabled);
+        assert_eq!(hook.timeout_seconds, 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "notifications.hooks[0].command is required")]
+    fn load_from_path_rejects_malformed_notification_hooks() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "notifications": {
+    "hooks": [
+      { "id": "missing-command" }
+    ]
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
     }
 
     #[test]

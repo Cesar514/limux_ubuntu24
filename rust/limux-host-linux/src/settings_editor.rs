@@ -240,7 +240,7 @@ fn build_notifications_page(input: &SettingsEditorInput) -> gtk::Widget {
         .build();
     enabled_row.set_title_lines(1);
     enabled_row.set_subtitle_lines(2);
-    let notifications = input.config.borrow().notifications;
+    let notifications = input.config.borrow().notifications.clone();
     let enabled_switch = gtk::Switch::new();
     enabled_switch.set_active(notifications.enabled);
     enabled_switch.set_valign(gtk::Align::Center);
