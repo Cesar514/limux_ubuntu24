@@ -1517,6 +1517,39 @@ struct NumericSetting {
     max: i32,
 }
 
+#[derive(Clone, Copy)]
+enum ScalarSettingKind {
+    Boolean {
+        default: bool,
+    },
+    Integer {
+        default: i32,
+        min: i32,
+        max: i32,
+    },
+    Decimal {
+        default: f64,
+        min: f64,
+        max: f64,
+    },
+    String {
+        default: &'static str,
+    },
+    Enum {
+        default: &'static str,
+        allowed: &'static [&'static str],
+    },
+    StringArray,
+}
+
+#[derive(Clone, Copy)]
+struct ScalarSetting {
+    key: &'static str,
+    section: &'static str,
+    json_path: &'static [&'static str],
+    kind: ScalarSettingKind,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -1627,6 +1660,227 @@ const TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING: BooleanSetting = BooleanSetti
     section: "terminal",
     json_key: "autoResumeAgentSessions",
     default: true,
+};
+
+const CUSTOM_SIDEBAR_RENDERERS: &[&str] = &["inProcess", "remote"];
+
+const TERMINAL_SHOW_SCROLL_BAR_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.showScrollBar",
+    section: "terminal",
+    json_path: &["showScrollBar"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const TERMINAL_COPY_ON_SELECT_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.copyOnSelect",
+    section: "terminal",
+    json_path: &["copyOnSelect"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_AGENT_HIBERNATION_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.agentHibernation.enabled",
+    section: "terminal",
+    json_path: &["agentHibernation", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_AGENT_HIBERNATION_IDLE_SECONDS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.agentHibernation.idleSeconds",
+    section: "terminal",
+    json_path: &["agentHibernation", "idleSeconds"],
+    kind: ScalarSettingKind::Decimal {
+        default: 5.0,
+        min: 0.1,
+        max: 3600.0,
+    },
+};
+
+const TERMINAL_AGENT_HIBERNATION_MAX_LIVE_TERMINALS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.agentHibernation.maxLiveTerminals",
+    section: "terminal",
+    json_path: &["agentHibernation", "maxLiveTerminals"],
+    kind: ScalarSettingKind::Integer {
+        default: 12,
+        min: 1,
+        max: 4096,
+    },
+};
+
+const TERMINAL_RENDERER_REALIZATION_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.rendererRealization.enabled",
+    section: "terminal",
+    json_path: &["rendererRealization", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const TERMINAL_RENDERER_REALIZATION_IDLE_SECONDS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.rendererRealization.idleSeconds",
+    section: "terminal",
+    json_path: &["rendererRealization", "idleSeconds"],
+    kind: ScalarSettingKind::Decimal {
+        default: 30.0,
+        min: 0.1,
+        max: 3600.0,
+    },
+};
+
+const TERMINAL_RENDERER_REALIZATION_MAX_WARM_RENDERERS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.rendererRealization.maxWarmRenderers",
+    section: "terminal",
+    json_path: &["rendererRealization", "maxWarmRenderers"],
+    kind: ScalarSettingKind::Integer {
+        default: 12,
+        min: 0,
+        max: 4096,
+    },
+};
+
+const TERMINAL_TITLE_COALESCING_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.titleUpdates.coalescing.enabled",
+    section: "terminal",
+    json_path: &["titleUpdates", "coalescing", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_TITLE_COALESCING_DELAY_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.titleUpdates.coalescing.delayMilliseconds",
+    section: "terminal",
+    json_path: &["titleUpdates", "coalescing", "delayMilliseconds"],
+    kind: ScalarSettingKind::Integer {
+        default: 500,
+        min: 1,
+        max: 60000,
+    },
+};
+
+const TERMINAL_TITLE_DIAGNOSTICS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.titleUpdates.diagnostics",
+    section: "terminal",
+    json_path: &["titleUpdates", "diagnostics"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_SHOW_TEXT_BOX_ON_NEW_TERMINALS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.showTextBoxOnNewTerminals",
+    section: "terminal",
+    json_path: &["showTextBoxOnNewTerminals"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_FOCUS_TEXT_BOX_ON_NEW_TERMINALS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.focusTextBoxOnNewTerminals",
+    section: "terminal",
+    json_path: &["focusTextBoxOnNewTerminals"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const TERMINAL_TEXT_BOX_MAX_LINES_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.textBoxMaxLines",
+    section: "terminal",
+    json_path: &["textBoxMaxLines"],
+    kind: ScalarSettingKind::Integer {
+        default: 10,
+        min: 1,
+        max: 1000,
+    },
+};
+
+const TERMINAL_TEXT_BOX_DEFAULT_SUBMIT_ACTION_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.textBoxDefaultSubmitAction",
+    section: "terminal",
+    json_path: &["textBoxDefaultSubmitAction"],
+    kind: ScalarSettingKind::String {
+        default: "text-entry",
+    },
+};
+
+const TERMINAL_TEXT_BOX_SUBMIT_ACTIONS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.textBoxSubmitActions",
+    section: "terminal",
+    json_path: &["textBoxSubmitActions"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const TERMINAL_RESUME_COMMANDS_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.resumeCommands",
+    section: "terminal",
+    json_path: &["resumeCommands"],
+    kind: ScalarSettingKind::StringArray,
+};
+
+const TERMINAL_SCROLL_SPEED_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.scrollSpeed",
+    section: "terminal",
+    json_path: &["scrollSpeed"],
+    kind: ScalarSettingKind::Decimal {
+        default: 1.0,
+        min: 0.25,
+        max: 3.0,
+    },
+};
+
+const TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.runawayMemoryGuardrail.enabled",
+    section: "terminal",
+    json_path: &["runawayMemoryGuardrail", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_THRESHOLD_GB_SETTING: ScalarSetting = ScalarSetting {
+    key: "terminal.runawayMemoryGuardrail.thresholdGB",
+    section: "terminal",
+    json_path: &["runawayMemoryGuardrail", "thresholdGB"],
+    kind: ScalarSettingKind::Decimal {
+        default: 8.0,
+        min: 0.1,
+        max: 1024.0,
+    },
+};
+
+const CUSTOM_SIDEBARS_RENDERER_SETTING: ScalarSetting = ScalarSetting {
+    key: "customSidebars.renderer",
+    section: "customSidebars",
+    json_path: &["renderer"],
+    kind: ScalarSettingKind::Enum {
+        default: "inProcess",
+        allowed: CUSTOM_SIDEBAR_RENDERERS,
+    },
+};
+
+const CUSTOM_SIDEBARS_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "customSidebars.beta.enabled",
+    section: "customSidebars",
+    json_path: &["beta", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const RIGHT_SIDEBAR_BETA_FEED_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "rightSidebar.beta.feed.enabled",
+    section: "rightSidebar",
+    json_path: &["beta", "feed", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const RIGHT_SIDEBAR_BETA_DOCK_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "rightSidebar.beta.dock.enabled",
+    section: "rightSidebar",
+    json_path: &["beta", "dock", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const EXTENSIONS_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "extensions.beta.enabled",
+    section: "extensions",
+    json_path: &["beta", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "remoteTmux.beta.enabled",
+    section: "remoteTmux",
+    json_path: &["beta", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
 };
 
 const SIDEBAR_HIDE_ALL_DETAILS_SETTING: BooleanSetting = BooleanSetting {
@@ -1766,7 +2020,19 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
+    "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
+    "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
+    "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
+    "terminal.rendererRealization.idleSeconds|terminal.rendererRealization.maxWarmRenderers|",
+    "terminal.titleUpdates.coalescing.enabled|terminal.titleUpdates.coalescing.delayMilliseconds|",
+    "terminal.titleUpdates.diagnostics|terminal.showTextBoxOnNewTerminals|",
+    "terminal.focusTextBoxOnNewTerminals|terminal.textBoxMaxLines|",
+    "terminal.textBoxDefaultSubmitAction|terminal.textBoxSubmitActions|",
+    "terminal.resumeCommands|terminal.scrollSpeed|",
+    "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
+    "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
+    "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.branchLayout|sidebar.showPullRequests|",
@@ -1788,7 +2054,19 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
+    "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
+    "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
+    "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
+    "terminal.rendererRealization.idleSeconds|terminal.rendererRealization.maxWarmRenderers|",
+    "terminal.titleUpdates.coalescing.enabled|terminal.titleUpdates.coalescing.delayMilliseconds|",
+    "terminal.titleUpdates.diagnostics|terminal.showTextBoxOnNewTerminals|",
+    "terminal.focusTextBoxOnNewTerminals|terminal.textBoxMaxLines|",
+    "terminal.textBoxDefaultSubmitAction|terminal.textBoxSubmitActions|",
+    "terminal.resumeCommands|terminal.scrollSpeed|",
+    "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
+    "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
+    "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.branchLayout|sidebar.showPullRequests|",
@@ -1905,6 +2183,65 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
 fn numeric_setting(raw: &str) -> Option<NumericSetting> {
     match raw {
         "sidebar.rightMaxWidth" => Some(SIDEBAR_RIGHT_MAX_WIDTH_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map remaining CMUX scalar settings to nested JSON descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "terminal.showScrollBar" => Some(TERMINAL_SHOW_SCROLL_BAR_SETTING),
+        "terminal.copyOnSelect" => Some(TERMINAL_COPY_ON_SELECT_SETTING),
+        "terminal.agentHibernation.enabled" => Some(TERMINAL_AGENT_HIBERNATION_ENABLED_SETTING),
+        "terminal.agentHibernation.idleSeconds" => {
+            Some(TERMINAL_AGENT_HIBERNATION_IDLE_SECONDS_SETTING)
+        }
+        "terminal.agentHibernation.maxLiveTerminals" => {
+            Some(TERMINAL_AGENT_HIBERNATION_MAX_LIVE_TERMINALS_SETTING)
+        }
+        "terminal.rendererRealization.enabled" => {
+            Some(TERMINAL_RENDERER_REALIZATION_ENABLED_SETTING)
+        }
+        "terminal.rendererRealization.idleSeconds" => {
+            Some(TERMINAL_RENDERER_REALIZATION_IDLE_SECONDS_SETTING)
+        }
+        "terminal.rendererRealization.maxWarmRenderers" => {
+            Some(TERMINAL_RENDERER_REALIZATION_MAX_WARM_RENDERERS_SETTING)
+        }
+        "terminal.titleUpdates.coalescing.enabled" => {
+            Some(TERMINAL_TITLE_COALESCING_ENABLED_SETTING)
+        }
+        "terminal.titleUpdates.coalescing.delayMilliseconds" => {
+            Some(TERMINAL_TITLE_COALESCING_DELAY_SETTING)
+        }
+        "terminal.titleUpdates.diagnostics" => Some(TERMINAL_TITLE_DIAGNOSTICS_SETTING),
+        "terminal.showTextBoxOnNewTerminals" => {
+            Some(TERMINAL_SHOW_TEXT_BOX_ON_NEW_TERMINALS_SETTING)
+        }
+        "terminal.focusTextBoxOnNewTerminals" => {
+            Some(TERMINAL_FOCUS_TEXT_BOX_ON_NEW_TERMINALS_SETTING)
+        }
+        "terminal.textBoxMaxLines" => Some(TERMINAL_TEXT_BOX_MAX_LINES_SETTING),
+        "terminal.textBoxDefaultSubmitAction" => {
+            Some(TERMINAL_TEXT_BOX_DEFAULT_SUBMIT_ACTION_SETTING)
+        }
+        "terminal.textBoxSubmitActions" => Some(TERMINAL_TEXT_BOX_SUBMIT_ACTIONS_SETTING),
+        "terminal.resumeCommands" => Some(TERMINAL_RESUME_COMMANDS_SETTING),
+        "terminal.scrollSpeed" => Some(TERMINAL_SCROLL_SPEED_SETTING),
+        "terminal.runawayMemoryGuardrail.enabled" => {
+            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_ENABLED_SETTING)
+        }
+        "terminal.runawayMemoryGuardrail.thresholdGB" => {
+            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_THRESHOLD_GB_SETTING)
+        }
+        "customSidebars.renderer" => Some(CUSTOM_SIDEBARS_RENDERER_SETTING),
+        "customSidebars.beta.enabled" => Some(CUSTOM_SIDEBARS_BETA_ENABLED_SETTING),
+        "rightSidebar.beta.feed.enabled" => Some(RIGHT_SIDEBAR_BETA_FEED_ENABLED_SETTING),
+        "rightSidebar.beta.dock.enabled" => Some(RIGHT_SIDEBAR_BETA_DOCK_ENABLED_SETTING),
+        "extensions.beta.enabled" => Some(EXTENSIONS_BETA_ENABLED_SETTING),
+        "remoteTmux.beta.enabled" => Some(REMOTE_TMUX_BETA_ENABLED_SETTING),
         _ => None,
     }
 }
@@ -2186,6 +2523,271 @@ fn set_config_numeric_setting_at(path: &Path, setting: NumericSetting, raw: &str
     Ok(value)
 }
 
+// purpose: Read a nested CMUX scalar setting with strict type validation.
+// inputs: Settings path and supported scalar setting descriptor.
+// returns/effects: Returns the rendered effective value and whether it was configured.
+fn get_config_scalar_setting_at(path: &Path, setting: ScalarSetting) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = nested_config_value(&root, setting.section, setting.json_path)? else {
+        return Ok((default_scalar_setting_value(setting)?, false));
+    };
+    Ok((parse_scalar_setting_value(setting, value)?, true))
+}
+
+// purpose: Write a nested CMUX scalar setting while preserving sibling keys.
+// inputs: Settings path, descriptor, and raw CLI value.
+// returns/effects: Strictly parses, creates required objects, and writes settings JSON.
+fn set_config_scalar_setting_at(path: &Path, setting: ScalarSetting, raw: &str) -> Result<String> {
+    let value = scalar_setting_json_value(setting, raw)?;
+    let rendered = render_scalar_setting_json_value(setting, &value)?;
+    let mut root = read_settings_root(path)?;
+    nested_config_insert(&mut root, setting.section, setting.json_path, value)?;
+    write_settings_root(path, &root)?;
+    Ok(rendered)
+}
+
+// purpose: Traverse a section-local nested settings path.
+// inputs: Settings root, top-level section, and nested key path.
+// returns/effects: Returns None for absent keys and errors for non-object path segments.
+fn nested_config_value<'a>(
+    root: &'a Map<String, Value>,
+    section: &str,
+    json_path: &[&str],
+) -> Result<Option<&'a Value>> {
+    let Some(mut value) = root.get(section) else {
+        return Ok(None);
+    };
+    for (index, key) in json_path.iter().enumerate() {
+        let object = value.as_object().ok_or_else(|| {
+            anyhow!(
+                "{} must be a JSON object",
+                dotted_setting_path(section, json_path, index)
+            )
+        })?;
+        let Some(next) = object.get(*key) else {
+            return Ok(None);
+        };
+        value = next;
+    }
+    Ok(Some(value))
+}
+
+// purpose: Insert a nested setting into a JSON object root.
+// inputs: Mutable settings root, section name, nested path, and validated value.
+// returns/effects: Creates missing JSON objects and errors on non-object parents.
+fn nested_config_insert(
+    root: &mut Map<String, Value>,
+    section: &str,
+    json_path: &[&str],
+    value: Value,
+) -> Result<()> {
+    if json_path.is_empty() {
+        bail!("{section} setting path cannot be empty");
+    }
+    let mut current = root
+        .entry(section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    for (index, key) in json_path[..json_path.len() - 1].iter().enumerate() {
+        let object = current.as_object_mut().ok_or_else(|| {
+            anyhow!(
+                "{} must be a JSON object",
+                dotted_setting_path(section, json_path, index)
+            )
+        })?;
+        current = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    let object = current.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "{} must be a JSON object",
+            dotted_setting_path(section, json_path, json_path.len() - 1)
+        )
+    })?;
+    object.insert(json_path[json_path.len() - 1].to_string(), value);
+    Ok(())
+}
+
+// purpose: Format a partial nested path for strict config errors.
+// inputs: Section, full path, and deepest parent index.
+// returns/effects: Returns a dotted settings path string.
+fn dotted_setting_path(section: &str, json_path: &[&str], index: usize) -> String {
+    let mut parts = Vec::with_capacity(index + 2);
+    parts.push(section);
+    parts.extend(json_path.iter().take(index));
+    parts.join(".")
+}
+
+// purpose: Return the rendered CMUX default for a scalar setting.
+// inputs: Supported scalar setting descriptor.
+// returns/effects: Returns a text value matching config get output.
+fn default_scalar_setting_value(setting: ScalarSetting) -> Result<String> {
+    match setting.kind {
+        ScalarSettingKind::Boolean { default } => Ok(default.to_string()),
+        ScalarSettingKind::Integer { default, .. } => Ok(default.to_string()),
+        ScalarSettingKind::Decimal { default, .. } => Ok(format_decimal_setting(default)),
+        ScalarSettingKind::String { default } | ScalarSettingKind::Enum { default, .. } => {
+            Ok(default.to_string())
+        }
+        ScalarSettingKind::StringArray => Ok("[]".to_string()),
+    }
+}
+
+// purpose: Parse a stored JSON scalar setting into rendered text.
+// inputs: Setting descriptor and raw JSON value.
+// returns/effects: Errors loudly when the persisted type or value is invalid.
+fn parse_scalar_setting_value(setting: ScalarSetting, value: &Value) -> Result<String> {
+    render_scalar_setting_json_value(setting, value)
+}
+
+// purpose: Parse CLI scalar input into its JSON representation.
+// inputs: Setting descriptor and raw CLI value.
+// returns/effects: Rejects malformed booleans, numbers, enums, and string arrays.
+fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value> {
+    match setting.kind {
+        ScalarSettingKind::Boolean { .. } => Ok(Value::Bool(parse_boolean_str(setting.key, raw)?)),
+        ScalarSettingKind::Integer { min, max, .. } => {
+            let value = parse_i32_scalar_setting(setting.key, raw, min, max)?;
+            Ok(json!(value))
+        }
+        ScalarSettingKind::Decimal { min, max, .. } => {
+            let value = parse_f64_scalar_setting(setting.key, raw, min, max)?;
+            Ok(json!(value))
+        }
+        ScalarSettingKind::String { .. } => Ok(Value::String(raw.to_string())),
+        ScalarSettingKind::Enum { allowed, .. } => {
+            if !allowed.contains(&raw) {
+                bail!("{} must be one of: {}", setting.key, allowed.join(", "));
+            }
+            Ok(Value::String(raw.to_string()))
+        }
+        ScalarSettingKind::StringArray => parse_string_array_setting(setting.key, raw),
+    }
+}
+
+// purpose: Render and validate a stored scalar JSON value.
+// inputs: Setting descriptor and raw JSON value.
+// returns/effects: Returns text output or an explicit config error.
+fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Result<String> {
+    match setting.kind {
+        ScalarSettingKind::Boolean { .. } => parse_boolean_value(setting.key, value),
+        ScalarSettingKind::Integer { min, max, .. } => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
+            Ok(clamp_f64_to_i32(setting.key, number, min, max)?.to_string())
+        }
+        ScalarSettingKind::Decimal { min, max, .. } => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
+            Ok(format_decimal_setting(clamp_f64_setting(
+                setting.key,
+                number,
+                min,
+                max,
+            )?))
+        }
+        ScalarSettingKind::String { .. } => value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{} must be a string", setting.key)),
+        ScalarSettingKind::Enum { allowed, .. } => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be one of: {}", setting.key, allowed.join(", ")))?;
+            if !allowed.contains(&raw) {
+                bail!("{} must be one of: {}", setting.key, allowed.join(", "));
+            }
+            Ok(raw.to_string())
+        }
+        ScalarSettingKind::StringArray => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow!("{} must be a JSON array of strings", setting.key))?;
+            let mut strings = Vec::with_capacity(values.len());
+            for item in values {
+                let Some(command) = item.as_str() else {
+                    bail!("{} must be a JSON array of strings", setting.key);
+                };
+                strings.push(Value::String(command.to_string()));
+            }
+            serde_json::to_string(&strings).context("serialize string array setting")
+        }
+    }
+}
+
+// purpose: Parse and clamp an integer-valued CMUX scalar.
+// inputs: User-facing key, raw CLI value, and accepted range.
+// returns/effects: Returns rounded integer or a loud validation error.
+fn parse_i32_scalar_setting(key: &str, raw: &str, min: i32, max: i32) -> Result<i32> {
+    let number = raw
+        .parse::<f64>()
+        .with_context(|| format!("{key} requires a positive number"))?;
+    clamp_f64_to_i32(key, number, min, max)
+}
+
+// purpose: Parse and clamp a decimal-valued CMUX scalar.
+// inputs: User-facing key, raw CLI value, and accepted range.
+// returns/effects: Returns clamped decimal or a loud validation error.
+fn parse_f64_scalar_setting(key: &str, raw: &str, min: f64, max: f64) -> Result<f64> {
+    let number = raw
+        .parse::<f64>()
+        .with_context(|| format!("{key} requires a positive number"))?;
+    clamp_f64_setting(key, number, min, max)
+}
+
+// purpose: Clamp a finite positive decimal value.
+// inputs: User-facing key, numeric value, and accepted range.
+// returns/effects: Returns clamped value or a loud validation error.
+fn clamp_f64_setting(key: &str, value: f64, min: f64, max: f64) -> Result<f64> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("{key} must be a positive number");
+    }
+    Ok(value.clamp(min, max))
+}
+
+// purpose: Clamp a finite positive decimal into an integer setting.
+// inputs: User-facing key, numeric value, and accepted integer range.
+// returns/effects: Returns rounded/clamped integer or a loud validation error.
+fn clamp_f64_to_i32(key: &str, value: f64, min: i32, max: i32) -> Result<i32> {
+    Ok(clamp_f64_setting(key, value, min as f64, max as f64)?.round() as i32)
+}
+
+// purpose: Parse terminal.resumeCommands as explicit JSON string arrays.
+// inputs: User-facing key and raw CLI value.
+// returns/effects: Returns a JSON array or rejects malformed/non-string elements.
+fn parse_string_array_setting(key: &str, raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .with_context(|| format!("{key} requires a JSON array of strings"))?;
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{key} must be a JSON array of strings"))?;
+    if values.iter().any(|item| !item.is_string()) {
+        bail!("{key} must be a JSON array of strings");
+    }
+    Ok(value)
+}
+
+// purpose: Format decimal settings without noisy trailing zeroes.
+// inputs: Decimal value.
+// returns/effects: Returns a stable, compact string.
+fn format_decimal_setting(value: f64) -> String {
+    let scaled = (value * 1000.0).round() as i64;
+    let whole = scaled / 1000;
+    let fraction = (scaled % 1000).abs();
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    if fraction % 100 == 0 {
+        return format!("{whole}.{}", fraction / 100);
+    }
+    if fraction % 10 == 0 {
+        return format!("{whole}.{:02}", fraction / 10);
+    }
+    format!("{whole}.{fraction:03}")
+}
+
 // purpose: Render CMUX-compatible config get output for one font-size setting.
 // inputs: Settings path and setting descriptor.
 // returns/effects: Returns text with effective value and backing path.
@@ -2376,6 +2978,32 @@ fn render_config_numeric_get(path: &Path, setting: NumericSetting) -> Result<Str
 // returns/effects: Writes settings JSON and returns user-facing status text.
 fn render_config_numeric_set(path: &Path, setting: NumericSetting, raw: &str) -> Result<String> {
     let value = set_config_numeric_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for one scalar setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_scalar_get(path: &Path, setting: ScalarSetting) -> Result<String> {
+    let (value, _) = get_config_scalar_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one scalar setting.
+// inputs: Settings path, setting descriptor, and raw argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_scalar_set(path: &Path, setting: ScalarSetting, raw: &str) -> Result<String> {
+    let value = set_config_scalar_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -3502,6 +4130,9 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             if let Some(setting) = numeric_setting(key) {
                 return Ok(CommandOutput::Text(render_config_numeric_get(&path, setting)?));
             }
+            if let Some(setting) = scalar_setting(key) {
+                return Ok(CommandOutput::Text(render_config_scalar_get(&path, setting)?));
+            }
             let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
             Ok(CommandOutput::Text(render_config_placement_get(
                 &path, setting,
@@ -3545,6 +4176,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             }
             if let Some(setting) = numeric_setting(key) {
                 return Ok(CommandOutput::Text(render_config_numeric_set(
+                    &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = scalar_setting(key) {
+                return Ok(CommandOutput::Text(render_config_scalar_set(
                     &path, setting, value,
                 )?));
             }
@@ -17502,6 +18138,120 @@ mod cli_arg_tests {
         let err = render_config_boolean_get(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify remaining CMUX terminal config keys default and write nested JSON.
+    // inputs: Temporary settings file and scalar config render helpers.
+    // returns/effects: Asserts nested values and unrelated sibling preservation.
+    #[test]
+    fn config_terminal_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, TERMINAL_SCROLL_SPEED_SETTING)
+            .expect("get scroll speed default");
+        assert!(text.contains("terminal.scrollSpeed = 1"));
+        let text = render_config_scalar_get(
+            &path,
+            TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_THRESHOLD_GB_SETTING,
+        )
+        .expect("get memory threshold default");
+        assert!(text.contains("terminal.runawayMemoryGuardrail.thresholdGB = 8"));
+        let text = render_config_scalar_get(&path, TERMINAL_RESUME_COMMANDS_SETTING)
+            .expect("get resume commands default");
+        assert!(text.contains("terminal.resumeCommands = []"));
+
+        fs::write(
+            &path,
+            br#"{"terminal":{"bell":true},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_scalar_set(
+            &path,
+            TERMINAL_AGENT_HIBERNATION_IDLE_SECONDS_SETTING,
+            "2.5",
+        )
+        .expect("set hibernation idle");
+        assert!(text.contains("terminal.agentHibernation.idleSeconds = 2.5"));
+        let text = render_config_scalar_set(
+            &path,
+            TERMINAL_RENDERER_REALIZATION_MAX_WARM_RENDERERS_SETTING,
+            "7",
+        )
+        .expect("set warm renderers");
+        assert!(text.contains("terminal.rendererRealization.maxWarmRenderers = 7"));
+        let text = render_config_scalar_set(
+            &path,
+            TERMINAL_RESUME_COMMANDS_SETTING,
+            r#"["codex","claude"]"#,
+        )
+        .expect("set resume commands");
+        assert!(text.contains(r#"terminal.resumeCommands = ["codex","claude"]"#));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["terminal"]["agentHibernation"]["idleSeconds"], 2.5);
+        assert_eq!(
+            parsed["terminal"]["rendererRealization"]["maxWarmRenderers"],
+            7
+        );
+        assert_eq!(parsed["terminal"]["resumeCommands"][0], "codex");
+        assert_eq!(parsed["terminal"]["bell"], true);
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify CMUX scalar settings reject malformed persisted and CLI values.
+    // inputs: Invalid enum, invalid JSON array, and malformed persisted decimal.
+    // returns/effects: Asserts loud validation errors.
+    #[test]
+    fn config_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, CUSTOM_SIDEBARS_RENDERER_SETTING, "sandboxed")
+            .expect_err("invalid renderer");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, TERMINAL_RESUME_COMMANDS_SETTING, r#"["ok", 1]"#)
+            .expect_err("invalid resume commands");
+        assert!(err.to_string().contains("JSON array of strings"));
+
+        fs::write(&path, br#"{"terminal":{"scrollSpeed":"fast"}}"#)
+            .expect("write malformed decimal");
+        let err = render_config_scalar_get(&path, TERMINAL_SCROLL_SPEED_SETTING)
+            .expect_err("invalid existing decimal");
+        assert!(err.to_string().contains("must be a positive number"));
+    }
+
+    // purpose: Verify CMUX custom sidebar and beta settings write nested JSON.
+    // inputs: Temporary settings file and scalar config render helpers.
+    // returns/effects: Asserts renderer enum and beta toggles persist under CMUX paths.
+    #[test]
+    fn config_custom_sidebar_and_beta_settings_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, CUSTOM_SIDEBARS_RENDERER_SETTING)
+            .expect("get renderer default");
+        assert!(text.contains("customSidebars.renderer = inProcess"));
+        let text = render_config_scalar_get(&path, CUSTOM_SIDEBARS_BETA_ENABLED_SETTING)
+            .expect("get custom sidebar beta default");
+        assert!(text.contains("customSidebars.beta.enabled = true"));
+
+        render_config_scalar_set(&path, CUSTOM_SIDEBARS_RENDERER_SETTING, "remote")
+            .expect("set renderer");
+        render_config_scalar_set(&path, RIGHT_SIDEBAR_BETA_FEED_ENABLED_SETTING, "true")
+            .expect("set feed beta");
+        render_config_scalar_set(&path, EXTENSIONS_BETA_ENABLED_SETTING, "true")
+            .expect("set extensions beta");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["customSidebars"]["renderer"], "remote");
+        assert_eq!(
+            parsed["rightSidebar"]["beta"]["feed"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["extensions"]["beta"]["enabled"], Value::Bool(true));
     }
 
     // purpose: Verify CMUX sidebar config booleans default true and preserve sibling keys.

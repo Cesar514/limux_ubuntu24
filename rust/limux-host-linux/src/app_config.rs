@@ -52,6 +52,10 @@ pub struct AppConfig {
     #[serde(skip)]
     pub terminal: TerminalBehaviorConfig,
     #[serde(skip)]
+    pub custom_sidebars: CustomSidebarsConfig,
+    #[serde(skip)]
+    pub beta_features: BetaFeaturesConfig,
+    #[serde(skip)]
     pub sidebar: SidebarConfig,
     #[serde(skip)]
     pub notifications: NotificationConfig,
@@ -101,9 +105,49 @@ impl AppBehaviorConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TerminalBehaviorConfig {
+    pub show_scroll_bar: bool,
+    pub copy_on_select: bool,
     pub auto_resume_agent_sessions: bool,
+    pub agent_hibernation: TerminalAgentHibernationConfig,
+    pub renderer_realization: TerminalRendererRealizationConfig,
+    pub title_updates: TerminalTitleUpdatesConfig,
+    pub show_text_box_on_new_terminals: bool,
+    pub focus_text_box_on_new_terminals: bool,
+    pub text_box_max_lines: i32,
+    pub text_box_default_submit_action: String,
+    pub text_box_submit_actions: String,
+    pub resume_commands: Vec<String>,
+    pub scroll_speed: f64,
+    pub runaway_memory_guardrail: TerminalRunawayMemoryGuardrailConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalAgentHibernationConfig {
+    pub enabled: bool,
+    pub idle_seconds: f64,
+    pub max_live_terminals: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalRendererRealizationConfig {
+    pub enabled: bool,
+    pub idle_seconds: f64,
+    pub max_warm_renderers: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalTitleUpdatesConfig {
+    pub coalescing_enabled: bool,
+    pub coalescing_delay_milliseconds: i32,
+    pub diagnostics: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalRunawayMemoryGuardrailConfig {
+    pub enabled: bool,
+    pub threshold_gb: f64,
 }
 
 impl Default for TerminalBehaviorConfig {
@@ -118,9 +162,84 @@ impl TerminalBehaviorConfig {
     // returns/effects: Defaults terminal behavior from CMUX runtime settings.
     fn cmux_default() -> Self {
         Self {
+            show_scroll_bar: true,
+            copy_on_select: false,
             auto_resume_agent_sessions: true,
+            agent_hibernation: TerminalAgentHibernationConfig {
+                enabled: false,
+                idle_seconds: 5.0,
+                max_live_terminals: 12,
+            },
+            renderer_realization: TerminalRendererRealizationConfig {
+                enabled: true,
+                idle_seconds: 30.0,
+                max_warm_renderers: 12,
+            },
+            title_updates: TerminalTitleUpdatesConfig {
+                coalescing_enabled: false,
+                coalescing_delay_milliseconds: 500,
+                diagnostics: false,
+            },
+            show_text_box_on_new_terminals: false,
+            focus_text_box_on_new_terminals: false,
+            text_box_max_lines: 10,
+            text_box_default_submit_action: "text-entry".to_string(),
+            text_box_submit_actions: String::new(),
+            resume_commands: Vec::new(),
+            scroll_speed: 1.0,
+            runaway_memory_guardrail: TerminalRunawayMemoryGuardrailConfig {
+                enabled: true,
+                threshold_gb: 8.0,
+            },
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CustomSidebarRendererMode {
+    #[default]
+    InProcess,
+    Remote,
+}
+
+impl CustomSidebarRendererMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "inProcess",
+            Self::Remote => "remote",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "inProcess" => Some(Self::InProcess),
+            "remote" => Some(Self::Remote),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomSidebarsConfig {
+    pub renderer: CustomSidebarRendererMode,
+    pub beta_enabled: bool,
+}
+
+impl Default for CustomSidebarsConfig {
+    fn default() -> Self {
+        Self {
+            renderer: CustomSidebarRendererMode::InProcess,
+            beta_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BetaFeaturesConfig {
+    pub right_sidebar_feed_enabled: bool,
+    pub right_sidebar_dock_enabled: bool,
+    pub extensions_enabled: bool,
+    pub remote_tmux_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -675,11 +794,12 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             .as_object()
             .unwrap_or_else(|| panic!("terminal must be an object"))
     });
-    let terminal_defaults = TerminalBehaviorConfig::cmux_default();
-    let auto_resume_agent_sessions = terminal
-        .and_then(|terminal| terminal.get("autoResumeAgentSessions"))
-        .map(|value| parse_bool_setting(value, "terminal.autoResumeAgentSessions"))
-        .unwrap_or(terminal_defaults.auto_resume_agent_sessions);
+    let terminal_config = parse_terminal_behavior_config(terminal);
+    let custom_sidebars = root
+        .get("customSidebars")
+        .map(parse_custom_sidebars_config)
+        .unwrap_or_default();
+    let beta_features = parse_beta_features_config(root);
     let sidebar = root.get("sidebar").map(|value| {
         value
             .as_object()
@@ -836,9 +956,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             workspace_inherit_working_directory,
             focus_pane_on_first_click,
         },
-        terminal: TerminalBehaviorConfig {
-            auto_resume_agent_sessions,
-        },
+        terminal: terminal_config,
+        custom_sidebars,
+        beta_features,
         sidebar: SidebarConfig {
             hide_all_details,
             wrap_workspace_titles,
@@ -880,6 +1000,247 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
     }
 }
 
+// purpose: Parse the CMUX terminal behavior section.
+// inputs: Optional terminal JSON object from settings.
+// returns/effects: Returns defaults plus strict overrides for known terminal keys.
+fn parse_terminal_behavior_config(
+    terminal: Option<&serde_json::Map<String, Value>>,
+) -> TerminalBehaviorConfig {
+    let defaults = TerminalBehaviorConfig::cmux_default();
+    let agent_hibernation = terminal
+        .and_then(|terminal| terminal.get("agentHibernation"))
+        .map(|value| {
+            let object = required_object_setting(value, "terminal.agentHibernation");
+            TerminalAgentHibernationConfig {
+                enabled: object
+                    .get("enabled")
+                    .map(|value| parse_bool_setting(value, "terminal.agentHibernation.enabled"))
+                    .unwrap_or(defaults.agent_hibernation.enabled),
+                idle_seconds: object
+                    .get("idleSeconds")
+                    .map(|value| {
+                        parse_positive_f64_setting(
+                            value,
+                            "terminal.agentHibernation.idleSeconds",
+                            0.1,
+                            3600.0,
+                        )
+                    })
+                    .unwrap_or(defaults.agent_hibernation.idle_seconds),
+                max_live_terminals: object
+                    .get("maxLiveTerminals")
+                    .map(|value| {
+                        parse_positive_i32_setting(
+                            value,
+                            "terminal.agentHibernation.maxLiveTerminals",
+                            1,
+                            4096,
+                        )
+                    })
+                    .unwrap_or(defaults.agent_hibernation.max_live_terminals),
+            }
+        })
+        .unwrap_or(defaults.agent_hibernation.clone());
+    let renderer_realization = terminal
+        .and_then(|terminal| terminal.get("rendererRealization"))
+        .map(|value| {
+            let object = required_object_setting(value, "terminal.rendererRealization");
+            TerminalRendererRealizationConfig {
+                enabled: object
+                    .get("enabled")
+                    .map(|value| parse_bool_setting(value, "terminal.rendererRealization.enabled"))
+                    .unwrap_or(defaults.renderer_realization.enabled),
+                idle_seconds: object
+                    .get("idleSeconds")
+                    .map(|value| {
+                        parse_positive_f64_setting(
+                            value,
+                            "terminal.rendererRealization.idleSeconds",
+                            0.1,
+                            3600.0,
+                        )
+                    })
+                    .unwrap_or(defaults.renderer_realization.idle_seconds),
+                max_warm_renderers: object
+                    .get("maxWarmRenderers")
+                    .map(|value| {
+                        parse_non_negative_i32_setting(
+                            value,
+                            "terminal.rendererRealization.maxWarmRenderers",
+                            4096,
+                        )
+                    })
+                    .unwrap_or(defaults.renderer_realization.max_warm_renderers),
+            }
+        })
+        .unwrap_or(defaults.renderer_realization.clone());
+    let title_updates = parse_terminal_title_updates_config(terminal, &defaults);
+    let runaway_memory_guardrail = terminal
+        .and_then(|terminal| terminal.get("runawayMemoryGuardrail"))
+        .map(|value| {
+            let object = required_object_setting(value, "terminal.runawayMemoryGuardrail");
+            TerminalRunawayMemoryGuardrailConfig {
+                enabled: object
+                    .get("enabled")
+                    .map(|value| {
+                        parse_bool_setting(value, "terminal.runawayMemoryGuardrail.enabled")
+                    })
+                    .unwrap_or(defaults.runaway_memory_guardrail.enabled),
+                threshold_gb: object
+                    .get("thresholdGB")
+                    .map(|value| {
+                        parse_positive_f64_setting(
+                            value,
+                            "terminal.runawayMemoryGuardrail.thresholdGB",
+                            0.1,
+                            1024.0,
+                        )
+                    })
+                    .unwrap_or(defaults.runaway_memory_guardrail.threshold_gb),
+            }
+        })
+        .unwrap_or(defaults.runaway_memory_guardrail.clone());
+    TerminalBehaviorConfig {
+        show_scroll_bar: terminal
+            .and_then(|terminal| terminal.get("showScrollBar"))
+            .map(|value| parse_bool_setting(value, "terminal.showScrollBar"))
+            .unwrap_or(defaults.show_scroll_bar),
+        copy_on_select: terminal
+            .and_then(|terminal| terminal.get("copyOnSelect"))
+            .map(|value| parse_bool_setting(value, "terminal.copyOnSelect"))
+            .unwrap_or(defaults.copy_on_select),
+        auto_resume_agent_sessions: terminal
+            .and_then(|terminal| terminal.get("autoResumeAgentSessions"))
+            .map(|value| parse_bool_setting(value, "terminal.autoResumeAgentSessions"))
+            .unwrap_or(defaults.auto_resume_agent_sessions),
+        agent_hibernation,
+        renderer_realization,
+        title_updates,
+        show_text_box_on_new_terminals: terminal
+            .and_then(|terminal| terminal.get("showTextBoxOnNewTerminals"))
+            .map(|value| parse_bool_setting(value, "terminal.showTextBoxOnNewTerminals"))
+            .unwrap_or(defaults.show_text_box_on_new_terminals),
+        focus_text_box_on_new_terminals: terminal
+            .and_then(|terminal| terminal.get("focusTextBoxOnNewTerminals"))
+            .map(|value| parse_bool_setting(value, "terminal.focusTextBoxOnNewTerminals"))
+            .unwrap_or(defaults.focus_text_box_on_new_terminals),
+        text_box_max_lines: terminal
+            .and_then(|terminal| terminal.get("textBoxMaxLines"))
+            .map(|value| parse_positive_i32_setting(value, "terminal.textBoxMaxLines", 1, 1000))
+            .unwrap_or(defaults.text_box_max_lines),
+        text_box_default_submit_action: terminal
+            .and_then(|terminal| terminal.get("textBoxDefaultSubmitAction"))
+            .map(|value| parse_string_setting(value, "terminal.textBoxDefaultSubmitAction"))
+            .unwrap_or(defaults.text_box_default_submit_action),
+        text_box_submit_actions: terminal
+            .and_then(|terminal| terminal.get("textBoxSubmitActions"))
+            .map(|value| parse_string_setting(value, "terminal.textBoxSubmitActions"))
+            .unwrap_or(defaults.text_box_submit_actions),
+        resume_commands: terminal
+            .and_then(|terminal| terminal.get("resumeCommands"))
+            .map(|value| parse_string_array_setting(value, "terminal.resumeCommands"))
+            .unwrap_or(defaults.resume_commands),
+        scroll_speed: terminal
+            .and_then(|terminal| terminal.get("scrollSpeed"))
+            .map(|value| parse_positive_f64_setting(value, "terminal.scrollSpeed", 0.25, 3.0))
+            .unwrap_or(defaults.scroll_speed),
+        runaway_memory_guardrail,
+    }
+}
+
+// purpose: Parse nested terminal title-update settings.
+// inputs: Optional terminal object and terminal defaults.
+// returns/effects: Returns coalescing/diagnostic settings with loud malformed-value failures.
+fn parse_terminal_title_updates_config(
+    terminal: Option<&serde_json::Map<String, Value>>,
+    defaults: &TerminalBehaviorConfig,
+) -> TerminalTitleUpdatesConfig {
+    let Some(title_updates) = terminal
+        .and_then(|terminal| terminal.get("titleUpdates"))
+        .map(|value| required_object_setting(value, "terminal.titleUpdates"))
+    else {
+        return defaults.title_updates.clone();
+    };
+    let coalescing = title_updates
+        .get("coalescing")
+        .map(|value| required_object_setting(value, "terminal.titleUpdates.coalescing"));
+    TerminalTitleUpdatesConfig {
+        coalescing_enabled: coalescing
+            .and_then(|coalescing| coalescing.get("enabled"))
+            .map(|value| parse_bool_setting(value, "terminal.titleUpdates.coalescing.enabled"))
+            .unwrap_or(defaults.title_updates.coalescing_enabled),
+        coalescing_delay_milliseconds: coalescing
+            .and_then(|coalescing| coalescing.get("delayMilliseconds"))
+            .map(|value| {
+                parse_positive_i32_setting(
+                    value,
+                    "terminal.titleUpdates.coalescing.delayMilliseconds",
+                    1,
+                    60000,
+                )
+            })
+            .unwrap_or(defaults.title_updates.coalescing_delay_milliseconds),
+        diagnostics: title_updates
+            .get("diagnostics")
+            .map(|value| parse_bool_setting(value, "terminal.titleUpdates.diagnostics"))
+            .unwrap_or(defaults.title_updates.diagnostics),
+    }
+}
+
+// purpose: Parse CMUX custom-sidebar settings.
+// inputs: Raw customSidebars JSON value.
+// returns/effects: Returns supported renderer/beta settings or panics on malformed values.
+fn parse_custom_sidebars_config(value: &Value) -> CustomSidebarsConfig {
+    let object = required_object_setting(value, "customSidebars");
+    let defaults = CustomSidebarsConfig::default();
+    let beta = object
+        .get("beta")
+        .map(|value| required_object_setting(value, "customSidebars.beta"));
+    CustomSidebarsConfig {
+        renderer: object
+            .get("renderer")
+            .map(|value| parse_custom_sidebar_renderer(value, "customSidebars.renderer"))
+            .unwrap_or(defaults.renderer),
+        beta_enabled: beta
+            .and_then(|beta| beta.get("enabled"))
+            .map(|value| parse_bool_setting(value, "customSidebars.beta.enabled"))
+            .unwrap_or(defaults.beta_enabled),
+    }
+}
+
+// purpose: Parse CMUX beta feature gates from their top-level sections.
+// inputs: Root settings JSON.
+// returns/effects: Returns supported beta toggles or defaults.
+fn parse_beta_features_config(root: &Value) -> BetaFeaturesConfig {
+    let defaults = BetaFeaturesConfig::default();
+    BetaFeaturesConfig {
+        right_sidebar_feed_enabled: nested_bool_setting(
+            root,
+            &["rightSidebar", "beta", "feed", "enabled"],
+            "rightSidebar.beta.feed.enabled",
+        )
+        .unwrap_or(defaults.right_sidebar_feed_enabled),
+        right_sidebar_dock_enabled: nested_bool_setting(
+            root,
+            &["rightSidebar", "beta", "dock", "enabled"],
+            "rightSidebar.beta.dock.enabled",
+        )
+        .unwrap_or(defaults.right_sidebar_dock_enabled),
+        extensions_enabled: nested_bool_setting(
+            root,
+            &["extensions", "beta", "enabled"],
+            "extensions.beta.enabled",
+        )
+        .unwrap_or(defaults.extensions_enabled),
+        remote_tmux_enabled: nested_bool_setting(
+            root,
+            &["remoteTmux", "beta", "enabled"],
+            "remoteTmux.beta.enabled",
+        )
+        .unwrap_or(defaults.remote_tmux_enabled),
+    }
+}
+
 // purpose: Parse a required boolean setting value without silent coercion.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns bool or panics for malformed existing config.
@@ -887,6 +1248,91 @@ fn parse_bool_setting(value: &Value, path: &str) -> bool {
     value
         .as_bool()
         .unwrap_or_else(|| panic!("{path} must be a boolean"))
+}
+
+// purpose: Require a settings value to be a JSON object.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns object reference or panics with the exact path.
+fn required_object_setting<'a>(value: &'a Value, path: &str) -> &'a serde_json::Map<String, Value> {
+    value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path} must be an object"))
+}
+
+// purpose: Parse nested optional booleans without silently accepting malformed parents.
+// inputs: Settings root, nested path, and user-facing config path.
+// returns/effects: Returns None for absent paths or panics for non-object/non-boolean values.
+fn nested_bool_setting(root: &Value, path: &[&str], display_path: &str) -> Option<bool> {
+    let mut value = root;
+    for (index, key) in path.iter().enumerate() {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{} must be an object", path[..index].join(".")));
+        let next = object.get(*key)?;
+        value = next;
+    }
+    Some(parse_bool_setting(value, display_path))
+}
+
+// purpose: Parse finite positive f64 settings with CMUX settings-editor clamp ranges.
+// inputs: Raw JSON value, user-facing path, and accepted range.
+// returns/effects: Returns clamped number or panics on malformed/non-positive values.
+fn parse_positive_f64_setting(value: &Value, path: &str, min: f64, max: f64) -> f64 {
+    let number = value
+        .as_f64()
+        .unwrap_or_else(|| panic!("{path} must be a positive number"));
+    if !number.is_finite() || number <= 0.0 {
+        panic!("{path} must be a positive number");
+    }
+    number.clamp(min, max)
+}
+
+// purpose: Parse finite positive integer settings with CMUX settings-editor clamp ranges.
+// inputs: Raw JSON value, user-facing path, and accepted range.
+// returns/effects: Returns rounded/clamped integer or panics on malformed/non-positive values.
+fn parse_positive_i32_setting(value: &Value, path: &str, min: i32, max: i32) -> i32 {
+    parse_positive_f64_setting(value, path, min as f64, max as f64).round() as i32
+}
+
+// purpose: Parse finite non-negative integer settings with an upper clamp.
+// inputs: Raw JSON value, user-facing path, and accepted maximum.
+// returns/effects: Returns rounded/clamped integer or panics on malformed/negative values.
+fn parse_non_negative_i32_setting(value: &Value, path: &str, max: i32) -> i32 {
+    let number = value
+        .as_f64()
+        .unwrap_or_else(|| panic!("{path} must be a non-negative number"));
+    if !number.is_finite() || number < 0.0 {
+        panic!("{path} must be a non-negative number");
+    }
+    number.round().clamp(0.0, max as f64) as i32
+}
+
+// purpose: Parse required JSON arrays of strings.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns owned strings or panics on malformed arrays.
+fn parse_string_array_setting(value: &Value, path: &str) -> Vec<String> {
+    let items = value
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} must be a JSON array of strings"));
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .unwrap_or_else(|| panic!("{path} must be a JSON array of strings"))
+                .to_string()
+        })
+        .collect()
+}
+
+// purpose: Parse CMUX custom-sidebar renderer mode values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns renderer enum or panics on unsupported values.
+fn parse_custom_sidebar_renderer(value: &Value, path: &str) -> CustomSidebarRendererMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be inProcess or remote"));
+    CustomSidebarRendererMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be inProcess or remote"))
 }
 
 // purpose: Parse CMUX sidebar rightMaxWidth while preserving its settings-editor clamp.
@@ -1281,9 +1727,107 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         *terminal = json!({});
     }
     terminal.as_object_mut().expect("terminal object").insert(
+        "showScrollBar".to_string(),
+        json!(config.terminal.show_scroll_bar),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "copyOnSelect".to_string(),
+        json!(config.terminal.copy_on_select),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
         "autoResumeAgentSessions".to_string(),
         json!(config.terminal.auto_resume_agent_sessions),
     );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "agentHibernation".to_string(),
+        json!({
+            "enabled": config.terminal.agent_hibernation.enabled,
+            "idleSeconds": config.terminal.agent_hibernation.idle_seconds,
+            "maxLiveTerminals": config.terminal.agent_hibernation.max_live_terminals,
+        }),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "rendererRealization".to_string(),
+        json!({
+            "enabled": config.terminal.renderer_realization.enabled,
+            "idleSeconds": config.terminal.renderer_realization.idle_seconds,
+            "maxWarmRenderers": config.terminal.renderer_realization.max_warm_renderers,
+        }),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "titleUpdates".to_string(),
+        json!({
+            "coalescing": {
+                "enabled": config.terminal.title_updates.coalescing_enabled,
+                "delayMilliseconds": config.terminal.title_updates.coalescing_delay_milliseconds,
+            },
+            "diagnostics": config.terminal.title_updates.diagnostics,
+        }),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "showTextBoxOnNewTerminals".to_string(),
+        json!(config.terminal.show_text_box_on_new_terminals),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "focusTextBoxOnNewTerminals".to_string(),
+        json!(config.terminal.focus_text_box_on_new_terminals),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "textBoxMaxLines".to_string(),
+        json!(config.terminal.text_box_max_lines),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "textBoxDefaultSubmitAction".to_string(),
+        json!(config.terminal.text_box_default_submit_action),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "textBoxSubmitActions".to_string(),
+        json!(config.terminal.text_box_submit_actions),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "resumeCommands".to_string(),
+        json!(config.terminal.resume_commands),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "scrollSpeed".to_string(),
+        json!(config.terminal.scroll_speed),
+    );
+    terminal.as_object_mut().expect("terminal object").insert(
+        "runawayMemoryGuardrail".to_string(),
+        json!({
+            "enabled": config.terminal.runaway_memory_guardrail.enabled,
+            "thresholdGB": config.terminal.runaway_memory_guardrail.threshold_gb,
+        }),
+    );
+    root.insert(
+        "customSidebars".to_string(),
+        json!({
+            "renderer": config.custom_sidebars.renderer.as_str(),
+            "beta": {
+                "enabled": config.custom_sidebars.beta_enabled,
+            },
+        }),
+    );
+    write_nested_bool_setting(
+        &mut root,
+        &["rightSidebar", "beta", "feed", "enabled"],
+        config.beta_features.right_sidebar_feed_enabled,
+    )?;
+    write_nested_bool_setting(
+        &mut root,
+        &["rightSidebar", "beta", "dock", "enabled"],
+        config.beta_features.right_sidebar_dock_enabled,
+    )?;
+    write_nested_bool_setting(
+        &mut root,
+        &["extensions", "beta", "enabled"],
+        config.beta_features.extensions_enabled,
+    )?;
+    write_nested_bool_setting(
+        &mut root,
+        &["remoteTmux", "beta", "enabled"],
+        config.beta_features.remote_tmux_enabled,
+    )?;
     let mut sidebar = serde_json::Map::from_iter([
         (
             "hideAllDetails".to_string(),
@@ -1392,6 +1936,41 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     let serialized =
         serde_json::to_string_pretty(&Value::Object(root)).expect("config should serialize");
     write_config_root_atomically(path, &serialized)
+}
+
+// purpose: Write a nested boolean setting while preserving unrelated sibling sections.
+// inputs: Mutable settings root, nested key path, and boolean value.
+// returns/effects: Creates missing JSON objects or errors on non-object parents.
+fn write_nested_bool_setting(
+    root: &mut serde_json::Map<String, Value>,
+    path: &[&str],
+    value: bool,
+) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("nested boolean settings path cannot be empty".to_string());
+    }
+    let mut current = root.entry(path[0].to_string()).or_insert_with(|| json!({}));
+    for (index, key) in path[1..path.len() - 1].iter().enumerate() {
+        if !current.is_object() {
+            return Err(format!("{} must be an object", path[..=index].join(".")));
+        }
+        current = current
+            .as_object_mut()
+            .expect("checked object")
+            .entry((*key).to_string())
+            .or_insert_with(|| json!({}));
+    }
+    if !current.is_object() {
+        return Err(format!(
+            "{} must be an object",
+            path[..path.len() - 1].join(".")
+        ));
+    }
+    current
+        .as_object_mut()
+        .expect("checked object")
+        .insert(path[path.len() - 1].to_string(), Value::Bool(value));
+    Ok(())
 }
 
 fn read_existing_config_root_for_save(
@@ -1846,6 +2425,113 @@ mod tests {
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"terminal":{"autoResumeAgentSessions":"false"}}"#)
             .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts remaining CMUX terminal config keys.
+    // inputs: Settings JSON with nested terminal performance and text-box values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_terminal_scalar_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "terminal": {
+    "showScrollBar": false,
+    "copyOnSelect": true,
+    "agentHibernation": { "enabled": true, "idleSeconds": 2.5, "maxLiveTerminals": 3 },
+    "rendererRealization": { "enabled": false, "idleSeconds": 12.5, "maxWarmRenderers": 4 },
+    "titleUpdates": { "coalescing": { "enabled": true, "delayMilliseconds": 250 }, "diagnostics": true },
+    "showTextBoxOnNewTerminals": true,
+    "focusTextBoxOnNewTerminals": true,
+    "textBoxMaxLines": 5,
+    "textBoxDefaultSubmitAction": "agent",
+    "textBoxSubmitActions": "[{\"id\":\"agent\"}]",
+    "resumeCommands": ["codex", "claude"],
+    "scrollSpeed": 2.25,
+    "runawayMemoryGuardrail": { "enabled": false, "thresholdGB": 4.5 }
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.terminal;
+
+        assert!(!loaded.show_scroll_bar);
+        assert!(loaded.copy_on_select);
+        assert!(loaded.agent_hibernation.enabled);
+        assert_eq!(loaded.agent_hibernation.idle_seconds, 2.5);
+        assert_eq!(loaded.renderer_realization.max_warm_renderers, 4);
+        assert!(loaded.title_updates.coalescing_enabled);
+        assert_eq!(loaded.title_updates.coalescing_delay_milliseconds, 250);
+        assert_eq!(loaded.text_box_default_submit_action, "agent");
+        assert_eq!(loaded.resume_commands, vec!["codex", "claude"]);
+        assert_eq!(loaded.scroll_speed, 2.25);
+        assert_eq!(loaded.runaway_memory_guardrail.threshold_gb, 4.5);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX terminal scalar keys.
+    // inputs: Settings JSON with a non-string terminal.resumeCommands element.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "terminal.resumeCommands must be a JSON array of strings")]
+    fn load_from_path_rejects_invalid_terminal_resume_commands() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"terminal":{"resumeCommands":["codex",1]}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts CMUX custom sidebar and beta settings.
+    // inputs: Settings JSON with renderer and beta feature toggles.
+    // returns/effects: Asserts parsed values override defaults.
+    #[test]
+    fn load_from_path_reads_custom_sidebar_and_beta_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "customSidebars": { "renderer": "remote", "beta": { "enabled": false } },
+  "rightSidebar": { "beta": { "feed": { "enabled": true }, "dock": { "enabled": true } } },
+  "extensions": { "beta": { "enabled": true } },
+  "remoteTmux": { "beta": { "enabled": true } }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config;
+
+        assert_eq!(
+            loaded.custom_sidebars.renderer,
+            CustomSidebarRendererMode::Remote
+        );
+        assert!(!loaded.custom_sidebars.beta_enabled);
+        assert!(loaded.beta_features.right_sidebar_feed_enabled);
+        assert!(loaded.beta_features.right_sidebar_dock_enabled);
+        assert!(loaded.beta_features.extensions_enabled);
+        assert!(loaded.beta_features.remote_tmux_enabled);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX custom sidebar renderer values.
+    // inputs: Settings JSON with an unsupported customSidebars.renderer value.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "customSidebars.renderer must be inProcess or remote")]
+    fn load_from_path_rejects_invalid_custom_sidebar_renderer() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"customSidebars":{"renderer":"sandboxed"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2680,6 +3366,52 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["terminal"]["bell"], Value::Bool(true));
+    }
+
+    // purpose: Verify host saving writes remaining CMUX terminal/custom-sidebar settings.
+    // inputs: Existing settings JSON and AppConfig values overriding CMUX defaults.
+    // returns/effects: Persists nested settings while preserving sibling values.
+    #[test]
+    fn save_to_path_writes_terminal_custom_sidebar_and_beta_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"terminal":{"bell":true},"rightSidebar":{"keep":"yes"}}"#,
+        )
+        .expect("write existing config");
+
+        let mut config = AppConfig::default();
+        config.terminal.scroll_speed = 2.5;
+        config.terminal.agent_hibernation.enabled = true;
+        config.terminal.resume_commands = vec!["codex".to_string()];
+        config.custom_sidebars.renderer = CustomSidebarRendererMode::Remote;
+        config.custom_sidebars.beta_enabled = false;
+        config.beta_features.right_sidebar_feed_enabled = true;
+        config.beta_features.extensions_enabled = true;
+        save_to_path(&path, &config).expect("save config");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(parsed["terminal"]["scrollSpeed"], 2.5);
+        assert_eq!(
+            parsed["terminal"]["agentHibernation"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["terminal"]["resumeCommands"][0], "codex");
+        assert_eq!(parsed["terminal"]["bell"], Value::Bool(true));
+        assert_eq!(parsed["customSidebars"]["renderer"], "remote");
+        assert_eq!(
+            parsed["customSidebars"]["beta"]["enabled"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["rightSidebar"]["beta"]["feed"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["rightSidebar"]["keep"], "yes");
+        assert_eq!(parsed["extensions"]["beta"]["enabled"], Value::Bool(true));
     }
 
     #[test]
