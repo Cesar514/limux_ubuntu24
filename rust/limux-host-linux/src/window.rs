@@ -2416,6 +2416,7 @@ struct DesktopNotificationTarget {
 struct DesktopNotificationRoute {
     target: DesktopNotificationTarget,
     activation_token: Option<String>,
+    feed_actions: HashMap<String, crate::feed::FeedNotificationDecision>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2424,6 +2425,7 @@ struct DesktopNotificationRequest {
     body: String,
     sound: app_config::NotificationSound,
     target: DesktopNotificationTarget,
+    feed_actions: Vec<crate::feed::FeedNotificationAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5584,10 +5586,6 @@ fn connect_desktop_notification_action_watch(
                 return;
             };
 
-            if action_key != "default" {
-                return;
-            }
-
             let route = {
                 let mut s = state.borrow_mut();
                 s.desktop_notification_routes.remove(&notification_id)
@@ -5596,13 +5594,43 @@ fn connect_desktop_notification_action_watch(
                 return;
             };
 
-            activate_desktop_notification_target(
-                &state,
-                &route.target,
-                route.activation_token.as_deref(),
-            );
+            if action_key == "default" {
+                activate_desktop_notification_target(
+                    &state,
+                    &route.target,
+                    route.activation_token.as_deref(),
+                );
+                return;
+            }
+            let Some(decision) = route.feed_actions.get(&action_key) else {
+                eprintln!("FATAL: Unknown desktop notification action key: {action_key}");
+                return;
+            };
+            if let Err(error) = apply_feed_desktop_notification_decision(decision) {
+                eprintln!("FATAL: Feed desktop notification action failed: {error:?}");
+            }
         },
     ))
+}
+
+// purpose: Resolve one inline Feed desktop notification action.
+// inputs: Feed decision stored in the desktop notification route.
+// returns/effects: Calls the shared Feed reply path and wakes any blocked Feed push.
+fn apply_feed_desktop_notification_decision(
+    decision: &crate::feed::FeedNotificationDecision,
+) -> Result<(), BridgeError> {
+    match decision {
+        crate::feed::FeedNotificationDecision::Permission { request_id, mode } => {
+            reply_to_feed_permission_request(request_id, mode)
+        }
+        crate::feed::FeedNotificationDecision::ExitPlan { request_id, mode } => {
+            reply_to_feed_exit_plan_request(request_id, mode)
+        }
+        crate::feed::FeedNotificationDecision::Question {
+            request_id,
+            selections,
+        } => reply_to_feed_question_request(request_id, selections.clone()),
+    }
 }
 
 fn connect_desktop_notification_closed_watch(
@@ -10586,6 +10614,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             title,
             subtitle,
             body,
+            feed_actions,
             reply,
         } => {
             // Resolve the workspace target. `WorkspaceTarget::Active` maps to
@@ -10673,6 +10702,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     &message,
                     false,
                     desktop_target.clone(),
+                    feed_actions.clone(),
                 ) {
                     if !effects.sound {
                         request.sound = app_config::NotificationSound::None;
@@ -10700,6 +10730,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                             app_config::NotificationSound::None
                         },
                         target: desktop_target,
+                        feed_actions: feed_actions.clone(),
                     },
                 );
             }
@@ -10975,6 +11006,7 @@ pub(crate) fn create_pane_for_workspace(
                         &message,
                         source_focused,
                         target,
+                        Vec::new(),
                     ) {
                         show_desktop_notification(&state, request);
                     }
@@ -12211,6 +12243,7 @@ fn mark_workspace_unread(
         "Process needs attention",
         source_focused,
         target,
+        Vec::new(),
     )
 }
 
@@ -12827,6 +12860,7 @@ fn mark_workspace_unread_with_message(
     message: &str,
     source_focused: bool,
     target: DesktopNotificationTarget,
+    feed_actions: Vec<crate::feed::FeedNotificationAction>,
 ) -> Option<DesktopNotificationRequest> {
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
@@ -12850,6 +12884,7 @@ fn mark_workspace_unread_with_message(
             body: message.to_string(),
             sound: notifications.sound,
             target: target.clone(),
+            feed_actions,
         });
 
         if idx != active_idx {
@@ -12898,6 +12933,26 @@ fn desktop_notification_actions() -> Vec<String> {
     vec!["default".to_string(), "Open".to_string()]
 }
 
+// purpose: Build DBus action pairs and a Feed decision route map for one notification.
+// inputs: Feed notification actions attached to the request.
+// returns/effects: Returns freedesktop action key/label pairs and action-key decisions.
+fn desktop_notification_action_entries(
+    feed_actions: &[crate::feed::FeedNotificationAction],
+) -> (
+    Vec<String>,
+    HashMap<String, crate::feed::FeedNotificationDecision>,
+) {
+    let mut actions = desktop_notification_actions();
+    let mut routes = HashMap::new();
+    for (index, action) in feed_actions.iter().enumerate() {
+        let key = format!("feed-{index}");
+        actions.push(key.clone());
+        actions.push(action.label.clone());
+        routes.insert(key, action.decision.clone());
+    }
+    (actions, routes)
+}
+
 fn show_desktop_notification(state: &State, request: DesktopNotificationRequest) {
     let state = state.clone();
     gio::DBusProxy::for_bus(
@@ -12912,9 +12967,12 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
             let Ok(proxy) = result else {
                 return;
             };
+            let (actions, feed_actions) =
+                desktop_notification_action_entries(&request.feed_actions);
             let route = DesktopNotificationRoute {
                 target: request.target.clone(),
                 activation_token: None,
+                feed_actions,
             };
 
             let params = (
@@ -12923,7 +12981,7 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
                 crate::APP_ID,
                 request.summary.as_str(),
                 request.body.as_str(),
-                desktop_notification_actions(),
+                actions,
                 desktop_notification_hints(request.sound),
                 DESKTOP_NOTIFICATION_EXPIRE_TIMEOUT_MS,
             )
@@ -12970,8 +13028,8 @@ mod tests {
         browser_count_script, browser_element_action_script, browser_find_script,
         browser_required_element_script, browser_scroll_script, browser_snapshot_script,
         browser_styles_script, build_window_css, clamp_workspace_insert_index_for_pinning,
-        desktop_notification_action_from_signal, desktop_notification_actions,
-        desktop_notification_activation_token_from_signal,
+        desktop_notification_action_entries, desktop_notification_action_from_signal,
+        desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, feed_exit_plan_action_specs,
         feed_permission_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -13472,6 +13530,45 @@ mod tests {
         assert_eq!(
             desktop_notification_actions(),
             vec!["default".to_string(), "Open".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_notification_action_entries_include_feed_decisions() {
+        let (actions, routes) = desktop_notification_action_entries(&[
+            crate::feed::FeedNotificationAction {
+                label: "Once".to_string(),
+                decision: crate::feed::FeedNotificationDecision::Permission {
+                    request_id: "req-1".to_string(),
+                    mode: "once".to_string(),
+                },
+            },
+            crate::feed::FeedNotificationAction {
+                label: "Deny".to_string(),
+                decision: crate::feed::FeedNotificationDecision::Permission {
+                    request_id: "req-1".to_string(),
+                    mode: "deny".to_string(),
+                },
+            },
+        ]);
+
+        assert_eq!(
+            actions,
+            vec![
+                "default".to_string(),
+                "Open".to_string(),
+                "feed-0".to_string(),
+                "Once".to_string(),
+                "feed-1".to_string(),
+                "Deny".to_string()
+            ]
+        );
+        assert_eq!(
+            routes.get("feed-1"),
+            Some(&crate::feed::FeedNotificationDecision::Permission {
+                request_id: "req-1".to_string(),
+                mode: "deny".to_string(),
+            })
         );
     }
 

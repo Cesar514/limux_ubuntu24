@@ -55,6 +55,29 @@ pub(crate) struct FeedNotificationRequest {
     pub(crate) surface_id: Option<String>,
     pub(crate) title: String,
     pub(crate) body: String,
+    pub(crate) actions: Vec<FeedNotificationAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FeedNotificationAction {
+    pub(crate) label: String,
+    pub(crate) decision: FeedNotificationDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FeedNotificationDecision {
+    Permission {
+        request_id: String,
+        mode: String,
+    },
+    ExitPlan {
+        request_id: String,
+        mode: String,
+    },
+    Question {
+        request_id: String,
+        selections: Vec<String>,
+    },
 }
 
 struct FeedPushReceipt {
@@ -663,7 +686,101 @@ fn feed_notification_request(item: &FeedItem) -> Option<FeedNotificationRequest>
             .map(str::to_string),
         title: feed_notification_title(item),
         body: feed_notification_body(item),
+        actions: feed_notification_actions(item),
     })
+}
+
+// purpose: Build inline native actions for pending Feed decision rows.
+// inputs: Pending Feed item with request id and kind-specific payload.
+// returns/effects: Returns valid decision actions or an empty list when no action is possible.
+fn feed_notification_actions(item: &FeedItem) -> Vec<FeedNotificationAction> {
+    let Some(request_id) = &item.request_id else {
+        return Vec::new();
+    };
+    match item.kind.as_str() {
+        "permissionRequest" | "PermissionRequest" => feed_notification_mode_actions(
+            request_id,
+            &[
+                ("Once", "once"),
+                ("Always", "always"),
+                ("Bypass", "bypass"),
+                ("Deny", "deny"),
+            ],
+            |request_id, mode| FeedNotificationDecision::Permission { request_id, mode },
+        ),
+        "exitPlan" | "ExitPlanMode" => feed_notification_mode_actions(
+            request_id,
+            &[
+                ("Manual", "manual"),
+                ("Auto", "autoAccept"),
+                ("Bypass", "bypassPermissions"),
+                ("Ultraplan", "ultraplan"),
+                ("Deny", "deny"),
+            ],
+            |request_id, mode| FeedNotificationDecision::ExitPlan { request_id, mode },
+        ),
+        "question" | "AskUserQuestion" => {
+            feed_notification_question_actions(request_id, &item.event)
+        }
+        _ => Vec::new(),
+    }
+}
+
+// purpose: Build inline actions for permission-like mode decisions.
+// inputs: Request id, label/mode pairs, and a decision constructor.
+// returns/effects: Returns notification actions without mutating Feed state.
+fn feed_notification_mode_actions<F>(
+    request_id: &str,
+    modes: &[(&str, &str)],
+    decision: F,
+) -> Vec<FeedNotificationAction>
+where
+    F: Fn(String, String) -> FeedNotificationDecision,
+{
+    modes
+        .iter()
+        .map(|(label, mode)| FeedNotificationAction {
+            label: (*label).to_string(),
+            decision: decision(request_id.to_string(), (*mode).to_string()),
+        })
+        .collect()
+}
+
+// purpose: Build inline actions for CMUX/Claude question options.
+// inputs: Request id and Feed event with optional question metadata.
+// returns/effects: Returns up to six direct choices or a multi-question default action.
+fn feed_notification_question_actions(
+    request_id: &str,
+    event: &Value,
+) -> Vec<FeedNotificationAction> {
+    let questions = feed_question_option_groups(event);
+    if questions.len() > 1 {
+        let selections = questions
+            .iter()
+            .map(|question| question.first().cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        return vec![FeedNotificationAction {
+            label: "Default".to_string(),
+            decision: FeedNotificationDecision::Question {
+                request_id: request_id.to_string(),
+                selections,
+            },
+        }];
+    }
+    questions
+        .first()
+        .into_iter()
+        .flat_map(|options| options.iter())
+        .take(6)
+        .filter(|option| !option.trim().is_empty())
+        .map(|option| FeedNotificationAction {
+            label: option.clone(),
+            decision: FeedNotificationDecision::Question {
+                request_id: request_id.to_string(),
+                selections: vec![option.clone()],
+            },
+        })
+        .collect()
 }
 
 // purpose: Format the native notification title for one pending Feed row.
@@ -719,6 +836,47 @@ fn first_question_prompt(event: &Value) -> Option<String> {
         .and_then(|question| string_field(question, &["question", "prompt", "text"]))?;
     let question = question.trim();
     (!question.is_empty()).then(|| question.to_string())
+}
+
+// purpose: Parse question option groups from CMUX/Claude question payloads.
+// inputs: Feed event with possible top-level options or tool_input.questions arrays.
+// returns/effects: Returns user-visible option labels without mutating state.
+fn feed_question_option_groups(event: &Value) -> Vec<Vec<String>> {
+    let Some(input) = event.get("tool_input").or_else(|| event.get("toolInput")) else {
+        let options = feed_question_options(event);
+        return (!options.is_empty())
+            .then_some(vec![options])
+            .unwrap_or_default();
+    };
+    if let Some(questions) = input.get("questions").and_then(Value::as_array) {
+        return questions
+            .iter()
+            .map(feed_question_options)
+            .filter(|options| !options.is_empty())
+            .collect();
+    }
+    let options = feed_question_options(input);
+    (!options.is_empty())
+        .then_some(vec![options])
+        .unwrap_or_default()
+}
+
+// purpose: Parse one set of question option labels from a JSON object.
+// inputs: JSON object with options or choices array.
+// returns/effects: Returns string labels in source order.
+fn feed_question_options(value: &Value) -> Vec<String> {
+    value
+        .get("options")
+        .or_else(|| value.get("choices"))
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // purpose: Convert an agent source token into concise title-case display text.
@@ -914,6 +1072,36 @@ mod tests {
                 surface_id: Some("7:tab-a".to_string()),
                 title: "Codex needs approval".to_string(),
                 body: "PermissionRequest: shell".to_string(),
+                actions: vec![
+                    FeedNotificationAction {
+                        label: "Once".to_string(),
+                        decision: FeedNotificationDecision::Permission {
+                            request_id: "request-a".to_string(),
+                            mode: "once".to_string(),
+                        },
+                    },
+                    FeedNotificationAction {
+                        label: "Always".to_string(),
+                        decision: FeedNotificationDecision::Permission {
+                            request_id: "request-a".to_string(),
+                            mode: "always".to_string(),
+                        },
+                    },
+                    FeedNotificationAction {
+                        label: "Bypass".to_string(),
+                        decision: FeedNotificationDecision::Permission {
+                            request_id: "request-a".to_string(),
+                            mode: "bypass".to_string(),
+                        },
+                    },
+                    FeedNotificationAction {
+                        label: "Deny".to_string(),
+                        decision: FeedNotificationDecision::Permission {
+                            request_id: "request-a".to_string(),
+                            mode: "deny".to_string(),
+                        },
+                    },
+                ],
             }]
         );
     }

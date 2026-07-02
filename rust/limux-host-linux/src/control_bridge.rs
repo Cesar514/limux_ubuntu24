@@ -827,6 +827,7 @@ pub enum ControlCommand {
         title: String,
         subtitle: String,
         body: String,
+        feed_actions: Vec<crate::feed::FeedNotificationAction>,
         reply: mpsc::Sender<BridgeResult>,
     },
     ListNotifications {
@@ -3792,6 +3793,7 @@ fn handle_method(
                     title,
                     subtitle,
                     body,
+                    feed_actions: Vec::new(),
                     reply,
                 },
                 rx,
@@ -3946,6 +3948,7 @@ fn feed_notification_command(
         title: notification.title.clone(),
         subtitle: "Feed".to_string(),
         body: notification.body.clone(),
+        feed_actions: notification.actions.clone(),
         reply,
     }
 }
@@ -4657,6 +4660,7 @@ mod tests {
                     title,
                     subtitle,
                     body,
+                    feed_actions,
                     reply,
                 } => {
                     assert_eq!(target, WorkspaceTarget::Handle("workspace-a".to_string()));
@@ -4664,6 +4668,7 @@ mod tests {
                     assert_eq!(title, "Codex needs approval");
                     assert_eq!(subtitle, "Feed");
                     assert_eq!(body, "PermissionRequest: Bash");
+                    assert_eq!(feed_actions.len(), 4);
                     let _ = reply.send(Ok(json!({ "notification_id": 1 })));
                 }
                 other => panic!("unexpected command: {other:?}"),
