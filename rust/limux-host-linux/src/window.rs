@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2802,9 +2803,28 @@ fn sync_right_sidebar_panel(state: &mut AppState) {
     );
     append_right_sidebar_section(&state.right_sidebar_body, "Workspace");
     append_right_sidebar_row(&state.right_sidebar_body, &workspace.name);
+    sync_right_sidebar_mode_rows(
+        &state.right_sidebar_body,
+        workspace,
+        &state.right_sidebar_mode,
+    );
     sync_right_sidebar_status_rows(&state.right_sidebar_body, workspace);
     sync_right_sidebar_progress_row(&state.right_sidebar_body, workspace);
     sync_right_sidebar_log_rows(&state.right_sidebar_body, workspace);
+}
+
+/// purpose: Render mode-specific right-sidebar content from live workspace state.
+/// inputs: Body widget, active workspace, and requested CMUX right-sidebar mode.
+/// returns/effects: Adds mode-specific preview rows to the right sidebar.
+fn sync_right_sidebar_mode_rows(body: &gtk::Box, workspace: &Workspace, mode: &RightSidebarMode) {
+    match mode {
+        RightSidebarMode::Files => sync_right_sidebar_files_rows(body, workspace),
+        RightSidebarMode::Find => sync_right_sidebar_find_rows(body, workspace),
+        RightSidebarMode::Vault => sync_right_sidebar_vault_rows(body, workspace),
+        RightSidebarMode::Sessions => sync_right_sidebar_sessions_rows(body, workspace),
+        RightSidebarMode::Feed => sync_right_sidebar_feed_rows(body),
+        RightSidebarMode::Dock => sync_right_sidebar_dock_rows(body, workspace),
+    }
 }
 
 /// purpose: Build the right-sidebar title from current mode/focus state.
@@ -2867,6 +2887,127 @@ fn append_right_sidebar_label(body: &gtk::Box, text: &str, css_class: &str) {
     body.append(&label);
 }
 
+/// purpose: Render a bounded file listing for the active workspace folder.
+/// inputs: Body widget and active workspace metadata.
+/// returns/effects: Reads at most the preview cap plus one directory entry and appends rows.
+fn sync_right_sidebar_files_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Files");
+    let Some(path) = right_sidebar_workspace_path(workspace) else {
+        append_right_sidebar_muted(body, "No workspace folder");
+        return;
+    };
+    append_right_sidebar_row(body, &path);
+    append_right_sidebar_result_rows(
+        body,
+        sidebar_file_preview_lines(Path::new(&path), RIGHT_SIDEBAR_FILE_PREVIEW_LIMIT),
+    );
+}
+
+/// purpose: Render current search roots and live surfaces for the Find mode panel.
+/// inputs: Body widget and active workspace.
+/// returns/effects: Adds search-root and surface context rows.
+fn sync_right_sidebar_find_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Search root");
+    match right_sidebar_workspace_path(workspace) {
+        Some(path) => append_right_sidebar_row(body, &path),
+        None => append_right_sidebar_muted(body, "No workspace folder"),
+    }
+    append_right_sidebar_surface_rows(body, workspace, "Open surfaces", false);
+}
+
+/// purpose: Render vault-adjacent workspace metadata without exposing secrets.
+/// inputs: Body widget and active workspace.
+/// returns/effects: Adds status/progress counts used by agent metadata commands.
+fn sync_right_sidebar_vault_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Vault metadata");
+    append_right_sidebar_row(
+        body,
+        &format!("status keys: {}", workspace.sidebar_status.len()),
+    );
+    append_right_sidebar_row(
+        body,
+        &format!("progress: {}", workspace.sidebar_progress.is_some()),
+    );
+}
+
+/// purpose: Render pane/session summaries for the active workspace.
+/// inputs: Body widget and active workspace.
+/// returns/effects: Adds pane rows and a bounded surface list.
+fn sync_right_sidebar_sessions_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Panes");
+    let panes = pane::pane_summaries_for_root(&workspace.root);
+    if panes.is_empty() {
+        append_right_sidebar_muted(body, "No panes");
+    }
+    for pane in panes {
+        append_right_sidebar_row(
+            body,
+            &format!("pane {} - {} surfaces", pane.pane_id, pane.surface_count),
+        );
+    }
+    append_right_sidebar_surface_rows(body, workspace, "Surfaces", false);
+}
+
+/// purpose: Render retained Feed items in the right-sidebar Feed mode.
+/// inputs: Body widget.
+/// returns/effects: Reads the bounded Feed coordinator state and appends rows.
+fn sync_right_sidebar_feed_rows(body: &gtk::Box) {
+    append_right_sidebar_section(body, "Feed");
+    let params = serde_json::Map::new();
+    match crate::feed::coordinator().list(&params) {
+        Ok(payload) => append_right_sidebar_lines(
+            body,
+            sidebar_feed_preview_lines_from_value(&payload, RIGHT_SIDEBAR_FEED_PREVIEW_LIMIT),
+            "No feed items",
+        ),
+        Err(error) => append_right_sidebar_muted(body, &format!("Feed unavailable: {error:?}")),
+    }
+}
+
+/// purpose: Render selected and open surfaces for Dock mode.
+/// inputs: Body widget and active workspace.
+/// returns/effects: Adds selected surface first, then a bounded surface list.
+fn sync_right_sidebar_dock_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_surface_rows(body, workspace, "Dock surfaces", true);
+}
+
+/// purpose: Append rows from a fallible preview builder.
+/// inputs: Body widget and rows/error result.
+/// returns/effects: Appends preview rows or an explicit error row.
+fn append_right_sidebar_result_rows(body: &gtk::Box, rows: Result<Vec<String>, String>) {
+    match rows {
+        Ok(rows) => append_right_sidebar_lines(body, rows, "none"),
+        Err(message) => append_right_sidebar_muted(body, &message),
+    }
+}
+
+/// purpose: Append normal rows or one muted empty-state row.
+/// inputs: Body widget, preview rows, and empty-state text.
+/// returns/effects: Adds rows to the right-sidebar body.
+fn append_right_sidebar_lines(body: &gtk::Box, rows: Vec<String>, empty_text: &str) {
+    if rows.is_empty() {
+        append_right_sidebar_muted(body, empty_text);
+        return;
+    }
+    for row in rows {
+        append_right_sidebar_row(body, &row);
+    }
+}
+
+/// purpose: Render bounded surface summaries for a workspace.
+/// inputs: Body widget, workspace, section title, and selected-first flag.
+/// returns/effects: Adds section rows for live pane surfaces.
+fn append_right_sidebar_surface_rows(
+    body: &gtk::Box,
+    workspace: &Workspace,
+    title: &str,
+    selected_first: bool,
+) {
+    append_right_sidebar_section(body, title);
+    let rows = sidebar_surface_preview_lines(workspace, selected_first);
+    append_right_sidebar_lines(body, rows, "No live surfaces");
+}
+
 /// purpose: Render sidebar status rows in the visible panel.
 /// inputs: Body widget and active workspace metadata.
 /// returns/effects: Adds status section rows to the right sidebar.
@@ -2913,6 +3054,79 @@ fn sync_right_sidebar_log_rows(body: &gtk::Box, workspace: &Workspace) {
 /// returns/effects: Returns rows sorted by priority then key.
 fn sidebar_status_preview_lines(workspace: &Workspace) -> Vec<String> {
     sidebar_status_preview_lines_from_entries(workspace.sidebar_status.values())
+}
+
+/// purpose: Resolve the workspace path displayed by Files and Find right-sidebar panels.
+/// inputs: Active workspace metadata.
+/// returns/effects: Returns folder_path or current terminal cwd without mutating state.
+fn right_sidebar_workspace_path(workspace: &Workspace) -> Option<String> {
+    workspace
+        .folder_path
+        .clone()
+        .or_else(|| workspace.cwd.borrow().clone())
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+/// purpose: Format a bounded non-recursive directory preview for Files mode.
+/// inputs: Directory path and maximum number of visible entries.
+/// returns/effects: Reads at most limit plus one entries and returns display rows or error text.
+fn sidebar_file_preview_lines(path: &Path, limit: usize) -> Result<Vec<String>, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("Cannot read path: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("Workspace path is not a directory".to_string());
+    }
+    let mut rows = fs::read_dir(path)
+        .map_err(|error| format!("Cannot list folder: {error}"))?
+        .take(limit.saturating_add(1))
+        .map(sidebar_file_entry_preview_line)
+        .collect::<Result<Vec<_>, _>>()?;
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    rows.sort();
+    if truncated {
+        rows.push("... more entries".to_string());
+    }
+    Ok(rows)
+}
+
+/// purpose: Format one filesystem entry for the Files right-sidebar panel.
+/// inputs: A directory entry result from std::fs::read_dir.
+/// returns/effects: Returns one display row or explicit error text.
+fn sidebar_file_entry_preview_line(entry: std::io::Result<fs::DirEntry>) -> Result<String, String> {
+    let entry = entry.map_err(|error| format!("Cannot read folder entry: {error}"))?;
+    let name = entry.file_name().to_string_lossy().to_string();
+    let kind = entry
+        .file_type()
+        .map_err(|error| format!("Cannot read entry type: {error}"))?;
+    if kind.is_dir() {
+        return Ok(format!("dir  {name}/"));
+    }
+    if kind.is_symlink() {
+        return Ok(format!("link {name}"));
+    }
+    Ok(format!("file {name}"))
+}
+
+/// purpose: Format live workspace surfaces for right-sidebar mode panels.
+/// inputs: Workspace and whether selected surfaces should be listed first.
+/// returns/effects: Returns bounded rows without mutating GTK state.
+fn sidebar_surface_preview_lines(workspace: &Workspace, selected_first: bool) -> Vec<String> {
+    let mut surfaces = pane::surface_summaries_for_root(&workspace.root);
+    if selected_first {
+        surfaces.sort_by(|left, right| right.selected.cmp(&left.selected));
+    }
+    surfaces
+        .into_iter()
+        .take(RIGHT_SIDEBAR_SURFACE_PREVIEW_LIMIT)
+        .map(|surface| {
+            let marker = if surface.selected { "*" } else { "-" };
+            format!(
+                "{marker} pane {} {} {}",
+                surface.pane_id, surface.kind, surface.title
+            )
+        })
+        .collect()
 }
 
 /// purpose: Format status preview rows from arbitrary retained entries.
@@ -2969,6 +3183,45 @@ fn sidebar_log_preview_lines_from_entries(
             _ => format!("[{}] {}", entry.level, entry.message),
         })
         .collect()
+}
+
+/// purpose: Format CMUX Feed list payload rows for the right-sidebar Feed panel.
+/// inputs: Feed list response payload and maximum rows.
+/// returns/effects: Returns newest retained rows first without mutating Feed state.
+fn sidebar_feed_preview_lines_from_value(payload: &serde_json::Value, limit: usize) -> Vec<String> {
+    let Some(items) = payload.get("items").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .rev()
+        .take(limit)
+        .map(sidebar_feed_preview_line)
+        .collect()
+}
+
+/// purpose: Format one CMUX Feed row for compact right-sidebar display.
+/// inputs: One Feed JSON row.
+/// returns/effects: Returns a compact source/kind/status string.
+fn sidebar_feed_preview_line(item: &serde_json::Value) -> String {
+    let status = json_string_field(item, "status").unwrap_or("unknown");
+    let source = json_string_field(item, "source").unwrap_or("unknown");
+    let kind = json_string_field(item, "kind").unwrap_or("event");
+    match json_string_field(item, "tool_name") {
+        Some(tool) => format!("[{status}] {source} {kind}: {tool}"),
+        None => format!("[{status}] {source} {kind}"),
+    }
+}
+
+/// purpose: Extract one non-empty string field from a JSON object.
+/// inputs: JSON value and field name.
+/// returns/effects: Returns the field string when present and non-empty.
+fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 /// purpose: Resolve a CMUX sidebar metadata workspace selector.
@@ -3452,6 +3705,9 @@ const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
 const RIGHT_SIDEBAR_WIDTH: i32 = 280;
 const RIGHT_SIDEBAR_LOG_PREVIEW_LIMIT: usize = 8;
+const RIGHT_SIDEBAR_FILE_PREVIEW_LIMIT: usize = 12;
+const RIGHT_SIDEBAR_FEED_PREVIEW_LIMIT: usize = 8;
+const RIGHT_SIDEBAR_SURFACE_PREVIEW_LIMIT: usize = 12;
 
 const BASE_CSS: &str = r#"
 .limux-host-entry {
@@ -11927,6 +12183,7 @@ mod tests {
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
+        sidebar_feed_preview_lines_from_value, sidebar_file_preview_lines,
         sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
@@ -11944,6 +12201,7 @@ mod tests {
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
     };
+    use serde_json::json;
     #[derive(Default)]
     struct TestSessionSaveState {
         persistence_suspended: bool,
@@ -12264,6 +12522,38 @@ mod tests {
             vec![
                 "[info] build: message 1".to_string(),
                 "[info] build: message 2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn right_sidebar_file_preview_is_bounded_and_non_recursive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("src")).expect("create folder");
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write file");
+        std::fs::write(dir.path().join("README.md"), "# test\n").expect("write file");
+
+        let rows = sidebar_file_preview_lines(dir.path(), 2).expect("preview files");
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row == "dir  src/"));
+        assert!(rows.iter().any(|row| row == "... more entries"));
+    }
+
+    #[test]
+    fn right_sidebar_feed_preview_formats_newest_rows_first() {
+        let payload = json!({
+            "items": [
+                { "source": "codex", "kind": "PostToolUse", "status": "telemetry", "tool_name": "read" },
+                { "source": "codex", "kind": "PermissionRequest", "status": "pending", "tool_name": "shell" }
+            ]
+        });
+
+        assert_eq!(
+            sidebar_feed_preview_lines_from_value(&payload, 2),
+            vec![
+                "[pending] codex PermissionRequest: shell".to_string(),
+                "[telemetry] codex PostToolUse: read".to_string()
             ]
         );
     }
