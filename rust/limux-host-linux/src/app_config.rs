@@ -466,24 +466,26 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let appearance = root.get("appearance").and_then(Value::as_object);
-
-    let color_scheme = appearance
-        .and_then(|appearance| appearance.get("color_scheme"))
-        .and_then(Value::as_str)
-        .and_then(ColorScheme::from_str)
-        .unwrap_or_default();
-
-    let ghostty_color_scheme = appearance
-        .and_then(|appearance| appearance.get("ghostty_color_scheme"))
-        .and_then(Value::as_str)
-        .and_then(ColorScheme::from_str)
-        .unwrap_or(color_scheme);
     let app = root.get("app").map(|value| {
         value
             .as_object()
             .unwrap_or_else(|| panic!("app must be an object"))
     });
+    let appearance = root.get("appearance").and_then(Value::as_object);
+
+    let legacy_color_scheme = appearance
+        .and_then(|appearance| appearance.get("color_scheme"))
+        .map(|value| parse_color_scheme_setting(value, "appearance.color_scheme"));
+    let color_scheme = app
+        .and_then(|app| app.get("appearance"))
+        .map(|value| parse_color_scheme_setting(value, "app.appearance"))
+        .or(legacy_color_scheme)
+        .unwrap_or_default();
+
+    let ghostty_color_scheme = appearance
+        .and_then(|appearance| appearance.get("ghostty_color_scheme"))
+        .map(|value| parse_color_scheme_setting(value, "appearance.ghostty_color_scheme"))
+        .unwrap_or(color_scheme);
     let new_workspace_placement = app
         .and_then(|app| app.get("newWorkspacePlacement"))
         .map(|value| parse_workspace_new_placement(value, "app.newWorkspacePlacement"))
@@ -570,6 +572,16 @@ fn parse_string_setting(value: &Value, path: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("{path} must be a string"))
         .to_string()
+}
+
+// purpose: Parse CMUX/Limux appearance strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns a color scheme or panics for malformed existing config.
+fn parse_color_scheme_setting(value: &Value, path: &str) -> ColorScheme {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    ColorScheme::from_str(raw).unwrap_or_else(|| panic!("{path} must be system, light, or dark"))
 }
 
 // purpose: Parse CMUX-compatible notification sound names.
@@ -883,6 +895,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "newWorkspacePlacement".to_string(),
         json!(config.new_workspace_placement.as_str()),
     );
+    app.as_object_mut().expect("app object").insert(
+        "appearance".to_string(),
+        json!(config.appearance.color_scheme.as_str()),
+    );
     root.insert(
         "notifications".to_string(),
         json!({
@@ -1121,6 +1137,46 @@ mod tests {
             loaded.config.appearance.ghostty_color_scheme,
             ColorScheme::Dark
         );
+    }
+
+    #[test]
+    fn load_from_path_prefers_cmux_app_appearance() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "appearance": "light"
+  },
+  "appearance": {
+    "color_scheme": "dark",
+    "ghostty_color_scheme": "system"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.config.appearance.color_scheme, ColorScheme::Light);
+        assert_eq!(
+            loaded.config.appearance.ghostty_color_scheme,
+            ColorScheme::System
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "app.appearance must be system, light, or dark")]
+    fn load_from_path_rejects_invalid_cmux_app_appearance() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"app":{"appearance":"auto"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
     }
 
     #[test]
@@ -1468,6 +1524,10 @@ mod tests {
         assert_eq!(
             parsed["appearance"]["ghostty_color_scheme"],
             Value::String("dark".to_string())
+        );
+        assert_eq!(
+            parsed["app"]["appearance"],
+            Value::String("light".to_string())
         );
     }
 

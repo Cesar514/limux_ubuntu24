@@ -1477,6 +1477,13 @@ struct PlacementSetting {
     json_key: &'static str,
 }
 
+#[derive(Clone, Copy)]
+struct AppearanceSetting {
+    key: &'static str,
+    section: &'static str,
+    json_key: &'static str,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -1513,6 +1520,12 @@ const APP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     json_key: "newWorkspacePlacement",
 };
 
+const APP_APPEARANCE_SETTING: AppearanceSetting = AppearanceSetting {
+    key: "app.appearance",
+    section: "app",
+    json_key: "appearance",
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1523,14 +1536,14 @@ const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.newWorkspacePlacement|",
+    "notifications.agentIdleReminder|app.appearance|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.newWorkspacePlacement|",
+    "notifications.agentIdleReminder|app.appearance|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -1568,6 +1581,16 @@ fn placement_setting(raw: &str) -> Option<PlacementSetting> {
         "workspaceGroups.newWorkspacePlacement" => {
             Some(WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING)
         }
+        _ => None,
+    }
+}
+
+// purpose: Map supported CMUX appearance settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn appearance_setting(raw: &str) -> Option<AppearanceSetting> {
+    match raw {
+        "app.appearance" => Some(APP_APPEARANCE_SETTING),
         _ => None,
     }
 }
@@ -1701,6 +1724,47 @@ fn set_config_placement_setting_at(
     Ok(placement.to_string())
 }
 
+// purpose: Read a nested appearance setting with CMUX defaults.
+// inputs: Settings path and supported appearance setting descriptor.
+// returns/effects: Returns the effective value and whether it was configured.
+fn get_config_appearance_setting_at(
+    path: &Path,
+    setting: AppearanceSetting,
+) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get(setting.section)
+        .and_then(Value::as_object)
+        .and_then(|section| section.get(setting.json_key))
+    else {
+        return Ok(("system".to_string(), false));
+    };
+    Ok((parse_appearance_value(setting.key, value)?, true))
+}
+
+// purpose: Write a nested appearance setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw appearance value.
+// returns/effects: Strictly parses the appearance and atomically writes settings JSON.
+fn set_config_appearance_setting_at(
+    path: &Path,
+    setting: AppearanceSetting,
+    raw: &str,
+) -> Result<String> {
+    let appearance = parse_appearance_str(setting.key, raw)?;
+    let mut root = read_settings_root(path)?;
+    let section = root
+        .entry(setting.section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be a JSON object", setting.section))?;
+    section.insert(
+        setting.json_key.to_string(),
+        Value::String(appearance.to_string()),
+    );
+    write_settings_root(path, &root)?;
+    Ok(appearance.to_string())
+}
+
 // purpose: Render CMUX-compatible config get output for one font-size setting.
 // inputs: Settings path and setting descriptor.
 // returns/effects: Returns text with effective value and backing path.
@@ -1779,6 +1843,36 @@ fn render_config_placement_set(
     raw: &str,
 ) -> Result<String> {
     let value = set_config_placement_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for one appearance setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_appearance_get(path: &Path, setting: AppearanceSetting) -> Result<String> {
+    let (value, _) = get_config_appearance_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one appearance setting.
+// inputs: Settings path, setting descriptor, and raw appearance argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_appearance_set(
+    path: &Path,
+    setting: AppearanceSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = set_config_appearance_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -1890,6 +1984,26 @@ fn parse_workspace_placement_str<'a>(key: &str, raw: &'a str) -> Result<&'a str>
     match raw {
         "afterCurrent" | "top" | "end" => Ok(raw),
         _ => bail!("{key} must be afterCurrent, top, or end"),
+    }
+}
+
+// purpose: Parse an existing JSON value for a supported app appearance config key.
+// inputs: User-facing key and raw JSON value.
+// returns/effects: Returns canonical appearance or errors on malformed settings JSON.
+fn parse_appearance_value(key: &str, value: &Value) -> Result<String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{key} must be system, light, or dark"))?;
+    parse_appearance_str(key, raw).map(str::to_string)
+}
+
+// purpose: Validate CMUX appearance mode strings.
+// inputs: User-facing key and raw appearance mode.
+// returns/effects: Returns canonical mode or a loud config error.
+fn parse_appearance_str<'a>(key: &str, raw: &'a str) -> Result<&'a str> {
+    match raw {
+        "system" | "light" | "dark" => Ok(raw),
+        _ => bail!("{key} must be system, light, or dark"),
     }
 }
 
@@ -2429,6 +2543,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
                     &path, setting,
                 )?));
             }
+            if let Some(setting) = appearance_setting(key) {
+                return Ok(CommandOutput::Text(render_config_appearance_get(
+                    &path, setting,
+                )?));
+            }
             let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
             Ok(CommandOutput::Text(render_config_placement_get(
                 &path, setting,
@@ -2452,6 +2571,11 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
             }
             if let Some(setting) = notification_setting(key) {
                 return Ok(CommandOutput::Text(render_config_notification_set(
+                    &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = appearance_setting(key) {
+                return Ok(CommandOutput::Text(render_config_appearance_set(
                     &path, setting, value,
                 )?));
             }
@@ -15234,6 +15358,46 @@ mod cli_arg_tests {
         assert!(err
             .to_string()
             .contains("must be afterCurrent, top, or end"));
+    }
+
+    #[test]
+    fn config_app_appearance_get_defaults_and_writes_nested_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_appearance_get(&path, APP_APPEARANCE_SETTING)
+            .expect("get default app appearance");
+        assert!(text.contains("app.appearance = system"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"newWorkspacePlacement":"end"},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_appearance_set(&path, APP_APPEARANCE_SETTING, "dark")
+            .expect("set app appearance");
+        assert!(text.contains("app.appearance = dark"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["app"]["newWorkspacePlacement"], "end");
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    #[test]
+    fn config_app_appearance_rejects_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_appearance_set(&path, APP_APPEARANCE_SETTING, "auto")
+            .expect_err("invalid appearance");
+        assert!(err.to_string().contains("must be system, light, or dark"));
+
+        fs::write(&path, br#"{"app":{"appearance":false}}"#).expect("write malformed appearance");
+        let err = render_config_appearance_get(&path, APP_APPEARANCE_SETTING)
+            .expect_err("invalid existing appearance");
+        assert!(err.to_string().contains("must be system, light, or dark"));
     }
 
     #[test]
