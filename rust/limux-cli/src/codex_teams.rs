@@ -5,9 +5,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
@@ -16,6 +19,187 @@ const PARAM_STRING_LIMIT: usize = 4_096;
 const PARAM_COLLECTION_LIMIT: usize = 50;
 const PARAM_DEPTH_LIMIT: usize = 5;
 const ITEM_CHANGE_LIMIT: usize = 20;
+pub const MAX_AUTO_DEPTH: usize = 2;
+pub const MANAGED_SUBAGENT_ENV_KEY: &str = "CMUX_AGENT_MANAGED_SUBAGENT";
+pub const THREAD_ENV_KEY: &str = "CMUX_CODEX_TEAMS_THREAD_ID";
+pub const PARENT_THREAD_ENV_KEY: &str = "CMUX_CODEX_TEAMS_PARENT_THREAD_ID";
+pub const DEPTH_ENV_KEY: &str = "CMUX_CODEX_TEAMS_DEPTH";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawn {
+    pub parent_thread_id: String,
+    pub source_depth: Option<usize>,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub status_type: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+    pub spawn: Option<Spawn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSplitPlan {
+    pub params: Value,
+    pub title: String,
+    pub command_text: String,
+    pub startup_script: PathBuf,
+}
+
+/// purpose: Parse the thread object delivered by Codex app-server notifications.
+/// inputs: Codex app-server `thread` JSON object.
+/// returns/effects: Returns a normalized thread model when the object has a non-empty id.
+pub fn thread_from_object(object: &Map<String, Value>) -> Option<Thread> {
+    let id = object.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(Thread {
+        id: id.to_string(),
+        cwd: string_value(object, &["cwd"]),
+        status_type: object
+            .get("status")
+            .and_then(Value::as_object)
+            .and_then(|status| string_value(status, &["type"])),
+        agent_nickname: string_value(object, &["agentNickname", "agent_nickname"]),
+        agent_role: string_value(object, &["agentRole", "agent_role"]),
+        spawn: spawn_from_thread_object(object),
+    })
+}
+
+/// purpose: Decide whether a Codex app-server thread is ready enough to attach.
+/// inputs: Parsed thread status.
+/// returns/effects: Returns false for missing status and `not_loaded` variants.
+pub fn thread_may_be_attachable(thread: &Thread) -> bool {
+    let Some(status_type) = thread.status_type.as_deref() else {
+        return false;
+    };
+    let normalized = status_type.replace('_', "").to_ascii_lowercase();
+    !normalized.is_empty() && normalized != "notloaded"
+}
+
+/// purpose: Build the command text used inside managed Codex subagent panes.
+/// inputs: Codex executable, app-server URL, child/parent thread ids, depth, and optional PATH.
+/// returns/effects: Returns a shell-quoted `env ... codex resume --remote ...` command.
+pub fn resume_command_text(
+    codex_executable: &str,
+    app_server_url: &str,
+    thread_id: &str,
+    parent_thread_id: &str,
+    depth: usize,
+    launch_path: Option<&str>,
+) -> String {
+    let mut parts = vec!["env".to_string()];
+    if let Some(launch_path) = nonempty_str(launch_path) {
+        parts.push(format!("PATH={launch_path}"));
+    }
+    parts.extend([
+        format!("CMUX_CODEX_TEAMS_APP_SERVER_URL={app_server_url}"),
+        format!("{MANAGED_SUBAGENT_ENV_KEY}=1"),
+        format!("{THREAD_ENV_KEY}={thread_id}"),
+        format!("{PARENT_THREAD_ENV_KEY}={parent_thread_id}"),
+        format!("{DEPTH_ENV_KEY}={}", depth.max(1)),
+        codex_executable.to_string(),
+        "resume".to_string(),
+        "--remote".to_string(),
+        app_server_url.to_string(),
+        thread_id.to_string(),
+    ]);
+    parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// purpose: Build the root Codex arguments for a private app-server launch.
+/// inputs: App-server URL and user-supplied Codex arguments.
+/// returns/effects: Inserts `--remote <url>` after `resume`/`fork` selectors or before normal args.
+pub fn root_codex_arguments(app_server_url: &str, command_args: &[String]) -> Vec<String> {
+    match command_args.first().map(String::as_str) {
+        Some("resume" | "fork") => {
+            let mut args = vec![
+                command_args[0].clone(),
+                "--remote".to_string(),
+                app_server_url.to_string(),
+            ];
+            args.extend(command_args.iter().skip(1).cloned());
+            args
+        }
+        _ => {
+            let mut args = vec!["--remote".to_string(), app_server_url.to_string()];
+            args.extend(command_args.iter().cloned());
+            args
+        }
+    }
+}
+
+/// purpose: Build CMUX-compatible `surface.split` params for a managed Codex subagent.
+/// inputs: Workspace/root surface, previous managed surface, Codex thread, spawn data, and launch metadata.
+/// returns/effects: Writes a one-shot startup script and returns split params plus tab title.
+pub fn subagent_split_plan(
+    workspace_id: &str,
+    root_surface_id: &str,
+    last_agent_surface_id: Option<&str>,
+    thread: &Thread,
+    spawn: &Spawn,
+    launch: &SubagentLaunch<'_>,
+) -> Result<SubagentSplitPlan> {
+    let command_text = resume_command_text(
+        launch.codex_executable,
+        launch.app_server_url,
+        &thread.id,
+        &spawn.parent_thread_id,
+        launch.depth,
+        launch.launch_path,
+    );
+    let startup_script = write_startup_script(&command_text, thread.cwd.as_deref())?;
+    let target_surface_id = last_agent_surface_id.unwrap_or(root_surface_id);
+    let direction = if last_agent_surface_id.is_some() {
+        "down"
+    } else {
+        "right"
+    };
+    let mut params = Map::new();
+    params.insert("workspace_id".to_string(), json!(workspace_id));
+    params.insert("surface_id".to_string(), json!(target_surface_id));
+    params.insert("direction".to_string(), json!(direction));
+    params.insert("focus".to_string(), json!(false));
+    params.insert(
+        "initial_command".to_string(),
+        json!(startup_script.display().to_string()),
+    );
+    params.insert(
+        "tmux_start_command".to_string(),
+        json!(command_text.clone()),
+    );
+    params.insert(
+        "startup_environment".to_string(),
+        startup_environment(thread, spawn, launch.depth),
+    );
+    if let Some(cwd) = nonempty_str(thread.cwd.as_deref()) {
+        params.insert("working_directory".to_string(), json!(cwd));
+    }
+    Ok(SubagentSplitPlan {
+        params: Value::Object(params),
+        title: title(thread, spawn, launch.depth),
+        command_text,
+        startup_script,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubagentLaunch<'a> {
+    pub codex_executable: &'a str,
+    pub app_server_url: &'a str,
+    pub launch_path: Option<&'a str>,
+    pub depth: usize,
+}
 
 /// purpose: Build the CMUX-shaped Feed event for a Codex app-server approval request.
 /// inputs: Codex app-server method, JSON-RPC request id, params, workspace id, and optional related item.
@@ -289,6 +473,99 @@ pub fn string_value(object: &Map<String, Value>, keys: &[&str]) -> Option<String
             _ => None,
         }
     })
+}
+
+fn spawn_from_thread_object(object: &Map<String, Value>) -> Option<Spawn> {
+    let source = object.get("source")?.as_object()?;
+    let subagent = first_value(source, &["subAgent", "subagent"])?.as_object()?;
+    let spawn = first_value(subagent, &["thread_spawn", "threadSpawn"])?.as_object()?;
+    let parent_thread_id = string_value(spawn, &["parent_thread_id", "parentThreadId"])?;
+    Some(Spawn {
+        parent_thread_id,
+        source_depth: spawn.get("depth").and_then(number_to_usize),
+        agent_nickname: string_value(spawn, &["agent_nickname", "agentNickname"]),
+        agent_role: string_value(spawn, &["agent_role", "agentRole"]),
+    })
+}
+
+fn number_to_usize(value: &Value) -> Option<usize> {
+    if let Some(value) = value.as_u64() {
+        usize::try_from(value).ok()
+    } else if let Some(value) = value.as_i64() {
+        usize::try_from(value).ok()
+    } else {
+        None
+    }
+}
+
+fn startup_environment(thread: &Thread, spawn: &Spawn, depth: usize) -> Value {
+    let mut env = BTreeMap::new();
+    env.insert(MANAGED_SUBAGENT_ENV_KEY.to_string(), "1".to_string());
+    env.insert(THREAD_ENV_KEY.to_string(), thread.id.clone());
+    env.insert(
+        PARENT_THREAD_ENV_KEY.to_string(),
+        spawn.parent_thread_id.clone(),
+    );
+    env.insert(DEPTH_ENV_KEY.to_string(), depth.max(1).to_string());
+    json!(env)
+}
+
+fn title(thread: &Thread, spawn: &Spawn, depth: usize) -> String {
+    let label = [
+        spawn.agent_role.as_deref(),
+        thread.agent_role.as_deref(),
+        spawn.agent_nickname.as_deref(),
+        thread.agent_nickname.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+    .unwrap_or_else(|| thread.id.chars().take(8).collect());
+    format!("Codex d{}: {}", depth.max(1), label)
+}
+
+fn write_startup_script(command_text: &str, cwd: Option<&str>) -> Result<PathBuf> {
+    let path = env::temp_dir().join(format!(
+        "limux-codex-teams-{}-{}.sh",
+        std::process::id(),
+        unique_millis()
+    ));
+    let mut lines = vec![
+        "#!/bin/sh".to_string(),
+        "rm -f -- \"$0\" 2>/dev/null || true".to_string(),
+    ];
+    if let Some(cwd) = nonempty_str(cwd) {
+        let quoted = shell_quote(cwd);
+        lines.push(format!(
+            "{{ cd -- {quoted} 2>/dev/null || [ ! -d {quoted} ]; }} || exit $?"
+        ));
+    }
+    lines.push(format!(
+        "exec \"${{SHELL:-/bin/sh}}\" -lc {}",
+        shell_quote(command_text)
+    ));
+    fs::write(&path, format!("{}\n", lines.join("\n")))?;
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions)?;
+    Ok(path)
+}
+
+fn unique_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn nonempty_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn approval_params_snapshot(params: &Map<String, Value>) -> Value {
@@ -622,6 +899,147 @@ mod tests {
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().cloned().expect("object")
+    }
+
+    #[test]
+    fn codex_teams_thread_parser_extracts_subagent_spawn_metadata() {
+        let thread_object = object(json!({
+            "id": "thread-child",
+            "cwd": "/repo",
+            "status": {"type": "loaded"},
+            "agentNickname": "builder",
+            "source": {
+                "subAgent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "thread-parent",
+                        "depth": 2,
+                        "agent_role": "reviewer"
+                    }
+                }
+            }
+        }));
+
+        let thread = thread_from_object(&thread_object).expect("thread");
+        assert_eq!(thread.id, "thread-child");
+        assert_eq!(thread.cwd.as_deref(), Some("/repo"));
+        assert_eq!(thread.status_type.as_deref(), Some("loaded"));
+        assert!(thread_may_be_attachable(&thread));
+        let spawn = thread.spawn.as_ref().expect("spawn");
+        assert_eq!(spawn.parent_thread_id, "thread-parent");
+        assert_eq!(spawn.source_depth, Some(2));
+        assert_eq!(spawn.agent_role.as_deref(), Some("reviewer"));
+
+        let not_loaded = Thread {
+            status_type: Some("not_loaded".to_string()),
+            ..thread
+        };
+        assert!(!thread_may_be_attachable(&not_loaded));
+    }
+
+    #[test]
+    fn codex_teams_root_arguments_insert_remote_in_cmux_position() {
+        assert_eq!(
+            root_codex_arguments("ws://127.0.0.1:1234", &["--model".into(), "gpt-5.4".into()]),
+            vec!["--remote", "ws://127.0.0.1:1234", "--model", "gpt-5.4"]
+        );
+        assert_eq!(
+            root_codex_arguments(
+                "ws://127.0.0.1:1234",
+                &[
+                    "resume".into(),
+                    "--last".into(),
+                    "--model".into(),
+                    "gpt-5.4".into()
+                ]
+            ),
+            vec![
+                "resume",
+                "--remote",
+                "ws://127.0.0.1:1234",
+                "--last",
+                "--model",
+                "gpt-5.4"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_teams_resume_command_quotes_env_and_remote_thread() {
+        let command = resume_command_text(
+            "/usr/local/bin/codex",
+            "ws://127.0.0.1:2345",
+            "thread-child",
+            "thread-parent",
+            2,
+            Some("/tmp/bin:/usr/bin"),
+        );
+
+        assert!(command.contains("'env'"));
+        assert!(command.contains("'PATH=/tmp/bin:/usr/bin'"));
+        assert!(command.contains("'CMUX_CODEX_TEAMS_APP_SERVER_URL=ws://127.0.0.1:2345'"));
+        assert!(command.contains("'CMUX_AGENT_MANAGED_SUBAGENT=1'"));
+        assert!(command.contains(
+            "'/usr/local/bin/codex' 'resume' '--remote' 'ws://127.0.0.1:2345' 'thread-child'"
+        ));
+    }
+
+    #[test]
+    fn codex_teams_subagent_split_plan_matches_cmux_surface_contract() {
+        let thread = Thread {
+            id: "thread-child".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            status_type: Some("loaded".to_string()),
+            agent_nickname: Some("builder".to_string()),
+            agent_role: None,
+            spawn: None,
+        };
+        let spawn = Spawn {
+            parent_thread_id: "thread-parent".to_string(),
+            source_depth: Some(1),
+            agent_nickname: None,
+            agent_role: Some("reviewer".to_string()),
+        };
+
+        let plan = subagent_split_plan(
+            "workspace-1",
+            "surface-root",
+            Some("surface-last"),
+            &thread,
+            &spawn,
+            &SubagentLaunch {
+                codex_executable: "/usr/local/bin/codex",
+                app_server_url: "ws://127.0.0.1:2345",
+                launch_path: Some("/tmp/bin"),
+                depth: 2,
+            },
+        )
+        .expect("split plan");
+
+        assert_eq!(plan.params["workspace_id"], "workspace-1");
+        assert_eq!(plan.params["surface_id"], "surface-last");
+        assert_eq!(plan.params["direction"], "down");
+        assert_eq!(plan.params["focus"], false);
+        assert_eq!(plan.params["working_directory"], "/tmp/project");
+        assert_eq!(
+            plan.params["startup_environment"][MANAGED_SUBAGENT_ENV_KEY],
+            "1"
+        );
+        assert_eq!(
+            plan.params["startup_environment"][THREAD_ENV_KEY],
+            "thread-child"
+        );
+        assert_eq!(
+            plan.params["startup_environment"][PARENT_THREAD_ENV_KEY],
+            "thread-parent"
+        );
+        assert_eq!(plan.params["startup_environment"][DEPTH_ENV_KEY], "2");
+        assert_eq!(plan.title, "Codex d2: reviewer");
+
+        let script = fs::read_to_string(&plan.startup_script).expect("startup script");
+        assert!(script.contains("cd -- '/tmp/project'"));
+        assert!(script.contains("exec \"${SHELL:-/bin/sh}\" -lc"));
+        assert!(script.contains("codex"));
+        fs::remove_file(&plan.startup_script).expect("cleanup startup script");
     }
 
     #[test]
