@@ -7238,8 +7238,8 @@ fn apply_workspace_group_action(
         } => set_workspace_group_anchor(state, &group_id, &workspace_id),
         WorkspaceGroupAction::NewWorkspace {
             group_id,
-            placement: _,
-        } => new_workspace_in_group(state, &group_id),
+            placement,
+        } => new_workspace_in_group(state, &group_id, placement.as_deref()),
         WorkspaceGroupAction::SetColor { group_id, color } => {
             update_workspace_group(state, &group_id, |group| group.custom_color = color)
         }
@@ -7505,22 +7505,47 @@ fn workspace_create_group_insert_index(
     placement: &str,
     reference_workspace_id: Option<&str>,
 ) -> usize {
+    let group_ids = state
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.group_id.as_deref())
+        .collect::<Vec<_>>();
+    let reference_index =
+        reference_workspace_id.and_then(|raw| workspace_index_for_raw_id(state, raw));
+    workspace_group_insert_index(
+        &group_ids,
+        state.active_idx,
+        reference_index,
+        group_id,
+        source_index,
+        placement,
+    )
+}
+
+// purpose: Resolve CMUX group placement against ordered workspace group ids.
+// inputs: Workspace group ids, active/reference indexes, group id, source index, and placement.
+// returns/effects: Returns an insertion index without mutating state.
+fn workspace_group_insert_index(
+    group_ids: &[Option<&str>],
+    active_index: usize,
+    reference_index: Option<usize>,
+    group_id: &str,
+    source_index: usize,
+    placement: &str,
+) -> usize {
     match placement {
-        "end" => state
-            .workspaces
+        "end" => group_ids
             .iter()
-            .rposition(|workspace| workspace.group_id.as_deref() == Some(group_id))
+            .rposition(|candidate| *candidate == Some(group_id))
             .map(|index| index + 1)
             .unwrap_or(source_index),
-        "afterCurrent" => reference_workspace_id
-            .and_then(|raw| workspace_index_for_raw_id(state, raw))
-            .or(Some(state.active_idx))
+        "afterCurrent" => reference_index
+            .or(Some(active_index))
             .map(|index| index + 1)
             .unwrap_or(source_index),
-        _ => state
-            .workspaces
+        _ => group_ids
             .iter()
-            .position(|workspace| workspace.group_id.as_deref() == Some(group_id))
+            .position(|candidate| *candidate == Some(group_id))
             .unwrap_or(source_index),
     }
 }
@@ -7583,11 +7608,15 @@ fn set_workspace_group_anchor(
     Ok(serde_json::json!({ "group": workspace_group_row(&group), "workspace": workspace }))
 }
 
-// purpose: Create a workspace inside an existing group.
-// inputs: Group id/ref.
-// returns/effects: Appends a grouped workspace, activates it, and queues persistence.
-fn new_workspace_in_group(state: &State, group_id: &str) -> Result<serde_json::Value, BridgeError> {
-    let (group_id, name, cwd) = {
+// purpose: Create a workspace inside an existing group using CMUX placement.
+// inputs: Group id/ref and optional top/end/afterCurrent placement.
+// returns/effects: Creates, activates, reorders, and persists the grouped workspace.
+fn new_workspace_in_group(
+    state: &State,
+    group_id: &str,
+    placement: Option<&str>,
+) -> Result<serde_json::Value, BridgeError> {
+    let (group_id, name, cwd, anchor_workspace_id) = {
         let s = state.borrow();
         let Some(group_index) = workspace_group_index(&s, group_id) else {
             return Err(BridgeError::not_found("workspace group not found"));
@@ -7599,9 +7628,19 @@ fn new_workspace_in_group(state: &State, group_id: &str) -> Result<serde_json::V
                 .find(|workspace| workspace.id == anchor_id)
                 .and_then(|workspace| workspace.cwd.borrow().clone())
         });
-        (group.id.clone(), group.name.clone(), cwd)
+        (
+            group.id.clone(),
+            group.name.clone(),
+            cwd,
+            group.anchor_workspace_id.clone(),
+        )
     };
     let workspace_id = add_group_anchor_workspace(state, &group_id, &name, cwd.as_deref(), true);
+    let placement = placement.unwrap_or("afterCurrent");
+    let reference = (placement == "afterCurrent")
+        .then_some(anchor_workspace_id.as_deref())
+        .flatten();
+    place_created_workspace_in_group(state, &workspace_id, &group_id, Some(placement), reference)?;
     let payload = {
         let s = state.borrow();
         let Some(index) = workspace_index_for_raw_id(&s, &workspace_id) else {
@@ -12788,14 +12827,14 @@ mod tests {
         surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
         tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_hidden_by_collapsed_group_id,
-        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
-        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
-        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        workspace_folder_path_from_input, workspace_group_insert_index,
+        workspace_hidden_by_collapsed_group_id, workspace_lifecycle_payload,
+        workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
+        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
+        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
+        SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
+        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{
@@ -13733,6 +13772,34 @@ mod tests {
         assert_eq!(payload["previous_workspace_id"], "workspace-old");
         assert_eq!(payload["previous_workspace_ref"], "workspace:workspace-old");
         assert_eq!(payload["origin"], "test");
+    }
+
+    #[test]
+    fn workspace_group_insert_index_matches_cmux_placements() {
+        let group_ids = [
+            None,
+            Some("group-a"),
+            Some("group-a"),
+            Some("group-b"),
+            Some("group-a"),
+        ];
+
+        assert_eq!(
+            workspace_group_insert_index(&group_ids, 2, None, "group-a", 4, "top"),
+            1
+        );
+        assert_eq!(
+            workspace_group_insert_index(&group_ids, 2, None, "group-a", 4, "end"),
+            5
+        );
+        assert_eq!(
+            workspace_group_insert_index(&group_ids, 2, Some(1), "group-a", 4, "afterCurrent"),
+            2
+        );
+        assert_eq!(
+            workspace_group_insert_index(&group_ids, 2, None, "group-a", 4, "afterCurrent"),
+            3
+        );
     }
 
     #[test]

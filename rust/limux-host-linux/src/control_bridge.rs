@@ -1414,16 +1414,35 @@ fn optional_group_placement(params: &Map<String, Value>) -> Result<Option<String
     let Some(value) = params.get("group_placement") else {
         return Ok(None);
     };
+    parse_group_placement_value(value, "workspace.create group_placement")
+}
+
+// purpose: Parse CMUX workspace-group new-workspace placement values.
+// inputs: workspace.group.new_workspace params with optional placement.
+// returns/effects: Returns normalized placement or rejects malformed socket input.
+fn optional_workspace_group_placement(
+    params: &Map<String, Value>,
+) -> Result<Option<String>, BridgeError> {
+    let Some(value) = params.get("placement") else {
+        return Ok(None);
+    };
+    parse_group_placement_value(value, "workspace.group.new_workspace placement")
+}
+
+// purpose: Validate one CMUX group placement JSON value.
+// inputs: JSON value and user-facing field label.
+// returns/effects: Returns top/end/afterCurrent or an invalid_params error.
+fn parse_group_placement_value(value: &Value, label: &str) -> Result<Option<String>, BridgeError> {
     let Some(raw) = value.as_str() else {
-        return Err(BridgeError::invalid_params(
-            "workspace.create group_placement must be a string",
-        ));
+        return Err(BridgeError::invalid_params(format!(
+            "{label} must be a string"
+        )));
     };
     match raw {
         "top" | "end" | "afterCurrent" => Ok(Some(raw.to_string())),
-        _ => Err(BridgeError::invalid_params(
-            "workspace.create group_placement must be top, end, or afterCurrent",
-        )),
+        _ => Err(BridgeError::invalid_params(format!(
+            "{label} must be top, end, or afterCurrent"
+        ))),
     }
 }
 
@@ -2063,7 +2082,7 @@ fn parse_workspace_group_action(
         },
         "workspace.group.new_workspace" => WorkspaceGroupAction::NewWorkspace {
             group_id: required_group_id(params, method)?,
-            placement: optional_string(params, &["placement"]),
+            placement: optional_workspace_group_placement(params)?,
         },
         "workspace.group.set_color" => WorkspaceGroupAction::SetColor {
             group_id: required_group_id(params, method)?,
@@ -4823,6 +4842,34 @@ mod tests {
         );
 
         assert_eq!(response.error, None);
+
+        let response = dispatch_request(
+            r#"{"id":3,"method":"workspace.group.new_workspace","params":{"group":"group-1","placement":"end"}}"#,
+            &|command| match command {
+                ControlCommand::WorkspaceGroupAction { action, reply } => {
+                    assert_eq!(
+                        action,
+                        WorkspaceGroupAction::NewWorkspace {
+                            group_id: "group-1".to_string(),
+                            placement: Some("end".to_string()),
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":4,"method":"workspace.group.new_workspace","params":{"group":"group-1","placement":"middle"}}"#,
+            &|command| panic!("invalid workspace group placement dispatched: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]
