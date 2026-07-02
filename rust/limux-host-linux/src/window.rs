@@ -67,6 +67,8 @@ struct Workspace {
     notify_dot: gtk::Label,
     /// Notification message label in the sidebar row.
     notify_label: gtk::Label,
+    /// Workspace description label shown in sidebar details.
+    description_label: gtk::Label,
     /// Whether this workspace has unread notifications.
     unread: bool,
     /// Whether this workspace is favorited/pinned to top.
@@ -6016,7 +6018,9 @@ fn apply_reloaded_app_config(
     let style_manager = adw::StyleManager::default();
     apply_appearance(&style_manager, system_prefers_dark, &config.appearance);
     let next_font_size = config.font_size;
+    let sidebar = config.sidebar.clone();
     state.borrow().config.borrow_mut().clone_from(&config);
+    sync_sidebar_detail_rows(state, &sidebar);
     if next_font_size == previous_font_size {
         return;
     }
@@ -6185,12 +6189,14 @@ fn activate_last_workspace_shortcut(state: &State) {
 
 fn build_sidebar_row(
     name: &str,
+    description: Option<&str>,
     folder_path: Option<&str>,
-    show_branch_directory: bool,
+    sidebar: &app_config::SidebarConfig,
 ) -> (
     gtk::ListBoxRow,
     gtk::Label,
     gtk::Button,
+    gtk::Label,
     gtk::Label,
     gtk::Label,
     gtk::Label,
@@ -6205,6 +6211,7 @@ fn build_sidebar_row(
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     name_label.add_css_class("limux-ws-name");
+    apply_sidebar_name_label_policy(&name_label, sidebar.wrap_workspace_titles);
 
     let favorite_button = gtk::Button::with_label("\u{2606}");
     favorite_button.add_css_class("flat");
@@ -6225,13 +6232,20 @@ fn build_sidebar_row(
         .margin_start(8)
         .build();
     path_label.add_css_class("limux-ws-path");
-    if let Some(p) = folder_path.filter(|_| show_branch_directory) {
-        path_label.set_label(&abbreviate_path(p));
-        path_label.set_tooltip_text(Some(p));
-        path_label.set_visible(true);
-    } else {
-        path_label.set_visible(false);
-    }
+
+    let description_label = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(8)
+        .build();
+    description_label.add_css_class("limux-ws-path");
+    apply_sidebar_detail_labels(
+        &description_label,
+        &path_label,
+        description,
+        folder_path,
+        sidebar,
+    );
 
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
@@ -6247,6 +6261,7 @@ fn build_sidebar_row(
         .build();
     vbox.add_css_class("limux-sidebar-row-box");
     vbox.append(&top_row);
+    vbox.append(&description_label);
     vbox.append(&path_label);
     vbox.append(&notify_label);
 
@@ -6260,7 +6275,76 @@ fn build_sidebar_row(
         notify_dot,
         notify_label,
         path_label,
+        description_label,
     )
+}
+
+// purpose: Apply CMUX title wrapping policy to a workspace sidebar row label.
+// inputs: GTK name label and the configured wrapWorkspaceTitles value.
+// returns/effects: Mutates label wrapping and ellipsizing to match the setting.
+fn apply_sidebar_name_label_policy(name_label: &gtk::Label, wrap_workspace_titles: bool) {
+    name_label.set_wrap(wrap_workspace_titles);
+    name_label.set_ellipsize(if wrap_workspace_titles {
+        gtk::pango::EllipsizeMode::None
+    } else {
+        gtk::pango::EllipsizeMode::End
+    });
+}
+
+// purpose: Apply CMUX sidebar detail text and visibility to labels.
+// inputs: Description/path labels, optional workspace detail values, and sidebar settings.
+// returns/effects: Mutates labels to show or hide configured detail rows.
+fn apply_sidebar_detail_labels(
+    description_label: &gtk::Label,
+    path_label: &gtk::Label,
+    description: Option<&str>,
+    folder_path: Option<&str>,
+    sidebar: &app_config::SidebarConfig,
+) {
+    let show_details = !sidebar.hide_all_details;
+    if let Some(description) = description.filter(|value| !value.is_empty()) {
+        description_label.set_label(description);
+        description_label.set_visible(show_details && sidebar.show_workspace_description);
+    } else {
+        description_label.set_visible(false);
+    }
+    if let Some(path) = folder_path.filter(|_| show_details) {
+        path_label.set_label(&abbreviate_path(path));
+        path_label.set_tooltip_text(Some(path));
+        path_label.set_visible(sidebar.show_branch_directory);
+    } else {
+        path_label.set_visible(false);
+    }
+}
+
+// purpose: Apply CMUX sidebar detail visibility to an existing workspace row.
+// inputs: Workspace row model and sidebar settings.
+// returns/effects: Updates title wrapping, description, path, and notification detail rows.
+fn sync_workspace_sidebar_detail_row(
+    workspace: &mut Workspace,
+    sidebar: &app_config::SidebarConfig,
+) {
+    apply_sidebar_name_label_policy(&workspace.name_label, sidebar.wrap_workspace_titles);
+    apply_sidebar_detail_labels(
+        &workspace.description_label,
+        &workspace.path_label,
+        workspace.description.as_deref(),
+        workspace.folder_path.as_deref(),
+        sidebar,
+    );
+    let show_notification =
+        workspace.unread && should_show_sidebar_notification_message(true, sidebar);
+    workspace.notify_label.set_visible(show_notification);
+}
+
+// purpose: Resync all open workspace sidebar rows after config reload.
+// inputs: App state and freshly loaded sidebar config.
+// returns/effects: Mutates existing GTK labels without rebuilding workspaces.
+fn sync_sidebar_detail_rows(state: &State, sidebar: &app_config::SidebarConfig) {
+    let mut app_state = state.borrow_mut();
+    for workspace in &mut app_state.workspaces {
+        sync_workspace_sidebar_detail_row(workspace, sidebar);
+    }
 }
 
 /// Abbreviate a path by replacing the home directory with ~.
@@ -6925,16 +7009,17 @@ fn create_workspace_for_tab_payload(
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
 
-    let show_branch_directory = {
+    let sidebar_config = {
         let app_state = state.borrow();
-        let show_branch_directory = app_state.config.borrow().sidebar.show_branch_directory;
-        show_branch_directory
+        let sidebar = app_state.config.borrow().sidebar.clone();
+        sidebar
     };
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, description_label) =
         build_sidebar_row(
             &seed.name,
+            None,
             seed.folder_path.as_deref(),
-            show_branch_directory,
+            &sidebar_config,
         );
     let row_clone = row.clone();
     {
@@ -6954,6 +7039,7 @@ fn create_workspace_for_tab_payload(
             favorite_button,
             notify_dot,
             notify_label,
+            description_label,
             unread: false,
             favorite: false,
             last_pane_id: None,
@@ -11415,16 +11501,17 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
     stack.add_named(&root, Some(&stack_name));
 
-    let show_branch_directory = {
+    let sidebar_config = {
         let app_state = state.borrow();
-        let show_branch_directory = app_state.config.borrow().sidebar.show_branch_directory;
-        show_branch_directory
+        let sidebar = app_state.config.borrow().sidebar.clone();
+        sidebar
     };
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
+    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, description_label) =
         build_sidebar_row(
             &workspace.name,
+            workspace.description.as_deref(),
             workspace.folder_path.as_deref(),
-            show_branch_directory,
+            &sidebar_config,
         );
     sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
@@ -11441,6 +11528,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         favorite_button,
         notify_dot,
         notify_label,
+        description_label,
         unread: false,
         favorite: workspace.favorite,
         last_pane_id: None,
@@ -13558,9 +13646,9 @@ fn should_show_unread_visual(workspace_is_active: bool, unread_pane_ring: bool) 
 // returns/effects: Returns true only when both the visual and text setting are enabled.
 fn should_show_sidebar_notification_message(
     unread_visual: bool,
-    show_notification_message: bool,
+    sidebar: &app_config::SidebarConfig,
 ) -> bool {
-    unread_visual && show_notification_message
+    unread_visual && !sidebar.hide_all_details && sidebar.show_notification_message
 }
 
 fn mark_workspace_unread_with_message(
@@ -13606,10 +13694,8 @@ fn mark_workspace_unread_with_message(
             ws.unread = true;
             ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
             ws.notify_dot.add_css_class("limux-notify-dot");
-            let show_message = should_show_sidebar_notification_message(
-                show_unread_visual,
-                sidebar.show_notification_message,
-            );
+            let show_message =
+                should_show_sidebar_notification_message(show_unread_visual, &sidebar);
             ws.notify_label.set_visible(show_message);
             if show_message {
                 ws.notify_label.set_label(message);
@@ -15275,9 +15361,23 @@ mod tests {
         assert!(should_show_unread_visual(false, true));
         assert!(!should_show_unread_visual(true, true));
         assert!(!should_show_unread_visual(false, false));
-        assert!(should_show_sidebar_notification_message(true, true));
-        assert!(!should_show_sidebar_notification_message(true, false));
-        assert!(!should_show_sidebar_notification_message(false, true));
+        let sidebar = crate::app_config::SidebarConfig::default();
+        assert!(should_show_sidebar_notification_message(true, &sidebar));
+        assert!(!should_show_sidebar_notification_message(false, &sidebar));
+        assert!(!should_show_sidebar_notification_message(
+            true,
+            &crate::app_config::SidebarConfig {
+                show_notification_message: false,
+                ..crate::app_config::SidebarConfig::default()
+            }
+        ));
+        assert!(!should_show_sidebar_notification_message(
+            true,
+            &crate::app_config::SidebarConfig {
+                hide_all_details: true,
+                ..crate::app_config::SidebarConfig::default()
+            }
+        ));
     }
 
     #[test]

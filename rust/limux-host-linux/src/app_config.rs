@@ -125,6 +125,9 @@ impl TerminalBehaviorConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarConfig {
+    pub hide_all_details: bool,
+    pub wrap_workspace_titles: bool,
+    pub show_workspace_description: bool,
     pub show_notification_message: bool,
     pub show_branch_directory: bool,
 }
@@ -132,6 +135,9 @@ pub struct SidebarConfig {
 impl Default for SidebarConfig {
     fn default() -> Self {
         Self {
+            hide_all_details: false,
+            wrap_workspace_titles: false,
+            show_workspace_description: true,
             show_notification_message: true,
             show_branch_directory: true,
         }
@@ -626,6 +632,18 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             .unwrap_or_else(|| panic!("sidebar must be an object"))
     });
     let sidebar_defaults = SidebarConfig::default();
+    let hide_all_details = sidebar
+        .and_then(|sidebar| sidebar.get("hideAllDetails"))
+        .map(|value| parse_bool_setting(value, "sidebar.hideAllDetails"))
+        .unwrap_or(sidebar_defaults.hide_all_details);
+    let wrap_workspace_titles = sidebar
+        .and_then(|sidebar| sidebar.get("wrapWorkspaceTitles"))
+        .map(|value| parse_bool_setting(value, "sidebar.wrapWorkspaceTitles"))
+        .unwrap_or(sidebar_defaults.wrap_workspace_titles);
+    let show_workspace_description = sidebar
+        .and_then(|sidebar| sidebar.get("showWorkspaceDescription"))
+        .map(|value| parse_bool_setting(value, "sidebar.showWorkspaceDescription"))
+        .unwrap_or(sidebar_defaults.show_workspace_description);
     let show_notification_message = sidebar
         .and_then(|sidebar| sidebar.get("showNotificationMessage"))
         .map(|value| parse_bool_setting(value, "sidebar.showNotificationMessage"))
@@ -721,6 +739,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             auto_resume_agent_sessions,
         },
         sidebar: SidebarConfig {
+            hide_all_details,
+            wrap_workspace_titles,
+            show_workspace_description,
             show_notification_message,
             show_branch_directory,
         },
@@ -1126,6 +1147,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "sidebar".to_string(),
         json!({
+            "hideAllDetails": config.sidebar.hide_all_details,
+            "wrapWorkspaceTitles": config.sidebar.wrap_workspace_titles,
+            "showWorkspaceDescription": config.sidebar.show_workspace_description,
             "showNotificationMessage": config.sidebar.show_notification_message,
             "showBranchDirectory": config.sidebar.show_branch_directory,
         }),
@@ -1258,6 +1282,9 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "suppressOnlyFocusedSurface": false
         },
         "sidebar": {
+            "hideAllDetails": false,
+            "wrapWorkspaceTitles": false,
+            "showWorkspaceDescription": true,
             "showNotificationMessage": true,
             "showBranchDirectory": true
         }
@@ -1356,6 +1383,12 @@ mod tests {
         );
         assert_eq!(
             parsed["sidebar"]["showNotificationMessage"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["sidebar"]["hideAllDetails"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["wrapWorkspaceTitles"], Value::Bool(false));
+        assert_eq!(
+            parsed["sidebar"]["showWorkspaceDescription"],
             Value::Bool(true)
         );
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(true));
@@ -1773,6 +1806,9 @@ mod tests {
             &path,
             r#"{
   "sidebar": {
+    "hideAllDetails": true,
+    "wrapWorkspaceTitles": true,
+    "showWorkspaceDescription": false,
     "showNotificationMessage": false,
     "showBranchDirectory": false
   }
@@ -1784,6 +1820,9 @@ mod tests {
         let loaded = load_from_path(&path);
 
         assert!(loaded.warnings.is_empty());
+        assert!(loaded.config.sidebar.hide_all_details);
+        assert!(loaded.config.sidebar.wrap_workspace_titles);
+        assert!(!loaded.config.sidebar.show_workspace_description);
         assert!(!loaded.config.sidebar.show_notification_message);
         assert!(!loaded.config.sidebar.show_branch_directory);
     }
@@ -2231,6 +2270,9 @@ mod tests {
         fs::write(&path, br#"{"app":{"appearance":"dark"}}"#).expect("write config");
 
         let mut config = AppConfig::default();
+        config.sidebar.hide_all_details = true;
+        config.sidebar.wrap_workspace_titles = true;
+        config.sidebar.show_workspace_description = false;
         config.sidebar.show_notification_message = false;
         config.sidebar.show_branch_directory = false;
         save_to_path(&path, &config).expect("save sidebar");
@@ -2243,6 +2285,12 @@ mod tests {
         );
         assert_eq!(
             parsed["sidebar"]["showNotificationMessage"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sidebar"]["hideAllDetails"], Value::Bool(true));
+        assert_eq!(parsed["sidebar"]["wrapWorkspaceTitles"], Value::Bool(true));
+        assert_eq!(
+            parsed["sidebar"]["showWorkspaceDescription"],
             Value::Bool(false)
         );
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));

@@ -1605,6 +1605,27 @@ const TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING: BooleanSetting = BooleanSetti
     default: true,
 };
 
+const SIDEBAR_HIDE_ALL_DETAILS_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.hideAllDetails",
+    section: "sidebar",
+    json_key: "hideAllDetails",
+    default: false,
+};
+
+const SIDEBAR_WRAP_WORKSPACE_TITLES_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.wrapWorkspaceTitles",
+    section: "sidebar",
+    json_key: "wrapWorkspaceTitles",
+    default: false,
+};
+
+const SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showWorkspaceDescription",
+    section: "sidebar",
+    json_key: "showWorkspaceDescription",
+    default: true,
+};
+
 const SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showNotificationMessage",
     section: "sidebar",
@@ -1636,7 +1657,9 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|sidebar.showNotificationMessage|",
+    "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
+    "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
+    "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
@@ -1650,7 +1673,9 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|sidebar.showNotificationMessage|",
+    "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
+    "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
+    "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -1720,6 +1745,9 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         }
         "app.focusPaneOnFirstClick" => Some(APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING),
         "terminal.autoResumeAgentSessions" => Some(TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING),
+        "sidebar.hideAllDetails" => Some(SIDEBAR_HIDE_ALL_DETAILS_SETTING),
+        "sidebar.wrapWorkspaceTitles" => Some(SIDEBAR_WRAP_WORKSPACE_TITLES_SETTING),
+        "sidebar.showWorkspaceDescription" => Some(SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING),
         "sidebar.showNotificationMessage" => Some(SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING),
         "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
         _ => None,
@@ -16089,6 +16117,15 @@ mod cli_arg_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.json");
 
+        let text = render_config_boolean_get(&path, SIDEBAR_HIDE_ALL_DETAILS_SETTING)
+            .expect("get default sidebar hide details");
+        assert!(text.contains("sidebar.hideAllDetails = false"));
+        let text = render_config_boolean_get(&path, SIDEBAR_WRAP_WORKSPACE_TITLES_SETTING)
+            .expect("get default sidebar title wrapping");
+        assert!(text.contains("sidebar.wrapWorkspaceTitles = false"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING)
+            .expect("get default sidebar workspace description");
+        assert!(text.contains("sidebar.showWorkspaceDescription = true"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING)
             .expect("get default sidebar notification message");
         assert!(text.contains("sidebar.showNotificationMessage = true"));
@@ -16101,6 +16138,16 @@ mod cli_arg_tests {
             br#"{"sidebar":{"custom":true},"notifications":{"sound":"Ping"}}"#,
         )
         .expect("write settings");
+        let text = render_config_boolean_set(&path, SIDEBAR_HIDE_ALL_DETAILS_SETTING, "true")
+            .expect("set sidebar hide details");
+        assert!(text.contains("sidebar.hideAllDetails = true"));
+        let text = render_config_boolean_set(&path, SIDEBAR_WRAP_WORKSPACE_TITLES_SETTING, "true")
+            .expect("set sidebar title wrapping");
+        assert!(text.contains("sidebar.wrapWorkspaceTitles = true"));
+        let text =
+            render_config_boolean_set(&path, SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING, "false")
+                .expect("set sidebar workspace description");
+        assert!(text.contains("sidebar.showWorkspaceDescription = false"));
         let text =
             render_config_boolean_set(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING, "false")
                 .expect("set sidebar notification message");
@@ -16112,6 +16159,9 @@ mod cli_arg_tests {
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
         assert_eq!(parsed["sidebar"]["custom"], true);
+        assert_eq!(parsed["sidebar"]["hideAllDetails"], true);
+        assert_eq!(parsed["sidebar"]["wrapWorkspaceTitles"], true);
+        assert_eq!(parsed["sidebar"]["showWorkspaceDescription"], false);
         assert_eq!(parsed["sidebar"]["showNotificationMessage"], false);
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
         assert_eq!(parsed["notifications"]["sound"], "Ping");
