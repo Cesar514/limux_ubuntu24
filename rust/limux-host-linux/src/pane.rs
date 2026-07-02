@@ -2199,6 +2199,16 @@ pub struct SurfaceSummary {
 pub struct TabActionSummary {
     pub surface: SurfaceSummary,
     pub pinned: bool,
+    pub created: Option<SurfaceSummary>,
+    pub closed: Vec<SurfaceSummary>,
+    pub skipped_pinned: usize,
+    pub reloaded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabActionError {
+    NotFound,
+    UnsupportedForSurface,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2446,20 +2456,210 @@ fn apply_tab_metadata_action(
     Some(entry.pinned)
 }
 
-// purpose: Apply supported CMUX tab metadata actions to a live tab.
+// purpose: Close tabs to the left, right, or all others around an anchor tab.
+// inputs: Pane internals, anchor tab id, and normalized close action key.
+// returns/effects: Removes non-pinned target tabs and reports closed/skipped counts.
+fn close_relative_tabs(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    action_key: &str,
+) -> Vec<SurfaceSummary> {
+    let target_ids = {
+        let tab_state = internals.tab_state.borrow();
+        let Some(anchor_index) = tab_state.tabs.iter().position(|entry| entry.id == tab_id) else {
+            return Vec::new();
+        };
+        tab_state
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let close = match action_key {
+                    "close_left" => index < anchor_index,
+                    "close_right" => index > anchor_index,
+                    "close_others" => index != anchor_index,
+                    _ => false,
+                };
+                (close && !entry.pinned).then(|| entry.id.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    close_tabs_by_id(internals, target_ids)
+}
+
+// purpose: Count pinned tabs skipped by a relative close action.
+// inputs: Pane internals, anchor tab id, and normalized close action key.
+// returns/effects: Returns the number of target tabs left open because they are pinned.
+fn skipped_pinned_relative_tabs(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    action_key: &str,
+) -> usize {
+    let tab_state = internals.tab_state.borrow();
+    let Some(anchor_index) = tab_state.tabs.iter().position(|entry| entry.id == tab_id) else {
+        return 0;
+    };
+    tab_state
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            let close = match action_key {
+                "close_left" => *index < anchor_index,
+                "close_right" => *index > anchor_index,
+                "close_others" => *index != anchor_index,
+                _ => false,
+            };
+            close && entry.pinned
+        })
+        .count()
+}
+
+// purpose: Remove selected tab ids and return summaries captured before removal.
+// inputs: Pane internals and tab ids in the pane.
+// returns/effects: Removes tabs from GTK state and invokes existing empty-pane behavior.
+fn close_tabs_by_id(internals: &Rc<PaneInternals>, tab_ids: Vec<String>) -> Vec<SurfaceSummary> {
+    let mut closed = Vec::new();
+    for tab_id in tab_ids {
+        if let Some(summary) = surface_summary_for_tab(internals, &tab_id) {
+            remove_tab(
+                &internals.tab_strip,
+                &internals.content_stack,
+                &internals.tab_state,
+                &tab_id,
+                &internals.callbacks,
+                &internals.pane_outer,
+                PaneEmptyReason::ClosedLastTab,
+            );
+            closed.push(summary);
+        }
+    }
+    closed
+}
+
+// purpose: Duplicate a browser tab in the same pane.
+// inputs: Pane internals and addressed browser tab id.
+// returns/effects: Creates a new browser tab with the same URI and returns its summary.
+fn duplicate_browser_tab(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+) -> Result<SurfaceSummary, TabActionError> {
+    let uri = {
+        let tab_state = internals.tab_state.borrow();
+        let entry = tab_state
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+            .ok_or(TabActionError::NotFound)?;
+        match &entry.kind {
+            TabKind::Browser { state } => state.uri.borrow().clone(),
+            TabKind::Terminal { .. } | TabKind::Keybinds => {
+                return Err(TabActionError::UnsupportedForSurface);
+            }
+        }
+    };
+    let options = BrowserTabOptions {
+        id: None,
+        custom_name: None,
+        pinned: false,
+        uri: uri.as_deref(),
+    };
+    let new_tab_id = add_browser_tab_inner(internals, Some(options));
+    surface_summary_for_tab(internals, &new_tab_id).ok_or(TabActionError::NotFound)
+}
+
+// purpose: Reload an addressed browser tab.
+// inputs: Pane internals and addressed tab id.
+// returns/effects: Invokes WebKit reload when the surface is a browser.
+fn reload_browser_tab(internals: &Rc<PaneInternals>, tab_id: &str) -> Result<(), TabActionError> {
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state
+        .tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .ok_or(TabActionError::NotFound)?;
+    match &entry.kind {
+        TabKind::Browser { state } => state
+            .handles
+            .reload()
+            .then_some(())
+            .ok_or(TabActionError::NotFound),
+        TabKind::Terminal { .. } | TabKind::Keybinds => Err(TabActionError::UnsupportedForSurface),
+    }
+}
+
+type TabActionMutation = (Option<SurfaceSummary>, Vec<SurfaceSummary>, bool);
+
+// purpose: Execute the mutating portion of a normalized CMUX tab action.
+// inputs: Pane internals, tab id, action key, and optional title for rename.
+// returns/effects: Mutates tab/browser state and returns created, closed, and reload outputs.
+fn apply_tab_action_mutation(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    action_key: &str,
+    title: Option<&str>,
+) -> Result<TabActionMutation, TabActionError> {
+    if matches!(action_key, "rename" | "clear_name" | "pin" | "unpin") {
+        apply_tab_metadata_action(internals, tab_id, action_key, title)
+            .ok_or(TabActionError::NotFound)?;
+        return Ok((None, Vec::new(), false));
+    }
+    if matches!(action_key, "close_left" | "close_right" | "close_others") {
+        return Ok((
+            None,
+            close_relative_tabs(internals, tab_id, action_key),
+            false,
+        ));
+    }
+    if matches!(action_key, "mark_read" | "mark_unread" | "mark_as_unread") {
+        return Ok((None, Vec::new(), false));
+    }
+    if action_key == "duplicate" {
+        return Ok((
+            Some(duplicate_browser_tab(internals, tab_id)?),
+            Vec::new(),
+            false,
+        ));
+    }
+    if action_key == "reload" {
+        reload_browser_tab(internals, tab_id)?;
+        return Ok((None, Vec::new(), true));
+    }
+    Err(TabActionError::UnsupportedForSurface)
+}
+
+// purpose: Apply supported CMUX tab actions to a live tab.
 // inputs: Workspace root, optional surface hint, normalized action key, and optional title.
-// returns/effects: Mutates the tab label/pinned state and returns updated metadata.
+// returns/effects: Mutates tab state or browser state and returns updated action metadata.
 pub fn apply_tab_action_for_root(
     root: &gtk::Widget,
     surface_hint: Option<&str>,
     action_key: &str,
     title: Option<&str>,
-) -> Option<TabActionSummary> {
-    let (internals, tab_id) = tab_action_target_for_root(root, surface_hint)?;
-    let pinned = apply_tab_metadata_action(&internals, &tab_id, action_key, title)?;
+) -> Result<TabActionSummary, TabActionError> {
+    let (internals, tab_id) =
+        tab_action_target_for_root(root, surface_hint).ok_or(TabActionError::NotFound)?;
+    let skipped_pinned = skipped_pinned_relative_tabs(&internals, &tab_id, action_key);
+    let (created, closed, reloaded) =
+        apply_tab_action_mutation(&internals, &tab_id, action_key, title)?;
     (internals.callbacks.on_state_changed)();
-    let surface = surface_summary_for_tab(&internals, &tab_id)?;
-    Some(TabActionSummary { surface, pinned })
+    let surface = surface_summary_for_tab(&internals, &tab_id).ok_or(TabActionError::NotFound)?;
+    let pinned = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .map(|entry| entry.pinned)
+        .unwrap_or(false);
+    Ok(TabActionSummary {
+        surface,
+        pinned,
+        created,
+        closed,
+        skipped_pinned,
+        reloaded,
+    })
 }
 
 /// purpose: Focus the active tab in a pane identified by pane id.

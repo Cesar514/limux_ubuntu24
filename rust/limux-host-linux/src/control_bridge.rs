@@ -3652,7 +3652,17 @@ fn handle_method(
                     );
                 }
             };
-            let action_key = action.to_ascii_lowercase().replace('-', "_");
+            let raw_action_key = action.to_ascii_lowercase().replace('-', "_");
+            let action_key = match raw_action_key.as_str() {
+                "reload_tab" => "reload",
+                "duplicate_tab" => "duplicate",
+                "close_to_left" => "close_left",
+                "close_to_right" => "close_right",
+                "close_other_tabs" => "close_others",
+                "mark_as_unread" => "mark_unread",
+                value => value,
+            }
+            .to_string();
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -3688,7 +3698,17 @@ fn handle_method(
                 )
             } else if !matches!(
                 action_key.as_str(),
-                "rename" | "clear_name" | "pin" | "unpin"
+                "rename"
+                    | "clear_name"
+                    | "pin"
+                    | "unpin"
+                    | "mark_read"
+                    | "mark_unread"
+                    | "reload"
+                    | "duplicate"
+                    | "close_left"
+                    | "close_right"
+                    | "close_others"
             ) {
                 return error_response(
                     id,
@@ -7349,14 +7369,49 @@ mod tests {
             Some(INVALID_PARAMS_CODE)
         );
 
-        let unsupported = dispatch_request(
-            r#"{"id":4,"method":"tab.action","params":{"action":"duplicate","tab_id":"tab:4:tab"}}"#,
+        let unknown = dispatch_request(
+            r#"{"id":4,"method":"tab.action","params":{"action":"teleport","tab_id":"tab:4:tab"}}"#,
             &|command| panic!("unsupported tab.action should not dispatch: {command:?}"),
         );
         assert_eq!(
-            unsupported.error.as_ref().map(|error| error.code),
+            unknown.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
+    }
+
+    #[test]
+    fn tab_action_aliases_route_to_live_command() {
+        for (raw_action, normalized) in [
+            ("reload-tab", "reload"),
+            ("duplicate-tab", "duplicate"),
+            ("close-to-left", "close_left"),
+            ("close-to-right", "close_right"),
+            ("close-other-tabs", "close_others"),
+            ("mark-as-unread", "mark_unread"),
+            ("mark-read", "mark_read"),
+        ] {
+            let request = format!(
+                concat!(
+                    r#"{{"id":1,"method":"tab.action","params":"#,
+                    r#"{{"action":"{}","tab_id":"tab:4:tab"}}}}"#
+                ),
+                raw_action
+            );
+            let response = dispatch_request(&request, &|command| match command {
+                ControlCommand::TabAction {
+                    surface_hint,
+                    action,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(action, normalized);
+                    let _ = reply.send(Ok(json!({ "action": action })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            });
+            assert_eq!(response.error, None, "action {raw_action} should route");
+        }
     }
 
     #[test]

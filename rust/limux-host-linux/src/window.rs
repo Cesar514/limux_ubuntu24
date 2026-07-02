@@ -8200,6 +8200,111 @@ fn mixed_workspace_layout(
     split_layout_from_panes(panes, 0)
 }
 
+// purpose: Build a CMUX-shaped result payload for one live tab action.
+// inputs: Workspace id, normalized action key, pane action summary, and optional unread state.
+// returns/effects: Returns refs and action-specific metadata without mutating host state.
+fn tab_action_payload(
+    workspace_id: &str,
+    action: &str,
+    summary: &pane::TabActionSummary,
+    unread: Option<bool>,
+) -> serde_json::Value {
+    let closed_refs = summary
+        .closed
+        .iter()
+        .map(|surface| json!(format!("surface:{}", surface.surface_id)))
+        .collect::<Vec<_>>();
+    let mut payload = json!({
+        "ok": true,
+        "action": action,
+        "workspace_id": workspace_id,
+        "workspace_ref": format!("workspace:{workspace_id}"),
+        "surface_id": summary.surface.surface_id,
+        "surface_ref": format!("surface:{}", summary.surface.surface_id),
+        "tab_ref": format!("tab:{}", summary.surface.surface_id),
+        "pane_id": summary.surface.pane_id,
+        "pane_ref": format!("pane:{}", summary.surface.pane_id),
+        "title": summary.surface.title,
+        "pinned": summary.pinned,
+        "closed": summary.closed.len(),
+        "closed_surface_refs": closed_refs,
+        "skipped_pinned": summary.skipped_pinned,
+        "reloaded": summary.reloaded,
+    });
+    if let Some(created) = &summary.created {
+        payload["created_surface_id"] = json!(created.surface_id);
+        payload["created_surface_ref"] = json!(format!("surface:{}", created.surface_id));
+        payload["created_tab_ref"] = json!(format!("tab:{}", created.surface_id));
+    }
+    if let Some(value) = unread {
+        payload["unread"] = json!(value);
+    }
+    payload
+}
+
+// purpose: Apply CMUX mark-read/mark-unread tab actions to Limux workspace unread UI.
+// inputs: Live app state, workspace id, action key, and resolved surface summary.
+// returns/effects: Mutates workspace unread styling for read/unread actions.
+fn apply_tab_read_state_action(
+    state: &State,
+    workspace_id: &str,
+    summary: &pane::TabActionSummary,
+    action: &str,
+) -> Option<bool> {
+    match action {
+        "mark_unread" | "mark_as_unread" => {
+            mark_workspace_unread_for_tab(state, workspace_id, &summary.surface);
+            Some(true)
+        }
+        "mark_read" => {
+            let mut app_state = state.borrow_mut();
+            if let Some(workspace) = app_state
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+            {
+                clear_workspace_unread_visual(workspace);
+            }
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+// purpose: Mark the owning workspace unread for a CMUX tab action.
+// inputs: Live app state, workspace id, and surface metadata for notification targeting.
+// returns/effects: Sets Limux workspace unread styling without emitting desktop notifications.
+fn mark_workspace_unread_for_tab(
+    state: &State,
+    workspace_id: &str,
+    surface: &pane::SurfaceSummary,
+) {
+    let mut app_state = state.borrow_mut();
+    let Some(workspace) = app_state
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return;
+    };
+    workspace.unread = true;
+    workspace
+        .notify_dot
+        .remove_css_class("limux-notify-dot-hidden");
+    workspace.notify_dot.add_css_class("limux-notify-dot");
+    workspace
+        .notify_label
+        .set_label(&format!("{} needs attention", surface.title));
+    workspace.notify_label.remove_css_class("limux-notify-msg");
+    workspace
+        .notify_label
+        .add_css_class("limux-notify-msg-unread");
+    workspace.notify_label.set_visible(true);
+    if let Some(row_box) = workspace.sidebar_row.child() {
+        row_box.add_css_class("limux-sidebar-row-unread");
+    }
+}
+
 fn dispatch_control_command(command: ControlCommand) {
     CONTROL_STATE.with(|slot| {
         let state = slot.borrow().clone();
@@ -8840,32 +8945,26 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let workspace = &app_state.workspaces[index];
                 (workspace.id.clone(), workspace.root.clone())
             };
-            let result = pane::apply_tab_action_for_root(
+            let summary = match pane::apply_tab_action_for_root(
                 &workspace_root,
                 surface_hint.as_deref(),
                 &action,
                 title.as_deref(),
-            )
-            .map(|summary| {
-                json!({
-                    "ok": true,
-                    "action": action,
-                    "workspace_id": workspace_id.clone(),
-                    "workspace_ref": format!("workspace:{workspace_id}"),
-                    "surface_id": summary.surface.surface_id,
-                    "surface_ref": format!("surface:{}", summary.surface.surface_id),
-                    "tab_ref": format!("tab:{}", summary.surface.surface_id),
-                    "pane_id": summary.surface.pane_id,
-                    "pane_ref": format!("pane:{}", summary.surface.pane_id),
-                    "title": summary.surface.title,
-                    "pinned": summary.pinned,
-                })
-            });
-
-            let Some(payload) = result else {
-                let _ = reply.send(Err(BridgeError::not_found("tab not found")));
-                return;
+            ) {
+                Ok(summary) => summary,
+                Err(pane::TabActionError::NotFound) => {
+                    let _ = reply.send(Err(BridgeError::not_found("tab not found")));
+                    return;
+                }
+                Err(pane::TabActionError::UnsupportedForSurface) => {
+                    let _ = reply.send(Err(BridgeError::invalid_params(format!(
+                        "tab.action {action} unsupported for surface type"
+                    ))));
+                    return;
+                }
             };
+            let unread = apply_tab_read_state_action(state, &workspace_id, &summary, &action);
+            let payload = tab_action_payload(&workspace_id, &action, &summary, unread);
             request_session_save(state);
             let _ = reply.send(Ok(payload));
         }
@@ -14375,6 +14474,57 @@ mod tests {
         assert_eq!(key_payload["surface_id"], "7:tab-a");
         assert_eq!(key_payload["pane_id"], "7");
         assert_eq!(key_payload["key"], "Enter");
+    }
+
+    #[test]
+    fn tab_action_payload_includes_created_closed_and_unread_metadata() {
+        let surface = crate::pane::SurfaceSummary {
+            pane_id: 7,
+            surface_id: "7:tab-a".to_string(),
+            title: "build".to_string(),
+            kind: "browser".to_string(),
+            selected: true,
+            cwd: None,
+            uri: Some("https://example.com".to_string()),
+        };
+        let created = crate::pane::SurfaceSummary {
+            pane_id: 7,
+            surface_id: "7:tab-b".to_string(),
+            title: "build copy".to_string(),
+            kind: "browser".to_string(),
+            selected: true,
+            cwd: None,
+            uri: Some("https://example.com".to_string()),
+        };
+        let summary = crate::pane::TabActionSummary {
+            surface,
+            pinned: false,
+            created: Some(created),
+            closed: vec![crate::pane::SurfaceSummary {
+                pane_id: 7,
+                surface_id: "7:tab-c".to_string(),
+                title: "old".to_string(),
+                kind: "terminal".to_string(),
+                selected: false,
+                cwd: Some("/tmp".to_string()),
+                uri: None,
+            }],
+            skipped_pinned: 1,
+            reloaded: true,
+        };
+
+        let payload = super::tab_action_payload("workspace-a", "duplicate", &summary, Some(true));
+
+        assert_eq!(payload["workspace_ref"], "workspace:workspace-a");
+        assert_eq!(payload["surface_ref"], "surface:7:tab-a");
+        assert_eq!(payload["tab_ref"], "tab:7:tab-a");
+        assert_eq!(payload["created_surface_ref"], "surface:7:tab-b");
+        assert_eq!(payload["created_tab_ref"], "tab:7:tab-b");
+        assert_eq!(payload["closed"], 1);
+        assert_eq!(payload["closed_surface_refs"], json!(["surface:7:tab-c"]));
+        assert_eq!(payload["skipped_pinned"], 1);
+        assert_eq!(payload["reloaded"], true);
+        assert_eq!(payload["unread"], true);
     }
 
     #[test]
