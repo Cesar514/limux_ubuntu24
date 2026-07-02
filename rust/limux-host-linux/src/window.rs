@@ -9767,6 +9767,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             name,
             cwd,
             command,
+            focus,
             environment,
             reply,
         } => {
@@ -9792,12 +9793,12 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 environment,
                 layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
             };
-            add_workspace_from_state(state, &workspace);
+            add_workspace_from_state_internal(state, &workspace, focus);
             request_session_save(state);
 
             let result = {
                 let app_state = state.borrow();
-                workspace_payload(&app_state, app_state.active_idx)
+                workspace_payload(&app_state, app_state.workspaces.len() - 1)
             };
 
             if let (Some(command), Some(workspace_id)) = (

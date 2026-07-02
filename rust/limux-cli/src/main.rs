@@ -356,7 +356,8 @@ fn full_help_text() -> &'static str {
         "  surface-health [--workspace <id|ref>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
-        "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--env KEY=VALUE] [--env-file <path>]\n",
+        "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--focus <true|false>]\n",
+        "      [--env KEY=VALUE] [--env-file <path>]\n",
         "  workspace env [<workspace>] [--workspace <id|ref|name>] [--mask]\n",
         "  select-workspace --workspace <id|ref>\n",
         "  close-workspace --workspace <id|ref>\n",
@@ -1776,6 +1777,29 @@ fn parse_opts(args: &[String], name: &str) -> Vec<String> {
 
 fn parse_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+// purpose: Parse CMUX boolean option values.
+// inputs: Raw value from an option such as --focus.
+// returns/effects: Returns a boolean for CMUX aliases or None for invalid text.
+fn parse_bool_string(raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+// purpose: Parse an optional CMUX boolean option while failing loudly on bad values.
+// inputs: CLI args and the option name to parse.
+// returns/effects: Returns Some(bool) when present, None when absent, or an error.
+fn parse_optional_bool_arg(args: &[String], name: &str) -> Result<Option<bool>> {
+    let Some(raw) = parse_opt(args, name) else {
+        return Ok(None);
+    };
+    parse_bool_string(&raw)
+        .map(Some)
+        .ok_or_else(|| anyhow!("{name} must be one of true, false, 1, 0, yes, no, on, or off"))
 }
 
 // purpose: Validate CMUX workspace environment variable names.
@@ -7092,9 +7116,9 @@ export default function limuxOmpSessionExtension(api) {
     )
 }
 
-// purpose: Build CMUX-compatible workspace.create params from CLI flags.
-// inputs: Arguments after `new-workspace` or `workspace create`.
-// returns/effects: Returns validated params without contacting the host.
+// purpose: Build CMUX-compatible workspace.create params from new-workspace args.
+// inputs: CLI args for new-workspace or workspace create.
+// returns/effects: Serializes title, cwd, command, focus, and workspace env.
 fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     let mut params = Map::new();
     if let Some(name) = parse_opt(args, "--name").or_else(|| parse_opt(args, "--title")) {
@@ -7105,6 +7129,9 @@ fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     }
     if let Some(command) = parse_opt(args, "--command") {
         params.insert("command".to_string(), Value::String(command));
+    }
+    if let Some(focus) = parse_optional_bool_arg(args, "--focus")? {
+        params.insert("focus".to_string(), Value::Bool(focus));
     }
     let environment = parse_workspace_env_args(args)?;
     if !environment.is_empty() {
@@ -7117,8 +7144,15 @@ fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     Ok(params)
 }
 
+// purpose: Create a CMUX-compatible workspace without stealing focus by default.
+// inputs: Active socket client and new-workspace args.
+// returns/effects: Calls workspace.create and restores original focus unless --focus true.
 async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
     let params = build_new_workspace_params(args)?;
+    let focus = params
+        .get("focus")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let original = resolve_current_workspace(client).await?;
 
     let created = client
@@ -7126,9 +7160,11 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
         .await
         .context("workspace.create failed")?;
 
-    let _ = client
-        .call("workspace.select", json!({ "workspace_id": original }))
-        .await;
+    if !focus {
+        let _ = client
+            .call("workspace.select", json!({ "workspace_id": original }))
+            .await;
+    }
 
     Ok(created)
 }
@@ -11344,6 +11380,25 @@ mod cli_arg_tests {
             build_new_workspace_params(&args(&["--title", "Launch"])).expect("workspace params");
 
         assert_eq!(params["title"], "Launch");
+    }
+
+    #[test]
+    fn new_workspace_params_include_focus_bool_aliases() {
+        let focused =
+            build_new_workspace_params(&args(&["--focus", "yes"])).expect("workspace params");
+        let background =
+            build_new_workspace_params(&args(&["--focus", "off"])).expect("workspace params");
+
+        assert_eq!(focused["focus"], true);
+        assert_eq!(background["focus"], false);
+    }
+
+    #[test]
+    fn new_workspace_params_reject_invalid_focus() {
+        let err =
+            build_new_workspace_params(&args(&["--focus", "maybe"])).expect_err("focus error");
+
+        assert!(err.to_string().contains("--focus must be one of"));
     }
 
     #[test]

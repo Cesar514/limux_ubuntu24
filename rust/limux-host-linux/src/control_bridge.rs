@@ -763,6 +763,7 @@ pub enum ControlCommand {
         name: Option<String>,
         cwd: Option<String>,
         command: Option<String>,
+        focus: bool,
         environment: BTreeMap<String, String>,
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -3320,12 +3321,17 @@ fn handle_method(
                 Ok(environment) => environment,
                 Err(error) => return error_response(id, error),
             };
+            let focus = match optional_bool(params, "focus") {
+                Ok(focus) => focus.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreateWorkspace {
                     name: optional_string(params, &["name", "title"]),
                     cwd: optional_string(params, &["cwd"]),
                     command: optional_string(params, &["command"]),
+                    focus,
                     environment,
                     reply,
                 },
@@ -4704,8 +4710,12 @@ mod tests {
             r#"{"id":1,"method":"workspace.create","params":{"workspace_env":{"FOO":"bar"}}}"#,
             &|command| match command {
                 ControlCommand::CreateWorkspace {
-                    environment, reply, ..
+                    focus,
+                    environment,
+                    reply,
+                    ..
                 } => {
+                    assert!(!focus);
                     assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
                     let _ = reply.send(Ok(json!({ "workspace_id": "workspace-a" })));
                 }
@@ -4734,6 +4744,30 @@ mod tests {
         let invalid = dispatch_request(
             r#"{"id":3,"method":"workspace.create","params":{"workspace_env":{"CMUX_SOCKET":"/tmp/socket"}}}"#,
             &|command| panic!("invalid workspace.create should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn workspace_create_route_accepts_focus_bool() {
+        let created = dispatch_request(
+            r#"{"id":1,"method":"workspace.create","params":{"focus":true}}"#,
+            &|command| match command {
+                ControlCommand::CreateWorkspace { focus, reply, .. } => {
+                    assert!(focus);
+                    let _ = reply.send(Ok(json!({ "workspace_id": "workspace-a" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(created.error, None);
+
+        let invalid = dispatch_request(
+            r#"{"id":2,"method":"workspace.create","params":{"focus":"yes"}}"#,
+            &|command| panic!("invalid focus should not dispatch: {command:?}"),
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
