@@ -163,6 +163,7 @@ struct WorkspaceEventSnapshot {
 struct SurfaceShellReport {
     tty: Option<String>,
     ports: Vec<u16>,
+    shell_state: Option<String>,
 }
 
 pub(crate) struct AppState {
@@ -2668,6 +2669,82 @@ fn surface_clear_ports_payload(
         &app_state.workspaces[workspace_index],
         &surface,
     ))
+}
+
+/// purpose: Apply a CMUX shell-reported working directory to one terminal surface.
+/// inputs: Host state, workspace, optional surface hint, and raw reported path.
+/// returns/effects: Updates the terminal cwd and returns CMUX-shaped JSON.
+fn surface_report_pwd_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+    path: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let normalized = normalize_reported_directory(path);
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    let updated = pane::set_terminal_working_directory_for_root(
+        &app_state.workspaces[workspace_index].root,
+        &surface.surface_id,
+        &normalized,
+    )
+    .ok_or_else(|| BridgeError::not_found("terminal surface not found"))?;
+    let mut payload = shell_report_payload(&app_state.workspaces[workspace_index], &updated);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "cwd".to_string(),
+            serde_json::Value::String(normalized.clone()),
+        );
+        map.insert(
+            "current_directory".to_string(),
+            serde_json::Value::String(normalized),
+        );
+    }
+    Ok(payload)
+}
+
+/// purpose: Record CMUX shell prompt/running state for one terminal surface.
+/// inputs: Host state, workspace, optional surface hint, and validated shell state.
+/// returns/effects: Updates in-memory metadata and returns CMUX-shaped JSON.
+fn surface_report_shell_state_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+    shell_state: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    prune_surface_shell_reports(app_state, workspace_index);
+    let key = shell_report_key(
+        &app_state.workspaces[workspace_index].id,
+        &surface.surface_id,
+    );
+    app_state
+        .surface_shell_reports
+        .entry(key)
+        .or_default()
+        .shell_state = Some(shell_state.to_string());
+    let mut payload = shell_report_payload(&app_state.workspaces[workspace_index], &surface);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "shell_state".to_string(),
+            serde_json::Value::String(shell_state.to_string()),
+        );
+    }
+    Ok(payload)
+}
+
+/// purpose: Normalize CMUX report_pwd path strings.
+/// inputs: Raw path or file:// URL from shell integration.
+/// returns/effects: Returns a trimmed local path string or preserves empty raw input.
+fn normalize_reported_directory(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return raw.to_string();
+    }
+    trimmed
+        .strip_prefix("file://")
+        .filter(|path| !path.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// purpose: Resolve the surface targeted by `surface.ports_kick`.
@@ -11267,6 +11344,50 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(result);
         }
+        ControlCommand::SurfaceReportPWD {
+            target,
+            surface_hint,
+            path,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_report_pwd_payload(
+                        &mut app_state,
+                        index,
+                        surface_hint.as_deref(),
+                        &path,
+                    )
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
+        ControlCommand::SurfaceReportShellState {
+            target,
+            surface_hint,
+            shell_state,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_report_shell_state_payload(
+                        &mut app_state,
+                        index,
+                        surface_hint.as_deref(),
+                        &shell_state,
+                    )
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
         ControlCommand::CreateWorkspace {
             name,
             description,
@@ -14841,6 +14962,7 @@ mod tests {
             SurfaceShellReport {
                 tty: Some("pts/1".to_string()),
                 ports: vec![3000, 5173],
+                shell_state: None,
             },
         );
         let mut rows = vec![serde_json::json!({

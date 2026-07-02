@@ -172,6 +172,8 @@ const METHODS: &[&str] = &[
     "surface.report_ports",
     "surface.clear_ports",
     "surface.report_tty",
+    "surface.report_pwd",
+    "surface.report_shell_state",
     "surface.ports_kick",
     "surface.read_text",
     "surface.send_text",
@@ -825,6 +827,18 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfaceReportPWD {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        path: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SurfaceReportShellState {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        shell_state: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -983,6 +997,8 @@ impl ControlCommand {
             | Self::SurfaceReportTTY { reply, .. }
             | Self::SurfaceReportPorts { reply, .. }
             | Self::SurfaceClearPorts { reply, .. }
+            | Self::SurfaceReportPWD { reply, .. }
+            | Self::SurfaceReportShellState { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::WorkspaceEnv { reply, .. }
@@ -4121,6 +4137,75 @@ fn handle_method(
                 rx,
             )
         }
+        "surface.report_pwd" | "report_pwd" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let Some(path) = optional_string(params, &["path", "pwd", "directory", "value"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.report_pwd requires path"),
+                );
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceReportPWD {
+                    target,
+                    surface_hint,
+                    path,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.report_shell_state" | "report_shell_state" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let Some(shell_state) = optional_string(params, &["state", "shell_state", "value"])
+            else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.report_shell_state requires state"),
+                );
+            };
+            if !matches!(shell_state.as_str(), "prompt" | "running") {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(
+                        "surface.report_shell_state state must be prompt or running",
+                    ),
+                );
+            }
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceReportShellState {
+                    target,
+                    surface_hint,
+                    shell_state,
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.read_text" | "read-screen" | "capture-pane" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -5003,6 +5088,8 @@ mod tests {
         assert!(METHODS.contains(&"surface.report_tty"));
         assert!(METHODS.contains(&"surface.report_ports"));
         assert!(METHODS.contains(&"surface.clear_ports"));
+        assert!(METHODS.contains(&"surface.report_pwd"));
+        assert!(METHODS.contains(&"surface.report_shell_state"));
     }
 
     #[test]
@@ -8439,6 +8526,44 @@ mod tests {
             },
         );
         assert_eq!(ports_response.error, None);
+
+        let pwd_response = dispatch_request(
+            r#"{"id":3,"method":"report_pwd","params":{"workspace_id":"codex","panel":"4:tab","path":"file:///tmp/project"}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceReportPWD {
+                    target,
+                    surface_hint,
+                    path,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(path, "file:///tmp/project");
+                    let _ = reply.send(Ok(json!({ "cwd": "/tmp/project" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(pwd_response.error, None);
+
+        let state_response = dispatch_request(
+            r#"{"id":4,"method":"surface.report_shell_state","params":{"workspace_id":"codex","surface_id":"surface:4:tab","state":"running"}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceReportShellState {
+                    target,
+                    surface_hint,
+                    shell_state,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(shell_state, "running");
+                    let _ = reply.send(Ok(json!({ "shell_state": "running" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(state_response.error, None);
     }
 
     #[test]

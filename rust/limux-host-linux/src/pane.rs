@@ -2201,6 +2201,41 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
     }
 }
 
+/// purpose: Update the tracked working directory for a terminal surface.
+/// inputs: Workspace root, surface hint, and normalized working directory.
+/// returns/effects: Mutates the matching terminal tab cwd and returns its summary.
+pub fn set_terminal_working_directory_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+    cwd: &str,
+) -> Option<SurfaceSummary> {
+    for internals in pane_internals_for_root(root) {
+        let pane_id = internals.pane_id;
+        let mut matched_tab_id = None;
+        let mut tab_state = internals.tab_state.borrow_mut();
+        for entry in &mut tab_state.tabs {
+            if !surface_hint_matches(
+                &composite_surface_id(pane_id, &entry.id),
+                &entry.id,
+                surface_hint,
+            ) {
+                continue;
+            }
+            let TabKind::Terminal { state } = &entry.kind else {
+                return None;
+            };
+            *state.cwd.borrow_mut() = Some(cwd.to_string());
+            matched_tab_id = Some(entry.id.clone());
+            break;
+        }
+        drop(tab_state);
+        if let Some(tab_id) = matched_tab_id {
+            return surface_summary_for_tab(&internals, &tab_id);
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneSummary {
     pub pane_id: u32,

@@ -359,6 +359,8 @@ fn full_help_text() -> &'static str {
         "  report_tty <tty> [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  report_ports <port...> [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  clear_ports [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  report_pwd <path> [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  report_shell_state <prompt|running> [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
@@ -2895,6 +2897,14 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "Usage: limux clear_ports [--workspace <id|ref>] [--surface <id|ref>]",
     ),
     (
+        "report_pwd",
+        "Usage: limux report_pwd <path> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
+        "report_shell_state",
+        "Usage: limux report_shell_state <prompt|running> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
         "ports-kick",
         "Usage: limux ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]",
     ),
@@ -4822,6 +4832,19 @@ fn build_surface_shell_report_params(method: &str, args: &[String]) -> Result<Ma
                 bail!("report_tty accepts exactly one tty value");
             }
             params.insert("tty".to_string(), Value::String(raw.to_string()));
+        } else if method == "surface.report_pwd" {
+            if params.contains_key("path") {
+                bail!("report_pwd accepts exactly one path value");
+            }
+            params.insert("path".to_string(), Value::String(raw.to_string()));
+        } else if method == "surface.report_shell_state" {
+            if params.contains_key("state") {
+                bail!("report_shell_state accepts exactly one state value");
+            }
+            params.insert(
+                "state".to_string(),
+                Value::String(parse_shell_state_arg(raw)?),
+            );
         } else if method == "surface.report_ports" {
             ports.push(parse_report_port_arg(raw)?);
         } else {
@@ -4837,6 +4860,12 @@ fn build_surface_shell_report_params(method: &str, args: &[String]) -> Result<Ma
     }
     if method == "surface.report_tty" && !params.contains_key("tty") {
         bail!("report_tty requires tty");
+    }
+    if method == "surface.report_pwd" && !params.contains_key("path") {
+        bail!("report_pwd requires path");
+    }
+    if method == "surface.report_shell_state" && !params.contains_key("state") {
+        bail!("report_shell_state requires prompt or running");
     }
     insert_context_surface_shell_report_params(&mut params);
     Ok(params)
@@ -4862,6 +4891,11 @@ fn insert_surface_shell_report_flag(
         "--surface" | "--tab" => params.insert("surface_id".to_string(), Value::String(value)),
         "--panel" => params.insert("panel_id".to_string(), Value::String(value)),
         "--tty" => params.insert("tty".to_string(), Value::String(value)),
+        "--path" => params.insert("path".to_string(), Value::String(value)),
+        "--state" => params.insert(
+            "state".to_string(),
+            Value::String(parse_shell_state_arg(&value)?),
+        ),
         _ => bail!("Unknown shell report option {name}"),
     };
     Ok(())
@@ -4878,6 +4912,16 @@ fn parse_report_port_arg(raw: &str) -> Result<u16> {
         bail!("report_ports values must be from 1 to 65535");
     }
     Ok(port as u16)
+}
+
+/// purpose: Parse a CMUX report_shell_state CLI value.
+/// inputs: Raw shell state string.
+/// returns/effects: Returns prompt/running or fails loudly for unsupported states.
+fn parse_shell_state_arg(raw: &str) -> Result<String> {
+    match raw {
+        "prompt" | "running" => Ok(raw.to_string()),
+        _ => bail!("report_shell_state requires prompt or running"),
+    }
 }
 
 /// purpose: Add Limux/CMUX workspace and surface context fallbacks.
@@ -14809,6 +14853,23 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
+        "report_pwd" | "report-pwd" => {
+            let payload = run_surface_shell_report(client, "surface.report_pwd", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "report_shell_state" | "report-shell-state" => {
+            let payload =
+                run_surface_shell_report(client, "surface.report_shell_state", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "list-panels"
         | "list-panes"
         | "list-workspaces"
@@ -15761,6 +15822,24 @@ mod cli_arg_tests {
         .expect("clear ports parses");
         assert_eq!(clear_params["workspace_id"], json!("workspace:abc"));
         assert_eq!(clear_params["surface_id"], json!("surface:1:tab"));
+
+        let pwd_params = build_surface_shell_report_params(
+            "surface.report_pwd",
+            &args(&["file:///tmp/project", "--panel", "panel-1"]),
+        )
+        .expect("report pwd parses");
+        assert_eq!(pwd_params["path"], json!("file:///tmp/project"));
+        assert_eq!(pwd_params["panel_id"], json!("panel-1"));
+
+        let state_params =
+            build_surface_shell_report_params("surface.report_shell_state", &args(&["running"]))
+                .expect("report shell state parses");
+        assert_eq!(state_params["state"], json!("running"));
+        assert!(build_surface_shell_report_params(
+            "surface.report_shell_state",
+            &args(&["sleeping"])
+        )
+        .is_err());
     }
 
     #[test]
