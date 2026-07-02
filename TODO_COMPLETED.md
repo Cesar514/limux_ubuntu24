@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T00:16:33Z Implement and verify live bridge CMUX tmux `pane.last` and `last-pane` parity using live pane focus history. \
 [x] 2026-07-02T00:11:57Z Implement and verify live bridge CMUX tmux workspace navigation parity for `next-window`, `previous-window`, and `last-window`. \
 [x] 2026-07-02T00:05:19Z Implement and verify CLI and live bridge CMUX `surface.drag_to_split`, `split-off`, and `drag-surface-to-split` parity for moving surfaces into new split panes. \
 [x] 2026-07-02T00:00:48Z Implement and verify CLI and live bridge CMUX `surface.split` and `new-split` parity for creating split terminal panes from surfaces. \

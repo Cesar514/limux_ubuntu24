@@ -61,6 +61,7 @@ const METHODS: &[&str] = &[
     "pane.create",
     "pane.create_many",
     "pane.focus",
+    "pane.last",
     "browser.open_split",
     "browser.navigate",
     "browser.url.get",
@@ -511,6 +512,10 @@ pub enum ControlCommand {
         pane_id: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    LastPane {
+        target: WorkspaceTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     BrowserAction {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -680,6 +685,7 @@ impl ControlCommand {
             | Self::CreatePane { reply, .. }
             | Self::CreatePanes { reply, .. }
             | Self::FocusPane { reply, .. }
+            | Self::LastPane { reply, .. }
             | Self::BrowserAction { reply, .. }
             | Self::BrowserTabAction { reply, .. }
             | Self::CreateSurface { reply, .. }
@@ -2133,6 +2139,14 @@ fn handle_method(
                 },
                 rx,
             )
+        }
+        "pane.last" | "last-pane" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::LastPane { target, reply }, rx)
         }
         "surface.split" | "new-split" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -4443,6 +4457,26 @@ mod tests {
         assert_eq!(
             response.result.expect("pane.focus result")["pane_ref"],
             "pane:11"
+        );
+    }
+
+    #[test]
+    fn pane_last_route_accepts_cmux_alias() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"last-pane","params":{"workspace_id":"codex"}}"#,
+            &|command| match command {
+                ControlCommand::LastPane { target, reply } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    let _ = reply.send(Ok(json!({ "pane_ref": "pane:10" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("pane.last result")["pane_ref"],
+            "pane:10"
         );
     }
 

@@ -64,6 +64,8 @@ struct Workspace {
     unread: bool,
     /// Whether this workspace is favorited/pinned to top.
     favorite: bool,
+    /// Previous pane focused through the live control bridge, for tmux `last-pane`.
+    last_pane_id: Option<u32>,
     /// CMUX-compatible workspace-group id when this workspace belongs to a group.
     group_id: Option<String>,
     /// Last known working directory from the terminal (via OSC 7).
@@ -1325,6 +1327,49 @@ fn focused_ids_for_workspace(state: &State, workspace_id: &str) -> (Option<u32>,
         return (None, None);
     };
     (Some(surface.pane_id), Some(surface.surface_id))
+}
+
+// purpose: Focus a live pane and record previous focus for tmux-compatible last-pane.
+// inputs: App state, workspace index, and pane id.
+// returns/effects: Focuses the pane's active tab and updates workspace last_pane_id.
+fn focus_pane_for_control(
+    state: &State,
+    workspace_index: usize,
+    pane_id: u32,
+) -> Result<serde_json::Value, BridgeError> {
+    let workspace_id = {
+        let app_state = state.borrow();
+        let workspace = app_state
+            .workspaces
+            .get(workspace_index)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        workspace.id.clone()
+    };
+    let previous_pane_id = focused_ids_for_workspace(state, &workspace_id).0;
+
+    let result = {
+        let app_state = state.borrow();
+        let workspace = app_state
+            .workspaces
+            .get(workspace_index)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        pane::focus_pane_for_root(&workspace.root, pane_id)
+            .map(|surface| pane_create_response_payload(&workspace.id, &workspace.name, surface))
+    }
+    .ok_or_else(|| BridgeError::not_found("pane not found"))?;
+
+    if previous_pane_id.is_some_and(|previous| previous != pane_id) {
+        if let Some(workspace) = state
+            .borrow_mut()
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.last_pane_id = previous_pane_id;
+        }
+    }
+
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4486,6 +4531,7 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             notify_label,
             unread: false,
             favorite: false,
+            last_pane_id: None,
             group_id: None,
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
@@ -5545,22 +5591,33 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let result = {
+            let _ = reply.send(focus_pane_for_control(state, index, pane_id));
+        }
+        ControlCommand::LastPane { target, reply } => {
+            let resolved = {
                 let app_state = state.borrow();
-                let workspace = &app_state.workspaces[index];
-                pane::focus_pane_for_root(&workspace.root, pane_id).map(|surface| {
-                    pane_create_response_payload(&workspace.id, &workspace.name, surface)
-                })
+                workspace_index_for_target(&app_state, &target)
             };
 
-            let Some(result) = result else {
+            let Some(index) = resolved else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
-                    "pane not found",
+                    "workspace not found",
                 )));
                 return;
             };
 
-            let _ = reply.send(Ok(result));
+            let last_pane_id = {
+                let app_state = state.borrow();
+                app_state.workspaces[index].last_pane_id
+            };
+            let Some(last_pane_id) = last_pane_id else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "last pane not found",
+                )));
+                return;
+            };
+
+            let _ = reply.send(focus_pane_for_control(state, index, last_pane_id));
         }
         ControlCommand::BrowserTabAction {
             target,
@@ -7326,6 +7383,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         notify_label,
         unread: false,
         favorite: workspace.favorite,
+        last_pane_id: None,
         group_id: workspace.group_id.clone(),
         cwd,
         folder_path: workspace.folder_path.clone(),
