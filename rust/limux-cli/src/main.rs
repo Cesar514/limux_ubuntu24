@@ -1555,6 +1555,13 @@ const APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING: BooleanSetting = BooleanSetting {
     default: false,
 };
 
+const TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING: BooleanSetting = BooleanSetting {
+    key: "terminal.autoResumeAgentSessions",
+    section: "terminal",
+    json_key: "autoResumeAgentSessions",
+    default: true,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1569,7 +1576,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "workspaceGroups.newWorkspacePlacement>"
+    "terminal.autoResumeAgentSessions|workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
@@ -1579,7 +1586,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "workspaceGroups.newWorkspacePlacement> <value>"
+    "terminal.autoResumeAgentSessions|workspaceGroups.newWorkspacePlacement> <value>"
 );
 
 // purpose: Map CMUX config font-size keys to their supported ranges.
@@ -1640,6 +1647,7 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
             Some(APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
         }
         "app.focusPaneOnFirstClick" => Some(APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING),
+        "terminal.autoResumeAgentSessions" => Some(TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING),
         _ => None,
     }
 }
@@ -15691,6 +15699,58 @@ mod cli_arg_tests {
         fs::write(&path, br#"{"app":{"focusPaneOnFirstClick":"true"}}"#)
             .expect("write malformed bool");
         let err = render_config_boolean_get(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify the CMUX terminal agent auto-resume key defaults and preserves siblings.
+    // inputs: Temporary settings file and the local config renderer helpers.
+    // returns/effects: Writes test settings JSON and asserts the nested boolean update.
+    #[test]
+    fn config_terminal_auto_resume_agent_sessions_get_defaults_and_writes_nested_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_boolean_get(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING)
+            .expect("get default terminal auto resume");
+        assert!(text.contains("terminal.autoResumeAgentSessions = true"));
+
+        fs::write(
+            &path,
+            br#"{"terminal":{"bell":true},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text =
+            render_config_boolean_set(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING, "false")
+                .expect("set terminal auto resume");
+        assert!(text.contains("terminal.autoResumeAgentSessions = false"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["terminal"]["autoResumeAgentSessions"], false);
+        assert_eq!(parsed["terminal"]["bell"], true);
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed CMUX terminal agent auto-resume values fail loudly.
+    // inputs: Invalid CLI value and malformed persisted settings JSON.
+    // returns/effects: Asserts errors instead of accepting silent defaults.
+    #[test]
+    fn config_terminal_auto_resume_agent_sessions_rejects_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err =
+            render_config_boolean_set(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING, "yes")
+                .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(
+            &path,
+            br#"{"terminal":{"autoResumeAgentSessions":"false"}}"#,
+        )
+        .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
     }

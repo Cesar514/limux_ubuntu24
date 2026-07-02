@@ -739,32 +739,59 @@ impl RestorableAgentIndex {
     }
 }
 
+// purpose: Merge live agent-hook session records into a persisted workspace layout.
+// inputs: Layout tree, workspace id, hook index, and the CMUX auto-resume policy.
+// returns/effects: Updates matching terminal tabs with restorable agent metadata.
 pub fn attach_restorable_agents_to_layout(
     layout: &mut LayoutNodeState,
     workspace_id: &str,
     index: &RestorableAgentIndex,
+    auto_resume_agent_sessions: bool,
 ) {
     match layout {
         LayoutNodeState::Pane(pane) => {
-            for tab in &mut pane.tabs {
-                if let TabContentState::Terminal { agent, .. } = &mut tab.content {
-                    if agent
-                        .as_ref()
-                        .is_some_and(|agent| !agent.restore_on_startup)
-                    {
-                        continue;
-                    }
-                    if let Some(restored_agent) =
-                        index.agent_for_surface(workspace_id, pane.pane_id, &tab.id)
-                    {
-                        *agent = Some(restored_agent);
-                    }
-                }
-            }
+            attach_restorable_agents_to_pane(pane, workspace_id, index, auto_resume_agent_sessions);
         }
         LayoutNodeState::Split(split) => {
-            attach_restorable_agents_to_layout(&mut split.start, workspace_id, index);
-            attach_restorable_agents_to_layout(&mut split.end, workspace_id, index);
+            attach_restorable_agents_to_layout(
+                &mut split.start,
+                workspace_id,
+                index,
+                auto_resume_agent_sessions,
+            );
+            attach_restorable_agents_to_layout(
+                &mut split.end,
+                workspace_id,
+                index,
+                auto_resume_agent_sessions,
+            );
+        }
+    }
+}
+
+// purpose: Attach hook-index agent records to each matching terminal tab in one pane.
+// inputs: Pane layout, workspace id, hook index, and the CMUX auto-resume policy.
+// returns/effects: Updates terminal agent metadata without mutating non-terminal tabs.
+fn attach_restorable_agents_to_pane(
+    pane: &mut PaneState,
+    workspace_id: &str,
+    index: &RestorableAgentIndex,
+    auto_resume_agent_sessions: bool,
+) {
+    for tab in &mut pane.tabs {
+        let TabContentState::Terminal { agent, .. } = &mut tab.content else {
+            continue;
+        };
+        if agent
+            .as_ref()
+            .is_some_and(|agent| !agent.restore_on_startup)
+        {
+            continue;
+        }
+        if let Some(restored_agent) = index.agent_for_surface(workspace_id, pane.pane_id, &tab.id) {
+            let mut restored_agent = restored_agent;
+            restored_agent.restore_on_startup = auto_resume_agent_sessions;
+            *agent = Some(restored_agent);
         }
     }
 }
@@ -1327,7 +1354,7 @@ mod tests {
             tabs: vec![TabState::terminal("tab-a", Some("/tmp/project"))],
         });
 
-        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index);
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index, true);
 
         let LayoutNodeState::Pane(pane) = layout else {
             panic!("expected pane");
@@ -1340,6 +1367,48 @@ mod tests {
                 let command = agent.resume_command().expect("resume command");
                 assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'session-a'"));
                 assert!(command.contains("hooks codex cleanup"));
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
+        }
+    }
+
+    // purpose: Verify CMUX terminal.autoResumeAgentSessions=false restores metadata without launching.
+    // inputs: Hook session index and a matching persisted terminal layout.
+    // returns/effects: Asserts restored agent metadata remains present but has no resume command.
+    #[test]
+    fn restorable_agent_auto_resume_setting_disables_resume_command() {
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "session-a".to_string(),
+            cwd: Some("/tmp/project".to_string()),
+            launch_command: None,
+            restore_on_startup: true,
+        };
+        let index = RestorableAgentIndex {
+            by_surface: HashMap::from([(
+                ("workspace-a".to_string(), "42:tab-a".to_string()),
+                (agent, 10.0),
+            )]),
+            by_any_workspace_surface: HashMap::new(),
+            by_tab_id: HashMap::new(),
+        };
+        let mut layout = LayoutNodeState::Pane(PaneState {
+            pane_id: Some(42),
+            active_tab_id: Some("tab-a".to_string()),
+            tabs: vec![TabState::terminal("tab-a", Some("/tmp/project"))],
+        });
+
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index, false);
+
+        let LayoutNodeState::Pane(pane) = layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal { agent, .. } => {
+                let agent = agent.as_ref().expect("agent metadata");
+                assert_eq!(agent.session_id, "session-a");
+                assert!(!agent.restore_on_startup);
+                assert_eq!(agent.resume_command(), None);
             }
             other => panic!("expected terminal tab, got {other:?}"),
         }
@@ -1553,7 +1622,7 @@ mod tests {
             }],
         });
 
-        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index);
+        attach_restorable_agents_to_layout(&mut layout, "workspace-a", &index, true);
 
         let LayoutNodeState::Pane(pane) = layout else {
             panic!("expected pane");
@@ -1603,7 +1672,7 @@ mod tests {
             tabs: vec![TabState::terminal("tab-a", Some("/tmp/project"))],
         });
 
-        attach_restorable_agents_to_layout(&mut layout, "", &index);
+        attach_restorable_agents_to_layout(&mut layout, "", &index, true);
 
         let LayoutNodeState::Pane(pane) = layout else {
             panic!("expected pane");

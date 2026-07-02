@@ -2753,11 +2753,18 @@ fn apply_loaded_session(state: &State, mut loaded: LoadedSession) {
     }
     if restored_any {
         let restorable_agents = layout_state::RestorableAgentIndex::load();
+        let auto_resume_agent_sessions = state
+            .borrow()
+            .config
+            .borrow()
+            .terminal
+            .auto_resume_agent_sessions;
         for workspace in &mut loaded.state.workspaces {
             layout_state::attach_restorable_agents_to_layout(
                 &mut workspace.layout,
                 workspace.id.as_deref().unwrap_or(""),
                 &restorable_agents,
+                auto_resume_agent_sessions,
             );
         }
         for workspace in &loaded.state.workspaces {
@@ -2847,6 +2854,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
                 &mut layout,
                 &workspace.id,
                 &restorable_agents,
+                s.config.borrow().terminal.auto_resume_agent_sessions,
             );
             WorkspaceState {
                 id: Some(workspace.id.clone()),

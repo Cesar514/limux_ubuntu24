@@ -50,6 +50,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub app: AppBehaviorConfig,
     #[serde(skip)]
+    pub terminal: TerminalBehaviorConfig,
+    #[serde(skip)]
     pub notifications: NotificationConfig,
     #[serde(skip)]
     pub workspace_groups: WorkspaceGroupsConfig,
@@ -93,6 +95,28 @@ impl AppBehaviorConfig {
             keep_workspace_open_when_closing_last_surface: false,
             workspace_inherit_working_directory: true,
             focus_pane_on_first_click: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalBehaviorConfig {
+    pub auto_resume_agent_sessions: bool,
+}
+
+impl Default for TerminalBehaviorConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl TerminalBehaviorConfig {
+    // purpose: Return CMUX terminal behavior defaults that differ from Rust primitive defaults.
+    // inputs: None.
+    // returns/effects: Defaults terminal behavior from CMUX runtime settings.
+    fn cmux_default() -> Self {
+        Self {
+            auto_resume_agent_sessions: true,
         }
     }
 }
@@ -531,6 +555,16 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
         .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
         .unwrap_or(app_defaults.keep_workspace_open_when_closing_last_surface);
+    let terminal = root.get("terminal").map(|value| {
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("terminal must be an object"))
+    });
+    let terminal_defaults = TerminalBehaviorConfig::cmux_default();
+    let auto_resume_agent_sessions = terminal
+        .and_then(|terminal| terminal.get("autoResumeAgentSessions"))
+        .map(|value| parse_bool_setting(value, "terminal.autoResumeAgentSessions"))
+        .unwrap_or(terminal_defaults.auto_resume_agent_sessions);
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -585,6 +619,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             keep_workspace_open_when_closing_last_surface,
             workspace_inherit_working_directory,
             focus_pane_on_first_click,
+        },
+        terminal: TerminalBehaviorConfig {
+            auto_resume_agent_sessions,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -956,6 +993,16 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     app.as_object_mut().expect("app object").insert(
         "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
         json!(config.app.keep_workspace_open_when_closing_last_surface),
+    );
+    let terminal = root
+        .entry("terminal".to_string())
+        .or_insert_with(|| json!({}));
+    if !terminal.is_object() {
+        *terminal = json!({});
+    }
+    terminal.as_object_mut().expect("terminal object").insert(
+        "autoResumeAgentSessions".to_string(),
+        json!(config.terminal.auto_resume_agent_sessions),
     );
     root.insert(
         "notifications".to_string(),
@@ -1360,6 +1407,45 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"app":{"focusPaneOnFirstClick":"true"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host config loading accepts the CMUX agent auto-resume key.
+    // inputs: Temporary settings JSON with terminal.autoResumeAgentSessions.
+    // returns/effects: Asserts explicit false overrides the CMUX true default.
+    #[test]
+    fn load_from_path_reads_terminal_auto_resume_agent_sessions() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "terminal": {
+    "autoResumeAgentSessions": false
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(!loaded.config.terminal.auto_resume_agent_sessions);
+    }
+
+    // purpose: Verify host config loading rejects malformed terminal auto-resume values.
+    // inputs: Temporary settings JSON with a string instead of a boolean.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "terminal.autoResumeAgentSessions must be a boolean")]
+    fn load_from_path_rejects_invalid_terminal_auto_resume_agent_sessions() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"terminal":{"autoResumeAgentSessions":"false"}}"#)
+            .expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -1854,6 +1940,29 @@ mod tests {
             parsed["notifications"]["agentIdleReminder"],
             Value::Bool(false)
         );
+    }
+
+    // purpose: Verify saving writes the CMUX terminal auto-resume setting without dropping siblings.
+    // inputs: Existing settings JSON with an unrelated terminal key and AppConfig false setting.
+    // returns/effects: Writes settings and asserts terminal.autoResumeAgentSessions is persisted.
+    #[test]
+    fn save_to_path_writes_terminal_auto_resume_agent_sessions() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"terminal":{"bell":true}}"#).expect("write existing config");
+
+        let mut config = AppConfig::default();
+        config.terminal.auto_resume_agent_sessions = false;
+        save_to_path(&path, &config).expect("save terminal config");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["terminal"]["autoResumeAgentSessions"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["terminal"]["bell"], Value::Bool(true));
     }
 
     #[test]
