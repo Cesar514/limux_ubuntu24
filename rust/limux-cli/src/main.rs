@@ -1231,6 +1231,354 @@ fn tmux_buffer_text(buffers: &BTreeMap<String, String>, name: &str) -> Result<St
         .ok_or_else(|| anyhow!("Buffer not found: {name}"))
 }
 
+// purpose: Convert a stable text id into tmux-style numeric handle material.
+// inputs: A workspace, pane, or surface identifier.
+// returns/effects: Returns a deterministic hash string for user-facing tmux refs.
+fn tmux_stable_numeric_id(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    (hasher.finish() % 1_000_000_000).to_string()
+}
+
+// purpose: Parse CMUX/tmux display-message arguments without affecting shared parsers.
+// inputs: Raw display-message argv after the command name.
+// returns/effects: Returns print mode, target, and chosen format string.
+fn parse_tmux_display_message_args(args: &[String]) -> (bool, Option<String>, Option<String>) {
+    let mut print = false;
+    let mut target = None;
+    let mut flag_format = None;
+    let mut positional = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-p" | "--print" => print = true,
+            "-F" | "--format" => {
+                index += 1;
+                flag_format = args.get(index).cloned();
+            }
+            "-t" | "--target" => {
+                index += 1;
+                target = args.get(index).cloned();
+            }
+            value if value.starts_with('-') => {}
+            value => positional.push(value.to_string()),
+        }
+        index += 1;
+    }
+    let format = if positional.is_empty() {
+        flag_format
+    } else {
+        Some(positional.join(" "))
+    };
+    (print, target, format)
+}
+
+// purpose: Render tmux format keys with CMUX-compatible unknown-key stripping.
+// inputs: Optional tmux format, context values, and fallback text.
+// returns/effects: Returns trimmed rendered text or the fallback when empty.
+fn tmux_render_format(
+    format: Option<&str>,
+    context: &BTreeMap<String, String>,
+    fallback: &str,
+) -> String {
+    let Some(format) = format.filter(|raw| !raw.is_empty()) else {
+        return fallback.to_string();
+    };
+    let mut rendered = String::new();
+    let mut rest = format;
+    while let Some(start) = rest.find("#{") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            rendered.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let key = &after_start[..end];
+        if let Some(value) = context.get(key) {
+            rendered.push_str(value);
+        }
+        rest = &after_start[end + 1..];
+    }
+    rendered.push_str(rest);
+    let trimmed = rendered.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// purpose: Build the default CMUX/tmux format fields available before host lookup.
+// inputs: Environment and cwd available to the CLI process.
+// returns/effects: Returns a context map for display-message expansion.
+fn base_tmux_format_context() -> BTreeMap<String, String> {
+    let cwd = env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .unwrap_or_default();
+    let mut context = BTreeMap::from([
+        ("session_name".to_string(), "cmux".to_string()),
+        ("session_attached".to_string(), "1".to_string()),
+        ("window_active".to_string(), "1".to_string()),
+        ("window_flags".to_string(), "*".to_string()),
+        ("window_width".to_string(), "80".to_string()),
+        ("window_height".to_string(), "24".to_string()),
+        ("pane_active".to_string(), "1".to_string()),
+        ("pane_width".to_string(), "80".to_string()),
+        ("pane_height".to_string(), "24".to_string()),
+        ("pane_current_path".to_string(), cwd),
+    ]);
+    for (limux_key, cmux_key) in [
+        ("LIMUX_WORKSPACE_ID", "CMUX_WORKSPACE_ID"),
+        ("LIMUX_SURFACE_ID", "CMUX_SURFACE_ID"),
+        ("LIMUX_PANE_ID", "CMUX_PANE_ID"),
+        ("LIMUX_TAB_ID", "CMUX_TAB_ID"),
+    ] {
+        if let Some(value) = context_env_value(limux_key) {
+            context.insert(limux_key.to_ascii_lowercase(), value.clone());
+            context.insert(cmux_key.to_ascii_lowercase(), value);
+        }
+    }
+    context
+}
+
+// purpose: Return a cloned JSON array from a control payload key.
+// inputs: JSON object payload and the expected array key.
+// returns/effects: Returns rows or an empty list when the host omits the key.
+fn payload_array(payload: &Value, key: &str) -> Vec<Value> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+// purpose: Apply a tmux target string to the current pane/surface handles.
+// inputs: Optional -t/--target value plus mutable pane and surface handles.
+// returns/effects: Updates the handle kind inferred from the target syntax.
+fn apply_tmux_target(
+    target: Option<&str>,
+    pane_id: &mut Option<String>,
+    surface_id: &mut Option<String>,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    if target.starts_with('%') || target.starts_with("pane:") {
+        *pane_id = Some(target.trim_start_matches('%').to_string());
+    } else {
+        *surface_id = Some(target.trim_start_matches('$').to_string());
+    }
+}
+
+// purpose: Select a row by id, then focused flag, then first row.
+// inputs: Candidate rows, an optional id, and accepted id key names.
+// returns/effects: Returns the best matching row for tmux format context.
+fn selected_tmux_row<'a>(
+    rows: &'a [Value],
+    id: Option<&str>,
+    id_keys: &[&str],
+) -> Option<&'a Value> {
+    id.and_then(|id| {
+        rows.iter()
+            .find(|row| get_string(row, id_keys).as_deref() == Some(id))
+    })
+    .or_else(|| {
+        rows.iter()
+            .find(|row| row.get("focused").and_then(Value::as_bool) == Some(true))
+    })
+    .or_else(|| rows.first())
+}
+
+// purpose: Return a trimmed non-empty title-like field from a payload.
+// inputs: JSON row with possible title or name keys.
+// returns/effects: Returns None for empty or whitespace-only names.
+fn nonempty_row_title(row: &Value) -> Option<String> {
+    get_string(row, &["title", "name"]).filter(|value| !value.trim().is_empty())
+}
+
+struct TmuxListContextSpec<'a> {
+    method: &'a str,
+    rows_key: &'a str,
+    selected_id: Option<&'a str>,
+    id_keys: &'a [&'a str],
+    insert: fn(&mut BTreeMap<String, String>, &Value),
+}
+
+struct TmuxTargetContext {
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+    surface_id: Option<String>,
+}
+
+// purpose: Build the current-surface request params from optional workspace context.
+// inputs: Optional workspace id from environment.
+// returns/effects: Returns an empty or workspace-scoped JSON request object.
+fn current_surface_params(workspace: Option<&str>) -> Value {
+    workspace
+        .map(|id| json!({"workspace_id": id}))
+        .unwrap_or_else(|| json!({}))
+}
+
+// purpose: Resolve current workspace, pane, and surface handles for tmux formats.
+// inputs: Live client and optional tmux target string.
+// returns/effects: Performs surface.current and applies target override syntax.
+async fn tmux_target_context(
+    client: &mut Client,
+    target: Option<&str>,
+) -> Result<TmuxTargetContext> {
+    let workspace = context_env_value("LIMUX_WORKSPACE_ID");
+    let current = client
+        .call(
+            "surface.current",
+            current_surface_params(workspace.as_deref()),
+        )
+        .await?;
+    let workspace_id = get_string(&current, &["workspace_id", "workspace_ref"]).or(workspace);
+    let mut pane_id = get_string(&current, &["pane_id", "pane_ref"]);
+    let mut surface_id = get_string(&current, &["surface_id", "surface_ref"]);
+    apply_tmux_target(target, &mut pane_id, &mut surface_id);
+    Ok(TmuxTargetContext {
+        workspace_id,
+        pane_id,
+        surface_id,
+    })
+}
+
+// purpose: Add host workspace, pane, and surface values to a tmux format context.
+// inputs: A live client plus optional tmux target string from -t/--target.
+// returns/effects: Performs bounded RPC lookups and returns CMUX-style fields.
+async fn tmux_format_context(
+    client: &mut Client,
+    target: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    let mut context = base_tmux_format_context();
+    let target_context = tmux_target_context(client, target).await?;
+    enrich_tmux_workspace_context(client, &mut context, target_context.workspace_id.as_deref())
+        .await?;
+    enrich_tmux_list_context(
+        client,
+        &mut context,
+        target_context.workspace_id.as_deref(),
+        TmuxListContextSpec {
+            method: "pane.list",
+            rows_key: "panes",
+            selected_id: target_context.pane_id.as_deref(),
+            id_keys: &["pane_id", "id"],
+            insert: insert_tmux_pane_row,
+        },
+    )
+    .await?;
+    enrich_tmux_list_context(
+        client,
+        &mut context,
+        target_context.workspace_id.as_deref(),
+        TmuxListContextSpec {
+            method: "surface.list",
+            rows_key: "surfaces",
+            selected_id: target_context.surface_id.as_deref(),
+            id_keys: &["surface_id", "id"],
+            insert: insert_tmux_surface_row,
+        },
+    )
+    .await?;
+    Ok(context)
+}
+
+// purpose: Add workspace/session fields from workspace.list to a tmux context.
+// inputs: Client, mutable context, and optional active workspace id.
+// returns/effects: Updates context from host data when available.
+async fn enrich_tmux_workspace_context(
+    client: &mut Client,
+    context: &mut BTreeMap<String, String>,
+    workspace_id: Option<&str>,
+) -> Result<()> {
+    let Some(workspace_id) = workspace_id else {
+        return Ok(());
+    };
+    context.insert(
+        "session_id".to_string(),
+        format!("${}", tmux_stable_numeric_id(workspace_id)),
+    );
+    context.insert(
+        "window_id".to_string(),
+        format!("@{}", tmux_stable_numeric_id(workspace_id)),
+    );
+    context.insert("window_uuid".to_string(), workspace_id.to_string());
+    let payload = client.call("workspace.list", json!({})).await?;
+    let workspaces = payload_array(&payload, "workspaces");
+    if let Some(row) = workspaces
+        .iter()
+        .find(|row| get_string(row, &["workspace_id", "id"]).as_deref() == Some(workspace_id))
+    {
+        if let Some(index) = row.get("index").and_then(Value::as_u64) {
+            context.insert("window_index".to_string(), index.to_string());
+        }
+        if let Some(title) = nonempty_row_title(row) {
+            context.insert("window_name".to_string(), title);
+        }
+    }
+    Ok(())
+}
+
+// purpose: Add the chosen pane row fields to a tmux context.
+// inputs: Mutable context and the selected pane row.
+// returns/effects: Updates pane handle, index, and active state.
+fn insert_tmux_pane_row(context: &mut BTreeMap<String, String>, pane: &Value) {
+    if let Some(id) = get_string(pane, &["pane_id", "id"]) {
+        context.insert(
+            "pane_id".to_string(),
+            format!("%{}", tmux_stable_numeric_id(&id)),
+        );
+        context.insert("pane_uuid".to_string(), id);
+    }
+    if let Some(index) = pane.get("index").and_then(Value::as_u64) {
+        context.insert("pane_index".to_string(), index.to_string());
+    }
+    if let Some(focused) = pane.get("focused").and_then(Value::as_bool) {
+        context.insert(
+            "pane_active".to_string(),
+            if focused { "1" } else { "0" }.to_string(),
+        );
+    }
+}
+
+// purpose: Add selected rows from a host list route to a tmux context.
+// inputs: Client, context, workspace id, list route, selection keys, and row inserter.
+// returns/effects: Calls the host list route and inserts the selected row when present.
+async fn enrich_tmux_list_context(
+    client: &mut Client,
+    context: &mut BTreeMap<String, String>,
+    workspace_id: Option<&str>,
+    spec: TmuxListContextSpec<'_>,
+) -> Result<()> {
+    let Some(workspace_id) = workspace_id else {
+        return Ok(());
+    };
+    let payload = client
+        .call(spec.method, json!({"workspace_id": workspace_id}))
+        .await?;
+    let rows = payload_array(&payload, spec.rows_key);
+    if let Some(row) = selected_tmux_row(&rows, spec.selected_id, spec.id_keys) {
+        (spec.insert)(context, row);
+    }
+    Ok(())
+}
+
+// purpose: Add the chosen surface row fields to a tmux context.
+// inputs: Mutable context and the selected surface row.
+// returns/effects: Updates surface id, pane title, and window fallback name.
+fn insert_tmux_surface_row(context: &mut BTreeMap<String, String>, surface: &Value) {
+    if let Some(id) = get_string(surface, &["surface_id", "id"]) {
+        context.insert("surface_id".to_string(), id);
+    }
+    if let Some(title) = nonempty_row_title(surface) {
+        context.insert("pane_title".to_string(), title.clone());
+        context.entry("window_name".to_string()).or_insert(title);
+    }
+}
+
 // purpose: Build the CMUX-compatible respawn payload for a terminal surface.
 // inputs: Raw CLI args after `respawn-pane`.
 // returns/effects: Returns optional workspace scope plus surface.respawn params.
@@ -6050,9 +6398,10 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             call_in_workspace_scope(client, workspace, "surface.respawn", params).await
         }
         "display-message" => {
-            let msg =
-                trailing_title(args).ok_or_else(|| anyhow!("display-message requires text"))?;
-            Ok(json!({"text": msg}))
+            let (print, target, format) = parse_tmux_display_message_args(args);
+            let context = tmux_format_context(client, target.as_deref()).await?;
+            let text = tmux_render_format(format.as_deref(), &context, "");
+            Ok(json!({"text": text, "printed": print}))
         }
         _ => bail!("unknown tmux command"),
     }
@@ -6940,6 +7289,50 @@ mod cli_arg_tests {
         );
         let error = tmux_buffer_text(&buffers, "missing").expect_err("missing buffer should fail");
         assert!(error.to_string().contains("Buffer not found: missing"));
+    }
+
+    // purpose: Verify CMUX/tmux display-message flags prefer positional text.
+    // inputs: Short tmux -p/-t/-F flags and positional message text.
+    // returns/effects: Asserts print flag, target, and selected format.
+    #[test]
+    fn tmux_display_message_args_parse_print_target_and_format() {
+        let (print, target, format) = parse_tmux_display_message_args(&args(&[
+            "-p",
+            "-t",
+            "%9",
+            "-F",
+            "#{pane_id}",
+            "hello",
+            "#{pane_title}",
+        ]));
+
+        assert!(print);
+        assert_eq!(target.as_deref(), Some("%9"));
+        assert_eq!(format.as_deref(), Some("hello #{pane_title}"));
+
+        let (_, _, flag_format) =
+            parse_tmux_display_message_args(&args(&["--format", "#{window_name}"]));
+        assert_eq!(flag_format.as_deref(), Some("#{window_name}"));
+    }
+
+    // purpose: Verify CMUX/tmux format rendering behavior.
+    // inputs: Known and unknown tmux format keys plus whitespace-only output.
+    // returns/effects: Asserts known substitution, unknown stripping, trim, and fallback.
+    #[test]
+    fn tmux_display_message_renderer_strips_unknown_keys_and_falls_back() {
+        let mut context = BTreeMap::new();
+        context.insert("pane_id".to_string(), "%42".to_string());
+        context.insert("pane_title".to_string(), "build".to_string());
+
+        assert_eq!(
+            tmux_render_format(Some(" #{pane_id}|#{missing}|#{pane_title} "), &context, ""),
+            "%42||build"
+        );
+        assert_eq!(
+            tmux_render_format(Some("#{missing}"), &context, "fallback"),
+            "fallback"
+        );
+        assert_eq!(tmux_render_format(None, &context, "fallback"), "fallback");
     }
 
     // purpose: Verify respawn-pane builds CMUX-compatible surface.respawn params.
