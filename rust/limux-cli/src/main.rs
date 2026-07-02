@@ -692,6 +692,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "docs" => Some(CommandOutput::Text(docs_text(
             args.first().map(String::as_str),
         )?)),
+        "settings" if args.first().map(String::as_str) == Some("open") => None,
         "settings" => Some(run_settings_command(args)?),
         "config" if args.first().map(String::as_str) == Some("reload") => None,
         "config" => Some(run_config_command(args)?),
@@ -978,9 +979,7 @@ fn run_settings_command(args: &[String]) -> Result<CommandOutput> {
         "path" => Ok(CommandOutput::Text(
             limux_settings_path()?.display().to_string(),
         )),
-        "open" => bail!(
-            "settings open requires running host settings UI support; use `limux settings path`"
-        ),
+        "open" => bail!("settings open requires a running Limux host"),
         target => bail!("unsupported settings target `{target}`; expected path, docs, or open"),
     }
 }
@@ -7528,6 +7527,19 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_memory_text(&payload, opts.id_format))
             }
         }
+        "settings" if args.first().map(String::as_str) == Some("open") => {
+            if args.len() != 1 {
+                bail!("Usage: limux settings open");
+            }
+            let payload = client
+                .call("settings.open", Value::Object(Map::new()))
+                .await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK settings opened".to_string())
+            }
+        }
         "config" if args.first().map(String::as_str) == Some("reload") => {
             if args.len() != 1 {
                 bail!("Usage: limux config reload");
@@ -8296,6 +8308,19 @@ mod cli_arg_tests {
         assert!(run_local_command(&default_opts(args(&["reload-config"])))
             .expect("reload-config local check")
             .is_none());
+    }
+
+    #[test]
+    fn settings_open_uses_socket_path() {
+        assert!(
+            run_local_command(&default_opts(args(&["settings", "open"])))
+                .expect("settings open local check")
+                .is_none()
+        );
+        let path_output = run_local_command(&default_opts(args(&["settings", "path"])))
+            .expect("settings path local check")
+            .expect("settings path stays local");
+        assert!(matches!(path_output, CommandOutput::Text(_)));
     }
 
     #[test]

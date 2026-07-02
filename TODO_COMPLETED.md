@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T05:06:48Z Implement and verify CMUX `settings open` live host settings dialog parity through the `settings.open` bridge method. \
 [x] 2026-07-02T04:59:27Z Implement and verify CMUX workspace-group collapsed sidebar row hiding while keeping anchors and active workspaces visible. \
 [x] 2026-07-02T04:55:46Z Implement and verify mode-specific rendered GTK right-sidebar panels for Files, Find, Vault, Sessions, Feed, and Dock previews. \
 [x] 2026-07-02T04:51:03Z Implement and verify a rendered GTK right-sidebar metadata panel for CMUX mode/status/progress/log visibility. \

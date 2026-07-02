@@ -2360,6 +2360,7 @@ struct TabDragWorkspaceSeed {
 }
 
 pub(crate) type State = Rc<RefCell<AppState>>;
+type SettingsConfigChangedHandler = dyn Fn(&app_config::AppConfig, &app_config::AppConfig);
 thread_local! {
     static CONTROL_STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
@@ -5492,6 +5493,60 @@ fn reload_config_for_control(state: &State) -> Result<serde_json::Value, BridgeE
     Ok(payload)
 }
 
+// purpose: Present the live host settings dialog for CMUX `settings open` parity.
+// inputs: Shared app state receiving a control-socket settings.open request.
+// returns/effects: Opens a modal settings dialog and returns an acknowledgement.
+fn open_settings_for_control(state: &State) -> Result<serde_json::Value, BridgeError> {
+    let (window, config, shortcuts) = {
+        let app_state = state.borrow();
+        (
+            app_state.window.clone(),
+            app_state.config.clone(),
+            app_state.shortcuts.clone(),
+        )
+    };
+    let input = crate::settings_editor::SettingsEditorInput {
+        config,
+        shortcuts,
+        on_capture: {
+            let state = state.clone();
+            Rc::new(move |id, binding| persist_shortcut_binding(&state, id, binding))
+        },
+        on_config_changed: settings_dialog_config_changed_handler(state),
+    };
+    crate::settings_editor::present_settings_dialog(&window, input);
+    let settings_path = app_config::settings_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    Ok(serde_json::json!({
+        "ok": true,
+        "opened": true,
+        "settings_path": settings_path,
+    }))
+}
+
+// purpose: Build the settings dialog config-change callback used by host UI entry points.
+// inputs: Shared app state.
+// returns/effects: Returns a callback that applies appearance and persists settings.
+fn settings_dialog_config_changed_handler(state: &State) -> Rc<SettingsConfigChangedHandler> {
+    let state = state.clone();
+    Rc::new(
+        move |previous: &app_config::AppConfig, updated: &app_config::AppConfig| {
+            let style_manager = adw::StyleManager::default();
+            let system_prefers_dark = state.borrow().system_prefers_dark.get();
+            apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
+            if let Err(err) = app_config::save(updated) {
+                state.borrow().config.borrow_mut().clone_from(previous);
+                apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
+
+                let detail = format!("Failed to save Limux settings: {err}");
+                eprintln!("limux: {detail}");
+                show_runtime_error(&state, "Failed to save settings", &detail);
+            }
+        },
+    )
+}
+
 fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
     let shortcuts = {
         let s = state.borrow();
@@ -7247,6 +7302,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::ReloadConfig { reply } => {
             let result = reload_config_for_control(state);
+            let _ = reply.send(result);
+        }
+        ControlCommand::OpenSettings { reply } => {
+            let result = open_settings_for_control(state);
             let _ = reply.send(result);
         }
         ControlCommand::ListWorkspaces { reply } => {
@@ -10131,7 +10190,7 @@ pub(crate) fn create_pane_for_workspace(
     let ws_id_empty = ws_id.to_string();
     let state_for_split_with_tab = state.clone();
     let state_for_config = state.clone();
-    let state_for_config_changed = state.clone();
+    let on_config_changed = settings_dialog_config_changed_handler(state);
     let state_for_workspace_env = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
     let ws_id_for_env = ws_id.to_string();
@@ -10252,30 +10311,7 @@ pub(crate) fn create_pane_for_workspace(
             let s = state_for_config.borrow();
             s.config.clone()
         }),
-        on_config_changed: Rc::new(
-            move |previous: &app_config::AppConfig, updated: &app_config::AppConfig| {
-                let style_manager = adw::StyleManager::default();
-                let system_prefers_dark =
-                    state_for_config_changed.borrow().system_prefers_dark.get();
-                apply_appearance(&style_manager, system_prefers_dark, &updated.appearance);
-                if let Err(err) = app_config::save(updated) {
-                    state_for_config_changed
-                        .borrow()
-                        .config
-                        .borrow_mut()
-                        .clone_from(previous);
-                    apply_appearance(&style_manager, system_prefers_dark, &previous.appearance);
-
-                    let detail = format!("Failed to save Limux settings: {err}");
-                    eprintln!("limux: {detail}");
-                    show_runtime_error(
-                        &state_for_config_changed,
-                        "Failed to save settings",
-                        &detail,
-                    );
-                }
-            },
-        ),
+        on_config_changed,
         workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
         workspace_environment_for_pane: Box::new(move |_pane_widget| {
             state_for_workspace_env

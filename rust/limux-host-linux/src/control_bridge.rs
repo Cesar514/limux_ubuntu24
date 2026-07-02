@@ -26,6 +26,7 @@ const METHODS: &[&str] = &[
     "system.memory",
     "reload_config",
     "config.reload",
+    "settings.open",
     "events.stream",
     "feed.push",
     "feed.list",
@@ -596,6 +597,9 @@ pub enum ControlCommand {
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
+    OpenSettings {
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CurrentWorkspace {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -853,6 +857,7 @@ impl ControlCommand {
             Self::Identify { reply, .. }
             | Self::Memory { reply, .. }
             | Self::ReloadConfig { reply }
+            | Self::OpenSettings { reply }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListWorkspaceGroups { reply }
@@ -1953,6 +1958,10 @@ fn handle_method(
         "reload_config" | "config.reload" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ReloadConfig { reply }, rx)
+        }
+        "settings.open" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::OpenSettings { reply }, rx)
         }
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
@@ -3779,6 +3788,11 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_settings_open_method() {
+        assert!(METHODS.contains(&"settings.open"));
+    }
+
+    #[test]
     fn capabilities_include_feed_methods() {
         assert!(METHODS.contains(&"feed.push"));
         assert!(METHODS.contains(&"feed.permission.reply"));
@@ -3966,6 +3980,22 @@ mod tests {
             assert_eq!(response.error, None);
             assert_eq!(response.result.expect("reload result")["reloaded"], true);
         }
+    }
+
+    #[test]
+    fn settings_open_routes_queue_live_command() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"settings.open","params":{}}"#,
+            &|command| match command {
+                ControlCommand::OpenSettings { reply } => {
+                    let _ = reply.send(Ok(json!({ "ok": true, "opened": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.expect("settings result")["opened"], true);
     }
 
     #[test]
