@@ -1468,6 +1468,13 @@ struct NotificationSetting {
     kind: NotificationSettingKind,
 }
 
+#[derive(Clone, Copy)]
+struct PlacementSetting {
+    key: &'static str,
+    section: &'static str,
+    json_key: &'static str,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -1486,15 +1493,29 @@ const AGENT_IDLE_REMINDER_SETTING: NotificationSetting = NotificationSetting {
     kind: NotificationSettingKind::Bool { default: true },
 };
 
+const APP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
+    key: "app.newWorkspacePlacement",
+    section: "app",
+    json_key: "newWorkspacePlacement",
+};
+
+const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
+    key: "workspaceGroups.newWorkspacePlacement",
+    section: "workspaceGroups",
+    json_key: "newWorkspacePlacement",
+};
+
 const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder>"
+    "notifications.agentIdleReminder|app.newWorkspacePlacement|",
+    "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder> <value>"
+    "notifications.agentIdleReminder|app.newWorkspacePlacement|",
+    "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
 // purpose: Map CMUX config font-size keys to their supported ranges.
@@ -1516,6 +1537,19 @@ fn notification_setting(raw: &str) -> Option<NotificationSetting> {
         "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
         "notifications.agentTurnComplete" => Some(AGENT_TURN_COMPLETE_SETTING),
         "notifications.agentIdleReminder" => Some(AGENT_IDLE_REMINDER_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map supported CMUX workspace placement settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn placement_setting(raw: &str) -> Option<PlacementSetting> {
+    match raw {
+        "app.newWorkspacePlacement" => Some(APP_NEW_WORKSPACE_PLACEMENT_SETTING),
+        "workspaceGroups.newWorkspacePlacement" => {
+            Some(WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING)
+        }
         _ => None,
     }
 }
@@ -1608,6 +1642,47 @@ fn set_config_notification_setting_at(
     Ok(display)
 }
 
+// purpose: Read a nested workspace placement setting with CMUX defaults.
+// inputs: Settings path and supported placement setting descriptor.
+// returns/effects: Returns the effective value and whether it was configured.
+fn get_config_placement_setting_at(
+    path: &Path,
+    setting: PlacementSetting,
+) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get(setting.section)
+        .and_then(Value::as_object)
+        .and_then(|section| section.get(setting.json_key))
+    else {
+        return Ok(("afterCurrent".to_string(), false));
+    };
+    Ok((parse_workspace_placement_value(setting.key, value)?, true))
+}
+
+// purpose: Write a nested workspace placement setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw placement value.
+// returns/effects: Strictly parses the placement and atomically writes settings JSON.
+fn set_config_placement_setting_at(
+    path: &Path,
+    setting: PlacementSetting,
+    raw: &str,
+) -> Result<String> {
+    let placement = parse_workspace_placement_str(setting.key, raw)?;
+    let mut root = read_settings_root(path)?;
+    let section = root
+        .entry(setting.section.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must be a JSON object", setting.section))?;
+    section.insert(
+        setting.json_key.to_string(),
+        Value::String(placement.to_string()),
+    );
+    write_settings_root(path, &root)?;
+    Ok(placement.to_string())
+}
+
 // purpose: Render CMUX-compatible config get output for one font-size setting.
 // inputs: Settings path and setting descriptor.
 // returns/effects: Returns text with effective value and backing path.
@@ -1656,6 +1731,36 @@ fn render_config_notification_set(
     raw: &str,
 ) -> Result<String> {
     let value = set_config_notification_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Render CMUX-compatible config get output for one workspace placement setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_placement_get(path: &Path, setting: PlacementSetting) -> Result<String> {
+    let (value, _) = get_config_placement_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one workspace placement setting.
+// inputs: Settings path, setting descriptor, and raw placement argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_placement_set(
+    path: &Path,
+    setting: PlacementSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = set_config_placement_setting_at(path, setting, raw)?;
     Ok(format!(
         "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
         setting.key,
@@ -1716,6 +1821,26 @@ fn parse_agent_turn_complete_value<'a>(raw: &'a str, key: &str) -> Result<&'a st
     match raw {
         "whenIdle" | "always" | "never" => Ok(raw),
         _ => bail!("{key} must be whenIdle, always, or never"),
+    }
+}
+
+// purpose: Parse an existing JSON value for a supported workspace placement config key.
+// inputs: User-facing key and raw JSON value.
+// returns/effects: Returns canonical placement or errors on malformed settings JSON.
+fn parse_workspace_placement_value(key: &str, value: &Value) -> Result<String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("{key} must be afterCurrent, top, or end"))?;
+    parse_workspace_placement_str(key, raw).map(str::to_string)
+}
+
+// purpose: Validate CMUX workspace placement strings.
+// inputs: User-facing key and raw placement.
+// returns/effects: Returns canonical placement or a loud config error.
+fn parse_workspace_placement_str<'a>(key: &str, raw: &'a str) -> Result<&'a str> {
+    match raw {
+        "afterCurrent" | "top" | "end" => Ok(raw),
+        _ => bail!("{key} must be afterCurrent, top, or end"),
     }
 }
 
@@ -2250,8 +2375,13 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
                     &path, setting,
                 )?));
             }
-            let setting = notification_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
-            Ok(CommandOutput::Text(render_config_notification_get(
+            if let Some(setting) = notification_setting(key) {
+                return Ok(CommandOutput::Text(render_config_notification_get(
+                    &path, setting,
+                )?));
+            }
+            let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
+            Ok(CommandOutput::Text(render_config_placement_get(
                 &path, setting,
             )?))
         }
@@ -2271,8 +2401,13 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
                     &path, setting, value,
                 )?));
             }
-            let setting = notification_setting(key).ok_or_else(|| anyhow!("{CONFIG_SET_USAGE}"))?;
-            Ok(CommandOutput::Text(render_config_notification_set(
+            if let Some(setting) = notification_setting(key) {
+                return Ok(CommandOutput::Text(render_config_notification_set(
+                    &path, setting, value,
+                )?));
+            }
+            let setting = placement_setting(key).ok_or_else(|| anyhow!("{CONFIG_SET_USAGE}"))?;
+            Ok(CommandOutput::Text(render_config_placement_set(
                 &path, setting, value,
             )?))
         }
@@ -14963,6 +15098,66 @@ mod cli_arg_tests {
         let err = render_config_notification_get(&path, AGENT_IDLE_REMINDER_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    #[test]
+    fn config_workspace_placement_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_placement_get(&path, APP_NEW_WORKSPACE_PLACEMENT_SETTING)
+            .expect("get default app placement");
+        assert!(text.contains("app.newWorkspacePlacement = afterCurrent"));
+
+        fs::write(
+            &path,
+            br#"{"notifications":{"agentIdleReminder":false},"workspaceGroups":{"byCwd":{"/tmp/project":{"newWorkspacePlacement":"top"}}}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_placement_set(&path, APP_NEW_WORKSPACE_PLACEMENT_SETTING, "end")
+            .expect("set app placement");
+        assert!(text.contains("app.newWorkspacePlacement = end"));
+        let text = render_config_placement_set(
+            &path,
+            WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING,
+            "top",
+        )
+        .expect("set workspace group placement");
+        assert!(text.contains("workspaceGroups.newWorkspacePlacement = top"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["notifications"]["agentIdleReminder"], false);
+        assert_eq!(parsed["app"]["newWorkspacePlacement"], "end");
+        assert_eq!(parsed["workspaceGroups"]["newWorkspacePlacement"], "top");
+        assert_eq!(
+            parsed["workspaceGroups"]["byCwd"]["/tmp/project"]["newWorkspacePlacement"],
+            "top"
+        );
+    }
+
+    #[test]
+    fn config_workspace_placement_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_placement_set(
+            &path,
+            WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING,
+            "middle",
+        )
+        .expect_err("invalid placement");
+        assert!(err
+            .to_string()
+            .contains("must be afterCurrent, top, or end"));
+
+        fs::write(&path, br#"{"app":{"newWorkspacePlacement":false}}"#)
+            .expect("write malformed settings");
+        let err = render_config_placement_get(&path, APP_NEW_WORKSPACE_PLACEMENT_SETTING)
+            .expect_err("invalid existing placement");
+        assert!(err
+            .to_string()
+            .contains("must be afterCurrent, top, or end"));
     }
 
     #[test]
