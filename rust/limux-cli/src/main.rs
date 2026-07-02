@@ -8,6 +8,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, ErrorKind, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2747,6 +2748,328 @@ fn remove_feed_history_files(path: &Path) -> Result<Vec<String>> {
     Ok(removed)
 }
 
+// purpose: Build CMUX `remote`/`remotes` registry request shapes.
+// inputs: Remotes command arguments after the top-level command.
+// returns/effects: Returns the CMUX socket method and strict JSON params.
+fn build_remotes_request(args: &[String]) -> Result<(&'static str, Value)> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        "help" | "--help" | "-h" => bail!("Usage: limux remotes <list|add|remove> [options]"),
+        "list" | "ls" => {
+            ensure_only_remotes_json_flags(rest)?;
+            Ok(("remotes.list", Value::Object(Map::new())))
+        }
+        "add" => build_remotes_add_request(rest),
+        "remove" | "rm" | "delete" => build_remotes_remove_request(rest),
+        other => bail!("Unknown remotes subcommand: {other}"),
+    }
+}
+
+struct RemotesAddArgs {
+    routes: Vec<String>,
+    tag: Option<String>,
+    positionals: Vec<String>,
+}
+
+// purpose: Build CMUX `remotes add` params with local route validation.
+// inputs: Arguments after `remotes add`.
+// returns/effects: Returns `remotes.add` params or a loud validation error.
+fn build_remotes_add_request(args: &[String]) -> Result<(&'static str, Value)> {
+    let parsed = parse_remotes_add_args(args)?;
+    let name = parsed
+        .positionals
+        .first()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("remotes add requires a name"))?;
+    if let Some(extra) = parsed.positionals.get(1) {
+        bail!("remotes add: unexpected argument '{extra}'. Pass routes with --route host:port.");
+    }
+    if parsed.routes.is_empty() {
+        bail!("remotes add requires at least one --route host:port");
+    }
+    let mut params = Map::new();
+    params.insert("name".to_string(), json!(name));
+    params.insert("routes".to_string(), json!(parsed.routes));
+    if let Some(tag) = parsed.tag.filter(|value| !value.is_empty()) {
+        params.insert("tag".to_string(), json!(tag));
+    }
+    Ok(("remotes.add", Value::Object(params)))
+}
+
+// purpose: Parse CMUX `remotes add` options without sending a socket request.
+// inputs: Arguments after `remotes add`.
+// returns/effects: Returns typed option buckets or a loud validation error.
+fn parse_remotes_add_args(args: &[String]) -> Result<RemotesAddArgs> {
+    let mut routes = Vec::new();
+    let mut tag = None;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--route" => {
+                index += 1;
+                let route = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("remotes add --route requires host:port"))?;
+                validate_remote_route_token(route)?;
+                routes.push(route.clone());
+            }
+            "--tag" => {
+                index += 1;
+                let raw_tag = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("remotes add --tag requires a value"))?;
+                tag = Some(raw_tag.clone());
+            }
+            "--json" => {}
+            "--help" | "-h" => bail!(
+                "Usage: limux remotes add <name> --route <host:port> [--route <host:port> ...] [--tag <tag>]"
+            ),
+            other if other.starts_with('-') => bail!("remotes add: unknown option '{other}'"),
+            other => positionals.push(other.to_string()),
+        }
+        index += 1;
+    }
+    Ok(RemotesAddArgs {
+        routes,
+        tag,
+        positionals,
+    })
+}
+
+// purpose: Build CMUX `remotes remove` params.
+// inputs: Arguments after `remotes remove`.
+// returns/effects: Returns `remotes.remove` params or a loud validation error.
+fn build_remotes_remove_request(args: &[String]) -> Result<(&'static str, Value)> {
+    let mut positionals = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--json" => {}
+            "--help" | "-h" => bail!("Usage: limux remotes remove <name-or-deviceId>"),
+            other if other.starts_with('-') => bail!("remotes remove: unknown option '{other}'"),
+            other => positionals.push(other.to_string()),
+        }
+    }
+    let target = positionals
+        .first()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("remotes remove requires a name or deviceId"))?;
+    if let Some(extra) = positionals.get(1) {
+        bail!("remotes remove: unexpected argument '{extra}'");
+    }
+    Ok(("remotes.remove", json!({ "target": target })))
+}
+
+// purpose: Validate flags accepted by `remotes list`.
+// inputs: Arguments after `remotes list`.
+// returns/effects: Allows command-position --json and rejects everything else loudly.
+fn ensure_only_remotes_json_flags(args: &[String]) -> Result<()> {
+    for arg in args {
+        match arg.as_str() {
+            "--json" => {}
+            "--help" | "-h" => bail!("Usage: limux remotes list [--json]"),
+            other => bail!("remotes list: unexpected argument '{other}'"),
+        }
+    }
+    Ok(())
+}
+
+// purpose: Validate CMUX remote registry route tokens before socket dispatch.
+// inputs: Raw host:port or bracketed IPv6 route token.
+// returns/effects: Fails for malformed ports and loopback/unspecified hosts.
+fn validate_remote_route_token(raw: &str) -> Result<()> {
+    let (host, port) = split_remote_route_token(raw)?;
+    let port_value = port
+        .parse::<u16>()
+        .with_context(|| format!("Invalid route '{raw}': port must be 1-65535"))?;
+    if port_value == 0 {
+        bail!("Invalid route '{raw}': port must be 1-65535");
+    }
+    if remote_host_is_loopback(&host) {
+        bail!(
+            "Refusing to add a loopback remote ({host}). Use the remote machine's Tailscale address instead."
+        );
+    }
+    Ok(())
+}
+
+// purpose: Split a CMUX remote route token into host and port.
+// inputs: Raw route text in host:port or [ipv6]:port form.
+// returns/effects: Returns trimmed host and port or a loud shape error.
+fn split_remote_route_token(raw: &str) -> Result<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Invalid route '{raw}'. Use host:port, e.g. 100.64.1.2:51001.");
+    }
+    if trimmed.starts_with('[') {
+        let close = trimmed
+            .find(']')
+            .ok_or_else(|| anyhow!("Invalid route '{raw}': unterminated IPv6 bracket."))?;
+        let host = trimmed[1..close].trim();
+        let after = &trimmed[close + 1..];
+        if !after.starts_with(':') {
+            bail!("Invalid route '{raw}': missing :port after IPv6 address.");
+        }
+        if host.is_empty() {
+            bail!("Invalid route '{raw}': empty host.");
+        }
+        return Ok((host.to_string(), after[1..].to_string()));
+    }
+    let Some(colon) = trimmed.rfind(':') else {
+        bail!("Invalid route '{raw}': missing :port. Use host:port, e.g. 100.64.1.2:51001.");
+    };
+    let host = trimmed[..colon].trim();
+    if host.contains(':') {
+        bail!("Invalid route '{raw}': bracket IPv6 addresses as [<ipv6>]:port.");
+    }
+    if host.is_empty() {
+        bail!("Invalid route '{raw}': empty host.");
+    }
+    Ok((host.to_string(), trimmed[colon + 1..].to_string()))
+}
+
+// purpose: Detect remote route hosts that CMUX refuses because phones cannot dial them.
+// inputs: Host part of a remote route token.
+// returns/effects: Returns true for localhost, loopback, and unspecified IP hosts.
+fn remote_host_is_loopback(raw_host: &str) -> bool {
+    let mut host = raw_host.trim().to_ascii_lowercase();
+    if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
+        host = host[1..host.len() - 1].to_string();
+    }
+    if let Some((base, _zone)) = host.split_once('%') {
+        host = base.to_string();
+    }
+    if host.ends_with('.') && host.len() > 1 {
+        host.pop();
+    }
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+        return addr.is_loopback() || addr.is_unspecified();
+    }
+    if let Ok(addr) = host.parse::<Ipv6Addr>() {
+        if addr.is_loopback() || addr.is_unspecified() {
+            return true;
+        }
+        if let Some(v4) = addr.to_ipv4_mapped() {
+            return v4.is_loopback() || v4.is_unspecified();
+        }
+    }
+    false
+}
+
+// purpose: Render CMUX-compatible remotes command text from a socket response.
+// inputs: Original subcommand, request params, and response payload.
+// returns/effects: Returns table or OK text without mutating state.
+fn render_remotes_text(sub: &str, params: &Value, payload: &Value) -> String {
+    match sub {
+        "list" | "ls" => render_remotes_list_text(payload),
+        "add" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("?");
+            let routes = params
+                .get("routes")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let device_id = payload
+                .get("deviceId")
+                .or_else(|| payload.get("device_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let mut text = format!("OK {name}\n  deviceId: {device_id}\n  routes:   {routes}");
+            if let Some(tag) = params.get("tag").and_then(Value::as_str) {
+                text.push_str(&format!("\n  tag:      {tag}"));
+            }
+            text
+        }
+        "remove" | "rm" | "delete" => {
+            let target = params.get("target").and_then(Value::as_str).unwrap_or("?");
+            format!("OK removed {target}")
+        }
+        _ => default_text_output(payload),
+    }
+}
+
+// purpose: Render a CMUX-compatible remotes list table.
+// inputs: `remotes.list` response payload.
+// returns/effects: Returns sanitized text output for terminal display.
+fn render_remotes_list_text(payload: &Value) -> String {
+    let Some(remotes) = payload.get("remotes").and_then(Value::as_array) else {
+        return "No remotes. Add one: limux remotes add <name> --route <host:port>".to_string();
+    };
+    if remotes.is_empty() {
+        return "No remotes. Add one: limux remotes add <name> --route <host:port>".to_string();
+    }
+    remotes
+        .iter()
+        .map(render_remote_row_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// purpose: Render one remote registry row without terminal control characters.
+// inputs: One CMUX remote row from `remotes.list`.
+// returns/effects: Returns a compact table row string.
+fn render_remote_row_text(remote: &Value) -> String {
+    let name = remote
+        .get("displayName")
+        .or_else(|| remote.get("display_name"))
+        .and_then(Value::as_str)
+        .map(sanitize_remote_text)
+        .unwrap_or_else(|| "(unnamed)".to_string());
+    let device_id = remote
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let short_id = device_id.chars().take(8).collect::<String>();
+    let routes = remote
+        .get("routes")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|route| {
+                    let host = route.get("host").and_then(Value::as_str)?;
+                    let port = route.get("port").and_then(Value::as_i64).unwrap_or(0);
+                    Some(format!("{}:{port}", sanitize_remote_text(host)))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "(no routes)".to_string());
+    let tag = remote
+        .get("tag")
+        .and_then(Value::as_str)
+        .map(|tag| format!(" tag={}", sanitize_remote_text(tag)))
+        .unwrap_or_default();
+    let last_seen = remote
+        .get("lastSeen")
+        .and_then(Value::as_str)
+        .map(|last_seen| format!(" lastSeen={}", sanitize_remote_text(last_seen)))
+        .unwrap_or_default();
+    format!("{name}  [{short_id}]  {routes}{tag}{last_seen}")
+}
+
+// purpose: Strip terminal controls from registry strings before text rendering.
+// inputs: Untrusted remote registry text.
+// returns/effects: Replaces control characters with the Unicode replacement character.
+fn sanitize_remote_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '\u{FFFD}' } else { ch })
+        .collect()
+}
+
 // purpose: Return CMUX-compatible no-socket help text for command probes.
 // inputs: Command name and its arguments.
 // returns/effects: Returns usage text only when the first command arg is --help or -h.
@@ -2780,8 +3103,6 @@ fn is_unsupported_remote_cli_command(command: &str) -> bool {
             | "ssh-session-cleanup"
             | "ssh-session-end"
             | "remote-daemon-status"
-            | "remote"
-            | "remotes"
             | "vm-ssh-attach"
     )
 }
@@ -15416,6 +15737,16 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Silent
             }
         }
+        "remote" | "remotes" => {
+            let (method, params) = build_remotes_request(args)?;
+            let sub = args.first().map(String::as_str).unwrap_or("list");
+            let payload = client.call(method, params.clone()).await?;
+            if opts.json_output || args.iter().any(|arg| arg == "--json") {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_remotes_text(sub, &params, &payload))
+            }
+        }
         "new-surface" => {
             let payload = run_new_surface(client, args).await?;
             if opts.json_output {
@@ -16300,14 +16631,17 @@ mod cli_arg_tests {
             "ssh-session-attach",
             "ssh-session-cleanup",
             "remote-daemon-status",
-            "remote",
-            "remotes",
         ] {
             assert!(is_unsupported_remote_cli_command(command));
             let opts = default_opts(args(&[command]));
             let error = run_local_command(&opts).expect_err("remote command should fail locally");
             assert!(error.to_string().contains("not_supported"), "{command}");
         }
+        assert!(!is_unsupported_remote_cli_command("remote"));
+        assert!(!is_unsupported_remote_cli_command("remotes"));
+        assert!(run_local_command(&default_opts(args(&["remotes"])))
+            .expect("local command check")
+            .is_none());
 
         let help = run_local_command(&default_opts(args(&["ssh-session-list", "--help"])))
             .expect("help probe")
@@ -16324,6 +16658,46 @@ mod cli_arg_tests {
             panic!("help should render text");
         };
         assert!(text.contains("Usage: limux remotes <list|add|remove>"));
+    }
+
+    #[test]
+    fn cmux_remotes_requests_map_to_socket_methods_and_validate_routes() {
+        let (method, params) = build_remotes_request(&args(&["list"])).expect("list request");
+        assert_eq!(method, "remotes.list");
+        assert_eq!(params, json!({}));
+
+        let (method, params) = build_remotes_request(&args(&[
+            "add",
+            "studio",
+            "--route",
+            "100.64.1.2:51001",
+            "--route",
+            "dev.tailnet.ts.net:443",
+            "--tag",
+            "stable",
+        ]))
+        .expect("add request");
+        assert_eq!(method, "remotes.add");
+        assert_eq!(params["name"], "studio");
+        assert_eq!(
+            params["routes"],
+            json!(["100.64.1.2:51001", "dev.tailnet.ts.net:443"])
+        );
+        assert_eq!(params["tag"], "stable");
+
+        let (method, params) =
+            build_remotes_request(&args(&["remove", "studio"])).expect("remove request");
+        assert_eq!(method, "remotes.remove");
+        assert_eq!(params["target"], "studio");
+
+        assert!(build_remotes_request(&args(&["add", "bad"])).is_err());
+        assert!(
+            build_remotes_request(&args(&["add", "bad", "--route", "localhost:51001"])).is_err()
+        );
+        assert!(build_remotes_request(&args(&["add", "bad", "--route", "[::1]:51001"])).is_err());
+        assert!(
+            build_remotes_request(&args(&["add", "bad", "--route", "100.64.1.2:70000"])).is_err()
+        );
     }
 
     // purpose: Verify normal command arguments still use the socket-backed path.

@@ -10,6 +10,7 @@ mod memory_diagnostics;
 mod pane;
 mod port_discovery;
 mod port_discovery_procfs;
+mod remote_registry;
 mod settings_editor;
 mod shortcut_config;
 mod split_tree;

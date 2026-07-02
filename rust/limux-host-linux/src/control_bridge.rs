@@ -56,6 +56,9 @@ const METHODS: &[&str] = &[
     "workspace.close",
     "workspace.remote.reconnect",
     "workspace.remote.disconnect",
+    "remotes.list",
+    "remotes.add",
+    "remotes.remove",
     "workspace.group.list",
     "workspace.group.create",
     "workspace.group.ungroup",
@@ -2586,6 +2589,12 @@ fn handle_method(
         }
         "system.capabilities" => {
             return V2Response::success(id, json!({ "commands": METHODS, "methods": METHODS }));
+        }
+        "remotes.list" | "remotes.add" | "remotes.remove" => {
+            return match crate::remote_registry::handle(method, params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
         }
         "feed.push" => {
             return match crate::feed::coordinator().push_with_received_hook(
@@ -5262,6 +5271,9 @@ mod tests {
     fn capabilities_include_remote_workspace_methods() {
         assert!(METHODS.contains(&"workspace.remote.reconnect"));
         assert!(METHODS.contains(&"workspace.remote.disconnect"));
+        assert!(METHODS.contains(&"remotes.list"));
+        assert!(METHODS.contains(&"remotes.add"));
+        assert!(METHODS.contains(&"remotes.remove"));
     }
 
     #[test]
