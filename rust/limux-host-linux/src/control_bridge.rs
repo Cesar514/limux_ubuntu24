@@ -201,6 +201,10 @@ const METHODS: &[&str] = &[
     "sidebar.log.clear",
     "sidebar.log.list",
     "sidebar.state",
+    "sidebar.custom.validate",
+    "sidebar.custom.reload",
+    "sidebar.custom.select",
+    "sidebar.custom.open",
     "set_status",
     "clear_status",
     "list_status",
@@ -577,6 +581,14 @@ pub enum RightSidebarAction {
     Focus,
     SetMode { mode: RightSidebarMode, focus: bool },
     GetState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CustomSidebarAction {
+    Validate { name: Option<String> },
+    Reload { name: Option<String> },
+    Select { name: String },
+    Open { name: String, focus: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -975,6 +987,11 @@ pub enum ControlCommand {
         target: RightSidebarTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    CustomSidebar {
+        action: CustomSidebarAction,
+        target: RightSidebarTarget,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     Sidebar {
         action: SidebarAction,
         target: WorkspaceTarget,
@@ -1047,6 +1064,7 @@ impl ControlCommand {
             | Self::JumpToUnreadNotification { reply }
             | Self::ClearNotifications { reply, .. }
             | Self::RightSidebar { reply, .. }
+            | Self::CustomSidebar { reply, .. }
             | Self::Sidebar { reply, .. } => {
                 let _ = reply.send(result);
             }
@@ -1083,7 +1101,8 @@ impl BridgeError {
         Self::new(NOT_FOUND_CODE, message)
     }
 
-    fn not_supported(method: &str) -> Self {
+    pub fn not_supported(method: impl AsRef<str>) -> Self {
+        let method = method.as_ref();
         Self::new(NOT_SUPPORTED_CODE, format!("not_supported: {method}"))
     }
 
@@ -1467,6 +1486,46 @@ fn parse_right_sidebar_request(
         _ => {
             let mode = parse_right_sidebar_mode(&action)?;
             RightSidebarAction::SetMode { mode, focus: true }
+        }
+    };
+    Ok((action, target))
+}
+
+/// purpose: Parse one CMUX custom-sidebar socket request.
+/// inputs: JSON parameter map and method-specific action.
+/// returns/effects: Returns a host command action/target or invalid_params for malformed names.
+fn parse_custom_sidebar_request(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<(CustomSidebarAction, RightSidebarTarget), BridgeError> {
+    let target = RightSidebarTarget {
+        workspace_id: optional_ref_handle(
+            params,
+            &["workspace_id", "workspace", "tab_id", "tab"],
+            "workspace:",
+        )?,
+        window_id: optional_ref_handle(params, &["window_id", "window"], "window:")?,
+    };
+    let name = optional_string(params, &["name"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let action = match method {
+        "sidebar.custom.validate" => CustomSidebarAction::Validate { name },
+        "sidebar.custom.reload" => CustomSidebarAction::Reload { name },
+        "sidebar.custom.select" => CustomSidebarAction::Select {
+            name: name.ok_or_else(|| {
+                BridgeError::invalid_params("sidebar.custom.select requires name")
+            })?,
+        },
+        "sidebar.custom.open" => CustomSidebarAction::Open {
+            name: name
+                .ok_or_else(|| BridgeError::invalid_params("sidebar.custom.open requires name"))?,
+            focus: optional_bool(params, "focus")?.unwrap_or(false),
+        },
+        _ => {
+            return Err(BridgeError::invalid_params(format!(
+                "unknown custom sidebar method {method}"
+            )));
         }
     };
     Ok((action, target))
@@ -2711,6 +2770,24 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::RightSidebar {
+                    action,
+                    target,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "sidebar.custom.validate"
+        | "sidebar.custom.reload"
+        | "sidebar.custom.select"
+        | "sidebar.custom.open" => {
+            let (action, target) = match parse_custom_sidebar_request(method, params) {
+                Ok(parsed) => parsed,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::CustomSidebar {
                     action,
                     target,
                     reply,
@@ -5343,6 +5420,50 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
         assert!(error.message.contains("Unknown right-sidebar mode"));
+    }
+
+    #[test]
+    fn custom_sidebar_routes_accept_cmux_methods_and_targets() {
+        let request = r#"{"id":1,"method":"sidebar.custom.select","params":{"name":"build-board","workspace_id":"workspace:2","window_id":"window:7"}}"#;
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::CustomSidebar {
+                action,
+                target,
+                reply,
+            } => {
+                assert_eq!(
+                    action,
+                    CustomSidebarAction::Select {
+                        name: "build-board".to_string()
+                    }
+                );
+                assert_eq!(target.workspace_id.as_deref(), Some("2"));
+                assert_eq!(target.window_id.as_deref(), Some("7"));
+                reply
+                    .send(Ok(json!({"selected_name": "build-board"})))
+                    .expect("reply sends");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("result")["selected_name"],
+            "build-board"
+        );
+    }
+
+    #[test]
+    fn custom_sidebar_route_rejects_missing_select_name() {
+        let request = r#"{"id":1,"method":"sidebar.custom.select","params":{}}"#;
+        let response = dispatch_request(request, &|command| {
+            panic!("invalid custom sidebar select should not dispatch: {command:?}");
+        });
+
+        assert_eq!(response.result, None);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, INVALID_PARAMS_CODE);
+        assert!(error.message.contains("requires name"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 // returns/effects: Presents the main window and persists workspace/session changes.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use serde_json::json;
 
 use crate::app_config;
 use crate::control_bridge::{
-    BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
+    BridgeError, BrowserAction, BrowserTabAction, ControlCommand, CustomSidebarAction,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
     RightSidebarMode, RightSidebarTarget, SidebarAction, SurfacePullRequestCommand,
     WorkspaceGroupAction, WorkspaceNavigation, WorkspaceTarget,
@@ -205,6 +205,35 @@ struct SurfacePullRequestReport {
     last_action_target: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct CustomSidebarSelection {
+    name: String,
+    path: String,
+    document: CustomSidebarDocument,
+}
+
+#[derive(Clone, Debug)]
+struct CustomSidebarDocument {
+    version: i64,
+    root: CustomSidebarNode,
+}
+
+#[derive(Clone, Debug)]
+struct CustomSidebarNode {
+    node_type: String,
+    children: Vec<CustomSidebarNode>,
+    text: Option<String>,
+    title: Option<String>,
+    system_name: Option<String>,
+    action: Option<CustomSidebarNodeAction>,
+}
+
+#[derive(Clone, Debug)]
+struct CustomSidebarNodeAction {
+    action_type: String,
+    message: Option<String>,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -232,6 +261,7 @@ pub(crate) struct AppState {
     right_sidebar_visible: bool,
     right_sidebar_mode: RightSidebarMode,
     right_sidebar_focused: bool,
+    custom_sidebar_selection: Option<CustomSidebarSelection>,
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
@@ -3363,9 +3393,14 @@ fn right_sidebar_state_payload(
 ) -> serde_json::Value {
     serde_json::json!({
         "visible": state.right_sidebar_visible,
-        "mode": state.right_sidebar_mode.as_str(),
+        "mode": if state.custom_sidebar_selection.is_some() { "custom" } else { state.right_sidebar_mode.as_str() },
         "focused": state.right_sidebar_focused,
         "workspace_id": workspace_id,
+        "custom_sidebar": state.custom_sidebar_selection.as_ref().map(|selection| serde_json::json!({
+            "name": selection.name,
+            "path": selection.path,
+            "version": selection.document.version,
+        })),
         "supported_modes": ["files", "find", "vault", "sessions", "feed", "dock"],
     })
 }
@@ -3402,11 +3437,352 @@ fn apply_right_sidebar_action(
             app_state.right_sidebar_visible = true;
             app_state.right_sidebar_mode = mode;
             app_state.right_sidebar_focused = focus;
+            app_state.custom_sidebar_selection = None;
         }
         RightSidebarAction::GetState => {}
     }
     sync_right_sidebar_panel(&mut app_state);
     Ok(right_sidebar_state_payload(&app_state, workspace_id))
+}
+
+/// purpose: Apply one CMUX custom-sidebar action against the live right sidebar.
+/// inputs: Host state, validated action, and optional workspace/window target.
+/// returns/effects: Validates custom sidebar files and renders JSON sidebars in the right sidebar.
+fn apply_custom_sidebar_action(
+    state: &State,
+    action: CustomSidebarAction,
+    target: RightSidebarTarget,
+) -> Result<serde_json::Value, BridgeError> {
+    let mut app_state = state.borrow_mut();
+    let workspace_id = validate_right_sidebar_target(&app_state, &target)?;
+    match action {
+        CustomSidebarAction::Validate { name } => Ok(custom_sidebar_report_payload(name.as_deref())),
+        CustomSidebarAction::Reload { name } => {
+            let mut payload = custom_sidebar_report_payload(name.as_deref());
+            let reloaded = payload["valid_count"].as_u64().unwrap_or(0);
+            payload["reloaded_count"] = json!(reloaded);
+            Ok(payload)
+        }
+        CustomSidebarAction::Select { name } => {
+            let selection = load_custom_sidebar_selection(&name)?;
+            app_state.right_sidebar_visible = true;
+            app_state.right_sidebar_focused = true;
+            app_state.custom_sidebar_selection = Some(selection);
+            sync_right_sidebar_panel(&mut app_state);
+            let mut payload = right_sidebar_state_payload(&app_state, workspace_id);
+            payload["selected_name"] = json!(name);
+            payload["selected_provider_id"] = json!(format!("custom:{name}"));
+            Ok(payload)
+        }
+        CustomSidebarAction::Open { name, .. } => Err(BridgeError::not_supported(format!(
+            "sidebar.custom.open requires custom-sidebar pane surfaces; JSON sidebar `{name}` can be selected with sidebar.custom.select"
+        ))),
+    }
+}
+
+/// purpose: Resolve the CMUX custom-sidebar directory used by the runtime host.
+/// inputs: XDG config environment.
+/// returns/effects: Returns ~/.config/cmux/sidebars or panics if config dir is unavailable.
+fn runtime_custom_sidebars_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|base| base.join("cmux/sidebars"))
+        .unwrap_or_else(|| panic!("XDG config directory is unavailable"))
+}
+
+/// purpose: Build a CMUX-shaped custom-sidebar validation payload.
+/// inputs: Optional sidebar name filter.
+/// returns/effects: Reads sidebar files and reports sorted validation rows.
+fn custom_sidebar_report_payload(filter: Option<&str>) -> serde_json::Value {
+    let dir = runtime_custom_sidebars_dir();
+    custom_sidebar_report_payload_at(&dir, filter)
+}
+
+/// purpose: Build a CMUX-shaped custom-sidebar validation payload for one directory.
+/// inputs: Sidebar directory and optional sidebar name filter.
+/// returns/effects: Reads sidebar files and reports sorted validation rows.
+fn custom_sidebar_report_payload_at(
+    dir: &std::path::Path,
+    filter: Option<&str>,
+) -> serde_json::Value {
+    let sidebars = discover_runtime_custom_sidebars(dir, filter);
+    let valid_count = sidebars
+        .iter()
+        .filter(|row| row["ok"].as_bool().unwrap_or(false))
+        .count();
+    let error_count = sidebars.len().saturating_sub(valid_count);
+    json!({
+        "directory": dir.display().to_string(),
+        "sidebars": sidebars,
+        "valid_count": valid_count,
+        "error_count": error_count,
+    })
+}
+
+/// purpose: Discover runtime custom sidebar files with CMUX Swift-over-JSON precedence.
+/// inputs: Sidebar directory and optional name filter.
+/// returns/effects: Returns validation rows; missing directories are empty unless a name is requested.
+fn discover_runtime_custom_sidebars(
+    dir: &std::path::Path,
+    filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if let Some(name) = filter {
+        return vec![runtime_custom_sidebar_row(dir, name)];
+    }
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut names = BTreeSet::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return vec![json!({
+                "name": "(directory)",
+                "kind": "directory",
+                "path": dir.display().to_string(),
+                "ok": false,
+                "error": format!("failed to read custom sidebar directory: {error}"),
+            })];
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let extension = path.extension().and_then(|value| value.to_str());
+        if !matches!(extension, Some("swift" | "json")) {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            names.insert(stem.to_string());
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| runtime_custom_sidebar_row(dir, &name))
+        .collect()
+}
+
+/// purpose: Validate one runtime custom sidebar source file.
+/// inputs: Sidebar directory and bare sidebar name.
+/// returns/effects: Returns a CMUX-shaped row with Swift precedence over JSON.
+fn runtime_custom_sidebar_row(dir: &std::path::Path, name: &str) -> serde_json::Value {
+    let swift = dir.join(format!("{name}.swift"));
+    let json_path = dir.join(format!("{name}.json"));
+    if swift.exists() {
+        return validate_runtime_custom_sidebar_source(name, &swift, "swift");
+    }
+    if json_path.exists() {
+        return validate_runtime_custom_sidebar_source(name, &json_path, "json");
+    }
+    json!({
+        "name": name,
+        "kind": "missing",
+        "path": dir.join(format!("{name}.swift")).display().to_string(),
+        "ok": false,
+        "error": "custom sidebar file not found",
+    })
+}
+
+/// purpose: Validate one runtime custom sidebar source by kind.
+/// inputs: Sidebar name, source path, and source kind.
+/// returns/effects: Returns OK/error metadata without mutating host state.
+fn validate_runtime_custom_sidebar_source(
+    name: &str,
+    path: &std::path::Path,
+    kind: &str,
+) -> serde_json::Value {
+    match read_runtime_custom_sidebar(path, kind) {
+        Ok(()) => json!({
+            "name": name,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "ok": true,
+        }),
+        Err(message) => json!({
+            "name": name,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "ok": false,
+            "error": message,
+        }),
+    }
+}
+
+/// purpose: Read and validate one runtime custom sidebar source.
+/// inputs: Path and kind.
+/// returns/effects: Ensures Swift is non-empty and JSON matches the declarative DSL shape.
+fn read_runtime_custom_sidebar(path: &std::path::Path, kind: &str) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read custom sidebar {}: {error}", path.display()))?;
+    match kind {
+        "swift" => {
+            if raw.trim().is_empty() {
+                return Err("custom sidebar Swift source is empty".to_string());
+            }
+            Ok(())
+        }
+        "json" => parse_custom_sidebar_document(&raw)
+            .map(|_| ())
+            .map_err(|error| format!("custom sidebar JSON is invalid: {error}")),
+        _ => Err(format!("unsupported custom sidebar kind {kind}")),
+    }
+}
+
+/// purpose: Load a named JSON custom sidebar for runtime rendering.
+/// inputs: Sidebar name.
+/// returns/effects: Returns a parsed selection or BridgeError for missing/Swift/invalid sources.
+fn load_custom_sidebar_selection(name: &str) -> Result<CustomSidebarSelection, BridgeError> {
+    let dir = runtime_custom_sidebars_dir();
+    load_custom_sidebar_selection_from_dir(&dir, name)
+}
+
+/// purpose: Load a named JSON custom sidebar from a caller-selected directory.
+/// inputs: Sidebar directory and sidebar name.
+/// returns/effects: Returns a parsed selection or BridgeError for missing/Swift/invalid sources.
+fn load_custom_sidebar_selection_from_dir(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<CustomSidebarSelection, BridgeError> {
+    let row = runtime_custom_sidebar_row(dir, name);
+    if !row["ok"].as_bool().unwrap_or(false) {
+        let message = row["error"]
+            .as_str()
+            .unwrap_or("custom sidebar validation failed");
+        return Err(BridgeError::invalid_params(message));
+    }
+    let kind = row["kind"].as_str().unwrap_or("");
+    if kind != "json" {
+        return Err(BridgeError::not_supported(
+            "runtime custom-sidebar selection currently supports declarative JSON sidebars; interpreted Swift sidebars remain unsupported",
+        ));
+    }
+    let path = row["path"]
+        .as_str()
+        .ok_or_else(|| BridgeError::internal("custom sidebar path missing"))?;
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        BridgeError::internal(format!("failed to read custom sidebar {path}: {error}"))
+    })?;
+    let document = parse_custom_sidebar_document(&raw).map_err(|error| {
+        BridgeError::invalid_params(format!("custom sidebar JSON is invalid: {error}"))
+    })?;
+    Ok(CustomSidebarSelection {
+        name: name.to_string(),
+        path: path.to_string(),
+        document,
+    })
+}
+
+/// purpose: Parse a CMUX declarative JSON custom-sidebar document.
+/// inputs: Raw JSON source.
+/// returns/effects: Returns a bounded static DSL tree or a validation error.
+fn parse_custom_sidebar_document(raw: &str) -> Result<CustomSidebarDocument, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "document must be a JSON object".to_string())?;
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(1);
+    if version < 1 {
+        return Err("version must be positive".to_string());
+    }
+    let root = object
+        .get("root")
+        .ok_or_else(|| "document root is required".to_string())?;
+    Ok(CustomSidebarDocument {
+        version,
+        root: parse_custom_sidebar_node(root, 0)?,
+    })
+}
+
+/// purpose: Parse one CMUX JSON sidebar node with an evaluation-depth budget.
+/// inputs: Raw node value and current depth.
+/// returns/effects: Returns a node or rejects malformed/oversized trees.
+fn parse_custom_sidebar_node(
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<CustomSidebarNode, String> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return Err("custom sidebar JSON exceeds maximum nesting depth".to_string());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "node must be a JSON object".to_string())?;
+    let node_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "node.type is required".to_string())?;
+    if !matches!(
+        node_type,
+        "vstack" | "hstack" | "zstack" | "text" | "button" | "image" | "spacer" | "divider"
+    ) {
+        return Err(format!("unsupported node.type `{node_type}`"));
+    }
+    let children = object
+        .get("children")
+        .map(|value| parse_custom_sidebar_children(value, depth + 1))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(CustomSidebarNode {
+        node_type: node_type.to_string(),
+        children,
+        text: optional_json_string(object, "text"),
+        title: optional_json_string(object, "title"),
+        system_name: optional_json_string(object, "systemName"),
+        action: parse_custom_sidebar_action(object.get("action"))?,
+    })
+}
+
+/// purpose: Parse child node arrays for CMUX JSON sidebars.
+/// inputs: Raw children value and child depth.
+/// returns/effects: Returns parsed children or rejects non-array/non-object entries.
+fn parse_custom_sidebar_children(
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<Vec<CustomSidebarNode>, String> {
+    let children = value
+        .as_array()
+        .ok_or_else(|| "node.children must be an array".to_string())?;
+    children
+        .iter()
+        .map(|child| parse_custom_sidebar_node(child, depth))
+        .collect()
+}
+
+/// purpose: Parse one optional JSON custom-sidebar action.
+/// inputs: Optional raw action value.
+/// returns/effects: Returns action metadata or rejects malformed actions.
+fn parse_custom_sidebar_action(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<CustomSidebarNodeAction>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "node.action must be a JSON object".to_string())?;
+    let action_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "node.action.type is required".to_string())?;
+    Ok(Some(CustomSidebarNodeAction {
+        action_type: action_type.to_string(),
+        message: optional_json_string(object, "message"),
+    }))
+}
+
+/// purpose: Read an optional string from a JSON object.
+/// inputs: JSON object and key.
+/// returns/effects: Returns Some for string values only.
+fn optional_json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// purpose: Convert right-sidebar mode to the visible panel heading.
@@ -3457,21 +3833,32 @@ fn sync_right_sidebar_panel(state: &mut AppState) {
         return;
     };
     append_right_sidebar_section(&state.right_sidebar_body, "Mode");
-    append_right_sidebar_row(
-        &state.right_sidebar_body,
-        &format!(
-            "{} - {}",
-            right_sidebar_mode_title(&state.right_sidebar_mode),
-            right_sidebar_mode_description(&state.right_sidebar_mode)
-        ),
-    );
+    if let Some(selection) = state.custom_sidebar_selection.as_ref() {
+        append_right_sidebar_row(
+            &state.right_sidebar_body,
+            &format!("Custom sidebar - {}", selection.name),
+        );
+    } else {
+        append_right_sidebar_row(
+            &state.right_sidebar_body,
+            &format!(
+                "{} - {}",
+                right_sidebar_mode_title(&state.right_sidebar_mode),
+                right_sidebar_mode_description(&state.right_sidebar_mode)
+            ),
+        );
+    }
     append_right_sidebar_section(&state.right_sidebar_body, "Workspace");
     append_right_sidebar_row(&state.right_sidebar_body, &workspace.name);
-    sync_right_sidebar_mode_rows(
-        &state.right_sidebar_body,
-        workspace,
-        &state.right_sidebar_mode,
-    );
+    if let Some(selection) = state.custom_sidebar_selection.as_ref() {
+        sync_custom_sidebar_rows(&state.right_sidebar_body, selection);
+    } else {
+        sync_right_sidebar_mode_rows(
+            &state.right_sidebar_body,
+            workspace,
+            &state.right_sidebar_mode,
+        );
+    }
     sync_right_sidebar_metadata_rows(
         &state.right_sidebar_body,
         workspace,
@@ -3527,6 +3914,107 @@ fn sync_right_sidebar_mode_rows(body: &gtk::Box, workspace: &Workspace, mode: &R
     }
 }
 
+/// purpose: Render a selected CMUX JSON custom sidebar in the right-sidebar panel.
+/// inputs: Body widget and parsed custom-sidebar selection.
+/// returns/effects: Appends static GTK widgets for the supported JSON DSL subset.
+fn sync_custom_sidebar_rows(body: &gtk::Box, selection: &CustomSidebarSelection) {
+    append_right_sidebar_section(body, &selection.name);
+    append_custom_sidebar_node(body, &selection.document.root);
+}
+
+/// purpose: Append one CMUX JSON sidebar node to a GTK box.
+/// inputs: Parent GTK box and parsed node.
+/// returns/effects: Adds GTK widgets for static text, image labels, buttons, and containers.
+fn append_custom_sidebar_node(parent: &gtk::Box, node: &CustomSidebarNode) {
+    match node.node_type.as_str() {
+        "vstack" | "zstack" => append_custom_sidebar_box(parent, node, gtk::Orientation::Vertical),
+        "hstack" => append_custom_sidebar_box(parent, node, gtk::Orientation::Horizontal),
+        "text" => append_right_sidebar_row(parent, node.text.as_deref().unwrap_or("")),
+        "image" => append_right_sidebar_row(parent, node.system_name.as_deref().unwrap_or("image")),
+        "button" => append_custom_sidebar_button(parent, node),
+        "spacer" => append_right_sidebar_muted(parent, ""),
+        "divider" => append_right_sidebar_section(parent, ""),
+        _ => append_right_sidebar_muted(parent, "Unsupported custom sidebar node"),
+    }
+}
+
+/// purpose: Append one JSON-sidebar container node.
+/// inputs: Parent box, node with children, and requested orientation.
+/// returns/effects: Adds a child box and recursively appends node children.
+fn append_custom_sidebar_box(
+    parent: &gtk::Box,
+    node: &CustomSidebarNode,
+    orientation: gtk::Orientation,
+) {
+    let box_widget = gtk::Box::builder()
+        .orientation(orientation)
+        .spacing(4)
+        .build();
+    for child in &node.children {
+        append_custom_sidebar_node(&box_widget, child);
+    }
+    parent.append(&box_widget);
+}
+
+/// purpose: Append one JSON-sidebar button node.
+/// inputs: Parent box and parsed button node.
+/// returns/effects: Adds a button and wires safe local actions.
+fn append_custom_sidebar_button(parent: &gtk::Box, node: &CustomSidebarNode) {
+    let button = gtk::Button::with_label(node.title.as_deref().unwrap_or(""));
+    button.add_css_class("flat");
+    button.set_halign(gtk::Align::Start);
+    if let Some(action) = node.action.clone() {
+        button.set_tooltip_text(Some(&custom_sidebar_action_tooltip(&action)));
+        button.connect_clicked(move |clicked| {
+            run_custom_sidebar_node_action(clicked, &action);
+        });
+    }
+    parent.append(&button);
+}
+
+/// purpose: Describe a custom-sidebar button action for GTK tooltips.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns visible text without mutating state.
+fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
+    match action.action_type.as_str() {
+        "log" => action.message.clone().unwrap_or_else(|| "log".to_string()),
+        "openURL" | "open" => action
+            .message
+            .clone()
+            .unwrap_or_else(|| "open URL".to_string()),
+        other => format!("not_supported: custom sidebar action {other}"),
+    }
+}
+
+/// purpose: Execute one supported JSON custom-sidebar button action.
+/// inputs: Button widget for feedback and parsed action metadata.
+/// returns/effects: Logs messages, opens URLs, or marks unsupported dispatcher actions visibly.
+fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNodeAction) {
+    match action.action_type.as_str() {
+        "log" => eprintln!(
+            "limux custom sidebar: {}",
+            action.message.as_deref().unwrap_or("")
+        ),
+        "openURL" | "open" => open_custom_sidebar_url(button, action.message.as_deref()),
+        other => button.set_tooltip_text(Some(&format!(
+            "not_supported: custom sidebar dispatcher action {other}"
+        ))),
+    }
+}
+
+/// purpose: Open a URL from a JSON custom-sidebar button action.
+/// inputs: Button widget for feedback and optional URL string.
+/// returns/effects: Launches the default URI handler or marks the button with a loud error.
+fn open_custom_sidebar_url(button: &gtk::Button, url: Option<&str>) {
+    let Some(url) = url.filter(|value| !value.trim().is_empty()) else {
+        button.set_tooltip_text(Some("custom sidebar openURL action requires message URL"));
+        return;
+    };
+    if let Err(error) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
+        button.set_tooltip_text(Some(&format!("custom sidebar openURL failed: {error}")));
+    }
+}
+
 /// purpose: Build the right-sidebar title from current mode/focus state.
 /// inputs: App state with right-sidebar mode and focus metadata.
 /// returns/effects: Returns a title string without mutating widgets.
@@ -3536,6 +4024,9 @@ fn right_sidebar_panel_title(state: &AppState) -> String {
     } else {
         ""
     };
+    if let Some(selection) = state.custom_sidebar_selection.as_ref() {
+        return format!("{}{}", selection.name, suffix);
+    }
     format!(
         "{}{}",
         right_sidebar_mode_title(&state.right_sidebar_mode),
@@ -5390,6 +5881,7 @@ pub fn build_window(app: &adw::Application) {
         right_sidebar_visible: false,
         right_sidebar_mode: RightSidebarMode::Files,
         right_sidebar_focused: false,
+        custom_sidebar_selection: None,
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
@@ -13698,6 +14190,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             let _ = reply.send(apply_right_sidebar_action(state, action, target));
         }
+        ControlCommand::CustomSidebar {
+            action,
+            target,
+            reply,
+        } => {
+            let _ = reply.send(apply_custom_sidebar_action(state, action, target));
+        }
         ControlCommand::Sidebar {
             action,
             target,
@@ -16103,30 +16602,32 @@ mod tests {
         browser_find_script, browser_required_element_script, browser_scroll_script,
         browser_snapshot_script, browser_styles_script, build_window_css,
         clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
-        desktop_notification_action_entries, desktop_notification_action_from_signal,
-        desktop_notification_actions, desktop_notification_activation_token_from_signal,
+        custom_sidebar_report_payload_at, desktop_notification_action_entries,
+        desktop_notification_action_from_signal, desktop_notification_actions,
+        desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        limit_text_to_last_lines, next_active_workspace_index, notification_command_env,
-        notification_hook_policy_payload, notification_policy_effects_from_value,
-        pane_create_split_placement, pending_exit_plan_request_id, pending_permission_request_id,
-        pending_question_request_id, publish_browser_event, publish_surface_input_sent_event,
-        publish_surface_key_sent_event, publish_surface_lifecycle_event,
-        publish_workspace_lifecycle_event, queue_session_save_request,
-        resolve_pane_create_source_id, resolve_workspace_creation_directory,
-        resolved_system_prefers_dark, right_sidebar_metadata_sections,
-        right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
-        sanitize_background_opacity, shell_report_key, shortcut_allowed_while_browser_find_active,
-        shortcut_blocked_by_editable, shortcut_command_from_key_event,
-        shortcut_dispatch_propagation, should_emit_desktop_notification,
-        should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
-        should_show_unread_visual, sidebar_branch_directory_label,
-        sidebar_branch_directory_tooltip, sidebar_feed_preview_lines_from_value,
-        sidebar_feed_visible_items, sidebar_file_preview_lines, sidebar_git_branch,
-        sidebar_log_preview_lines_from_entries, sidebar_port_link_specs, sidebar_ports_rows,
-        sidebar_progress_preview_line, sidebar_pull_request_link_specs, sidebar_pull_request_rows,
+        limit_text_to_last_lines, load_custom_sidebar_selection_from_dir,
+        next_active_workspace_index, notification_command_env, notification_hook_policy_payload,
+        notification_policy_effects_from_value, pane_create_split_placement,
+        pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
+        publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
+        publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
+        queue_session_save_request, resolve_pane_create_source_id,
+        resolve_workspace_creation_directory, resolved_system_prefers_dark,
+        right_sidebar_metadata_sections, right_sidebar_mode_description, right_sidebar_mode_title,
+        run_notification_hook_command, sanitize_background_opacity, shell_report_key,
+        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation,
+        should_emit_desktop_notification, should_keep_workspace_open_after_empty_pane,
+        should_show_sidebar_notification_message, should_show_unread_visual,
+        sidebar_branch_directory_label, sidebar_branch_directory_tooltip,
+        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
+        sidebar_file_preview_lines, sidebar_git_branch, sidebar_log_preview_lines_from_entries,
+        sidebar_port_link_specs, sidebar_ports_rows, sidebar_progress_preview_line,
+        sidebar_pull_request_link_specs, sidebar_pull_request_rows,
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
@@ -16634,6 +17135,50 @@ mod tests {
             }),
             "63% - Building"
         );
+    }
+
+    #[test]
+    fn custom_sidebar_json_loader_accepts_static_dsl_and_reports_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("build-board.json"),
+            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Logs","action":{"type":"log","message":"clicked"}}]}}"#,
+        )
+        .expect("write json sidebar");
+
+        let report = custom_sidebar_report_payload_at(dir.path(), Some("build-board"));
+        assert_eq!(report["valid_count"], json!(1));
+        assert_eq!(report["error_count"], json!(0));
+
+        let selection = load_custom_sidebar_selection_from_dir(dir.path(), "build-board")
+            .expect("load json sidebar");
+        assert_eq!(selection.name, "build-board");
+        assert_eq!(selection.document.version, 1);
+        assert_eq!(selection.document.root.node_type, "vstack");
+        assert_eq!(selection.document.root.children.len(), 2);
+    }
+
+    #[test]
+    fn custom_sidebar_loader_rejects_swift_and_invalid_json_runtime_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("swift-only.swift"),
+            "VStack { Text(\"Hi\") }",
+        )
+        .expect("write swift");
+        fs::write(
+            dir.path().join("bad.json"),
+            r#"{"version":1,"root":{"type":"unknown"}}"#,
+        )
+        .expect("write bad json");
+
+        let swift_error = load_custom_sidebar_selection_from_dir(dir.path(), "swift-only")
+            .expect_err("swift runtime unsupported");
+        assert!(format!("{swift_error:?}").contains("not_supported"));
+
+        let bad_error = load_custom_sidebar_selection_from_dir(dir.path(), "bad")
+            .expect_err("invalid json rejected");
+        assert!(format!("{bad_error:?}").contains("unsupported node.type"));
     }
 
     #[test]

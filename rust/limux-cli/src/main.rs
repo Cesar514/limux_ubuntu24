@@ -522,8 +522,9 @@ fn custom_sidebar_docs_text() -> Result<String> {
             "Supported source files: <name>.swift or <name>.json. ",
             "When both exist, .swift wins.\n",
             "Validate locally with: limux sidebar validate [name|--all]\n",
-            "Limux validates files and reports CMUX-shaped results; ",
-            "runtime custom-sidebar rendering remains tracked in the CMUX parity matrix."
+            "Runtime selection currently renders declarative JSON sidebars ",
+            "in the Limux right sidebar; interpreted Swift and pane-open rendering ",
+            "remain tracked in the CMUX parity matrix."
         ),
         cmux_sidebars_dir()?.display()
     ))
@@ -3253,6 +3254,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "settings" => Some(run_settings_command(args)?),
         "config" if args.first().map(String::as_str) == Some("reload") => None,
         "config" => Some(run_config_command(args)?),
+        "sidebar" if matches!(args.first().map(String::as_str), Some("select" | "open")) => None,
         "sidebar" => Some(run_custom_sidebar_command(args, opts.json_output)?),
         "shortcuts" => Some(CommandOutput::Text(
             limux_shortcuts_path()?.display().to_string(),
@@ -4231,6 +4233,33 @@ fn run_custom_sidebar_command(args: &[String], json_output: bool) -> Result<Comm
     }
 }
 
+// purpose: Build a live socket request for CMUX custom-sidebar runtime actions.
+// inputs: Sidebar CLI args after `sidebar`.
+// returns/effects: Returns method, params, and action name for rendering.
+fn build_custom_sidebar_runtime_request(
+    args: &[String],
+) -> Result<(&'static str, Map<String, Value>, String)> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("Usage: limux sidebar <select|open> <name>"))?;
+    let name = args
+        .get(1)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("sidebar {action} requires a sidebar name"))?;
+    if args.len() != 2 {
+        bail!("sidebar {action} accepts exactly one sidebar name");
+    }
+    let method = match action {
+        "select" => "sidebar.custom.select",
+        "open" => "sidebar.custom.open",
+        _ => bail!("Unknown sidebar command '{action}'"),
+    };
+    let mut params = Map::new();
+    params.insert("name".to_string(), Value::String(name.clone()));
+    Ok((method, params, action.to_string()))
+}
+
 // purpose: Validate one sidebar before a runtime action that Limux cannot render yet.
 // inputs: Sidebar action and requested sidebar name.
 // returns/effects: Fails loudly for missing/invalid files before reporting missing renderer support.
@@ -4284,8 +4313,8 @@ fn custom_sidebar_help_text() -> String {
         "Commands:\n",
         "  validate [name]   Validate all custom sidebars, or one named sidebar\n",
         "  reload [name]     Validate all sidebars, then reload every valid one\n",
-        "  select <name>     Activate one custom sidebar when runtime support exists\n",
-        "  open <name>       Open one custom sidebar when runtime support exists"
+        "  select <name>     Activate one JSON custom sidebar in the right sidebar\n",
+        "  open <name>       Open one custom sidebar as a Bonsplit pane when supported"
     )
     .to_string()
 }
@@ -4429,6 +4458,23 @@ fn render_custom_sidebar_report(payload: &Value, action: &str) -> String {
         lines.push(format!(
             "Reloaded {reloaded} valid sidebars. {valid} valid, {errors} invalid."
         ));
+    } else if action == "select" {
+        if let Some(name) = payload.get("selected_name").and_then(Value::as_str) {
+            lines.push(format!("Selected {name}."));
+        } else {
+            lines.push(format!("{valid} valid, {errors} invalid."));
+        }
+    } else if action == "open" {
+        if let Some(name) = payload.get("opened_name").and_then(Value::as_str) {
+            let surface = payload
+                .get("surface_ref")
+                .or_else(|| payload.get("surface_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            lines.push(format!("Opened {name} as pane {surface}."));
+        } else {
+            lines.push(format!("{valid} valid, {errors} invalid."));
+        }
     } else {
         lines.push(format!("{valid} valid, {errors} invalid."));
     }
@@ -16373,6 +16419,15 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Silent
             }
         }
+        "sidebar" => {
+            let (method, params, action) = build_custom_sidebar_runtime_request(args)?;
+            let payload = client.call(method, Value::Object(params)).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_custom_sidebar_report(&payload, &action))
+            }
+        }
         "remote" | "remotes" => {
             let (method, params) = build_remotes_request(args)?;
             let sub = args.first().map(String::as_str).unwrap_or("list");
@@ -16752,6 +16807,29 @@ mod cli_arg_tests {
         let error =
             run_custom_sidebar_command(&args(&["open"]), false).expect_err("open requires name");
         assert!(error.to_string().contains("requires a sidebar name"));
+    }
+
+    #[test]
+    fn custom_sidebar_runtime_actions_map_to_socket_methods() {
+        let (method, params, action) =
+            build_custom_sidebar_runtime_request(&args(&["select", "build-board"]))
+                .expect("select parses");
+        assert_eq!(method, "sidebar.custom.select");
+        assert_eq!(params["name"], "build-board");
+        assert_eq!(action, "select");
+
+        let (method, params, action) =
+            build_custom_sidebar_runtime_request(&args(&["open", "build-board"]))
+                .expect("open parses");
+        assert_eq!(method, "sidebar.custom.open");
+        assert_eq!(params["name"], "build-board");
+        assert_eq!(action, "open");
+
+        let rendered = render_custom_sidebar_report(
+            &json!({"selected_name":"build-board","valid_count":1,"error_count":0,"sidebars":[]}),
+            "select",
+        );
+        assert!(rendered.contains("Selected build-board."));
     }
 
     #[tokio::test]
