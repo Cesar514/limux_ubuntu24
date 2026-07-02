@@ -3945,10 +3945,23 @@ fn sidebar_git_branch(cwd: Option<&str>) -> String {
     }
 }
 
+/// purpose: Render CMUX sidebar port rows according to visibility settings.
+/// inputs: Sidebar config for the workspace row.
+/// returns/effects: Returns hidden or currently detected ports without mutating state.
+fn sidebar_ports_rows(sidebar: &app_config::SidebarConfig) -> Vec<serde_json::Value> {
+    if sidebar.hide_all_details || !sidebar.show_ports {
+        return Vec::new();
+    }
+    Vec::new()
+}
+
 /// purpose: Render all retained CMUX sidebar metadata for one workspace.
-/// inputs: Workspace with status/progress/log state.
+/// inputs: Workspace with status/progress/log state plus current sidebar settings.
 /// returns/effects: Returns aggregate JSON without mutating state.
-fn sidebar_state_payload(workspace: &Workspace) -> serde_json::Value {
+fn sidebar_state_payload(
+    workspace: &Workspace,
+    sidebar: &app_config::SidebarConfig,
+) -> serde_json::Value {
     let cwd = workspace
         .folder_path
         .clone()
@@ -3965,7 +3978,7 @@ fn sidebar_state_payload(workspace: &Workspace) -> serde_json::Value {
         "workspace_ref": workspace_ref(&workspace.id),
         "cwd": cwd,
         "git_branch": git_branch,
-        "ports": [],
+        "ports": sidebar_ports_rows(sidebar),
         "status": sidebar_status_rows(workspace),
         "progress": sidebar_progress_row(workspace),
         "log": sidebar_log_rows(workspace, None),
@@ -4023,7 +4036,13 @@ fn apply_sidebar_action(
             "workspace_id": workspace_id,
             "log": sidebar_log_rows(&app_state.workspaces[index], limit),
         })),
-        SidebarAction::State => Ok(sidebar_state_payload(&app_state.workspaces[index])),
+        SidebarAction::State => {
+            let sidebar_config = app_state.config.borrow().sidebar.clone();
+            Ok(sidebar_state_payload(
+                &app_state.workspaces[index],
+                &sidebar_config,
+            ))
+        }
     };
     if result.is_ok() {
         sync_right_sidebar_panel(&mut app_state);
@@ -13967,7 +13986,7 @@ mod tests {
         should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
         should_show_unread_visual, sidebar_feed_preview_lines_from_value,
         sidebar_feed_visible_items, sidebar_file_preview_lines,
-        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
+        sidebar_log_preview_lines_from_entries, sidebar_ports_rows, sidebar_progress_preview_line,
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
@@ -14307,6 +14326,28 @@ mod tests {
             right_sidebar_metadata_sections(&custom),
             (false, true, false)
         );
+    }
+
+    // purpose: Verify CMUX sidebar port visibility respects the master/detail settings.
+    // inputs: Default config plus disabled showPorts and hideAllDetails variants.
+    // returns/effects: Asserts hidden configs expose no port rows.
+    #[test]
+    fn sidebar_ports_rows_follow_sidebar_visibility_config() {
+        let defaults = crate::app_config::SidebarConfig::default();
+        assert!(sidebar_ports_rows(&defaults).is_empty());
+
+        let ports_hidden = crate::app_config::SidebarConfig {
+            show_ports: false,
+            ..crate::app_config::SidebarConfig::default()
+        };
+        assert!(sidebar_ports_rows(&ports_hidden).is_empty());
+
+        let all_details_hidden = crate::app_config::SidebarConfig {
+            hide_all_details: true,
+            show_ports: true,
+            ..crate::app_config::SidebarConfig::default()
+        };
+        assert!(sidebar_ports_rows(&all_details_hidden).is_empty());
     }
 
     // purpose: Verify Limux clamps right-sidebar widths using CMUX policy values.

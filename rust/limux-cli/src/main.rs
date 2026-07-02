@@ -1664,6 +1664,13 @@ const SIDEBAR_WATCH_GIT_STATUS_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_SHOW_PORTS_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showPorts",
+    section: "sidebar",
+    json_key: "showPorts",
+    default: true,
+};
+
 const SIDEBAR_SHOW_CUSTOM_METADATA_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showCustomMetadata",
     section: "sidebar",
@@ -1715,8 +1722,8 @@ const CONFIG_GET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showPullRequests|",
-    "sidebar.watchGitStatus|sidebar.showCustomMetadata|sidebar.showProgress|",
-    "sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showCustomMetadata|",
+    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
@@ -1734,8 +1741,8 @@ const CONFIG_SET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showPullRequests|",
-    "sidebar.watchGitStatus|sidebar.showCustomMetadata|sidebar.showProgress|",
-    "sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showCustomMetadata|",
+    "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -1812,6 +1819,7 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
         "sidebar.showPullRequests" => Some(SIDEBAR_SHOW_PULL_REQUESTS_SETTING),
         "sidebar.watchGitStatus" => Some(SIDEBAR_WATCH_GIT_STATUS_SETTING),
+        "sidebar.showPorts" => Some(SIDEBAR_SHOW_PORTS_SETTING),
         "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
         "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
         "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
@@ -16308,6 +16316,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING)
             .expect("get default sidebar git watch");
         assert!(text.contains("sidebar.watchGitStatus = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_PORTS_SETTING)
+            .expect("get default sidebar ports");
+        assert!(text.contains("sidebar.showPorts = true"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING)
             .expect("get default sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = true"));
@@ -16349,6 +16360,9 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING, "false")
             .expect("set sidebar git watch");
         assert!(text.contains("sidebar.watchGitStatus = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_PORTS_SETTING, "false")
+            .expect("set sidebar ports");
+        assert!(text.contains("sidebar.showPorts = false"));
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING, "false")
             .expect("set sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = false"));
@@ -16372,6 +16386,7 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
         assert_eq!(parsed["sidebar"]["showPullRequests"], false);
         assert_eq!(parsed["sidebar"]["watchGitStatus"], false);
+        assert_eq!(parsed["sidebar"]["showPorts"], false);
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], false);
         assert_eq!(parsed["sidebar"]["showProgress"], false);
         assert_eq!(parsed["sidebar"]["showLog"], false);
@@ -16391,9 +16406,8 @@ mod cli_arg_tests {
             .expect_err("invalid bool");
         assert!(err.to_string().contains("requires true or false"));
 
-        fs::write(&path, br#"{"sidebar":{"watchGitStatus":"false"}}"#)
-            .expect("write malformed bool");
-        let err = render_config_boolean_get(&path, SIDEBAR_WATCH_GIT_STATUS_SETTING)
+        fs::write(&path, br#"{"sidebar":{"showPorts":"false"}}"#).expect("write malformed bool");
+        let err = render_config_boolean_get(&path, SIDEBAR_SHOW_PORTS_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
 

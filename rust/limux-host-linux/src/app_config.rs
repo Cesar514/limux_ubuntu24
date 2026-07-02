@@ -132,6 +132,7 @@ pub struct SidebarConfig {
     pub show_branch_directory: bool,
     pub show_pull_requests: bool,
     pub watch_git_status: bool,
+    pub show_ports: bool,
     pub show_custom_metadata: bool,
     pub show_progress: bool,
     pub show_log: bool,
@@ -148,6 +149,7 @@ impl Default for SidebarConfig {
             show_branch_directory: true,
             show_pull_requests: true,
             watch_git_status: true,
+            show_ports: true,
             show_custom_metadata: true,
             show_progress: true,
             show_log: true,
@@ -672,6 +674,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("watchGitStatus"))
         .map(|value| parse_bool_setting(value, "sidebar.watchGitStatus"))
         .unwrap_or(sidebar_defaults.watch_git_status);
+    let show_ports = sidebar
+        .and_then(|sidebar| sidebar.get("showPorts"))
+        .map(|value| parse_bool_setting(value, "sidebar.showPorts"))
+        .unwrap_or(sidebar_defaults.show_ports);
     let show_custom_metadata = sidebar
         .and_then(|sidebar| sidebar.get("showCustomMetadata"))
         .map(|value| parse_bool_setting(value, "sidebar.showCustomMetadata"))
@@ -781,6 +787,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_branch_directory,
             show_pull_requests,
             watch_git_status,
+            show_ports,
             show_custom_metadata,
             show_progress,
             show_log,
@@ -1230,6 +1237,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "watchGitStatus".to_string(),
             json!(config.sidebar.watch_git_status),
         ),
+        ("showPorts".to_string(), json!(config.sidebar.show_ports)),
         (
             "showCustomMetadata".to_string(),
             json!(config.sidebar.show_custom_metadata),
@@ -1379,6 +1387,7 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "showBranchDirectory": true,
             "showPullRequests": true,
             "watchGitStatus": true,
+            "showPorts": true,
             "showCustomMetadata": true,
             "showProgress": true,
             "showLog": true
@@ -1908,6 +1917,7 @@ mod tests {
     "showBranchDirectory": false,
     "showPullRequests": false,
     "watchGitStatus": false,
+    "showPorts": false,
     "showCustomMetadata": false,
     "showProgress": false,
     "showLog": false,
@@ -1928,6 +1938,7 @@ mod tests {
         assert!(!loaded.config.sidebar.show_branch_directory);
         assert!(!loaded.config.sidebar.show_pull_requests);
         assert!(!loaded.config.sidebar.watch_git_status);
+        assert!(!loaded.config.sidebar.show_ports);
         assert!(!loaded.config.sidebar.show_custom_metadata);
         assert!(!loaded.config.sidebar.show_progress);
         assert!(!loaded.config.sidebar.show_log);
@@ -1955,6 +1966,20 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"watchGitStatus":"false"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX sidebar port visibility settings fail loudly.
+    // inputs: Settings JSON with non-boolean sidebar.showPorts.
+    // returns/effects: Panics instead of accepting a silent fallback.
+    #[test]
+    #[should_panic(expected = "sidebar.showPorts must be a boolean")]
+    fn load_from_path_rejects_invalid_sidebar_show_ports() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"showPorts":"false"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2411,6 +2436,7 @@ mod tests {
         config.sidebar.show_branch_directory = false;
         config.sidebar.show_pull_requests = false;
         config.sidebar.watch_git_status = false;
+        config.sidebar.show_ports = false;
         config.sidebar.show_custom_metadata = false;
         config.sidebar.show_progress = false;
         config.sidebar.show_log = false;
@@ -2435,6 +2461,7 @@ mod tests {
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showPullRequests"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["watchGitStatus"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["showPorts"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));
