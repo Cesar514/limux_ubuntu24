@@ -10445,14 +10445,15 @@ fn insert_tmux_split_targets(params: &mut Map<String, Value>, args: &[String]) {
 // inputs: Raw split-window args using tmux -h/-v/-b/-d/-c/-t/-P/-F/-l forms.
 // returns/effects: Returns surface.split params plus whether tmux -P output was requested.
 fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
-    if tmux_has_short_flag(args, "-d") {
-        bail!("split-window -d is not supported until surface.split can preserve focus");
-    }
     let mut params = Map::new();
     insert_tmux_split_targets(&mut params, args);
     params.insert(
         "direction".to_string(),
         Value::String(tmux_split_direction(args).to_string()),
+    );
+    params.insert(
+        "focus".to_string(),
+        Value::Bool(!tmux_has_short_flag(args, "-d")),
     );
     if let Some(cwd) = parse_opt(args, "-c").filter(|value| !value.trim().is_empty()) {
         params.insert("working_directory".to_string(), Value::String(cwd));
@@ -13598,6 +13599,7 @@ mod cli_arg_tests {
         assert!(print_result);
         assert_eq!(params["surface_id"], "surface:7:tab-a");
         assert_eq!(params["direction"], "right");
+        assert_eq!(params["focus"], true);
         assert_eq!(params["working_directory"], "/tmp/project");
         assert_eq!(params["command"], "echo ready");
 
@@ -13611,12 +13613,10 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn tmux_split_window_rejects_detached_focus_fallback() {
-        let error = build_tmux_split_window_request(&args(&["-d"]))
-            .expect_err("detached split should fail loudly");
-        assert!(error
-            .to_string()
-            .contains("split-window -d is not supported"));
+    fn tmux_split_window_serializes_detached_focus() {
+        let (params, _) =
+            build_tmux_split_window_request(&args(&["-d"])).expect("detached split parses");
+        assert_eq!(params["focus"], false);
     }
 
     #[test]

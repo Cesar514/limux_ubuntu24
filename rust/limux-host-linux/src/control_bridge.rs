@@ -447,6 +447,7 @@ pub struct CreatePaneRequest {
     pub initial_command: Option<String>,
     pub working_directory: Option<String>,
     pub startup_environment: BTreeMap<String, String>,
+    pub focus: bool,
     pub url: Option<String>,
 }
 
@@ -1884,6 +1885,7 @@ fn parse_create_pane_request(
         initial_command,
         working_directory,
         startup_environment,
+        focus: optional_bool(params, "focus")?.unwrap_or(true),
         url,
     })
 }
@@ -3314,6 +3316,10 @@ fn handle_method(
                             &["working_directory", "workingDirectory"],
                         ),
                         startup_environment,
+                        focus: match optional_bool(params, "focus") {
+                            Ok(focus) => focus.unwrap_or(true),
+                            Err(error) => return error_response(id, error),
+                        },
                         url: None,
                     },
                     reply,
@@ -5422,6 +5428,7 @@ mod tests {
         assert_eq!(request.direction, PaneCreateDirection::Left);
         assert_eq!(request.pane_type, PaneCreateType::Terminal);
         assert_eq!(request.command, Some("claude".to_string()));
+        assert!(request.focus);
     }
 
     // purpose: Verify CMUX watcher startup fields parse for terminal pane creation.
@@ -5561,6 +5568,7 @@ mod tests {
                     assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
                     assert_eq!(request.source_surface_id, Some("4:tab".to_string()));
                     assert_eq!(request.direction, PaneCreateDirection::Right);
+                    assert!(request.focus);
                     assert_eq!(
                         request.initial_command.as_deref(),
                         Some("/tmp/cmux-codex-teams.sh")
@@ -5587,6 +5595,34 @@ mod tests {
         assert_eq!(response.error, None);
         assert_eq!(
             response.result.expect("surface.split should return result")["surface_ref"],
+            "surface:9:tab"
+        );
+    }
+
+    // purpose: Verify surface.split preserves CMUX/tmux detached focus requests.
+    // inputs: surface.split request with focus false.
+    // returns/effects: Asserts queued CreatePane request carries focus=false.
+    #[test]
+    fn surface_split_route_preserves_focus_false() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.split","params":{"workspace_id":"codex","surface_id":"surface:4:tab","focus":false}}"#,
+            &|command| match command {
+                ControlCommand::CreatePane { request, reply } => {
+                    assert!(!request.focus);
+                    let _ = reply.send(Ok(json!({
+                        "pane_id": "9",
+                        "pane_ref": "pane:9",
+                        "surface_id": "9:tab",
+                        "surface_ref": "surface:9:tab"
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.split result")["surface_ref"],
             "surface:9:tab"
         );
     }
@@ -6829,6 +6865,7 @@ mod tests {
                     assert_eq!(request.direction, PaneCreateDirection::Down);
                     assert_eq!(request.pane_type, PaneCreateType::Terminal);
                     assert_eq!(request.command, Some("top".to_string()));
+                    assert!(request.focus);
                     assert_eq!(request.url, None);
                     let _ = reply.send(Ok(json!({
                         "pane_ref": "pane:12",

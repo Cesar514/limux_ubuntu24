@@ -9419,7 +9419,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                         command: request.initial_command.or_else(|| request.command.clone()),
                         working_directory: request.working_directory,
                         extra_env: request.startup_environment.into_iter().collect(),
-                        activate: true,
+                        activate: request.focus,
                     },
                 )
             } else {
