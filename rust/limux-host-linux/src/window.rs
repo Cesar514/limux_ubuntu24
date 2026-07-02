@@ -81,6 +81,10 @@ struct Workspace {
 struct HostNotification {
     id: u64,
     workspace_id: String,
+    surface_id: Option<String>,
+    pane_id: Option<u32>,
+    tab_title: Option<String>,
+    created_at: String,
     title: String,
     subtitle: String,
     body: String,
@@ -7671,6 +7675,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::CreateNotification {
             target,
+            surface_hint,
             title,
             subtitle,
             body,
@@ -7691,6 +7696,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             let ws_id = state.borrow().workspaces[index].id.clone();
+            let surface = {
+                let app_state = state.borrow();
+                notification_surface_metadata(&app_state.workspaces[index], surface_hint.as_deref())
+            };
+            let surface = match surface {
+                Ok(surface) => surface,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
 
             // Build the sidebar message: title becomes the bold prefix,
             // subtitle + body are joined with " — " for the body text.
@@ -7703,8 +7719,11 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let message = workspace_notification_message(&title, &combined_body);
             let target = DesktopNotificationTarget {
                 workspace_id: ws_id.clone(),
-                pane_id: None,
-                tab_id: None,
+                pane_id: surface.as_ref().map(|surface| surface.pane_id),
+                tab_id: surface
+                    .as_ref()
+                    .and_then(|surface| surface.surface_id.rsplit_once(':'))
+                    .map(|(_, tab_id)| tab_id.to_string()),
             };
             if let Some(request) =
                 mark_workspace_unread_with_message(state, &ws_id, &message, false, target)
@@ -7715,6 +7734,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let notification = push_host_notification(
                 state,
                 ws_id.clone(),
+                surface,
                 title.clone(),
                 subtitle.clone(),
                 body.clone(),
@@ -9137,6 +9157,34 @@ fn workspace_notification_message(title: &str, body: &str) -> String {
     }
 }
 
+// purpose: Create the public timestamp used by host notification rows.
+// inputs: System wall clock.
+// returns/effects: Panics if the system clock is before the Unix epoch.
+fn notification_created_at() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after UNIX_EPOCH")
+        .as_millis();
+    format!("unix_ms:{millis}")
+}
+
+// purpose: Resolve optional notification surface metadata within one workspace.
+// inputs: Workspace and an optional CMUX surface or tab hint.
+// returns/effects: Returns None for workspace notifications or an error for unknown hints.
+fn notification_surface_metadata(
+    workspace: &Workspace,
+    surface_hint: Option<&str>,
+) -> Result<Option<pane::SurfaceSummary>, BridgeError> {
+    let Some(hint) = surface_hint else {
+        return Ok(None);
+    };
+    pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .find(|surface| surface_hint_matches(&surface.surface_id, hint))
+        .map(Some)
+        .ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
 /// purpose: Render one live-host notification in the public control API shape.
 /// inputs: notification is a stored host notification.
 /// returns/effects: Returns JSON without mutating state.
@@ -9148,8 +9196,14 @@ fn host_notification_row(notification: &HostNotification) -> serde_json::Value {
         "title": notification.title,
         "subtitle": notification.subtitle,
         "body": notification.body,
+        "created_at": notification.created_at,
         "workspace_id": notification.workspace_id,
         "workspace_ref": workspace_ref(&notification.workspace_id),
+        "surface_id": notification.surface_id,
+        "surface_ref": notification.surface_id.as_ref().map(|surface_id| surface_ref(surface_id)),
+        "pane_id": notification.pane_id.map(|pane_id| pane_id.to_string()),
+        "pane_ref": notification.pane_id.map(pane_ref),
+        "tab_title": notification.tab_title,
         "is_read": !notification.unread,
         "unread": notification.unread,
     })
@@ -9161,10 +9215,17 @@ fn publish_notification_event(name: &str, notification: &HostNotification) {
         category: "notification",
         source: "notification.store",
         workspace_id: Some(serde_json::Value::String(notification.workspace_id.clone())),
-        surface_id: None,
-        pane_id: None,
+        surface_id: notification
+            .surface_id
+            .clone()
+            .map(serde_json::Value::String),
+        pane_id: notification
+            .pane_id
+            .map(|pane_id| serde_json::Value::String(pane_id.to_string())),
         payload: serde_json::json!({
             "notification_id": notification.id,
+            "created_at": notification.created_at,
+            "tab_title": notification.tab_title,
             "title_length": notification.title.len(),
             "subtitle_length": notification.subtitle.len(),
             "body_length": notification.body.len(),
@@ -9192,6 +9253,7 @@ fn publish_notification_bulk_event(name: &str, count: usize) {
 fn push_host_notification(
     state: &State,
     workspace_id: String,
+    surface: Option<pane::SurfaceSummary>,
     title: String,
     subtitle: String,
     body: String,
@@ -9200,9 +9262,16 @@ fn push_host_notification(
     let mut s = state.borrow_mut();
     let id = s.next_notification_id;
     s.next_notification_id = s.next_notification_id.saturating_add(1);
+    let surface_id = surface.as_ref().map(|surface| surface.surface_id.clone());
+    let pane_id = surface.as_ref().map(|surface| surface.pane_id);
+    let tab_title = surface.map(|surface| surface.title);
     let notification = HostNotification {
         id,
         workspace_id,
+        surface_id,
+        pane_id,
+        tab_title,
+        created_at: notification_created_at(),
         title,
         subtitle,
         body,
@@ -9669,15 +9738,15 @@ mod tests {
         desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, next_active_workspace_index,
-        pane_create_split_placement, queue_session_save_request, resolve_pane_create_source_id,
-        resolved_system_prefers_dark, sanitize_background_opacity,
+        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
+        next_active_workspace_index, pane_create_split_placement, queue_session_save_request,
+        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
         workspace_folder_path_from_input, workspace_notification_message, Direction,
-        EditableCaptureContext, NeighborScore, PaneBounds, PaneCreateDirection,
+        EditableCaptureContext, HostNotification, NeighborScore, PaneBounds, PaneCreateDirection,
         PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
@@ -10112,6 +10181,32 @@ mod tests {
             workspace_notification_message("  ", "  "),
             "Process needs attention"
         );
+    }
+
+    #[test]
+    fn host_notification_row_includes_surface_and_created_metadata() {
+        let notification = HostNotification {
+            id: 7,
+            workspace_id: "workspace-a".to_string(),
+            surface_id: Some("3:tab-a".to_string()),
+            pane_id: Some(3),
+            tab_title: Some("Build".to_string()),
+            created_at: "unix_ms:123".to_string(),
+            title: "Codex".to_string(),
+            subtitle: "Done".to_string(),
+            body: "Turn complete".to_string(),
+            message: "Codex: Turn complete".to_string(),
+            unread: true,
+        };
+
+        let row = host_notification_row(&notification);
+
+        assert_eq!(row["created_at"], "unix_ms:123");
+        assert_eq!(row["surface_id"], "3:tab-a");
+        assert_eq!(row["surface_ref"], "surface:3:tab-a");
+        assert_eq!(row["pane_id"], "3");
+        assert_eq!(row["pane_ref"], "pane:3");
+        assert_eq!(row["tab_title"], "Build");
     }
 
     #[test]

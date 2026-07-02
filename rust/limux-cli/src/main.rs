@@ -1776,7 +1776,11 @@ async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
         .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
     let surface = parse_opt(args, "--surface")
+        .or_else(|| parse_opt(args, "--surface-id"))
+        .or_else(|| parse_opt(args, "--tab"))
+        .or_else(|| parse_opt(args, "--tab-id"))
         .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+        .or_else(|| context_env_value("CMUX_SURFACE_ID"))
         .filter(|s| !s.is_empty());
 
     let text = trailing_title(args).ok_or_else(|| anyhow!("send requires text"))?;
@@ -1827,6 +1831,13 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .filter(|s| !s.is_empty());
+    let surface = parse_opt(args, "--surface")
+        .or_else(|| parse_opt(args, "--surface-id"))
+        .or_else(|| parse_opt(args, "--tab"))
+        .or_else(|| parse_opt(args, "--tab-id"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+        .or_else(|| context_env_value("CMUX_SURFACE_ID"))
+        .filter(|s| !s.is_empty());
 
     // Title can be provided either via --title or as the trailing positional
     // (matching `limux send`'s ergonomics).
@@ -1846,6 +1857,9 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     }
     if !body.is_empty() {
         params.insert("body".to_string(), Value::String(body));
+    }
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
     }
 
     call_in_workspace_scope(

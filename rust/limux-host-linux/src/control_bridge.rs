@@ -680,6 +680,7 @@ pub enum ControlCommand {
     /// the currently-active workspace is used.
     CreateNotification {
         target: WorkspaceTarget,
+        surface_hint: Option<String>,
         title: String,
         subtitle: String,
         body: String,
@@ -2927,6 +2928,7 @@ fn handle_method(
             };
             let subtitle = optional_string(params, &["subtitle"]).unwrap_or_default();
             let body = optional_string(params, &["body", "message"]).unwrap_or_default();
+            let surface_hint = optional_string(params, &["surface_id", "surface", "tab_id", "tab"]);
             // allow_name = true: lets agent hooks target a peer by name.
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -2936,6 +2938,7 @@ fn handle_method(
             (
                 ControlCommand::CreateNotification {
                     target,
+                    surface_hint,
                     title,
                     subtitle,
                     body,
@@ -5291,6 +5294,24 @@ mod tests {
 
     #[test]
     fn notification_list_and_clear_routes_validate_params() {
+        let created = dispatch_request(
+            r#"{"id":1,"method":"notification.create","params":{"title":"Done","surface_id":"2:tab-a"}}"#,
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    surface_hint,
+                    title,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint.as_deref(), Some("2:tab-a"));
+                    assert_eq!(title, "Done");
+                    let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(created.error, None);
+
         let listed = dispatch_request(
             r#"{"id":1,"method":"notification.list","params":{"unread_only":true}}"#,
             &|command| match command {

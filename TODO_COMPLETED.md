@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T01:35:42Z Implement and verify CMUX surface-targeted notification metadata parity for `created_at`, surface/pane refs, and `tab_title` rows/events. \
 [x] 2026-07-02T01:30:11Z Implement and verify CMUX durable bounded `~/.cmuxterm/events.jsonl` event logging with 16 MiB rotation and oversized event-frame truncation. \
 [x] 2026-07-02T01:27:16Z Implement and verify CMUX config `sidebar-font-size` and `surface-tab-bar-font-size` get/set parity while preserving unrelated Limux settings JSON. \
 [x] 2026-07-02T01:05:00Z Refresh the CMUX audit clone to current `manaflow-ai/cmux` main commit `871aa710b30d0775f5f18f0bf98f57cdb42047f4` and verify the Limux fork is ahead of `am-will/main` without pushing to `am-will`. \
