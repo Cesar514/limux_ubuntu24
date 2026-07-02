@@ -7616,7 +7616,7 @@ fn new_workspace_in_group(
     group_id: &str,
     placement: Option<&str>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let (group_id, name, cwd, anchor_workspace_id) = {
+    let (group_id, name, cwd, anchor_workspace_id, configured_placement) = {
         let s = state.borrow();
         let Some(group_index) = workspace_group_index(&s, group_id) else {
             return Err(BridgeError::not_found("workspace group not found"));
@@ -7628,15 +7628,21 @@ fn new_workspace_in_group(
                 .find(|workspace| workspace.id == anchor_id)
                 .and_then(|workspace| workspace.cwd.borrow().clone())
         });
+        let configured_placement = s
+            .config
+            .borrow()
+            .workspace_groups
+            .new_workspace_placement_for_cwd(cwd.as_deref());
         (
             group.id.clone(),
             group.name.clone(),
             cwd,
             group.anchor_workspace_id.clone(),
+            configured_placement,
         )
     };
     let workspace_id = add_group_anchor_workspace(state, &group_id, &name, cwd.as_deref(), true);
-    let placement = placement.unwrap_or("afterCurrent");
+    let placement = placement.unwrap_or_else(|| configured_placement.as_str());
     let reference = (placement == "afterCurrent")
         .then_some(anchor_workspace_id.as_deref())
         .flatten();

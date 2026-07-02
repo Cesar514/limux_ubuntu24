@@ -50,6 +50,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub notifications: NotificationConfig,
     #[serde(skip)]
+    pub workspace_groups: WorkspaceGroupsConfig,
+    #[serde(skip)]
     pub font_size: Option<f32>,
 }
 
@@ -63,6 +65,78 @@ pub struct AppearanceConfig {
 pub struct FocusConfig {
     #[serde(default)]
     pub hover_terminal_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceGroupNewPlacement {
+    #[default]
+    AfterCurrent,
+    Top,
+    End,
+}
+
+impl WorkspaceGroupNewPlacement {
+    // purpose: Serialize the placement enum using CMUX's config spelling.
+    // inputs: Placement value selected from parsed settings or live defaults.
+    // returns/effects: Returns a stable config/API string without allocation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AfterCurrent => "afterCurrent",
+            Self::Top => "top",
+            Self::End => "end",
+        }
+    }
+
+    // purpose: Parse CMUX workspace group placement strings.
+    // inputs: Raw string from settings or API parameters.
+    // returns/effects: Returns None for unsupported placement names.
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "afterCurrent" => Some(Self::AfterCurrent),
+            "top" => Some(Self::Top),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceGroupsConfig {
+    pub new_workspace_placement: WorkspaceGroupNewPlacement,
+    pub by_cwd: Vec<WorkspaceGroupCwdConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceGroupCwdConfig {
+    pub key: String,
+    pub normalized_key: String,
+    pub is_glob: bool,
+    pub new_workspace_placement: Option<WorkspaceGroupNewPlacement>,
+}
+
+impl WorkspaceGroupsConfig {
+    // purpose: Resolve the placement default for a workspace group child.
+    // inputs: Optional cwd for the source/reference workspace.
+    // returns/effects: Returns per-cwd placement when matched, otherwise the global default.
+    pub fn new_workspace_placement_for_cwd(&self, cwd: Option<&str>) -> WorkspaceGroupNewPlacement {
+        cwd.and_then(|cwd| self.matching_cwd_entry(cwd))
+            .and_then(|entry| entry.new_workspace_placement)
+            .unwrap_or(self.new_workspace_placement)
+    }
+
+    // purpose: Find the most specific byCwd entry for a normalized source cwd.
+    // inputs: Raw cwd from the anchor/reference workspace.
+    // returns/effects: Returns the longest matching prefix or glob entry.
+    fn matching_cwd_entry(&self, cwd: &str) -> Option<&WorkspaceGroupCwdConfig> {
+        if cwd.trim().is_empty() {
+            return None;
+        }
+        let normalized_cwd = normalize_absolute_path(cwd);
+        self.by_cwd
+            .iter()
+            .filter(|entry| cwd_entry_matches(entry, &normalized_cwd))
+            .max_by_key(|entry| entry.normalized_key.len())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -252,6 +326,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("hooks"))
         .map(parse_notification_hooks)
         .unwrap_or_default();
+    let workspace_groups = root
+        .get("workspaceGroups")
+        .map(parse_workspace_groups_config)
+        .unwrap_or_default();
 
     let font_size = root
         .get("font_size")
@@ -272,8 +350,82 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             sound: notification_sound,
             hooks: notification_hooks,
         },
+        workspace_groups,
         font_size,
     }
+}
+
+// purpose: Parse CMUX-compatible workspace group settings.
+// inputs: Value from workspaceGroups in Limux settings JSON.
+// returns/effects: Returns group placement config or panics on malformed placement.
+fn parse_workspace_groups_config(value: &Value) -> WorkspaceGroupsConfig {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("workspaceGroups must be an object"));
+    let new_workspace_placement = object
+        .get("newWorkspacePlacement")
+        .map(|value| {
+            parse_workspace_group_placement(value, "workspaceGroups.newWorkspacePlacement")
+        })
+        .unwrap_or_default();
+    let by_cwd = object
+        .get("byCwd")
+        .map(parse_workspace_group_cwd_configs)
+        .unwrap_or_default();
+    WorkspaceGroupsConfig {
+        new_workspace_placement,
+        by_cwd,
+    }
+}
+
+// purpose: Parse workspaceGroups.byCwd map entries.
+// inputs: Value from workspaceGroups.byCwd.
+// returns/effects: Returns normalized cwd config entries or panics on malformed shape.
+fn parse_workspace_group_cwd_configs(value: &Value) -> Vec<WorkspaceGroupCwdConfig> {
+    let entries = value
+        .as_object()
+        .unwrap_or_else(|| panic!("workspaceGroups.byCwd must be an object"));
+    entries
+        .iter()
+        .filter_map(|(key, entry)| {
+            let trimmed = key.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let object = entry
+                .as_object()
+                .unwrap_or_else(|| panic!("workspaceGroups.byCwd[{trimmed}] must be an object"));
+            let placement = object.get("newWorkspacePlacement").map(|value| {
+                parse_workspace_group_placement(
+                    value,
+                    &format!("workspaceGroups.byCwd[{trimmed}].newWorkspacePlacement"),
+                )
+            });
+            let is_glob = trimmed.contains('*') || trimmed.contains('?');
+            let normalized_key = if is_glob {
+                expand_tilde_preserving_glob(trimmed)
+            } else {
+                normalize_absolute_path(trimmed)
+            };
+            Some(WorkspaceGroupCwdConfig {
+                key: trimmed.to_string(),
+                normalized_key,
+                is_glob,
+                new_workspace_placement: placement,
+            })
+        })
+        .collect()
+}
+
+// purpose: Parse one workspace group placement setting.
+// inputs: JSON string value plus a diagnostic label.
+// returns/effects: Returns a valid placement or panics loudly.
+fn parse_workspace_group_placement(value: &Value, label: &str) -> WorkspaceGroupNewPlacement {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} must be a string"));
+    WorkspaceGroupNewPlacement::from_str(raw)
+        .unwrap_or_else(|| panic!("{label} must be afterCurrent, top, or end"))
 }
 
 // purpose: Parse CMUX-style notification hook definitions from settings JSON.
@@ -321,6 +473,124 @@ fn parse_notification_hooks(value: &Value) -> Vec<NotificationHookConfig> {
         .collect()
 }
 
+// purpose: Expand a leading tilde while preserving glob characters.
+// inputs: Raw cwd key from workspaceGroups.byCwd.
+// returns/effects: Returns a comparable path pattern without filesystem access.
+fn expand_tilde_preserving_glob(pattern: &str) -> String {
+    let trimmed = pattern.trim();
+    let Some(suffix) = trimmed.strip_prefix('~') else {
+        return trimmed.to_string();
+    };
+    let home = dirs::home_dir()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| panic!("home directory unavailable for workspaceGroups.byCwd tilde"));
+    if suffix.is_empty() {
+        home
+    } else {
+        format!("{home}{suffix}")
+    }
+}
+
+// purpose: Normalize a cwd/prefix setting for deterministic matching.
+// inputs: Raw cwd or non-glob byCwd key.
+// returns/effects: Expands tilde and removes simple lexical path noise.
+fn normalize_absolute_path(path: &str) -> String {
+    let expanded = expand_tilde_preserving_glob(path);
+    std::path::PathBuf::from(expanded)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .to_string()
+}
+
+// purpose: Match one workspaceGroups.byCwd entry against a normalized cwd.
+// inputs: Resolved config entry and normalized cwd.
+// returns/effects: Returns true for glob or prefix matches.
+fn cwd_entry_matches(entry: &WorkspaceGroupCwdConfig, cwd: &str) -> bool {
+    let key = entry.normalized_key.as_str();
+    if entry.is_glob {
+        return glob_match(key, cwd);
+    }
+    if cwd == key {
+        return true;
+    }
+    if key == "/" {
+        return cwd.starts_with('/');
+    }
+    cwd.strip_prefix(key)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+// purpose: Provide the minimal CMUX-style glob matching needed for byCwd keys.
+// inputs: Pattern with '*' and '?' plus candidate cwd.
+// returns/effects: Returns true when the pattern matches the whole candidate.
+fn glob_match(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let candidate = candidate.as_bytes();
+    let anchored_start = !pattern.starts_with(b"*");
+    let anchored_end = !pattern.ends_with(b"*");
+    let parts = pattern
+        .split(|byte| *byte == b'*')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return true;
+    }
+    let mut offset = 0;
+    for (index, part) in parts.iter().enumerate() {
+        let is_first = index == 0;
+        let is_last = index + 1 == parts.len();
+        let found = glob_part_position(
+            candidate,
+            part,
+            offset,
+            anchored_start && is_first,
+            anchored_end && is_last,
+        );
+        let Some(start) = found else {
+            return false;
+        };
+        offset = start + part.len();
+    }
+    true
+}
+
+// purpose: Find one non-star glob part inside a candidate path.
+// inputs: Candidate bytes, glob part bytes, current offset, and anchor requirements.
+// returns/effects: Returns the matched byte offset or None when the part cannot match.
+fn glob_part_position(
+    candidate: &[u8],
+    part: &[u8],
+    offset: usize,
+    anchored_start: bool,
+    anchored_end: bool,
+) -> Option<usize> {
+    if anchored_start {
+        return glob_part_matches_at(candidate, part, 0).filter(|_| offset == 0);
+    }
+    if anchored_end {
+        return candidate
+            .len()
+            .checked_sub(part.len())
+            .filter(|start| *start >= offset)
+            .filter(|start| glob_part_matches_at(candidate, part, *start).is_some());
+    }
+    let end = candidate.len().checked_sub(part.len())?;
+    (offset..=end).find(|start| glob_part_matches_at(candidate, part, *start).is_some())
+}
+
+// purpose: Match a non-star glob part at a fixed path offset.
+// inputs: Candidate bytes, part bytes where '?' matches one byte, and start offset.
+// returns/effects: Returns the start offset only when the whole part matches there.
+fn glob_part_matches_at(candidate: &[u8], part: &[u8], start: usize) -> Option<usize> {
+    let end = start.checked_add(part.len())?;
+    let window = candidate.get(start..end)?;
+    part.iter()
+        .zip(window)
+        .all(|(pattern, candidate)| *pattern == b'?' || pattern == candidate)
+        .then_some(start)
+}
+
 pub fn save(config: &AppConfig) -> Result<(), String> {
     let Some(path) = settings_path() else {
         return Err("config_dir unavailable; cannot save app settings".to_string());
@@ -357,6 +627,19 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             })).collect::<Vec<_>>(),
         }),
     );
+    let workspace_groups = root
+        .entry("workspaceGroups".to_string())
+        .or_insert_with(|| json!({}));
+    if !workspace_groups.is_object() {
+        *workspace_groups = json!({});
+    }
+    workspace_groups
+        .as_object_mut()
+        .expect("workspaceGroups object")
+        .insert(
+            "newWorkspacePlacement".to_string(),
+            json!(config.workspace_groups.new_workspace_placement.as_str()),
+        );
 
     if let Some(size) = config.font_size {
         root.insert("font_size".to_string(), json!(size));
@@ -645,6 +928,76 @@ mod tests {
     }
 
     #[test]
+    fn load_from_path_reads_workspace_group_placement_config() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "workspaceGroups": {
+    "newWorkspacePlacement": "end",
+    "byCwd": {
+      "/tmp/projects": {
+        "newWorkspacePlacement": "top"
+      },
+      "/tmp/projects/special": {
+        "newWorkspacePlacement": "afterCurrent"
+      },
+      "/tmp/worktrees/*": {
+        "newWorkspacePlacement": "top"
+      }
+    }
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+        let groups = &loaded.config.workspace_groups;
+
+        assert_eq!(
+            groups.new_workspace_placement,
+            WorkspaceGroupNewPlacement::End
+        );
+        let cases = [
+            ("/tmp/projects/app", WorkspaceGroupNewPlacement::Top),
+            (
+                "/tmp/projects/special/app",
+                WorkspaceGroupNewPlacement::AfterCurrent,
+            ),
+            ("/tmp/worktrees/demo", WorkspaceGroupNewPlacement::Top),
+            ("/tmp/elsewhere", WorkspaceGroupNewPlacement::End),
+        ];
+        for (cwd, expected) in cases {
+            assert_eq!(groups.new_workspace_placement_for_cwd(Some(cwd)), expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "workspaceGroups.newWorkspacePlacement must be afterCurrent, top, or end"
+    )]
+    fn load_from_path_rejects_invalid_workspace_group_placement() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "workspaceGroups": {
+    "newWorkspacePlacement": "middle"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
     #[should_panic(expected = "notifications.hooks[0].command is required")]
     fn load_from_path_rejects_malformed_notification_hooks() {
         let dir = TempDir::new().expect("temp dir");
@@ -763,6 +1116,47 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("alert".to_string())
+        );
+    }
+
+    #[test]
+    fn save_to_path_writes_workspace_group_default_and_preserves_by_cwd() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r##"{
+  "workspaceGroups": {
+    "byCwd": {
+      "/tmp/project": {
+        "color": "#3366ff",
+        "newWorkspacePlacement": "top"
+      }
+    }
+  }
+}
+"##,
+        )
+        .expect("write config");
+
+        let mut config = load_from_path(&path).config;
+        config.workspace_groups.new_workspace_placement = WorkspaceGroupNewPlacement::End;
+        save_to_path(&path, &config).expect("save workspace groups");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["workspaceGroups"]["newWorkspacePlacement"],
+            Value::String("end".to_string())
+        );
+        assert_eq!(
+            parsed["workspaceGroups"]["byCwd"]["/tmp/project"]["color"],
+            Value::String("#3366ff".to_string())
+        );
+        assert_eq!(
+            parsed["workspaceGroups"]["byCwd"]["/tmp/project"]["newWorkspacePlacement"],
+            Value::String("top".to_string())
         );
     }
 
