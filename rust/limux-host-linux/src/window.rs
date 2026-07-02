@@ -4394,10 +4394,9 @@ fn custom_sidebar_is_hex_color(color: &str) -> bool {
 fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
     match action.action_type.as_str() {
         "log" => action.message.clone().unwrap_or_else(|| "log".to_string()),
-        "openURL" | "open" => action
-            .message
-            .clone()
-            .unwrap_or_else(|| "open URL".to_string()),
+        "openURL" | "open" | "open.url" | "link.open" => {
+            custom_sidebar_action_url(action).unwrap_or_else(|_| "open URL".to_string())
+        }
         other => match custom_sidebar_dispatcher_action(action) {
             Ok(Some(_)) => format!("cmux dispatcher: {other}"),
             Ok(None) => format!("not_supported: custom sidebar action {other}"),
@@ -4415,7 +4414,9 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
             "limux custom sidebar: {}",
             action.message.as_deref().unwrap_or("")
         ),
-        "openURL" | "open" => open_custom_sidebar_url(button, action.message.as_deref()),
+        "openURL" | "open" | "open.url" | "link.open" => {
+            open_custom_sidebar_url(button, custom_sidebar_action_url(action).ok().as_deref())
+        }
         _ => run_custom_sidebar_dispatcher_action(button, action),
     }
 }
@@ -4522,6 +4523,21 @@ fn custom_sidebar_action_surface_id(action: &CustomSidebarNodeAction) -> Result<
 /// returns/effects: Returns the tab/surface id or a loud validation error.
 fn custom_sidebar_action_tab_id(action: &CustomSidebarNodeAction) -> Result<String, String> {
     custom_sidebar_action_param_string_any(action, &["tab_id", "surface_id", "param", "value"])
+}
+
+/// purpose: Read a URL from CMUX custom-sidebar URL action aliases.
+/// inputs: Parsed action metadata.
+/// returns/effects: Returns message/url/param/value URL text or a loud validation error.
+fn custom_sidebar_action_url(action: &CustomSidebarNodeAction) -> Result<String, String> {
+    if let Some(message) = action
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(message.to_string());
+    }
+    custom_sidebar_action_param_string_any(action, &["url", "param", "value"])
 }
 
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
@@ -5246,7 +5262,9 @@ impl CustomSidebarWorkspaceReorderResult {
 /// returns/effects: Launches the default URI handler or marks the button with a loud error.
 fn open_custom_sidebar_url(button: &gtk::Button, url: Option<&str>) {
     let Some(url) = url.filter(|value| !value.trim().is_empty()) else {
-        button.set_tooltip_text(Some("custom sidebar openURL action requires message URL"));
+        button.set_tooltip_text(Some(
+            "custom sidebar URL action requires message or url param",
+        ));
         return;
     };
     if let Err(error) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
@@ -18579,6 +18597,25 @@ mod tests {
             message: None,
             params: workspace_param_alias,
         };
+        let mut url_param = serde_json::Map::new();
+        url_param.insert("url".to_string(), json!("https://example.test/pr/1"));
+        let open_url_dot = CustomSidebarNodeAction {
+            action_type: "open.url".to_string(),
+            message: None,
+            params: url_param.clone(),
+        };
+        let link_open = CustomSidebarNodeAction {
+            action_type: "link.open".to_string(),
+            message: None,
+            params: url_param,
+        };
+        let mut open_url_param_alias = serde_json::Map::new();
+        open_url_param_alias.insert("param".to_string(), json!("https://example.test/pr/2"));
+        let open_url_camel_param = CustomSidebarNodeAction {
+            action_type: "openURL".to_string(),
+            message: None,
+            params: open_url_param_alias,
+        };
         let mut tab_param_alias = serde_json::Map::new();
         tab_param_alias.insert("param".to_string(), json!("tab-a"));
         let tab_toggle_pin = CustomSidebarNodeAction {
@@ -18745,6 +18782,22 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&no_param_action("workspace.markAllRead")),
             "cmux dispatcher: workspace.markAllRead"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&open_url_dot),
+            "https://example.test/pr/1"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&link_open),
+            "https://example.test/pr/1"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&open_url_camel_param),
+            "https://example.test/pr/2"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&no_param_action("open.url")),
+            "open URL"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&tab_toggle_pin),
