@@ -5,10 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1346,11 +1347,6 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     if let Some(text) = command_help_probe_text(command, args) {
         return Ok(Some(CommandOutput::Text(text.to_string())));
     }
-    if command == "codex-teams" {
-        bail!(
-            "not_supported: codex-teams requires CMUX Codex app-server orchestration, which Limux does not implement yet"
-        );
-    }
     if is_unsupported_remote_cli_command(command) {
         bail!(
             "not_supported: {command} requires CMUX remote daemon support, which Limux does not implement yet"
@@ -1544,8 +1540,7 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
          Launch Codex with cmux-managed subagent panes.\n\n\
          This CMUX command starts a private Codex app-server, launches the root Codex TUI against it, \
          watches live Codex thread-spawn subagents, opens subagents up to depth 2 as native splits, \
-         and forwards all remaining arguments to codex.\n\n\
-         Limux currently reports this command as not_supported until the Codex app-server watcher exists.",
+         bridges app-server approvals through Feed, and forwards all remaining arguments to codex.",
     ),
     ("themes", "Usage: limux themes"),
     ("omo", "Usage: limux omo [opencode-args...]"),
@@ -11116,6 +11111,300 @@ async fn handle_codex_teams_approval_request(
     Ok(true)
 }
 
+/// purpose: Run public CMUX-compatible `limux codex-teams`.
+/// inputs: Socket client, forwarded Codex args, and resolved socket password.
+/// returns/effects: Starts Codex app-server, root Codex TUI, hidden watcher, then exits with root status.
+async fn run_codex_teams(
+    client: &Client,
+    command_args: &[String],
+    socket_password: Option<String>,
+) -> Result<CommandOutput> {
+    let workspace_id = context_env_value("LIMUX_WORKSPACE_ID").ok_or_else(|| {
+        anyhow!("limux codex-teams must be started from a Limux terminal surface")
+    })?;
+    let surface_id = context_env_value("LIMUX_SURFACE_ID").ok_or_else(|| {
+        anyhow!("limux codex-teams must be started from a Limux terminal surface")
+    })?;
+    let cwd = env::current_dir().context("failed to resolve current directory")?;
+    codex_teams::validate_working_directory(command_args, &cwd)?;
+    let codex_path = resolve_executable_in_path("codex")
+        .ok_or_else(|| anyhow!("Codex executable `codex` was not found in PATH"))?;
+    let app_server_url = format!("ws://127.0.0.1:{}", bindable_loopback_port()?);
+    let app_server_log = codex_teams_log_path(&app_server_url, "app-server");
+    let watcher_log = codex_teams_log_path(&app_server_url, "watcher");
+    let mut environment = env::vars().collect::<BTreeMap<_, _>>();
+    environment.insert(
+        "CMUX_SOCKET_PATH".to_string(),
+        client.socket.display().to_string(),
+    );
+    environment.remove("CMUX_SOCKET");
+    if let Some(password) = socket_password.as_deref().filter(|value| !value.is_empty()) {
+        environment.insert("CMUX_SOCKET_PASSWORD".to_string(), password.to_string());
+    }
+
+    let mut app_server = spawn_logged_process(
+        &codex_path,
+        &[
+            "app-server".to_string(),
+            "--listen".to_string(),
+            app_server_url.clone(),
+        ],
+        &environment,
+        &app_server_log,
+    )?;
+    if let Err(error) = wait_for_codex_teams_app_server(&app_server_url)
+        .await
+        .with_context(|| {
+            format!(
+                "Codex app-server did not become ready; log: {}",
+                app_server_log.display()
+            )
+        })
+    {
+        terminate_child(&mut app_server)
+            .context("failed to stop Codex app-server after startup failure")?;
+        return Err(error);
+    }
+
+    let launch_exe = env::current_exe().context("failed to resolve current executable")?;
+    let launch_exe_text = launch_exe.display().to_string();
+    let launch_path = environment
+        .get("PATH")
+        .cloned()
+        .ok_or_else(|| anyhow!("PATH is required to launch Codex Teams helpers"))?;
+    let mut root_environment = environment.clone();
+    root_environment.insert(
+        "CMUX_CODEX_TEAMS_APP_SERVER_URL".to_string(),
+        app_server_url.clone(),
+    );
+    root_environment.insert(
+        "CMUX_CODEX_TEAMS_MAX_AUTO_DEPTH".to_string(),
+        codex_teams::MAX_AUTO_DEPTH.to_string(),
+    );
+    root_environment.insert(
+        "CMUX_AGENT_LAUNCH_KIND".to_string(),
+        "codexTeams".to_string(),
+    );
+    root_environment.insert(
+        "CMUX_AGENT_LAUNCH_EXECUTABLE".to_string(),
+        launch_exe_text.clone(),
+    );
+    root_environment.insert(
+        "CMUX_AGENT_LAUNCH_ARGV".to_string(),
+        format!("{} codex-teams {}", launch_exe_text, command_args.join(" ")),
+    );
+    root_environment.insert(
+        "CMUX_AGENT_LAUNCH_CWD".to_string(),
+        cwd.display().to_string(),
+    );
+
+    let root_args = codex_teams::root_codex_arguments(&app_server_url, command_args);
+    let mut root_codex = Command::new(&codex_path)
+        .args(root_args)
+        .envs(&root_environment)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start root Codex process")?;
+    let mut watcher_args = vec!["--socket".to_string(), client.socket.display().to_string()];
+    if let Some(password) = socket_password.as_deref().filter(|value| !value.is_empty()) {
+        watcher_args.extend(["--password".to_string(), password.to_string()]);
+    }
+    watcher_args.extend([
+        "__codex-teams-watch".to_string(),
+        "--workspace-id".to_string(),
+        workspace_id,
+        "--surface-id".to_string(),
+        surface_id,
+        "--app-server-url".to_string(),
+        app_server_url.clone(),
+        "--codex-path".to_string(),
+        codex_path.clone(),
+        "--launch-path".to_string(),
+        launch_path,
+        "--max-auto-depth".to_string(),
+        codex_teams::MAX_AUTO_DEPTH.to_string(),
+    ]);
+    let mut watcher =
+        spawn_logged_process(&launch_exe_text, &watcher_args, &environment, &watcher_log)?;
+    let status = root_codex
+        .wait()
+        .context("failed waiting for root Codex process")?;
+    terminate_child(&mut watcher).context("failed to stop Codex Teams watcher")?;
+    terminate_child(&mut app_server).context("failed to stop Codex app-server")?;
+    let code = status.code().unwrap_or(1);
+    Ok(CommandOutput::Exit {
+        stdout: String::new(),
+        stderr: String::new(),
+        status: code,
+    })
+}
+
+/// purpose: Probe the Codex app-server websocket until it accepts initialization.
+/// inputs: App-server websocket URL chosen by the public launcher.
+/// returns/effects: Returns success when initialized or the last readiness error after timeout.
+async fn wait_for_codex_teams_app_server(app_server_url: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last_error: Option<anyhow::Error> = None;
+    while Instant::now() < deadline {
+        match codex_teams::AppServerConnection::connect(app_server_url).await {
+            Ok(mut connection) => {
+                match connection
+                    .initialize(
+                        "limux-codex-teams-probe",
+                        env!("CARGO_PKG_VERSION"),
+                        &[],
+                        Duration::from_secs(1),
+                    )
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if let Some(error) = last_error {
+        Err(error)
+    } else {
+        bail!("Codex app-server did not become ready")
+    }
+}
+
+/// purpose: Spawn a background helper with private stdout/stderr logs.
+/// inputs: Executable path, argument vector, environment map, and target log path.
+/// returns/effects: Creates or truncates the log at 0600 and returns the child process handle.
+fn spawn_logged_process(
+    executable: &str,
+    args: &[String],
+    environment: &BTreeMap<String, String>,
+    log_path: &Path,
+) -> Result<std::process::Child> {
+    let log = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(log_path)
+        .with_context(|| format!("failed to open log {}", log_path.display()))?;
+    let stderr = log.try_clone().context("failed to clone process log")?;
+    Command::new(executable)
+        .args(args)
+        .envs(environment)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable))
+}
+
+/// purpose: Stop a background helper process after the root Codex process exits.
+/// inputs: Mutable child process handle.
+/// returns/effects: Kills and waits for the child when it is still running.
+fn terminate_child(child: &mut std::process::Child) -> Result<()> {
+    let pgid = child.id() as i32;
+    signal_process_group(pgid, libc::SIGTERM)
+        .context("failed to terminate helper process group")?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while process_group_exists(pgid)? && Instant::now() < deadline {
+        let _ = child
+            .try_wait()
+            .context("failed to inspect helper process")?;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if process_group_exists(pgid)? {
+        signal_process_group(pgid, libc::SIGKILL).context("failed to kill helper process group")?;
+        let kill_deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pgid)? && Instant::now() < kill_deadline {
+            let _ = child
+                .try_wait()
+                .context("failed to inspect helper process")?;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_group_exists(pgid)? {
+            bail!("helper process group {pgid} survived SIGKILL");
+        }
+    }
+    if child
+        .try_wait()
+        .context("failed to inspect helper process")?
+        .is_none()
+    {
+        child.wait().context("failed to wait for helper process")?;
+    }
+    Ok(())
+}
+
+/// purpose: Send a Unix signal to a helper process group.
+/// inputs: Positive process-group id and signal number.
+/// returns/effects: Signals the negative process-group id; missing groups are treated as stopped.
+fn signal_process_group(pgid: i32, signal: i32) -> Result<()> {
+    let result = unsafe { libc::kill(-pgid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("failed to send signal {signal} to process group {pgid}"))
+}
+
+/// purpose: Check whether a helper process group still has live members.
+/// inputs: Positive process-group id.
+/// returns/effects: Uses signal 0; returns false when the group no longer exists.
+fn process_group_exists(pgid: i32) -> Result<bool> {
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error).with_context(|| format!("failed to inspect process group {pgid}"))
+}
+
+/// purpose: Reserve a currently bindable loopback port for Codex app-server startup.
+/// inputs: None.
+/// returns/effects: Returns an available localhost TCP port number or fails loudly.
+fn bindable_loopback_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to allocate a localhost port for Codex app-server")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// purpose: Build a predictable private temp log path for Codex Teams helpers.
+/// inputs: App-server URL and helper log name.
+/// returns/effects: Returns a temp-file path; no filesystem writes are performed here.
+fn codex_teams_log_path(app_server_url: &str, name: &str) -> PathBuf {
+    let port = app_server_url
+        .rsplit(':')
+        .next()
+        .expect("rsplit always yields at least one segment")
+        .replace('/', "_");
+    env::temp_dir().join(format!("limux-codex-teams-{port}-{name}.log"))
+}
+
+/// purpose: Resolve an executable name against PATH without invoking a shell.
+/// inputs: Program name to search for.
+/// returns/effects: Returns the first matching executable-looking file path from PATH.
+fn resolve_executable_in_path(name: &str) -> Option<String> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            Some(candidate.display().to_string())
+        } else {
+            None
+        }
+    })
+}
+
 async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<CommandOutput> {
     if let Some(raw_request) = &opts.request {
         let request: V2Request =
@@ -11166,6 +11455,9 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "events" => return run_events(client, args).await,
+        "codex-teams" => {
+            return run_codex_teams(client, args, client.password.clone()).await;
+        }
         "__codex-teams-watch" => return run_codex_teams_watcher(client, args).await,
         "capabilities" | "current-workspace" | "select-workspace" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
@@ -12042,7 +12334,7 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn cmux_codex_teams_help_is_local_and_execution_fails_explicitly() {
+    fn cmux_codex_teams_help_is_local_and_execution_is_remote() {
         let help = run_local_command(&default_opts(args(&["codex-teams", "--help"])))
             .expect("help probe")
             .expect("help output");
@@ -12050,12 +12342,23 @@ mod cli_arg_tests {
             panic!("help should render text");
         };
         assert!(text.contains("Usage: limux codex-teams [codex-args...]"));
-        assert!(text.contains("Codex app-server watcher"));
+        assert!(text.contains("bridges app-server approvals through Feed"));
 
         let opts = default_opts(args(&["codex-teams", "--model", "gpt-5.4"]));
-        let error = run_local_command(&opts).expect_err("codex-teams should fail locally");
-        assert!(error.to_string().contains("not_supported"));
-        assert!(error.to_string().contains("Codex app-server orchestration"));
+        assert!(run_local_command(&opts)
+            .expect("codex-teams should route to socket-backed execution")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cmux_codex_teams_public_launcher_requires_limux_terminal_context() {
+        let client = Client::new(PathBuf::from("/tmp/limux-missing.sock"), None);
+        let error = run_codex_teams(&client, &args(&["--model", "gpt-5.4"]), None)
+            .await
+            .expect_err("missing Limux terminal env fails before process startup");
+        assert!(error
+            .to_string()
+            .contains("limux codex-teams must be started from a Limux terminal surface"));
     }
 
     #[tokio::test]
