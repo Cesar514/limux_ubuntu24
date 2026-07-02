@@ -222,7 +222,8 @@ fn parse_global_args_from(mut args: Vec<String>) -> Result<GlobalOptions> {
         }
     }
 
-    let command_args = args.split_off(command_start);
+    let mut command_args = args.split_off(command_start);
+    parse_command_presentation_flags(&mut command_args, &mut json_output, &mut id_format)?;
 
     Ok(GlobalOptions {
         socket,
@@ -235,6 +236,43 @@ fn parse_global_args_from(mut args: Vec<String>) -> Result<GlobalOptions> {
         pretty,
         command_args,
     })
+}
+
+/// purpose: Accept CMUX presentation flags before or after the command name.
+/// inputs: Mutable command args plus global output-format state.
+/// returns/effects: Removes consumed presentation flags or fails on malformed values.
+fn parse_command_presentation_flags(
+    command_args: &mut Vec<String>,
+    json_output: &mut bool,
+    id_format: &mut IdFormat,
+) -> Result<()> {
+    let mut normalized = Vec::with_capacity(command_args.len());
+    let mut idx = 0usize;
+    while idx < command_args.len() {
+        match command_args[idx].as_str() {
+            "--" => {
+                normalized.extend_from_slice(&command_args[idx..]);
+                break;
+            }
+            "--json" => {
+                *json_output = true;
+                idx += 1;
+            }
+            "--id-format" => {
+                let value = command_args
+                    .get(idx + 1)
+                    .ok_or_else(|| anyhow!("--id-format requires refs|both|uuids"))?;
+                *id_format = IdFormat::parse(value)?;
+                idx += 2;
+            }
+            _ => {
+                normalized.push(command_args[idx].clone());
+                idx += 1;
+            }
+        }
+    }
+    *command_args = normalized;
+    Ok(())
 }
 
 fn print_help() {
@@ -7279,6 +7317,45 @@ mod cli_arg_tests {
         assert_eq!(opts.window.as_deref(), Some("window:3"));
         assert_eq!(opts.password.as_deref(), Some("secret"));
         assert_eq!(opts.command_args, args(&["focus-window"]));
+    }
+
+    #[test]
+    fn cmux_command_position_presentation_flags_parse_before_socket() {
+        let opts =
+            parse_global_args_from(args(&["list-workspaces", "--json", "--id-format", "both"]))
+                .expect("command-position presentation args parse");
+
+        assert!(opts.json_output);
+        assert_eq!(opts.id_format, IdFormat::Both);
+        assert_eq!(opts.command_args, args(&["list-workspaces"]));
+    }
+
+    #[test]
+    fn cmux_command_position_presentation_flags_preserve_command_options() {
+        let opts = parse_global_args_from(args(&[
+            "list-panes",
+            "--workspace",
+            "workspace-a",
+            "--id-format",
+            "uuids",
+            "--json",
+        ]))
+        .expect("mixed command options parse");
+
+        assert!(opts.json_output);
+        assert_eq!(opts.id_format, IdFormat::Uuids);
+        assert_eq!(
+            opts.command_args,
+            args(&["list-panes", "--workspace", "workspace-a"])
+        );
+    }
+
+    #[test]
+    fn cmux_command_position_id_format_errors_loudly() {
+        let err = parse_global_args_from(args(&["list-workspaces", "--id-format"]))
+            .expect_err("missing id-format value should fail");
+
+        assert!(err.to_string().contains("--id-format requires"));
     }
 
     #[test]

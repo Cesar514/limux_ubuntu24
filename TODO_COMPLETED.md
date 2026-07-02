@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T04:14:32Z Implement and verify CMUX command-position `--json` and `--id-format` presentation flag parity outside browser commands. \
 [x] 2026-07-02T04:10:06Z Implement and verify no-socket CMUX command help probes for socket-backed commands and legacy aliases. \
 [x] 2026-07-02T04:05:28Z Implement and verify CMUX `sessions list/debug` and `session-debug` no-socket session diagnostics with stale saved-PID reporting. \
 [x] 2026-07-02T03:50:01Z Implement and verify CMUX tmux `list-windows`/`list-panes` format output parity plus `lsw`/`lsp` aliases. \
