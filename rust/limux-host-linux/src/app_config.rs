@@ -52,6 +52,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub terminal: TerminalBehaviorConfig,
     #[serde(skip)]
+    pub sidebar: SidebarConfig,
+    #[serde(skip)]
     pub notifications: NotificationConfig,
     #[serde(skip)]
     pub workspace_groups: WorkspaceGroupsConfig,
@@ -117,6 +119,21 @@ impl TerminalBehaviorConfig {
     fn cmux_default() -> Self {
         Self {
             auto_resume_agent_sessions: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarConfig {
+    pub show_notification_message: bool,
+    pub show_branch_directory: bool,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            show_notification_message: true,
+            show_branch_directory: true,
         }
     }
 }
@@ -603,6 +620,20 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|terminal| terminal.get("autoResumeAgentSessions"))
         .map(|value| parse_bool_setting(value, "terminal.autoResumeAgentSessions"))
         .unwrap_or(terminal_defaults.auto_resume_agent_sessions);
+    let sidebar = root.get("sidebar").map(|value| {
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("sidebar must be an object"))
+    });
+    let sidebar_defaults = SidebarConfig::default();
+    let show_notification_message = sidebar
+        .and_then(|sidebar| sidebar.get("showNotificationMessage"))
+        .map(|value| parse_bool_setting(value, "sidebar.showNotificationMessage"))
+        .unwrap_or(sidebar_defaults.show_notification_message);
+    let show_branch_directory = sidebar
+        .and_then(|sidebar| sidebar.get("showBranchDirectory"))
+        .map(|value| parse_bool_setting(value, "sidebar.showBranchDirectory"))
+        .unwrap_or(sidebar_defaults.show_branch_directory);
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -688,6 +719,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         terminal: TerminalBehaviorConfig {
             auto_resume_agent_sessions,
+        },
+        sidebar: SidebarConfig {
+            show_notification_message,
+            show_branch_directory,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -1089,6 +1124,13 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!(config.terminal.auto_resume_agent_sessions),
     );
     root.insert(
+        "sidebar".to_string(),
+        json!({
+            "showNotificationMessage": config.sidebar.show_notification_message,
+            "showBranchDirectory": config.sidebar.show_branch_directory,
+        }),
+    );
+    root.insert(
         "notifications".to_string(),
         json!({
             "enabled": config.notifications.enabled,
@@ -1214,6 +1256,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "command": "",
             "hooksMode": "append",
             "suppressOnlyFocusedSurface": false
+        },
+        "sidebar": {
+            "showNotificationMessage": true,
+            "showBranchDirectory": true
         }
     });
     let serialized = serde_json::to_string_pretty(&default_root)
@@ -1308,6 +1354,11 @@ mod tests {
             parsed["notifications"]["suppressOnlyFocusedSurface"],
             Value::Bool(false)
         );
+        assert_eq!(
+            parsed["sidebar"]["showNotificationMessage"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(true));
     }
 
     #[test]
@@ -1709,6 +1760,42 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"notifications":{"hooksMode":"merge"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
+    fn load_from_path_reads_sidebar_preferences() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "sidebar": {
+    "showNotificationMessage": false,
+    "showBranchDirectory": false
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(loaded.warnings.is_empty());
+        assert!(!loaded.config.sidebar.show_notification_message);
+        assert!(!loaded.config.sidebar.show_branch_directory);
+    }
+
+    #[test]
+    #[should_panic(expected = "sidebar.showNotificationMessage must be a boolean")]
+    fn load_from_path_rejects_invalid_sidebar_notification_message() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"showNotificationMessage":"false"}}"#)
+            .expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2134,6 +2221,31 @@ mod tests {
             parsed["notifications"]["suppressOnlyFocusedSurface"],
             Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn save_to_path_writes_sidebar_preferences() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, br#"{"app":{"appearance":"dark"}}"#).expect("write config");
+
+        let mut config = AppConfig::default();
+        config.sidebar.show_notification_message = false;
+        config.sidebar.show_branch_directory = false;
+        save_to_path(&path, &config).expect("save sidebar");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["app"]["appearance"],
+            Value::String("system".to_string())
+        );
+        assert_eq!(
+            parsed["sidebar"]["showNotificationMessage"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
     }
 
     // purpose: Verify saving writes the CMUX terminal auto-resume setting without dropping siblings.

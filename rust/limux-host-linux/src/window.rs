@@ -6186,6 +6186,7 @@ fn activate_last_workspace_shortcut(state: &State) {
 fn build_sidebar_row(
     name: &str,
     folder_path: Option<&str>,
+    show_branch_directory: bool,
 ) -> (
     gtk::ListBoxRow,
     gtk::Label,
@@ -6224,7 +6225,7 @@ fn build_sidebar_row(
         .margin_start(8)
         .build();
     path_label.add_css_class("limux-ws-path");
-    if let Some(p) = folder_path {
+    if let Some(p) = folder_path.filter(|_| show_branch_directory) {
         path_label.set_label(&abbreviate_path(p));
         path_label.set_tooltip_text(Some(p));
         path_label.set_visible(true);
@@ -6924,8 +6925,17 @@ fn create_workspace_for_tab_payload(
     let split_container = SplitTreeContainer::new(state, pane.clone().upcast());
     let root = split_container.widget().clone();
 
+    let show_branch_directory = {
+        let app_state = state.borrow();
+        let show_branch_directory = app_state.config.borrow().sidebar.show_branch_directory;
+        show_branch_directory
+    };
     let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&seed.name, seed.folder_path.as_deref());
+        build_sidebar_row(
+            &seed.name,
+            seed.folder_path.as_deref(),
+            show_branch_directory,
+        );
     let row_clone = row.clone();
     {
         let mut app_state = state.borrow_mut();
@@ -11405,8 +11415,17 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         build_workspace_root(state, &shortcuts, &id, working_dir, &workspace.layout);
     stack.add_named(&root, Some(&stack_name));
 
+    let show_branch_directory = {
+        let app_state = state.borrow();
+        let show_branch_directory = app_state.config.borrow().sidebar.show_branch_directory;
+        show_branch_directory
+    };
     let (row, name_label, favorite_button, notify_dot, notify_label, path_label) =
-        build_sidebar_row(&workspace.name, workspace.folder_path.as_deref());
+        build_sidebar_row(
+            &workspace.name,
+            workspace.folder_path.as_deref(),
+            show_branch_directory,
+        );
     sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
@@ -13534,6 +13553,16 @@ fn should_show_unread_visual(workspace_is_active: bool, unread_pane_ring: bool) 
     !workspace_is_active && unread_pane_ring
 }
 
+// purpose: Decide whether CMUX sidebar notification text should accompany unread visuals.
+// inputs: Current unread visual decision and sidebar message preference.
+// returns/effects: Returns true only when both the visual and text setting are enabled.
+fn should_show_sidebar_notification_message(
+    unread_visual: bool,
+    show_notification_message: bool,
+) -> bool {
+    unread_visual && show_notification_message
+}
+
 fn mark_workspace_unread_with_message(
     state: &State,
     ws_id: &str,
@@ -13545,7 +13574,9 @@ fn mark_workspace_unread_with_message(
     let mut s = state.borrow_mut();
     let active_idx = s.active_idx;
     let window_active = s.window.is_active();
-    let notifications = s.config.borrow().notifications.clone();
+    let config = s.config.borrow().clone();
+    let notifications = config.notifications;
+    let sidebar = config.sidebar;
     if let Some((idx, ws)) = s
         .workspaces
         .iter_mut()
@@ -13569,14 +13600,22 @@ fn mark_workspace_unread_with_message(
             feed_actions,
         });
 
-        if should_show_unread_visual(workspace_is_active, notifications.unread_pane_ring) {
+        let show_unread_visual =
+            should_show_unread_visual(workspace_is_active, notifications.unread_pane_ring);
+        if show_unread_visual {
             ws.unread = true;
             ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
             ws.notify_dot.add_css_class("limux-notify-dot");
-            ws.notify_label.set_label(message);
-            ws.notify_label.remove_css_class("limux-notify-msg");
-            ws.notify_label.add_css_class("limux-notify-msg-unread");
-            ws.notify_label.set_visible(true);
+            let show_message = should_show_sidebar_notification_message(
+                show_unread_visual,
+                sidebar.show_notification_message,
+            );
+            ws.notify_label.set_visible(show_message);
+            if show_message {
+                ws.notify_label.set_label(message);
+                ws.notify_label.remove_css_class("limux-notify-msg");
+                ws.notify_label.add_css_class("limux-notify-msg-unread");
+            }
             // Add glow pulse to the sidebar row box
             if let Some(row_box) = ws.sidebar_row.child() {
                 row_box.add_css_class("limux-sidebar-row-unread");
@@ -13737,13 +13776,14 @@ mod tests {
         shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
         shortcut_command_from_key_event, shortcut_dispatch_propagation,
         should_emit_desktop_notification, should_keep_workspace_open_after_empty_pane,
-        should_show_unread_visual, sidebar_feed_preview_lines_from_value,
-        sidebar_feed_visible_items, sidebar_file_preview_lines,
-        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
-        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
-        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
-        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
+        should_show_sidebar_notification_message, should_show_unread_visual,
+        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
+        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
+        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
+        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
+        tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
@@ -15235,6 +15275,9 @@ mod tests {
         assert!(should_show_unread_visual(false, true));
         assert!(!should_show_unread_visual(true, true));
         assert!(!should_show_unread_visual(false, false));
+        assert!(should_show_sidebar_notification_message(true, true));
+        assert!(!should_show_sidebar_notification_message(true, false));
+        assert!(!should_show_sidebar_notification_message(false, true));
     }
 
     #[test]

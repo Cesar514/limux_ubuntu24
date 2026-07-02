@@ -1605,6 +1605,20 @@ const TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING: BooleanSetting = BooleanSetti
     default: true,
 };
 
+const SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showNotificationMessage",
+    section: "sidebar",
+    json_key: "showNotificationMessage",
+    default: true,
+};
+
+const SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showBranchDirectory",
+    section: "sidebar",
+    json_key: "showBranchDirectory",
+    default: true,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1622,7 +1636,8 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|workspaceGroups.newWorkspacePlacement>"
+    "terminal.autoResumeAgentSessions|sidebar.showNotificationMessage|",
+    "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
@@ -1635,7 +1650,8 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "terminal.autoResumeAgentSessions|workspaceGroups.newWorkspacePlacement> <value>"
+    "terminal.autoResumeAgentSessions|sidebar.showNotificationMessage|",
+    "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement> <value>"
 );
 
 // purpose: Map CMUX config font-size keys to their supported ranges.
@@ -1704,6 +1720,8 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         }
         "app.focusPaneOnFirstClick" => Some(APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING),
         "terminal.autoResumeAgentSessions" => Some(TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING),
+        "sidebar.showNotificationMessage" => Some(SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING),
+        "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
         _ => None,
     }
 }
@@ -16059,6 +16077,61 @@ mod cli_arg_tests {
         )
         .expect("write malformed bool");
         let err = render_config_boolean_get(&path, TERMINAL_AUTO_RESUME_AGENT_SESSIONS_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify CMUX sidebar config booleans default true and preserve sibling keys.
+    // inputs: Temporary settings file and the local config renderer helpers.
+    // returns/effects: Writes test settings JSON and asserts nested sidebar updates.
+    #[test]
+    fn config_sidebar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING)
+            .expect("get default sidebar notification message");
+        assert!(text.contains("sidebar.showNotificationMessage = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING)
+            .expect("get default sidebar branch directory");
+        assert!(text.contains("sidebar.showBranchDirectory = true"));
+
+        fs::write(
+            &path,
+            br#"{"sidebar":{"custom":true},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text =
+            render_config_boolean_set(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING, "false")
+                .expect("set sidebar notification message");
+        assert!(text.contains("sidebar.showNotificationMessage = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING, "false")
+            .expect("set sidebar branch directory");
+        assert!(text.contains("sidebar.showBranchDirectory = false"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["sidebar"]["custom"], true);
+        assert_eq!(parsed["sidebar"]["showNotificationMessage"], false);
+        assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed CMUX sidebar config booleans fail loudly.
+    // inputs: Invalid CLI value and malformed persisted settings JSON.
+    // returns/effects: Asserts errors instead of accepting silent defaults.
+    #[test]
+    fn config_sidebar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_boolean_set(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(&path, br#"{"sidebar":{"showNotificationMessage":"false"}}"#)
+            .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
     }
