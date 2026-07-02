@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T04:43:27Z Implement and verify explicit CMUX Remote/SSH CLI `not_supported` surfacing while preserving no-socket help probes. \
 [x] 2026-07-02T04:40:48Z Implement and verify CMUX sidebar metadata command help and non-JSON `sidebar-state` output parity. \
 [x] 2026-07-02T04:37:18Z Implement and verify CMUX sidebar status/progress/log command state parity in CLI, live bridge, host state, and retained events. \
 [x] 2026-07-02T04:25:15Z Implement and verify CMUX `right-sidebar` visibility, mode, focus, and state command parity in CLI and live bridge paths. \

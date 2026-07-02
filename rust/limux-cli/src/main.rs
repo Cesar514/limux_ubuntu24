@@ -683,6 +683,11 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     if let Some(text) = command_help_probe_text(command, args) {
         return Ok(Some(CommandOutput::Text(text.to_string())));
     }
+    if is_unsupported_remote_cli_command(command) {
+        bail!(
+            "not_supported: {command} requires CMUX remote daemon support, which Limux does not implement yet"
+        );
+    }
     let out = match command {
         "docs" => Some(CommandOutput::Text(docs_text(
             args.first().map(String::as_str),
@@ -723,6 +728,24 @@ fn cmux_command_usage(command: &str) -> Option<&'static str> {
     CMUX_HELP_USAGES
         .iter()
         .find_map(|(name, usage)| (*name == command).then_some(*usage))
+}
+
+// purpose: Identify CMUX remote/SSH commands that need the unavailable remote daemon.
+// inputs: Top-level CLI command name.
+// returns/effects: Returns true for commands that should fail locally with not_supported.
+fn is_unsupported_remote_cli_command(command: &str) -> bool {
+    matches!(
+        command,
+        "ssh"
+            | "ssh-tmux"
+            | "ssh-pty-attach"
+            | "ssh-session-list"
+            | "ssh-session-attach"
+            | "ssh-session-cleanup"
+            | "ssh-session-end"
+            | "remote-daemon-status"
+            | "vm-ssh-attach"
+    )
 }
 
 const CMUX_HELP_USAGES: &[(&str, &str)] = &[
@@ -776,12 +799,23 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("new-workspace", "Usage: limux new-workspace"),
     ("list-workspaces", "Usage: limux list-workspaces"),
     ("ssh", "Usage: limux ssh <destination>\n--forward-agent"),
+    ("ssh-tmux", "Usage: limux ssh-tmux <destination>"),
+    (
+        "ssh-pty-attach",
+        "Usage: limux ssh-pty-attach --workspace <workspace> --session-id <id>",
+    ),
     ("ssh-session-list", "Usage: limux ssh-session-list"),
     (
         "ssh-session-attach",
         "Usage: limux ssh-session-attach --session-id <id>",
     ),
     ("ssh-session-cleanup", "Usage: limux ssh-session-cleanup"),
+    (
+        "ssh-session-end",
+        "Usage: limux ssh-session-end --relay-port <port> --workspace <id>",
+    ),
+    ("remote-daemon-status", "Usage: limux remote-daemon-status"),
+    ("vm-ssh-attach", "Usage: limux vm-ssh-attach --id <vm-id>"),
     ("new-split", "Usage: limux new-split"),
     ("list-panes", "Usage: limux list-panes"),
     ("list-pane-surfaces", "Usage: limux list-pane-surfaces"),
@@ -8125,6 +8159,31 @@ mod cli_arg_tests {
             };
             assert!(text.contains(expected), "{command} output: {text}");
         }
+    }
+
+    #[test]
+    fn cmux_remote_ssh_commands_fail_locally_with_not_supported() {
+        for command in [
+            "ssh",
+            "ssh-tmux",
+            "ssh-session-list",
+            "ssh-session-attach",
+            "ssh-session-cleanup",
+            "remote-daemon-status",
+        ] {
+            assert!(is_unsupported_remote_cli_command(command));
+            let opts = default_opts(args(&[command]));
+            let error = run_local_command(&opts).expect_err("remote command should fail locally");
+            assert!(error.to_string().contains("not_supported"), "{command}");
+        }
+
+        let help = run_local_command(&default_opts(args(&["ssh-session-list", "--help"])))
+            .expect("help probe")
+            .expect("help output");
+        let CommandOutput::Text(text) = help else {
+            panic!("help should render text");
+        };
+        assert!(text.contains("Usage: limux ssh-session-list"));
     }
 
     // purpose: Verify normal command arguments still use the socket-backed path.
