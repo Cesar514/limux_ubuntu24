@@ -345,6 +345,7 @@ type PaneShortcutCaptureCallback =
 type PaneSplitWithTabCallback = dyn Fn(&gtk::Widget, &gtk::Widget, gtk::Orientation, String, bool);
 type PaneConfigCallback = dyn Fn() -> Rc<RefCell<AppConfig>>;
 type PaneConfigChangedCallback = dyn Fn(&AppConfig, &AppConfig);
+type PaneCustomSidebarBuilderCallback = dyn Fn(&str) -> gtk::Widget;
 /// Returns the workspace id that owns a given pane widget, or `None` if the
 /// pane is not yet attached to a workspace. Used to stamp `LIMUX_WORKSPACE_ID`
 /// onto every terminal spawned inside the pane.
@@ -366,6 +367,7 @@ pub struct PaneCallbacks {
     pub on_split_with_tab: Box<PaneSplitWithTabCallback>,
     pub current_config: Box<PaneConfigCallback>,
     pub on_config_changed: Rc<PaneConfigChangedCallback>,
+    pub build_custom_sidebar: Box<PaneCustomSidebarBuilderCallback>,
     /// Resolve the workspace id for a given pane widget. May be `None` while
     /// the pane is still being constructed; callers treat that as "unknown".
     pub workspace_for_pane: Box<PaneWorkspaceLookupCallback>,
@@ -1131,6 +1133,7 @@ pub fn exact_terminal_handle_for_surface(
 enum TabKind {
     Terminal { state: TerminalTabState },
     Browser { state: BrowserTabState },
+    CustomSidebar { name: String },
     Keybinds,
 }
 
@@ -1145,6 +1148,7 @@ impl TabFocusTarget {
         match &entry.kind {
             TabKind::Terminal { state } => Self::Terminal(state.handle.clone()),
             TabKind::Browser { state } => Self::Browser(state.handles.clone()),
+            TabKind::CustomSidebar { .. } => Self::Widget(entry.content.clone()),
             TabKind::Keybinds => Self::Widget(entry.content.clone()),
         }
     }
@@ -1297,6 +1301,13 @@ struct KeybindsTabOptions<'a> {
     pinned: bool,
 }
 
+struct CustomSidebarTabOptions<'a> {
+    id: Option<&'a str>,
+    custom_name: Option<&'a str>,
+    pinned: bool,
+    activate: bool,
+}
+
 struct KeybindsTabInput<'a> {
     shortcuts: Rc<ResolvedShortcutConfig>,
     on_capture: Rc<PaneShortcutCaptureCallback>,
@@ -1353,6 +1364,20 @@ fn restore_tabs_from_state(
                         custom_name: saved_tab.custom_name.as_deref(),
                         pinned: saved_tab.pinned,
                         uri: uri.as_deref(),
+                    }),
+                );
+            }
+            TabContentState::CustomSidebar { name } => {
+                let widget = (internals.callbacks.build_custom_sidebar)(name);
+                add_custom_sidebar_tab_inner(
+                    internals,
+                    name,
+                    widget,
+                    Some(CustomSidebarTabOptions {
+                        id: Some(saved_tab.id.as_str()),
+                        custom_name: saved_tab.custom_name.as_deref(),
+                        pinned: saved_tab.pinned,
+                        activate: restore_active,
                     }),
                 );
             }
@@ -1872,6 +1897,128 @@ fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTa
     }
 }
 
+// purpose: Add a custom-sidebar widget tab to a pane.
+// inputs: Pane internals, sidebar name, rendered widget, and optional restored tab metadata.
+// returns/effects: Inserts/focuses a customSidebar surface and returns the tab id.
+fn add_custom_sidebar_tab_inner(
+    internals: &Rc<PaneInternals>,
+    name: &str,
+    widget: gtk::Widget,
+    options: Option<CustomSidebarTabOptions<'_>>,
+) -> String {
+    let metadata = custom_sidebar_tab_metadata(name, options.as_ref());
+    let (tab_btn, title_label) = build_tab_button(&metadata.title, &metadata.tab_id, internals);
+    internals
+        .content_stack
+        .add_named(&widget, Some(&metadata.tab_id));
+    push_custom_sidebar_tab_entry(
+        internals,
+        CustomSidebarTabEntryInput {
+            tab_id: metadata.tab_id.clone(),
+            tab_btn,
+            title_label,
+            widget,
+            name: name.to_string(),
+            custom_name: metadata.custom_name,
+            pinned: metadata.pinned,
+        },
+    );
+    append_custom_sidebar_tab_button(internals, &metadata.tab_id, metadata.pinned);
+    activate_custom_sidebar_tab_if_requested(internals, &metadata.tab_id, metadata.activate);
+    if options.is_none() {
+        (internals.callbacks.on_state_changed)();
+    }
+    metadata.tab_id
+}
+
+struct CustomSidebarTabMetadata {
+    tab_id: String,
+    title: String,
+    custom_name: Option<String>,
+    pinned: bool,
+    activate: bool,
+}
+
+// purpose: Normalize optional custom-sidebar tab insertion metadata.
+// inputs: Sidebar name and optional restored tab options.
+// returns/effects: Returns owned metadata without mutating GTK state.
+fn custom_sidebar_tab_metadata(
+    name: &str,
+    options: Option<&CustomSidebarTabOptions<'_>>,
+) -> CustomSidebarTabMetadata {
+    CustomSidebarTabMetadata {
+        tab_id: options
+            .and_then(|value| value.id.map(|id| id.to_string()))
+            .unwrap_or_else(next_tab_id),
+        title: options
+            .and_then(|value| value.custom_name)
+            .unwrap_or(name)
+            .to_string(),
+        custom_name: options.and_then(|value| value.custom_name.map(|name| name.to_string())),
+        pinned: options.map(|value| value.pinned).unwrap_or(false),
+        activate: options.map(|value| value.activate).unwrap_or(true),
+    }
+}
+
+struct CustomSidebarTabEntryInput {
+    tab_id: String,
+    tab_btn: gtk::Box,
+    title_label: gtk::Label,
+    widget: gtk::Widget,
+    name: String,
+    custom_name: Option<String>,
+    pinned: bool,
+}
+
+// purpose: Store one custom-sidebar tab entry in pane state.
+// inputs: Pane internals and prebuilt GTK tab/content widgets.
+// returns/effects: Mutates tab state without changing active selection.
+fn push_custom_sidebar_tab_entry(internals: &Rc<PaneInternals>, input: CustomSidebarTabEntryInput) {
+    internals.tab_state.borrow_mut().tabs.push(TabEntry {
+        id: input.tab_id,
+        tab_button: input.tab_btn,
+        title_label: input.title_label,
+        content: input.widget,
+        custom_name: input.custom_name,
+        pinned: input.pinned,
+        kind: TabKind::CustomSidebar { name: input.name },
+    });
+}
+
+// purpose: Append a custom-sidebar tab button and apply pinned visuals.
+// inputs: Pane internals, inserted tab id, and pin flag.
+// returns/effects: Mutates the GTK tab strip for the inserted tab.
+fn append_custom_sidebar_tab_button(internals: &Rc<PaneInternals>, tab_id: &str, pinned: bool) {
+    let tab_state = internals.tab_state.borrow();
+    let entry = tab_state
+        .tabs
+        .iter()
+        .find(|entry| entry.id == tab_id)
+        .expect("custom sidebar tab inserted");
+    internals.tab_strip.append(&entry.tab_button);
+    if pinned {
+        apply_pin_visuals(&entry.tab_button, true);
+    }
+}
+
+// purpose: Activate a custom-sidebar tab when the caller requested focus.
+// inputs: Pane internals, tab id, and activation flag.
+// returns/effects: Changes active tab only when activation is requested.
+fn activate_custom_sidebar_tab_if_requested(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    activate: bool,
+) {
+    if activate {
+        activate_tab(
+            &internals.tab_strip,
+            &internals.content_stack,
+            &internals.tab_state,
+            tab_id,
+        );
+    }
+}
+
 // Public wrappers for keyboard shortcut use
 #[allow(dead_code)]
 pub fn add_terminal_tab_to_pane(pane_widget: &gtk::Widget) {
@@ -1910,6 +2057,7 @@ pub fn add_terminal_tab_to_pane_with_command(
     let (kind, cwd, uri) = match &entry.kind {
         TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
         TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::CustomSidebar { .. } => ("customSidebar".to_string(), None, None),
         TabKind::Keybinds => ("keybinds".to_string(), None, None),
     };
     Some(SurfaceSummary {
@@ -1977,7 +2125,7 @@ pub fn respawn_terminal_surface(
         })?;
         let cwd = match &entry.kind {
             TabKind::Terminal { state } => state.cwd.borrow().clone(),
-            TabKind::Browser { .. } | TabKind::Keybinds => None,
+            TabKind::Browser { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => None,
         };
         (
             entry.id.clone(),
@@ -2053,6 +2201,49 @@ pub fn add_browser_tab_to_pane_with_uri(
     if notify_after_insert {
         (internals.callbacks.on_state_changed)();
     }
+    surface_summary_for_tab(&internals, &tab_id)
+}
+
+// purpose: Add or focus a named custom sidebar tab in one pane.
+// inputs: Pane widget, sidebar name, rendered widget, and focus policy.
+// returns/effects: Reuses an existing matching customSidebar tab or creates one.
+pub fn add_custom_sidebar_tab_to_pane(
+    pane_widget: &gtk::Widget,
+    name: &str,
+    widget: gtk::Widget,
+    activate: bool,
+) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    if let Some(existing_id) = internals
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .find(|entry| matches!(&entry.kind, TabKind::CustomSidebar { name: current } if current == name))
+        .map(|entry| entry.id.clone())
+    {
+        if activate {
+            activate_tab(
+                &internals.tab_strip,
+                &internals.content_stack,
+                &internals.tab_state,
+                &existing_id,
+            );
+        }
+        return surface_summary_for_tab(&internals, &existing_id);
+    }
+    let tab_id = add_custom_sidebar_tab_inner(
+        &internals,
+        name,
+        widget,
+        Some(CustomSidebarTabOptions {
+            id: None,
+            custom_name: None,
+            pinned: false,
+            activate,
+        }),
+    );
+    (internals.callbacks.on_state_changed)();
     surface_summary_for_tab(&internals, &tab_id)
 }
 
@@ -2142,6 +2333,9 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
                 },
+                TabKind::CustomSidebar { name } => {
+                    TabContentState::CustomSidebar { name: name.clone() }
+                }
                 TabKind::Keybinds => TabContentState::Keybinds {},
             };
             SavedTabState {
@@ -2197,7 +2391,7 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
     let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
     match &entry.kind {
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
-        TabKind::Browser { .. } | TabKind::Keybinds => None,
+        TabKind::Browser { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => None,
     }
 }
 
@@ -2292,6 +2486,7 @@ fn surface_summary_for_tab(internals: &Rc<PaneInternals>, tab_id: &str) -> Optio
     let (kind, cwd, uri) = match &entry.kind {
         TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
         TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::CustomSidebar { .. } => ("customSidebar".to_string(), None, None),
         TabKind::Keybinds => ("keybinds".to_string(), None, None),
     };
     Some(SurfaceSummary {
@@ -2340,7 +2535,9 @@ pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
                 .and_then(|active_tab| tab_state.tabs.iter().find(|entry| entry.id == active_tab))
                 .and_then(|entry| match &entry.kind {
                     TabKind::Terminal { state } => Some(state.handle.health()),
-                    TabKind::Browser { .. } | TabKind::Keybinds => None,
+                    TabKind::Browser { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => {
+                        None
+                    }
                 });
             PaneSummary {
                 pane_id,
@@ -2403,6 +2600,7 @@ pub fn surface_summaries_for_root(root: &gtk::Widget) -> Vec<SurfaceSummary> {
                 TabKind::Browser { state } => {
                     ("browser".to_string(), None, state.uri.borrow().clone())
                 }
+                TabKind::CustomSidebar { .. } => ("customSidebar".to_string(), None, None),
                 TabKind::Keybinds => ("keybinds".to_string(), None, None),
             };
             surfaces.push(SurfaceSummary {
@@ -2438,6 +2636,7 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
     let (kind, cwd, uri) = match &entry.kind {
         TabKind::Terminal { state } => ("terminal".to_string(), state.cwd.borrow().clone(), None),
         TabKind::Browser { state } => ("browser".to_string(), None, state.uri.borrow().clone()),
+        TabKind::CustomSidebar { .. } => ("customSidebar".to_string(), None, None),
         TabKind::Keybinds => ("keybinds".to_string(), None, None),
     };
     Some(SurfaceSummary {
@@ -2613,7 +2812,7 @@ fn duplicate_browser_tab(
             .ok_or(TabActionError::NotFound)?;
         match &entry.kind {
             TabKind::Browser { state } => state.uri.borrow().clone(),
-            TabKind::Terminal { .. } | TabKind::Keybinds => {
+            TabKind::Terminal { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => {
                 return Err(TabActionError::UnsupportedForSurface);
             }
         }
@@ -2644,7 +2843,9 @@ fn reload_browser_tab(internals: &Rc<PaneInternals>, tab_id: &str) -> Result<(),
             .reload()
             .then_some(())
             .ok_or(TabActionError::NotFound),
-        TabKind::Terminal { .. } | TabKind::Keybinds => Err(TabActionError::UnsupportedForSurface),
+        TabKind::Terminal { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => {
+            Err(TabActionError::UnsupportedForSurface)
+        }
     }
 }
 
@@ -2847,7 +3048,9 @@ pub fn browser_tab_summaries_for_root(
                     cwd: None,
                     uri: state.uri.borrow().clone(),
                 }),
-                TabKind::Terminal { .. } | TabKind::Keybinds => None,
+                TabKind::Terminal { .. } | TabKind::CustomSidebar { .. } | TabKind::Keybinds => {
+                    None
+                }
             })
             .collect::<Vec<_>>();
         return Some(tabs);
@@ -3300,6 +3503,10 @@ pub fn focused_shortcut_target(pane_widget: &gtk::Widget) -> FocusedShortcutTarg
                 kind: TabKind::Keybinds,
                 ..
             }) => FocusedShortcutTarget::Keybinds,
+            Some(TabEntry {
+                kind: TabKind::CustomSidebar { .. },
+                ..
+            }) => FocusedShortcutTarget::None,
             None => FocusedShortcutTarget::None,
         }
     };

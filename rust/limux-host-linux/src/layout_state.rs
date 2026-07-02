@@ -227,6 +227,9 @@ pub enum TabContentState {
         #[serde(default)]
         uri: Option<String>,
     },
+    CustomSidebar {
+        name: String,
+    },
     Keybinds {},
     Settings {},
 }
@@ -1911,6 +1914,52 @@ mod tests {
             Some("Agent surfaces")
         );
         assert_eq!(decoded.workspaces[0].group_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn custom_sidebar_tab_round_trips_through_session_json() {
+        let state = AppSessionState {
+            workspaces: vec![WorkspaceState {
+                id: Some("66666666-6666-4666-8666-666666666666".to_string()),
+                name: "workspace".to_string(),
+                description: None,
+                favorite: false,
+                cwd: None,
+                folder_path: None,
+                group_id: None,
+                environment: BTreeMap::new(),
+                layout: LayoutNodeState::Pane(PaneState {
+                    pane_id: Some(7),
+                    active_tab_id: Some("custom-1".to_string()),
+                    tabs: vec![TabState {
+                        id: "custom-1".to_string(),
+                        custom_name: Some("Build Board".to_string()),
+                        pinned: true,
+                        content: TabContentState::CustomSidebar {
+                            name: "build-board".to_string(),
+                        },
+                    }],
+                }),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let raw = serde_json::to_string(&state).expect("serialize custom sidebar session");
+        assert!(raw.contains("custom_sidebar"));
+        assert!(raw.contains("build-board"));
+
+        let decoded: AppSessionState =
+            serde_json::from_str(&raw).expect("decode custom sidebar session");
+        let LayoutNodeState::Pane(pane) = &decoded.workspaces[0].layout else {
+            panic!("expected pane layout");
+        };
+        assert_eq!(pane.active_tab_id.as_deref(), Some("custom-1"));
+        assert_eq!(pane.tabs[0].custom_name.as_deref(), Some("Build Board"));
+        assert!(pane.tabs[0].pinned);
+        assert!(matches!(
+            &pane.tabs[0].content,
+            TabContentState::CustomSidebar { name } if name == "build-board"
+        ));
     }
 
     #[test]

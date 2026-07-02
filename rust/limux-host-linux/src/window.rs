@@ -3488,17 +3488,106 @@ fn apply_custom_sidebar_action(
             payload["selected_provider_id"] = json!(format!("custom:{name}"));
             Ok(payload)
         }
-        CustomSidebarAction::Open { name, .. } => {
-            if !beta_enabled {
-                return Err(BridgeError::not_supported(
-                    "custom sidebars are disabled by customSidebars.beta.enabled",
-                ));
-            }
-            Err(BridgeError::not_supported(format!(
-                "sidebar.custom.open requires custom-sidebar pane surfaces; JSON sidebar `{name}` can be selected with sidebar.custom.select"
-            )))
+        CustomSidebarAction::Open { name, focus } => {
+            let selection = load_custom_sidebar_selection_with_beta(&name, beta_enabled)?;
+            let workspace_id = workspace_id
+                .clone()
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+            drop(app_state);
+            let surface = open_custom_sidebar_pane_surface(
+                state,
+                workspace_id.as_str(),
+                &name,
+                &selection,
+                focus,
+            )?;
+            let mut payload = custom_sidebar_report_payload_with_beta(Some(&name), beta_enabled);
+            payload["opened_name"] = json!(name);
+            payload["workspace_id"] = json!(workspace_id.clone());
+            payload["workspace_ref"] = json!(workspace_ref(&workspace_id));
+            payload["surface_id"] = json!(surface.surface_id);
+            payload["surface_ref"] = json!(surface_ref(&surface.surface_id));
+            payload["tab_ref"] = json!(format!("tab:{}", surface.surface_id));
+            payload["type"] = json!("customSidebar");
+            payload["focused"] = json!(focus);
+            Ok(payload)
         }
     }
+}
+
+/// purpose: Open or focus a CMUX custom sidebar as a normal pane tab.
+/// inputs: Host state, target workspace id, loaded JSON selection, and focus policy.
+/// returns/effects: Creates/focuses a customSidebar surface and schedules persistence.
+fn open_custom_sidebar_pane_surface(
+    state: &State,
+    workspace_id: &str,
+    name: &str,
+    selection: &CustomSidebarSelection,
+    focus: bool,
+) -> Result<pane::SurfaceSummary, BridgeError> {
+    if focus {
+        let index = {
+            let app_state = state.borrow();
+            app_state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == workspace_id)
+        }
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        select_workspace_for_control(state, index)?;
+    }
+    let workspace_root = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.root.clone())
+    }
+    .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    let source_pane = focused_or_first_pane_for_workspace(state, workspace_id, &workspace_root);
+    let Some(source_pane) = source_pane else {
+        return Err(BridgeError::not_found("pane not found"));
+    };
+    if focus {
+        if let Some(split) = split_pane(
+            state,
+            workspace_id,
+            &source_pane,
+            gtk::Orientation::Horizontal,
+            SplitPaneOptions {
+                initial_state: None,
+                skip_default_tab: true,
+                new_pane_first: false,
+                initial_ratio: None,
+                persist: true,
+            },
+        ) {
+            let widget = custom_sidebar_pane_widget_from_selection(selection);
+            if let Some(surface) = pane::add_custom_sidebar_tab_to_pane(&split, name, widget, true)
+            {
+                return Ok(surface);
+            }
+        }
+    }
+    let widget = custom_sidebar_pane_widget_from_selection(selection);
+    pane::add_custom_sidebar_tab_to_pane(&source_pane, name, widget, focus)
+        .ok_or_else(|| BridgeError::internal("failed to open custom sidebar pane"))
+}
+
+/// purpose: Resolve the focused pane in a workspace, falling back to the first leaf pane.
+/// inputs: Host state, target workspace id, and the target workspace root.
+/// returns/effects: Returns a pane widget without mutating state.
+fn focused_or_first_pane_for_workspace(
+    state: &State,
+    workspace_id: &str,
+    workspace_root: &gtk::Widget,
+) -> Option<gtk::Widget> {
+    find_focused_pane(state)
+        .and_then(|(focused_workspace_id, pane)| {
+            (focused_workspace_id == workspace_id).then_some(pane)
+        })
+        .or_else(|| Some(first_leaf_pane(workspace_root)).filter(pane::is_pane_widget))
 }
 
 /// purpose: Resolve the CMUX custom-sidebar directory used by the runtime host.
@@ -4016,6 +4105,48 @@ fn sync_right_sidebar_mode_rows(body: &gtk::Box, workspace: &Workspace, mode: &R
 fn sync_custom_sidebar_rows(body: &gtk::Box, selection: &CustomSidebarSelection) {
     append_right_sidebar_section(body, &selection.name);
     append_custom_sidebar_node(body, &selection.document.root);
+}
+
+/// purpose: Build a pane-hosted CMUX custom sidebar widget from a validated JSON selection.
+/// inputs: A loaded custom-sidebar selection.
+/// returns/effects: Returns a focusable GTK widget containing the rendered static DSL.
+fn custom_sidebar_pane_widget_from_selection(selection: &CustomSidebarSelection) -> gtk::Widget {
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    sync_custom_sidebar_rows(&body, selection);
+    scrolled.set_child(Some(&body));
+    scrolled.upcast()
+}
+
+/// purpose: Build a pane-hosted custom sidebar by name for restored sessions.
+/// inputs: Host state for config beta gate and the custom sidebar name.
+/// returns/effects: Returns the rendered widget or a visible fatal error panel.
+fn build_custom_sidebar_pane_widget(state: &State, name: &str) -> gtk::Widget {
+    let beta_enabled = state.borrow().config.borrow().custom_sidebars.beta_enabled;
+    match load_custom_sidebar_selection_with_beta(name, beta_enabled) {
+        Ok(selection) => custom_sidebar_pane_widget_from_selection(&selection),
+        Err(error) => {
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            body.set_margin_top(12);
+            body.set_margin_bottom(12);
+            body.set_margin_start(12);
+            body.set_margin_end(12);
+            append_right_sidebar_section(&body, name);
+            append_right_sidebar_label(
+                &body,
+                &format!("Failed to restore custom sidebar: {error:?}"),
+                "error",
+            );
+            body.upcast()
+        }
+    }
 }
 
 /// purpose: Append one CMUX JSON sidebar node to a GTK box.
@@ -15190,6 +15321,7 @@ pub(crate) fn create_pane_for_workspace(
     let state_for_split_with_tab = state.clone();
     let state_for_config = state.clone();
     let on_config_changed = settings_dialog_config_changed_handler(state);
+    let state_for_custom_sidebar = state.clone();
     let state_for_workspace_env = state.clone();
     let ws_id_split_with_tab = ws_id.to_string();
     let ws_id_for_env = ws_id.to_string();
@@ -15331,6 +15463,9 @@ pub(crate) fn create_pane_for_workspace(
             s.config.clone()
         }),
         on_config_changed,
+        build_custom_sidebar: Box::new(move |name| {
+            build_custom_sidebar_pane_widget(&state_for_custom_sidebar, name)
+        }),
         workspace_for_pane: Box::new(move |_pane_widget| Some(ws_id_for_env.clone())),
         workspace_environment_for_pane: Box::new(move |_pane_widget| {
             state_for_workspace_env

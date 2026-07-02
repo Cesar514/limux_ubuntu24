@@ -5454,6 +5454,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_sidebar_open_route_accepts_focus_and_targets() {
+        let request = r#"{"id":1,"method":"sidebar.custom.open","params":{"name":"build-board","focus":true,"workspace_id":"workspace:2","window_id":"window:7"}}"#;
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::CustomSidebar {
+                action,
+                target,
+                reply,
+            } => {
+                assert_eq!(
+                    action,
+                    CustomSidebarAction::Open {
+                        name: "build-board".to_string(),
+                        focus: true
+                    }
+                );
+                assert_eq!(target.workspace_id.as_deref(), Some("2"));
+                assert_eq!(target.window_id.as_deref(), Some("7"));
+                reply
+                    .send(Ok(json!({
+                        "opened_name": "build-board",
+                        "type": "customSidebar"
+                    })))
+                    .expect("reply sends");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+        let result = response.result.expect("result");
+        assert_eq!(result["opened_name"], "build-board");
+        assert_eq!(result["type"], "customSidebar");
+    }
+
+    #[test]
     fn custom_sidebar_route_rejects_missing_select_name() {
         let request = r#"{"id":1,"method":"sidebar.custom.select","params":{}}"#;
         let response = dispatch_request(request, &|command| {
