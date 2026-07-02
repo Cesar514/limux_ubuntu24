@@ -24,6 +24,8 @@ const METHODS: &[&str] = &[
     "system.identify",
     "system.capabilities",
     "system.memory",
+    "auth.login",
+    "auth.status",
     "reload_config",
     "config.reload",
     "settings.open",
@@ -194,6 +196,7 @@ const INVALID_PARAMS_CODE: i64 = -32602;
 const UNKNOWN_METHOD_CODE: i64 = -32601;
 const INTERNAL_ERROR_CODE: i64 = -32603;
 const NOT_SUPPORTED_CODE: i64 = -32001;
+const UNAUTHORIZED_CODE: i64 = -32002;
 const NOT_FOUND_CODE: i64 = -32004;
 const CONFLICT_CODE: i64 = -32009;
 
@@ -1882,6 +1885,9 @@ fn handle_method(
 
     let queued = match method {
         "system.ping" | "ping" => return V2Response::success(id, json!({ "pong": true })),
+        "auth.status" => {
+            return V2Response::success(id, json!({ "authenticated": true, "mode": "password" }));
+        }
         "system.capabilities" => {
             return V2Response::success(id, json!({ "commands": METHODS, "methods": METHODS }));
         }
@@ -3650,9 +3656,76 @@ fn error_response(id: Option<Value>, error: BridgeError) -> V2Response {
     V2Response::error(id, error.code, error.message, error.data)
 }
 
+fn auth_login_response(id: Option<Value>, params: &Value, authenticated: &mut bool) -> V2Response {
+    let Some(password) = params.get("password").and_then(Value::as_str) else {
+        return V2Response::error(
+            id,
+            INVALID_PARAMS_CODE,
+            "auth.login requires password",
+            None,
+        );
+    };
+    match auth::configured_socket_password() {
+        Ok(expected) if auth::password_matches(password, &expected) => {
+            *authenticated = true;
+            V2Response::success(id, json!({ "ok": true, "authenticated": true }))
+        }
+        Ok(_) => V2Response::error(id, UNAUTHORIZED_CODE, "unauthorized: bad password", None),
+        Err(error) => V2Response::error(
+            id,
+            INTERNAL_ERROR_CODE,
+            format!("socket password is not configured: {error}"),
+            None,
+        ),
+    }
+}
+
+fn legacy_auth_response(input: &str, authenticated: &mut bool) -> Option<String> {
+    let password = input.strip_prefix("auth ")?;
+    match auth::configured_socket_password() {
+        Ok(expected) if auth::password_matches(password, &expected) => {
+            *authenticated = true;
+            Some("OK\n".to_string())
+        }
+        Ok(_) => Some("ERROR: unauthorized: bad password\n".to_string()),
+        Err(error) => Some(format!(
+            "ERROR: socket password is not configured: {error}\n"
+        )),
+    }
+}
+
+#[cfg(test)]
 fn dispatch_request(input: &str, dispatch: &dyn Fn(ControlCommand)) -> V2Response {
+    let mut authenticated = true;
+    dispatch_request_with_auth(
+        input,
+        dispatch,
+        SocketControlMode::AllowAll,
+        &mut authenticated,
+    )
+}
+
+fn dispatch_request_with_auth(
+    input: &str,
+    dispatch: &dyn Fn(ControlCommand),
+    control_mode: SocketControlMode,
+    authenticated: &mut bool,
+) -> V2Response {
     match parse_request(input) {
-        Ok(request) => handle_method(request.id, &request.method, request.params, dispatch),
+        Ok(request) => {
+            if request.method == "auth.login" {
+                return auth_login_response(request.id, &request.params, authenticated);
+            }
+            if control_mode.requires_password() && !*authenticated {
+                return V2Response::error(
+                    request.id,
+                    UNAUTHORIZED_CODE,
+                    "unauthorized: authentication required",
+                    None,
+                );
+            }
+            handle_method(request.id, &request.method, request.params, dispatch)
+        }
         Err(error) => error_response(None, error),
     }
 }
@@ -3675,6 +3748,7 @@ fn try_handle_event_stream(input: &str, writer: &mut UnixStream) -> io::Result<b
 
 fn handle_client(
     stream: UnixStream,
+    control_mode: SocketControlMode,
     dispatch: &(dyn Fn(ControlCommand) + Send + Sync + 'static),
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(request_io::CLIENT_IDLE_TIMEOUT))?;
@@ -3683,6 +3757,7 @@ fn handle_client(
     let mut reader = io::BufReader::new(reader_stream);
     let mut writer = stream;
     let mut line_buf = Vec::with_capacity(4096);
+    let mut authenticated = !control_mode.requires_password();
 
     loop {
         if !read_request_frame(&mut reader, &mut line_buf)? {
@@ -3696,11 +3771,29 @@ fn handle_client(
             continue;
         }
 
+        if let Some(response) = legacy_auth_response(input, &mut authenticated) {
+            writer.write_all(response.as_bytes())?;
+            writer.flush()?;
+            continue;
+        }
+
+        if control_mode.requires_password() && !authenticated {
+            let response =
+                dispatch_request_with_auth(input, dispatch, control_mode, &mut authenticated);
+            let mut payload = serde_json::to_string(&response)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            payload.push('\n');
+            writer.write_all(payload.as_bytes())?;
+            writer.flush()?;
+            continue;
+        }
+
         if try_handle_event_stream(input, &mut writer)? {
             return Ok(());
         }
 
-        let response = dispatch_request(input, dispatch);
+        let response =
+            dispatch_request_with_auth(input, dispatch, control_mode, &mut authenticated);
         let mut payload = serde_json::to_string(&response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         payload.push('\n');
@@ -3742,13 +3835,22 @@ pub fn start(dispatch: fn(ControlCommand)) {
         .name("limux-control".into())
         .spawn(move || {
             let path = resolve_socket_path(None, SocketMode::Runtime);
-            let control_mode = match SocketControlMode::from_env() {
+            let control_mode = match auth::socket_control_mode_from_env() {
                 Ok(mode) => mode,
                 Err(error) => {
                     eprintln!("limux: invalid control socket mode: {error}");
                     return;
                 }
             };
+            if control_mode.requires_password() {
+                match auth::configured_socket_password() {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("limux: password control mode is not configured: {error}");
+                        return;
+                    }
+                }
+            }
             let listener = match bind_listener(
                 &path,
                 SocketMode::Runtime,
@@ -3786,7 +3888,9 @@ pub fn start(dispatch: fn(ControlCommand)) {
                             .name("limux-ctrl-conn".into())
                             .spawn(move || {
                                 let _slot = slot;
-                                if let Err(error) = handle_client(stream, dispatch.as_ref()) {
+                                if let Err(error) =
+                                    handle_client(stream, control_mode, dispatch.as_ref())
+                                {
                                     eprintln!(
                                         "limux: control connection error for pid={} uid={}: {error}",
                                         peer.pid, peer.uid
@@ -3819,6 +3923,39 @@ mod tests {
             .expect("feed test lock")
     }
 
+    fn auth_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static AUTH_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        AUTH_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("auth test lock")
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let old = std::env::var_os(key);
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn parses_v2_request_directly() {
         let request = parse_request(r#"{"id":"1","method":"system.ping","params":{}}"#)
@@ -3844,6 +3981,68 @@ mod tests {
     fn capabilities_include_config_reload_methods() {
         assert!(METHODS.contains(&"reload_config"));
         assert!(METHODS.contains(&"config.reload"));
+    }
+
+    #[test]
+    fn capabilities_include_socket_auth_methods() {
+        assert!(METHODS.contains(&"auth.login"));
+        assert!(METHODS.contains(&"auth.status"));
+    }
+
+    #[test]
+    fn password_mode_rejects_request_until_auth_login_succeeds() {
+        let _lock = auth_test_guard();
+        let _password = EnvGuard::set("CMUX_SOCKET_PASSWORD", Some("secret"));
+        let mut authenticated = false;
+
+        let rejected = dispatch_request_with_auth(
+            r#"{"id":"1","method":"system.ping","params":{}}"#,
+            &|_| panic!("unauthenticated command must not dispatch"),
+            SocketControlMode::Password,
+            &mut authenticated,
+        );
+        assert!(!rejected.ok);
+        assert_eq!(
+            rejected.error.as_ref().map(|error| error.code),
+            Some(UNAUTHORIZED_CODE)
+        );
+
+        let login = dispatch_request_with_auth(
+            r#"{"id":"2","method":"auth.login","params":{"password":"secret"}}"#,
+            &|_| panic!("auth.login must not dispatch through host command queue"),
+            SocketControlMode::Password,
+            &mut authenticated,
+        );
+        assert!(login.ok);
+        assert!(authenticated);
+
+        let accepted = dispatch_request_with_auth(
+            r#"{"id":"3","method":"system.ping","params":{}}"#,
+            &|_| panic!("system.ping is handled without queue dispatch"),
+            SocketControlMode::Password,
+            &mut authenticated,
+        );
+        assert!(accepted.ok);
+        assert_eq!(
+            accepted.result.as_ref().and_then(|value| value.get("pong")),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn legacy_cmux_auth_command_returns_text_status() {
+        let _lock = auth_test_guard();
+        let _password = EnvGuard::set("CMUX_SOCKET_PASSWORD", Some("secret"));
+        let mut authenticated = false;
+
+        let ok = legacy_auth_response("auth secret", &mut authenticated).expect("legacy auth");
+        assert_eq!(ok, "OK\n");
+        assert!(authenticated);
+
+        let mut rejected_auth = false;
+        let error = legacy_auth_response("auth wrong", &mut rejected_auth).expect("legacy auth");
+        assert_eq!(error, "ERROR: unauthorized: bad password\n");
+        assert!(!rejected_auth);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use limux_control::auth;
 use limux_control::socket_path::{resolve_socket_path_checked, SocketMode};
 use limux_protocol::{V2Request, V2Response};
 use serde_json::{json, Map, Value};
@@ -68,12 +69,17 @@ enum CommandOutput {
 
 struct Client {
     socket: PathBuf,
+    password: Option<String>,
     seq: u64,
 }
 
 impl Client {
-    fn new(socket: PathBuf) -> Self {
-        Self { socket, seq: 0 }
+    fn new(socket: PathBuf, password: Option<String>) -> Self {
+        Self {
+            socket,
+            password,
+            seq: 0,
+        }
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -91,20 +97,46 @@ impl Client {
             .await
             .with_context(|| format!("failed to connect to socket {}", self.socket.display()))?;
         let (reader_half, mut writer_half) = stream.into_split();
+        let mut reader = BufReader::new(reader_half);
 
-        let mut payload = serde_json::to_string(&request).context("failed to encode request")?;
+        if let Some(password) = &self.password {
+            let auth_request = V2Request {
+                id: Some(Value::String("cli-auth".to_string())),
+                method: "auth.login".to_string(),
+                params: json!({ "password": password }),
+            };
+            Self::write_request(&mut writer_half, &auth_request).await?;
+            let auth_response = Self::read_response(&mut reader).await?;
+            if !auth_response.ok {
+                let err = auth_response
+                    .error
+                    .ok_or_else(|| anyhow!("server returned !ok without error payload"))?;
+                bail!("{}: {}", err.code, err.message);
+            }
+        }
+
+        Self::write_request(&mut writer_half, &request).await?;
+        Self::read_success_response(&mut reader).await
+    }
+
+    async fn write_request(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        request: &V2Request,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_string(request).context("failed to encode request")?;
         payload.push('\n');
 
-        writer_half
+        writer
             .write_all(payload.as_bytes())
             .await
             .context("failed to write request")?;
-        writer_half
-            .flush()
-            .await
-            .context("failed to flush request")?;
+        writer.flush().await.context("failed to flush request")?;
+        Ok(())
+    }
 
-        let mut reader = BufReader::new(reader_half);
+    async fn read_response(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> Result<V2Response> {
         let mut line = String::new();
         reader
             .read_line(&mut line)
@@ -115,9 +147,13 @@ impl Client {
             bail!("server returned an empty response");
         }
 
-        let response: V2Response =
-            serde_json::from_str(line.trim()).context("response was not valid v2 JSON")?;
+        serde_json::from_str(line.trim()).context("response was not valid v2 JSON")
+    }
 
+    async fn read_success_response(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> Result<Value> {
+        let response = Self::read_response(reader).await?;
         if response.ok {
             Ok(response.result.unwrap_or_else(|| json!({})))
         } else {
@@ -8244,8 +8280,10 @@ async fn main() -> Result<()> {
 
     let socket = resolve_socket_path_checked(opts.socket.clone(), opts.socket_mode)
         .map_err(anyhow::Error::msg)?;
+    let password = auth::socket_password_from_env_or_file(opts.password.as_deref())
+        .context("failed to resolve socket password")?;
 
-    let mut client = Client::new(socket);
+    let mut client = Client::new(socket, password);
     let output = execute_command(&mut client, &opts).await;
 
     match output {
@@ -8341,6 +8379,57 @@ mod cli_arg_tests {
         assert_eq!(opts.window.as_deref(), Some("window:3"));
         assert_eq!(opts.password.as_deref(), Some("secret"));
         assert_eq!(opts.command_args, args(&["focus-window"]));
+    }
+
+    #[tokio::test]
+    async fn client_sends_auth_login_before_request_when_password_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("limux.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind mock socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader_half, mut writer_half) = stream.into_split();
+            let mut reader = BufReader::new(reader_half);
+
+            let mut auth_line = String::new();
+            reader.read_line(&mut auth_line).await.expect("read auth");
+            let auth_request: V2Request =
+                serde_json::from_str(auth_line.trim()).expect("parse auth request");
+            assert_eq!(auth_request.method, "auth.login");
+            assert_eq!(auth_request.params["password"], "secret");
+            let auth_response =
+                V2Response::success(auth_request.id, json!({"ok": true, "authenticated": true}));
+            let mut encoded_auth = serde_json::to_string(&auth_response).expect("encode auth");
+            encoded_auth.push('\n');
+            writer_half
+                .write_all(encoded_auth.as_bytes())
+                .await
+                .expect("write auth response");
+
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .await
+                .expect("read request");
+            let request: V2Request =
+                serde_json::from_str(request_line.trim()).expect("parse request");
+            assert_eq!(request.method, "system.ping");
+            let response = V2Response::success(request.id, json!({"pong": true}));
+            let mut encoded = serde_json::to_string(&response).expect("encode response");
+            encoded.push('\n');
+            writer_half
+                .write_all(encoded.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let mut client = Client::new(socket, Some("secret".to_string()));
+        let result = client
+            .call("system.ping", json!({}))
+            .await
+            .expect("client request");
+        assert_eq!(result["pong"], true);
+        server.await.expect("mock server");
     }
 
     #[test]

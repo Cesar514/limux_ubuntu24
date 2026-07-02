@@ -23,7 +23,7 @@ pub async fn run_server<P: AsRef<Path>>(
     dispatcher: Dispatcher,
 ) -> io::Result<()> {
     let socket_path = socket_path.as_ref();
-    let control_mode = SocketControlMode::from_env()?;
+    let control_mode = auth::socket_control_mode_from_env()?;
     let listener = bind_tokio_listener(
         socket_path,
         socket_mode,
@@ -33,7 +33,7 @@ pub async fn run_server<P: AsRef<Path>>(
 }
 
 pub async fn serve(listener: UnixListener, dispatcher: Dispatcher) -> io::Result<()> {
-    let control_mode = SocketControlMode::from_env()?;
+    let control_mode = auth::socket_control_mode_from_env()?;
     serve_with_mode(listener, dispatcher, control_mode).await
 }
 
@@ -42,6 +42,9 @@ async fn serve_with_mode(
     dispatcher: Dispatcher,
     control_mode: SocketControlMode,
 ) -> io::Result<()> {
+    if control_mode.requires_password() {
+        auth::configured_socket_password()?;
+    }
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
@@ -64,7 +67,7 @@ async fn serve_with_mode(
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, dispatcher).await {
+            if let Err(error) = handle_connection(stream, dispatcher, control_mode).await {
                 eprintln!(
                     "limux-control: connection error for pid={} uid={}: {error}",
                     peer.pid, peer.uid
@@ -74,10 +77,15 @@ async fn serve_with_mode(
     }
 }
 
-pub async fn handle_connection(stream: UnixStream, dispatcher: Dispatcher) -> io::Result<()> {
+pub async fn handle_connection(
+    stream: UnixStream,
+    dispatcher: Dispatcher,
+    control_mode: SocketControlMode,
+) -> io::Result<()> {
     let (reader_half, mut writer_half) = stream.into_split();
     let mut reader = BufReader::new(reader_half);
     let mut line_buf = Vec::with_capacity(4096);
+    let mut authenticated = !control_mode.requires_password();
 
     loop {
         if !read_request_frame_async(&mut reader, &mut line_buf).await? {
@@ -92,7 +100,15 @@ pub async fn handle_connection(stream: UnixStream, dispatcher: Dispatcher) -> io
         }
 
         let response = match parse_request(incoming) {
-            Ok(request) => dispatcher.dispatch(request).await,
+            Ok(request) => {
+                if request.method == "auth.login" {
+                    handle_auth_login(request, &mut authenticated)
+                } else if !authenticated {
+                    V2Response::error(None, -32001, "unauthorized: authentication required", None)
+                } else {
+                    dispatcher.dispatch(request).await
+                }
+            }
             Err(message) => V2Response::error(None, -32700, message, None),
         };
 
@@ -102,6 +118,32 @@ pub async fn handle_connection(stream: UnixStream, dispatcher: Dispatcher) -> io
 
         writer_half.write_all(payload.as_bytes()).await?;
         writer_half.flush().await?;
+    }
+}
+
+fn handle_auth_login(request: V2Request, authenticated: &mut bool) -> V2Response {
+    let Some(password) = request
+        .params
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return V2Response::error(request.id, -32602, "auth.login requires password", None);
+    };
+    match auth::configured_socket_password() {
+        Ok(expected) if auth::password_matches(password, &expected) => {
+            *authenticated = true;
+            V2Response::success(
+                request.id,
+                serde_json::json!({"ok": true, "authenticated": true}),
+            )
+        }
+        Ok(_) => V2Response::error(request.id, -32001, "unauthorized: bad password", None),
+        Err(error) => V2Response::error(
+            request.id,
+            -32002,
+            format!("socket password is not configured: {error}"),
+            None,
+        ),
     }
 }
 
