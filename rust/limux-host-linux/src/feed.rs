@@ -700,12 +700,7 @@ fn feed_notification_actions(item: &FeedItem) -> Vec<FeedNotificationAction> {
     match item.kind.as_str() {
         "permissionRequest" | "PermissionRequest" => feed_notification_mode_actions(
             request_id,
-            &[
-                ("Once", "once"),
-                ("Always", "always"),
-                ("Bypass", "bypass"),
-                ("Deny", "deny"),
-            ],
+            &crate::feed_actions::permission_action_specs(&item.source, &item.event),
             |request_id, mode| FeedNotificationDecision::Permission { request_id, mode },
         ),
         "exitPlan" | "ExitPlanMode" => feed_notification_mode_actions(
@@ -1103,6 +1098,58 @@ mod tests {
                     },
                 ],
             }]
+        );
+    }
+
+    // purpose: Verify native notification actions honor Codex app-server approval capabilities.
+    // inputs: Pending Codex app-server Feed permission row with only amendment and decline decisions.
+    // returns/effects: Asserts notification buttons expose `all` and `deny`, not unsupported modes.
+    #[test]
+    fn push_notifies_codex_app_server_permission_with_supported_actions() {
+        let feed = FeedCoordinator::with_audit_log_path(None);
+        let mut params = Map::new();
+        params.insert(
+            "event".to_string(),
+            json!({
+                "session_id": "codex-thread-1",
+                "hook_event_name": "PermissionRequest",
+                "_source": "codex",
+                "_opencode_request_id": "codex-app-server-approval-1",
+                "workspace_id": "workspace-a",
+                "tool_name": "Bash",
+                "tool_input": {
+                    "app_server_method": "item/commandExecution/requestApproval",
+                    "available_decisions": [{"acceptWithExecpolicyAmendment": {}}, "decline"],
+                    "proposed_execpolicy_amendment": [{"kind": "prefix", "value": "cargo test"}]
+                }
+            }),
+        );
+
+        let mut notifications = Vec::new();
+        feed.push_with_received_hook(&params, |notification| {
+            notifications.push(notification.clone());
+        })
+        .expect("push pending app-server feed item");
+
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].actions,
+            vec![
+                FeedNotificationAction {
+                    label: "All".to_string(),
+                    decision: FeedNotificationDecision::Permission {
+                        request_id: "codex-app-server-approval-1".to_string(),
+                        mode: "all".to_string(),
+                    },
+                },
+                FeedNotificationAction {
+                    label: "Deny".to_string(),
+                    decision: FeedNotificationDecision::Permission {
+                        request_id: "codex-app-server-approval-1".to_string(),
+                        mode: "deny".to_string(),
+                    },
+                },
+            ]
         );
     }
 

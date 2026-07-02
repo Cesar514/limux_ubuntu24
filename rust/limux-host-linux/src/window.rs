@@ -3001,7 +3001,7 @@ fn append_right_sidebar_feed_items(body: &gtk::Box, payload: &serde_json::Value)
 /// returns/effects: Appends buttons that call the matching feed.*.reply method.
 fn append_feed_decision_actions(body: &gtk::Box, item: &serde_json::Value) {
     if let Some(request_id) = pending_permission_request_id(item) {
-        append_feed_permission_actions(body, request_id);
+        append_feed_permission_actions(body, request_id, item);
     } else if let Some(request_id) = pending_exit_plan_request_id(item) {
         append_feed_exit_plan_actions(body, request_id);
     } else if let Some(request_id) = pending_question_request_id(item) {
@@ -3010,13 +3010,14 @@ fn append_feed_decision_actions(body: &gtk::Box, item: &serde_json::Value) {
 }
 
 /// purpose: Add permission decision buttons for a pending Feed row.
-/// inputs: Body widget and request id.
+/// inputs: Body widget, request id, and Feed row.
 /// returns/effects: Appends buttons that call feed.permission.reply for the request id.
-fn append_feed_permission_actions(body: &gtk::Box, request_id: String) {
+fn append_feed_permission_actions(body: &gtk::Box, request_id: String, item: &serde_json::Value) {
+    let source = json_string_field(item, "source").unwrap_or("");
     append_feed_action_buttons(
         body,
         &request_id,
-        feed_permission_action_specs(),
+        &crate::feed_actions::permission_action_specs(source, item),
         reply_to_feed_permission_request,
     );
 }
@@ -3073,7 +3074,7 @@ fn append_feed_question_actions(body: &gtk::Box, request_id: String, item: &serd
 fn append_feed_action_buttons<F>(
     body: &gtk::Box,
     request_id: &str,
-    specs: &'static [(&'static str, &'static str)],
+    specs: &[(&'static str, &'static str)],
     reply: F,
 ) where
     F: Fn(&str, &str) -> Result<(), BridgeError> + Copy + 'static,
@@ -3174,18 +3175,6 @@ fn feed_reply_params(
         );
     }
     params
-}
-
-/// purpose: Define direct CMUX permission decisions exposed in the Feed sidebar.
-/// inputs: None.
-/// returns/effects: Returns stable button label and mode pairs.
-fn feed_permission_action_specs() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("Once", "once"),
-        ("Always", "always"),
-        ("Bypass", "bypass"),
-        ("Deny", "deny"),
-    ]
 }
 
 /// purpose: Define direct CMUX exit-plan decisions exposed in the Feed sidebar.
@@ -13032,9 +13021,9 @@ mod tests {
         desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_id_from_response,
         directional_neighbor_score, favorites_prefix_len, feed_exit_plan_action_specs,
-        feed_permission_action_specs, feed_question_action_specs, font_size_after_delta,
-        ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
+        feed_question_action_specs, font_size_after_delta, ghostty_prefers_dark,
+        gtk_system_prefers_dark_from_raw, host_notification_row, limit_text_to_last_lines,
+        next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
         pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
         publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
@@ -13514,8 +13503,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            feed_permission_action_specs(),
-            &[
+            crate::feed_actions::permission_action_specs(
+                visible[3]
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                visible[3]
+            ),
+            vec![
                 ("Once", "once"),
                 ("Always", "always"),
                 ("Bypass", "bypass"),
@@ -13523,6 +13518,32 @@ mod tests {
             ]
         );
         assert_eq!(pending_permission_request_id(visible[3]), None);
+    }
+
+    // purpose: Verify right-sidebar Feed permission actions honor Codex app-server capabilities.
+    // inputs: Pending Codex app-server Feed row with only amendment and decline decisions.
+    // returns/effects: Asserts sidebar action policy exposes `all` and `deny`, not unsupported modes.
+    #[test]
+    fn right_sidebar_codex_app_server_permission_actions_follow_capabilities() {
+        let item = json!({
+            "source": "codex",
+            "kind": "PermissionRequest",
+            "status": "pending",
+            "request_id": "req-app-server",
+            "tool_input": {
+                "app_server_method": "item/commandExecution/requestApproval",
+                "available_decisions": [
+                    {"acceptWithExecpolicyAmendment": {}},
+                    "decline"
+                ],
+                "proposed_execpolicy_amendment": [{"kind": "prefix", "value": "cargo test"}]
+            }
+        });
+
+        assert_eq!(
+            crate::feed_actions::permission_action_specs("codex", &item),
+            vec![("All", "all"), ("Deny", "deny")]
+        );
     }
 
     #[test]

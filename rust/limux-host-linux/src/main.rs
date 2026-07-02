@@ -2,6 +2,7 @@ mod app_config;
 mod control_bridge;
 mod event_bus;
 mod feed;
+mod feed_actions;
 mod ghostty_config;
 mod keybind_editor;
 mod layout_state;
