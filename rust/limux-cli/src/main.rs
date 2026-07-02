@@ -982,6 +982,12 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     if let Some(text) = command_help_probe_text(command, args) {
         return Ok(Some(CommandOutput::Text(text.to_string())));
     }
+    if is_unsupported_feed_cli_command(command, args) {
+        bail!(
+            "not_supported: {command} {} requires CMUX interactive Feed UI support",
+            args[0]
+        );
+    }
     if is_unsupported_remote_cli_command(command) {
         bail!(
             "not_supported: {command} requires CMUX remote daemon support, which Limux does not implement yet"
@@ -1009,6 +1015,13 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         _ => None,
     };
     Ok(out)
+}
+
+// purpose: Identify CMUX top-level Feed UI commands not yet backed by Limux.
+// inputs: Top-level command and remaining CLI args.
+// returns/effects: Returns true only for interactive Feed UI forms, not hook forwarding.
+fn is_unsupported_feed_cli_command(command: &str, args: &[String]) -> bool {
+    command == "feed" && matches!(args.first().map(String::as_str), Some("tui" | "clear"))
 }
 
 // purpose: Return CMUX-compatible no-socket help text for command probes.
@@ -8649,6 +8662,23 @@ mod cli_arg_tests {
             };
             assert!(text.contains(expected), "{command} output: {text}");
         }
+    }
+
+    #[test]
+    fn cmux_feed_tui_commands_fail_locally_with_not_supported() {
+        for subcommand in ["tui", "clear"] {
+            let opts = default_opts(args(&["feed", subcommand]));
+            let error = run_local_command(&opts).expect_err("feed UI command should fail locally");
+            assert!(error.to_string().contains("not_supported"), "{subcommand}");
+        }
+
+        let help = run_local_command(&default_opts(args(&["feed", "--help"])))
+            .expect("help probe")
+            .expect("help output");
+        let CommandOutput::Text(text) = help else {
+            panic!("help should render text");
+        };
+        assert!(text.contains("Usage: limux feed tui"));
     }
 
     #[test]
