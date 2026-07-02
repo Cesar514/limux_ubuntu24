@@ -51,12 +51,19 @@ pub(crate) fn read_process_parent_if_alive(pid: u32) -> Result<Option<u32>, Stri
 
 /// purpose: Read Limux workspace attribution from process environment.
 /// inputs: Process id.
-/// returns/effects: Returns None when no Limux workspace id exists or process exited.
+/// returns/effects: Returns None when no Limux workspace id exists or procfs denies/exits during scan.
 pub(crate) fn process_workspace_id(pid: u32) -> Result<Option<String>, String> {
     let path = format!("/proc/{pid}/environ");
     let raw = match fs::read(&path) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(format!("failed to read {path}: {error}")),
     };
     for entry in raw

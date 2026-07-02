@@ -9222,7 +9222,7 @@ fn install_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
                 .map(|agent| vec![agent])
         })
         .transpose()?
-        .unwrap_or_else(default_hook_targets);
+        .unwrap_or_else(default_install_hook_targets);
 
     let mut installed = Vec::new();
     for agent in agents {
@@ -9251,11 +9251,104 @@ fn uninstall_hook_targets(target: Option<&str>) -> Result<Vec<String>> {
 }
 
 fn default_hook_targets() -> Vec<agent_hooks::AgentKind> {
-    vec![
-        agent_hooks::AgentKind::Codex,
-        agent_hooks::AgentKind::Claude,
-        agent_hooks::AgentKind::Gemini,
-    ]
+    agent_hooks::AgentKind::all().to_vec()
+}
+
+// purpose: Select CMUX-style default hook setup targets available on this host.
+// inputs: PATH, HOME, and agent-specific config-dir environment variables.
+// returns/effects: Returns implemented agents with a visible binary and usable config root.
+fn default_install_hook_targets() -> Vec<agent_hooks::AgentKind> {
+    default_hook_targets()
+        .into_iter()
+        .filter(|agent| hook_setup_target_available(*agent))
+        .collect()
+}
+
+// purpose: Match CMUX default `hooks setup` skip rules for one agent.
+// inputs: Agent kind plus current filesystem and PATH state.
+// returns/effects: Returns false when default setup should skip without writing config.
+fn hook_setup_target_available(agent: agent_hooks::AgentKind) -> bool {
+    let has_config_dir =
+        hook_setup_can_use_missing_config_dir(agent) || hook_setup_config_dir(agent).exists();
+    has_config_dir && resolve_executable_in_path(hook_setup_binary_name(agent)).is_some()
+}
+
+// purpose: Identify agents whose CMUX setup path may create a missing config directory.
+// inputs: Agent kind.
+// returns/effects: Returns the upstream create-missing policy for default setup.
+fn hook_setup_can_use_missing_config_dir(agent: agent_hooks::AgentKind) -> bool {
+    matches!(
+        agent,
+        agent_hooks::AgentKind::Grok
+            | agent_hooks::AgentKind::OpenCode
+            | agent_hooks::AgentKind::Pi
+            | agent_hooks::AgentKind::Omp
+            | agent_hooks::AgentKind::Amp
+            | agent_hooks::AgentKind::Kiro
+            | agent_hooks::AgentKind::Antigravity
+            | agent_hooks::AgentKind::RovoDev
+    )
+}
+
+// purpose: Return the executable name CMUX checks before default hook setup.
+// inputs: Agent kind.
+// returns/effects: Returns a PATH lookup token without reading the filesystem.
+fn hook_setup_binary_name(agent: agent_hooks::AgentKind) -> &'static str {
+    match agent {
+        agent_hooks::AgentKind::Claude => "claude",
+        agent_hooks::AgentKind::Codex => "codex",
+        agent_hooks::AgentKind::Grok => "grok",
+        agent_hooks::AgentKind::OpenCode => "opencode",
+        agent_hooks::AgentKind::Cursor => "cursor-agent",
+        agent_hooks::AgentKind::Kiro => "kiro-cli",
+        agent_hooks::AgentKind::Antigravity => "agy",
+        agent_hooks::AgentKind::RovoDev => "acli",
+        agent_hooks::AgentKind::Pi => "pi",
+        agent_hooks::AgentKind::Omp => "omp",
+        agent_hooks::AgentKind::Amp => "amp",
+        agent_hooks::AgentKind::HermesAgent => "hermes",
+        agent_hooks::AgentKind::Gemini => "gemini",
+        agent_hooks::AgentKind::Copilot => "copilot",
+        agent_hooks::AgentKind::CodeBuddy => "codebuddy",
+        agent_hooks::AgentKind::Factory => "droid",
+        agent_hooks::AgentKind::Qoder => "qodercli",
+    }
+}
+
+// purpose: Resolve the config directory CMUX checks before default hook setup.
+// inputs: Agent kind.
+// returns/effects: Returns a config root path without creating it.
+fn hook_setup_config_dir(agent: agent_hooks::AgentKind) -> PathBuf {
+    match agent {
+        agent_hooks::AgentKind::Codex => parent_dir_or_current(codex_hooks_path()),
+        agent_hooks::AgentKind::Grok => parent_dir_or_current(grok_hooks_path()),
+        agent_hooks::AgentKind::Claude => parent_dir_or_current(claude_settings_path()),
+        agent_hooks::AgentKind::OpenCode => opencode_config_dir(),
+        agent_hooks::AgentKind::Cursor => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".cursor"),
+        agent_hooks::AgentKind::Kiro => parent_dir_or_current(kiro_agent_path()),
+        agent_hooks::AgentKind::Antigravity => parent_dir_or_current(antigravity_hooks_path()),
+        agent_hooks::AgentKind::RovoDev => parent_dir_or_current(rovodev_config_path()),
+        agent_hooks::AgentKind::Pi => resolved_pi_agent_directory(),
+        agent_hooks::AgentKind::Omp => resolved_omp_agent_directory(),
+        agent_hooks::AgentKind::Amp => amp_config_dir(),
+        agent_hooks::AgentKind::HermesAgent => hermes_agent_config_dir(),
+        agent_hooks::AgentKind::Gemini => parent_dir_or_current(gemini_settings_path()),
+        agent_hooks::AgentKind::Copilot => parent_dir_or_current(copilot_config_path()),
+        agent_hooks::AgentKind::CodeBuddy => parent_dir_or_current(codebuddy_settings_path()),
+        agent_hooks::AgentKind::Factory => parent_dir_or_current(factory_settings_path()),
+        agent_hooks::AgentKind::Qoder => parent_dir_or_current(qoder_settings_path()),
+    }
+}
+
+// purpose: Get a path's parent when present.
+// inputs: File path.
+// returns/effects: Returns `.` for parentless relative paths.
+fn parent_dir_or_current(path: PathBuf) -> PathBuf {
+    path.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
@@ -20799,13 +20892,27 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn default_hook_setup_omits_opencode_until_supported() {
+    fn default_hook_setup_covers_implemented_cmux_agents() {
         assert_eq!(
             default_hook_targets(),
             vec![
-                agent_hooks::AgentKind::Codex,
                 agent_hooks::AgentKind::Claude,
+                agent_hooks::AgentKind::Codex,
+                agent_hooks::AgentKind::Grok,
+                agent_hooks::AgentKind::OpenCode,
+                agent_hooks::AgentKind::Cursor,
+                agent_hooks::AgentKind::Kiro,
+                agent_hooks::AgentKind::Antigravity,
+                agent_hooks::AgentKind::RovoDev,
+                agent_hooks::AgentKind::Pi,
+                agent_hooks::AgentKind::Omp,
+                agent_hooks::AgentKind::Amp,
+                agent_hooks::AgentKind::HermesAgent,
                 agent_hooks::AgentKind::Gemini,
+                agent_hooks::AgentKind::Copilot,
+                agent_hooks::AgentKind::CodeBuddy,
+                agent_hooks::AgentKind::Factory,
+                agent_hooks::AgentKind::Qoder,
             ]
         );
         assert_eq!(
@@ -20856,17 +20963,6 @@ mod cli_arg_tests {
             agent_hooks::AgentKind::from_hook_name("qodercli"),
             Some(agent_hooks::AgentKind::Qoder)
         );
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Cursor));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Antigravity));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::RovoDev));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Pi));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Omp));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Amp));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::HermesAgent));
-        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
     #[test]
