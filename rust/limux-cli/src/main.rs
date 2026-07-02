@@ -4539,6 +4539,19 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             kiro_feed_hook_events(),
         ),
+        agent_hooks::AgentKind::Antigravity => install_antigravity_hooks_with_feed(
+            &antigravity_hooks_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("PreInvocation", "prompt-submit"),
+                ("Stop", "stop"),
+                ("turn-completion", "stop"),
+                ("Notification", "notification"),
+                ("SessionEnd", "session-end"),
+            ],
+            antigravity_feed_hook_events(),
+        ),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4611,6 +4624,9 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         }
         agent_hooks::AgentKind::Cursor => uninstall_json_hooks(&cursor_hooks_path(), agent),
         agent_hooks::AgentKind::Kiro => uninstall_json_hooks(&kiro_agent_path(), agent),
+        agent_hooks::AgentKind::Antigravity => {
+            uninstall_antigravity_hooks(&antigravity_hooks_path(), agent)
+        }
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -4852,6 +4868,83 @@ fn remove_owned_hook_entries(
     });
 }
 
+// purpose: Install Antigravity hooks into the top-level CMUX hook group.
+// inputs: Antigravity hooks path, agent kind, lifecycle event mappings, and Feed event names.
+// returns/effects: Replaces the owned `cmux` group while preserving other hook groups.
+fn install_antigravity_hooks_with_feed(
+    path: &Path,
+    agent: agent_hooks::AgentKind,
+    events: &[(&str, &str)],
+    feed_events: &[&str],
+) -> Result<()> {
+    let mut root = read_json_object(path)?;
+    let mut group = Map::new();
+    for (agent_event, limux_event) in events {
+        let entry = antigravity_hook_entry(
+            hook_command(agent, limux_event)?,
+            hook_timeout(agent),
+            agent_event,
+        );
+        append_antigravity_group_entry(&mut group, agent_event, entry);
+    }
+    for agent_event in feed_events {
+        let entry = antigravity_hook_entry(
+            feed_hook_command(agent, agent_event)?,
+            feed_hook_timeout(agent),
+            agent_event,
+        );
+        append_antigravity_group_entry(&mut group, agent_event, entry);
+    }
+    root.insert("cmux".to_string(), Value::Object(group));
+    write_json_object(path, &root)
+}
+
+// purpose: Append one Antigravity hook entry to an event list inside a group.
+// inputs: Mutable group map, event name, and hook entry value.
+// returns/effects: Mutates the event array, creating it when absent.
+fn append_antigravity_group_entry(group: &mut Map<String, Value>, event: &str, entry: Value) {
+    let entries = group
+        .entry(event.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(entries) = entries.as_array_mut() else {
+        panic!("new Antigravity hook group event must be an array");
+    };
+    entries.push(entry);
+}
+
+// purpose: Build an Antigravity hook entry matching CMUX's lifecycle and Feed schemas.
+// inputs: Shell command, second-based timeout value, and Antigravity event name.
+// returns/effects: Returns a plain command entry or matcher-wrapped Feed hook entry.
+fn antigravity_hook_entry(command: String, timeout_seconds: u64, event_name: &str) -> Value {
+    let hook = json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout_seconds.max(1)
+    });
+    if matches!(event_name, "PreToolUse" | "PostToolUse") {
+        return json!({ "matcher": "*", "hooks": [hook] });
+    }
+    hook
+}
+
+// purpose: Remove Limux's Antigravity hook group when it contains owned commands.
+// inputs: Antigravity hooks path and agent kind.
+// returns/effects: Rewrites the JSON file with the `cmux` group removed when present.
+fn uninstall_antigravity_hooks(path: &Path, agent: agent_hooks::AgentKind) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut root = read_json_object(path)?;
+    let marker = hook_marker(agent);
+    let should_remove = root
+        .get("cmux")
+        .is_some_and(|group| hook_entry_matches_agent(agent, group, marker));
+    if should_remove {
+        root.remove("cmux");
+    }
+    write_json_object(path, &root)
+}
+
 // purpose: List the Claude hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Claude hook event names without side effects.
@@ -4895,6 +4988,13 @@ fn kiro_feed_hook_events() -> &'static [&'static str] {
     &["preToolUse", "postToolUse"]
 }
 
+// purpose: List the Antigravity hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Antigravity hook event names without side effects.
+fn antigravity_feed_hook_events() -> &'static [&'static str] {
+    &["PreToolUse", "PostToolUse"]
+}
+
 // purpose: List the Gemini hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Gemini hook event names without side effects.
@@ -4912,6 +5012,7 @@ fn pre_tool_use_feed_hook_events() -> &'static [&'static str] {
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Grok => 5,
+        agent_hooks::AgentKind::Antigravity => 10,
         agent_hooks::AgentKind::Codex
         | agent_hooks::AgentKind::Cursor
         | agent_hooks::AgentKind::Kiro
@@ -4933,6 +5034,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::Grok => 120,
         agent_hooks::AgentKind::Cursor => 0,
         agent_hooks::AgentKind::Kiro => 120_000,
+        agent_hooks::AgentKind::Antigravity => 120,
         agent_hooks::AgentKind::Claude
         | agent_hooks::AgentKind::Gemini
         | agent_hooks::AgentKind::Copilot
@@ -5079,6 +5181,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Cursor => "hooks cursor",
         agent_hooks::AgentKind::Kiro => "hooks kiro",
+        agent_hooks::AgentKind::Antigravity => "hooks antigravity",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5170,6 +5273,12 @@ fn kiro_agent_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kiro/agents/cmux.json")
+}
+
+fn antigravity_hooks_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".gemini/config/hooks.json")
 }
 
 fn gemini_settings_path() -> PathBuf {
@@ -10117,6 +10226,26 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn feed_permission_decision_renders_antigravity_output() {
+        let output = render_feed_decision(
+            &args(&["--source", "antigravity"]),
+            None,
+            &json!({}),
+            &json!({ "kind": "permission", "mode": "deny" }),
+        )
+        .expect("render");
+        let parsed: Value = serde_json::from_str(&output).expect("json");
+
+        assert_eq!(
+            parsed,
+            json!({
+                "decision": "deny",
+                "reason": "User denied permission via Limux Feed."
+            })
+        );
+    }
+
+    #[test]
     fn feed_permission_decision_renders_claude_deny_output() {
         let output = render_feed_decision(
             &args(&["--source", "claude"]),
@@ -10205,6 +10334,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Kiro)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("agy"),
+            Some(agent_hooks::AgentKind::Antigravity)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -10220,6 +10353,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Cursor));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Antigravity));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -10497,6 +10631,55 @@ mod cli_arg_tests {
             .contains("hooks feed --source kiro --event 'postToolUse'"));
         assert!(pre_tool.get("hooks").is_none());
         assert!(pre_tool.get("timeout").is_none());
+    }
+
+    /// purpose: Verify Antigravity setup writes CMUX's named hook group and Feed hooks.
+    /// inputs: Temporary hooks JSON file and the Antigravity installer/uninstaller.
+    /// returns/effects: Asserts group shape, second-based timeouts, matcher Feed entries, and removal.
+    #[test]
+    fn antigravity_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+        fs::write(&path, r#"{"other":{"Stop":[{"command":"keep"}]}}"#).expect("seed hooks");
+
+        install_antigravity_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Antigravity,
+            &[
+                ("SessionStart", "session-start"),
+                ("PreInvocation", "prompt-submit"),
+                ("Stop", "stop"),
+            ],
+            antigravity_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        let group = &root["cmux"];
+        let pre_tool = &group["PreToolUse"][0];
+
+        assert_eq!(root["other"]["Stop"][0]["command"], "keep");
+        assert_eq!(group["SessionStart"][0]["timeout"], 10);
+        assert_eq!(group["SessionStart"][0]["type"], "command");
+        assert!(group["SessionStart"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks antigravity session-start"));
+        assert_eq!(pre_tool["matcher"], "*");
+        assert_eq!(pre_tool["hooks"][0]["timeout"], 120);
+        assert_eq!(pre_tool["hooks"][0]["type"], "command");
+        assert!(pre_tool["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source antigravity --event 'PreToolUse'"));
+
+        uninstall_antigravity_hooks(&path, agent_hooks::AgentKind::Antigravity)
+            .expect("uninstall hooks");
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        assert!(root.get("cmux").is_none());
+        assert_eq!(root["other"]["Stop"][0]["command"], "keep");
     }
 
     /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.

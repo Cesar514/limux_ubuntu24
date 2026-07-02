@@ -15,6 +15,7 @@ pub(crate) enum AgentKind {
     OpenCode,
     Cursor,
     Kiro,
+    Antigravity,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -23,7 +24,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 11] {
+    pub(crate) fn all() -> [Self; 12] {
         [
             Self::Claude,
             Self::Codex,
@@ -31,6 +32,7 @@ impl AgentKind {
             Self::OpenCode,
             Self::Cursor,
             Self::Kiro,
+            Self::Antigravity,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -47,6 +49,7 @@ impl AgentKind {
             "opencode" | "open-code" => Some(Self::OpenCode),
             "cursor" | "cursor-agent" => Some(Self::Cursor),
             "kiro" | "kiro-cli" => Some(Self::Kiro),
+            "antigravity" | "agy" => Some(Self::Antigravity),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -64,6 +67,7 @@ impl AgentKind {
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor",
             Self::Kiro => "kiro",
+            Self::Antigravity => "antigravity",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -80,6 +84,7 @@ impl AgentKind {
             Self::OpenCode => "OpenCode",
             Self::Cursor => "Cursor",
             Self::Kiro => "Kiro",
+            Self::Antigravity => "Antigravity",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -96,6 +101,7 @@ impl AgentKind {
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor-agent",
             Self::Kiro => "kiro-cli",
+            Self::Antigravity => "agy",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -366,6 +372,9 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::Antigravity => {
+            parts.extend(preserved_tail);
+        }
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -473,6 +482,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::Kiro => arg == "--resume-id" || arg.starts_with("--resume-id="),
+        AgentKind::Antigravity => false,
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -748,5 +758,21 @@ mod tests {
             command,
             "'kiro-cli' 'chat' '--resume-id' 'new' '--agent' 'cmux'"
         );
+    }
+
+    #[test]
+    fn antigravity_resume_command_replays_launch_without_resume_selector() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "agy".to_string(),
+            arguments: vec!["agy".to_string(), "--model".to_string(), "fast".to_string()],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 60.0,
+        };
+
+        let command = build_resume_command(AgentKind::Antigravity, "ignored", Some(&launch), None)
+            .expect("resume");
+
+        assert_eq!(command, "'agy' '--model' 'fast'");
     }
 }

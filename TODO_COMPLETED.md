@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T06:33:51Z Implement and verify CMUX Antigravity hook group setup, Feed PreToolUse/PostToolUse bridge, Antigravity decision JSON rendering, and replay-style session restore parity. \
 [x] 2026-07-02T06:29:28Z Implement and verify CMUX Kiro CLI agent hook setup, Feed preToolUse/postToolUse bridge, Kiro side-effect approval classification, and native resume parity. \
 [x] 2026-07-02T06:23:57Z Implement and verify CMUX Cursor CLI flat hook setup, Feed beforeShellExecution bridge, and native resume parity. \
 [x] 2026-07-02T06:20:12Z Implement and verify CMUX nested JSON hook setup, Feed PreToolUse bridge, and native resume parity for Copilot, CodeBuddy, Factory, and Qoder. \
