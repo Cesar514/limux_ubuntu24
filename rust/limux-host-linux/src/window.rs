@@ -3982,13 +3982,16 @@ fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
             .message
             .clone()
             .unwrap_or_else(|| "open URL".to_string()),
+        other if custom_sidebar_dispatcher_action(other).is_some() => {
+            format!("cmux dispatcher: {other}")
+        }
         other => format!("not_supported: custom sidebar action {other}"),
     }
 }
 
 /// purpose: Execute one supported JSON custom-sidebar button action.
 /// inputs: Button widget for feedback and parsed action metadata.
-/// returns/effects: Logs messages, opens URLs, or marks unsupported dispatcher actions visibly.
+/// returns/effects: Logs messages, opens URLs, dispatches safe CMUX methods, or marks errors visibly.
 fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNodeAction) {
     match action.action_type.as_str() {
         "log" => eprintln!(
@@ -3996,10 +3999,117 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
             action.message.as_deref().unwrap_or("")
         ),
         "openURL" | "open" => open_custom_sidebar_url(button, action.message.as_deref()),
-        other => button.set_tooltip_text(Some(&format!(
-            "not_supported: custom sidebar dispatcher action {other}"
+        other => run_custom_sidebar_dispatcher_action(button, other),
+    }
+}
+
+/// purpose: Map CMUX JSON action types to supported no-parameter dispatcher actions.
+/// inputs: Raw JSON action type.
+/// returns/effects: Returns the equivalent host action for no-param dispatcher actions only.
+fn custom_sidebar_dispatcher_action(method: &str) -> Option<CustomSidebarDispatcherAction> {
+    match method {
+        "workspace.next" | "next-window" => Some(CustomSidebarDispatcherAction::WorkspaceNext),
+        "workspace.previous" | "previous-window" => {
+            Some(CustomSidebarDispatcherAction::WorkspacePrevious)
+        }
+        "workspace.last" | "last-window" => Some(CustomSidebarDispatcherAction::WorkspaceLast),
+        "notification.jump_to_unread" | "jump-to-unread" => {
+            Some(CustomSidebarDispatcherAction::JumpToUnread)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustomSidebarDispatcherAction {
+    WorkspaceNext,
+    WorkspacePrevious,
+    WorkspaceLast,
+    JumpToUnread,
+}
+
+/// purpose: Execute a supported CMUX dispatcher action from a JSON custom-sidebar button.
+/// inputs: Button widget for feedback and raw dispatcher method.
+/// returns/effects: Mutates host state through existing workspace/notification helpers.
+fn run_custom_sidebar_dispatcher_action(button: &gtk::Button, method: &str) {
+    let Some(action) = custom_sidebar_dispatcher_action(method) else {
+        button.set_tooltip_text(Some(&format!(
+            "not_supported: custom sidebar dispatcher action {method}"
+        )));
+        return;
+    };
+    let result = CONTROL_STATE.with(|slot| {
+        let state = slot.borrow().clone();
+        state
+            .ok_or_else(|| BridgeError::internal("custom sidebar dispatcher state is unavailable"))
+            .and_then(|state| apply_custom_sidebar_dispatcher_action(&state, action))
+    });
+    match result {
+        Ok(_) => button.set_tooltip_text(Some(&format!("cmux dispatcher: {method}"))),
+        Err(error) => button.set_tooltip_text(Some(&format!(
+            "custom sidebar dispatcher action {method} failed: {error:?}"
         ))),
     }
+}
+
+/// purpose: Apply a no-parameter dispatcher action through existing host helpers.
+/// inputs: Live host state and parsed action.
+/// returns/effects: Navigates workspaces or jumps to unread notifications.
+fn apply_custom_sidebar_dispatcher_action(
+    state: &State,
+    action: CustomSidebarDispatcherAction,
+) -> Result<serde_json::Value, BridgeError> {
+    match action {
+        CustomSidebarDispatcherAction::WorkspaceNext => {
+            select_relative_workspace_for_custom_sidebar(state, WorkspaceNavigation::Next)
+        }
+        CustomSidebarDispatcherAction::WorkspacePrevious => {
+            select_relative_workspace_for_custom_sidebar(state, WorkspaceNavigation::Previous)
+        }
+        CustomSidebarDispatcherAction::WorkspaceLast => {
+            select_relative_workspace_for_custom_sidebar(state, WorkspaceNavigation::Last)
+        }
+        CustomSidebarDispatcherAction::JumpToUnread => jump_to_unread_notification(state),
+    }
+}
+
+/// purpose: Select a relative workspace from a JSON custom-sidebar dispatcher action.
+/// inputs: Live host state and workspace navigation direction.
+/// returns/effects: Reuses the same selection semantics as workspace.next/previous/last.
+fn select_relative_workspace_for_custom_sidebar(
+    state: &State,
+    action: WorkspaceNavigation,
+) -> Result<serde_json::Value, BridgeError> {
+    let resolved = {
+        let app_state = state.borrow();
+        match action {
+            WorkspaceNavigation::Next if !app_state.workspaces.is_empty() => {
+                Some((app_state.active_idx + 1) % app_state.workspaces.len())
+            }
+            WorkspaceNavigation::Previous if !app_state.workspaces.is_empty() => Some(
+                app_state
+                    .active_idx
+                    .checked_sub(1)
+                    .unwrap_or_else(|| app_state.workspaces.len() - 1),
+            ),
+            WorkspaceNavigation::Last => {
+                app_state
+                    .previous_workspace_id
+                    .as_deref()
+                    .and_then(|previous_id| {
+                        app_state
+                            .workspaces
+                            .iter()
+                            .position(|workspace| workspace.id == previous_id)
+                    })
+            }
+            _ => None,
+        }
+    };
+    let Some(index) = resolved else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    select_workspace_for_control(state, index)
 }
 
 /// purpose: Open a URL from a JSON custom-sidebar button action.
@@ -16602,6 +16712,7 @@ mod tests {
         browser_find_script, browser_required_element_script, browser_scroll_script,
         browser_snapshot_script, browser_styles_script, build_window_css,
         clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
+        custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action,
         custom_sidebar_report_payload_at, desktop_notification_action_entries,
         desktop_notification_action_from_signal, desktop_notification_actions,
         desktop_notification_activation_token_from_signal,
@@ -16637,12 +16748,13 @@ mod tests {
         workspace_insert_index_for_placement, workspace_lifecycle_payload,
         workspace_notification_message, workspace_reorder_uses_top_level_rows,
         workspace_reordered_payload, workspace_sidebar_render_items,
-        workspace_title_from_directory, workspace_top_level_ids, BrowserEvent, Direction,
-        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
-        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
-        SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport,
-        WorkspaceEventSnapshot, WorkspaceOrderRow, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
+        workspace_title_from_directory, workspace_top_level_ids, BrowserEvent,
+        CustomSidebarDispatcherAction, CustomSidebarNodeAction, Direction, EditableCaptureContext,
+        HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
+        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
+        SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
+        SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot,
+        WorkspaceOrderRow, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
         WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
@@ -17142,7 +17254,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
             dir.path().join("build-board.json"),
-            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Logs","action":{"type":"log","message":"clicked"}}]}}"#,
+            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Logs","action":{"type":"workspace.next","message":"ignored"}}]}}"#,
         )
         .expect("write json sidebar");
 
@@ -17156,6 +17268,40 @@ mod tests {
         assert_eq!(selection.document.version, 1);
         assert_eq!(selection.document.root.node_type, "vstack");
         assert_eq!(selection.document.root.children.len(), 2);
+        let action = selection.document.root.children[1]
+            .action
+            .as_ref()
+            .expect("button action");
+        assert_eq!(action.action_type, "workspace.next");
+        assert_eq!(
+            custom_sidebar_action_tooltip(action),
+            "cmux dispatcher: workspace.next"
+        );
+    }
+
+    #[test]
+    fn custom_sidebar_dispatcher_actions_allow_only_no_param_cmux_methods() {
+        assert_eq!(
+            custom_sidebar_dispatcher_action("workspace.next"),
+            Some(CustomSidebarDispatcherAction::WorkspaceNext)
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action("previous-window"),
+            Some(CustomSidebarDispatcherAction::WorkspacePrevious)
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action("notification.jump_to_unread"),
+            Some(CustomSidebarDispatcherAction::JumpToUnread)
+        );
+        assert_eq!(custom_sidebar_dispatcher_action("workspace.select"), None);
+        assert_eq!(custom_sidebar_dispatcher_action("surface.focus"), None);
+        assert_eq!(
+            custom_sidebar_action_tooltip(&CustomSidebarNodeAction {
+                action_type: "surface.focus".to_string(),
+                message: None,
+            }),
+            "not_supported: custom sidebar action surface.focus"
+        );
     }
 
     #[test]
