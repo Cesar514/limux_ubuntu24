@@ -1455,9 +1455,51 @@ const SURFACE_TAB_BAR_FONT_SIZE: FontSizeSetting = FontSizeSetting {
     max: 14.0,
 };
 
-/// purpose: Map CMUX config font-size keys to their supported ranges.
-/// inputs: Raw config key from CLI arguments.
-/// returns/effects: Returns the supported descriptor or None for unknown keys.
+#[derive(Clone, Copy)]
+enum NotificationSettingKind {
+    Bool { default: bool },
+    TurnComplete,
+}
+
+#[derive(Clone, Copy)]
+struct NotificationSetting {
+    key: &'static str,
+    json_key: &'static str,
+    kind: NotificationSettingKind,
+}
+
+const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.agentPermissionPrompt",
+    json_key: "agentPermissionPrompt",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
+const AGENT_TURN_COMPLETE_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.agentTurnComplete",
+    json_key: "agentTurnComplete",
+    kind: NotificationSettingKind::TurnComplete,
+};
+
+const AGENT_IDLE_REMINDER_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.agentIdleReminder",
+    json_key: "agentIdleReminder",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
+const CONFIG_GET_USAGE: &str = concat!(
+    "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
+    "notifications.agentIdleReminder>"
+);
+const CONFIG_SET_USAGE: &str = concat!(
+    "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
+    "notifications.agentIdleReminder> <value>"
+);
+
+// purpose: Map CMUX config font-size keys to their supported ranges.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
 fn font_size_setting(raw: &str) -> Option<FontSizeSetting> {
     match raw {
         "sidebar-font-size" => Some(SIDEBAR_FONT_SIZE),
@@ -1466,9 +1508,21 @@ fn font_size_setting(raw: &str) -> Option<FontSizeSetting> {
     }
 }
 
-/// purpose: Format CMUX font-size values without unnecessary trailing zeros.
-/// inputs: Numeric point size.
-/// returns/effects: Returns strings like 12, 12.5, or 13.75.
+// purpose: Map supported CMUX notification settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn notification_setting(raw: &str) -> Option<NotificationSetting> {
+    match raw {
+        "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
+        "notifications.agentTurnComplete" => Some(AGENT_TURN_COMPLETE_SETTING),
+        "notifications.agentIdleReminder" => Some(AGENT_IDLE_REMINDER_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Format CMUX font-size values without unnecessary trailing zeros.
+// inputs: Numeric point size.
+// returns/effects: Returns strings like 12, 12.5, or 13.75.
 fn format_font_size(value: f64) -> String {
     let scaled = (value * 100.0).round() as i64;
     let whole = scaled / 100;
@@ -1482,9 +1536,9 @@ fn format_font_size(value: f64) -> String {
     format!("{whole}.{fraction:02}")
 }
 
-/// purpose: Read the effective CMUX font-size setting from Limux settings JSON.
-/// inputs: Settings path and supported font-size descriptor.
-/// returns/effects: Returns configured value when present, otherwise CMUX default.
+// purpose: Read the effective CMUX font-size setting from Limux settings JSON.
+// inputs: Settings path and supported font-size descriptor.
+// returns/effects: Returns configured value when present, otherwise CMUX default.
 fn get_config_font_size_at(path: &Path, setting: FontSizeSetting) -> Result<(f64, bool)> {
     let root = read_settings_root(path)?;
     let configured = root
@@ -1495,9 +1549,9 @@ fn get_config_font_size_at(path: &Path, setting: FontSizeSetting) -> Result<(f64
     Ok((configured.unwrap_or(setting.default), configured.is_some()))
 }
 
-/// purpose: Write a CMUX font-size setting while preserving unrelated settings.
-/// inputs: Settings path, supported descriptor, and raw CLI value.
-/// returns/effects: Clamps numeric values and atomically writes settings JSON.
+// purpose: Write a CMUX font-size setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw CLI value.
+// returns/effects: Clamps numeric values and atomically writes settings JSON.
 fn set_config_font_size_at(path: &Path, setting: FontSizeSetting, raw: &str) -> Result<f64> {
     let requested = raw
         .parse::<f64>()
@@ -1512,9 +1566,51 @@ fn set_config_font_size_at(path: &Path, setting: FontSizeSetting, raw: &str) -> 
     Ok(value)
 }
 
-/// purpose: Render CMUX-compatible config get output for one font-size setting.
-/// inputs: Settings path and setting descriptor.
-/// returns/effects: Returns text with effective value and backing path.
+// purpose: Read a nested notifications setting with CMUX defaults.
+// inputs: Settings path and supported notification setting descriptor.
+// returns/effects: Returns the effective string value and whether it was configured.
+fn get_config_notification_setting_at(
+    path: &Path,
+    setting: NotificationSetting,
+) -> Result<(String, bool)> {
+    let root = read_settings_root(path)?;
+    let Some(value) = root
+        .get("notifications")
+        .and_then(Value::as_object)
+        .and_then(|notifications| notifications.get(setting.json_key))
+    else {
+        return Ok((
+            default_notification_setting_value(setting).to_string(),
+            false,
+        ));
+    };
+    Ok((parse_notification_setting_value(setting, value)?, true))
+}
+
+// purpose: Write a nested notifications setting while preserving unrelated settings.
+// inputs: Settings path, supported descriptor, and raw CLI value.
+// returns/effects: Strictly parses the value and atomically writes settings JSON.
+fn set_config_notification_setting_at(
+    path: &Path,
+    setting: NotificationSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = notification_setting_json_value(setting, raw)?;
+    let display = parse_notification_setting_value(setting, &value)?;
+    let mut root = read_settings_root(path)?;
+    let notifications = root
+        .entry("notifications".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("notifications must be a JSON object"))?;
+    notifications.insert(setting.json_key.to_string(), value);
+    write_settings_root(path, &root)?;
+    Ok(display)
+}
+
+// purpose: Render CMUX-compatible config get output for one font-size setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
 fn render_config_font_size_get(path: &Path, setting: FontSizeSetting) -> Result<String> {
     let (value, _) = get_config_font_size_at(path, setting)?;
     Ok(format!(
@@ -1525,9 +1621,9 @@ fn render_config_font_size_get(path: &Path, setting: FontSizeSetting) -> Result<
     ))
 }
 
-/// purpose: Apply a CMUX-compatible config set operation for one font-size setting.
-/// inputs: Settings path, setting descriptor, and raw point-size argument.
-/// returns/effects: Writes settings JSON and returns user-facing status text.
+// purpose: Apply a CMUX-compatible config set operation for one font-size setting.
+// inputs: Settings path, setting descriptor, and raw point-size argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
 fn render_config_font_size_set(path: &Path, setting: FontSizeSetting, raw: &str) -> Result<String> {
     let value = set_config_font_size_at(path, setting, raw)?;
     Ok(format!(
@@ -1536,6 +1632,91 @@ fn render_config_font_size_set(path: &Path, setting: FontSizeSetting, raw: &str)
         format_font_size(value),
         path.display()
     ))
+}
+
+// purpose: Render CMUX-compatible config get output for one notification setting.
+// inputs: Settings path and setting descriptor.
+// returns/effects: Returns text with effective value and backing path.
+fn render_config_notification_get(path: &Path, setting: NotificationSetting) -> Result<String> {
+    let (value, _) = get_config_notification_setting_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Apply a CMUX-compatible config set for one notification setting.
+// inputs: Settings path, setting descriptor, and raw value argument.
+// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_notification_set(
+    path: &Path,
+    setting: NotificationSetting,
+    raw: &str,
+) -> Result<String> {
+    let value = set_config_notification_setting_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        value,
+        path.display()
+    ))
+}
+
+// purpose: Return the CMUX default value for supported notification config keys.
+// inputs: Supported notification setting descriptor.
+// returns/effects: Returns the default as rendered text.
+fn default_notification_setting_value(setting: NotificationSetting) -> &'static str {
+    match setting.kind {
+        NotificationSettingKind::Bool { default: true } => "true",
+        NotificationSettingKind::Bool { default: false } => "false",
+        NotificationSettingKind::TurnComplete => "whenIdle",
+    }
+}
+
+// purpose: Parse an existing JSON value for a supported notification config key.
+// inputs: Supported descriptor and raw JSON value.
+// returns/effects: Returns rendered value or errors on malformed settings JSON.
+fn parse_notification_setting_value(setting: NotificationSetting, value: &Value) -> Result<String> {
+    match setting.kind {
+        NotificationSettingKind::Bool { .. } => value
+            .as_bool()
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow!("{} must be a boolean", setting.key)),
+        NotificationSettingKind::TurnComplete => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be whenIdle, always, or never", setting.key))?;
+            parse_agent_turn_complete_value(raw, setting.key).map(str::to_string)
+        }
+    }
+}
+
+// purpose: Parse CLI input into the JSON value for a supported notification setting.
+// inputs: Supported descriptor and raw CLI value.
+// returns/effects: Returns strict JSON value or a user-facing validation error.
+fn notification_setting_json_value(setting: NotificationSetting, raw: &str) -> Result<Value> {
+    match setting.kind {
+        NotificationSettingKind::Bool { .. } => match raw {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => bail!("{} requires true or false", setting.key),
+        },
+        NotificationSettingKind::TurnComplete => Ok(Value::String(
+            parse_agent_turn_complete_value(raw, setting.key)?.to_string(),
+        )),
+    }
+}
+
+// purpose: Validate CMUX agent turn-complete notification policy values.
+// inputs: Raw setting value and key for error context.
+// returns/effects: Returns the canonical value or a loud config error.
+fn parse_agent_turn_complete_value<'a>(raw: &'a str, key: &str) -> Result<&'a str> {
+    match raw {
+        "whenIdle" | "always" | "never" => Ok(raw),
+        _ => bail!("{key} must be whenIdle, always, or never"),
+    }
 }
 
 /// purpose: Handle CMUX-compatible local commands without requiring a socket.
@@ -2058,38 +2239,41 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
         "reload" => bail!("config reload requires running host reload support; restart Limux after editing settings"),
         "get" => {
             if args.len() != 2 {
-                bail!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>");
+                bail!("{CONFIG_GET_USAGE}");
             }
             let key = args
                 .get(1)
-                .ok_or_else(|| anyhow!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>"))?;
-            let setting = font_size_setting(key).ok_or_else(|| {
-                anyhow!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>")
-            })?;
-            Ok(CommandOutput::Text(render_config_font_size_get(
-                &limux_settings_path()?,
-                setting,
+                .ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
+            let path = limux_settings_path()?;
+            if let Some(setting) = font_size_setting(key) {
+                return Ok(CommandOutput::Text(render_config_font_size_get(
+                    &path, setting,
+                )?));
+            }
+            let setting = notification_setting(key).ok_or_else(|| anyhow!("{CONFIG_GET_USAGE}"))?;
+            Ok(CommandOutput::Text(render_config_notification_get(
+                &path, setting,
             )?))
         }
         "set" => {
             if args.len() != 3 {
-                bail!(
-                    "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"
-                );
+                bail!("{CONFIG_SET_USAGE}");
             }
             let key = args
                 .get(1)
-                .ok_or_else(|| anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"))?;
+                .ok_or_else(|| anyhow!("{CONFIG_SET_USAGE}"))?;
             let value = args
                 .get(2)
-                .ok_or_else(|| anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"))?;
-            let setting = font_size_setting(key).ok_or_else(|| {
-                anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>")
-            })?;
-            Ok(CommandOutput::Text(render_config_font_size_set(
-                &limux_settings_path()?,
-                setting,
-                value,
+                .ok_or_else(|| anyhow!("{CONFIG_SET_USAGE}"))?;
+            let path = limux_settings_path()?;
+            if let Some(setting) = font_size_setting(key) {
+                return Ok(CommandOutput::Text(render_config_font_size_set(
+                    &path, setting, value,
+                )?));
+            }
+            let setting = notification_setting(key).ok_or_else(|| anyhow!("{CONFIG_SET_USAGE}"))?;
+            Ok(CommandOutput::Text(render_config_notification_set(
+                &path, setting, value,
             )?))
         }
         "sidebar-font-size" | "surface-tab-bar-font-size" => {
@@ -14737,6 +14921,48 @@ mod cli_arg_tests {
         let err = render_config_font_size_set(&path, SIDEBAR_FONT_SIZE, "large")
             .expect_err("invalid value");
         assert!(err.to_string().contains("requires a numeric point size"));
+    }
+
+    #[test]
+    fn config_notification_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_notification_get(&path, AGENT_PERMISSION_PROMPT_SETTING)
+            .expect("get default permission prompt");
+        assert!(text.contains("notifications.agentPermissionPrompt = true"));
+
+        fs::write(&path, br#"{"app":{"newWorkspacePlacement":"end"}}"#).expect("write settings");
+        let text = render_config_notification_set(&path, AGENT_TURN_COMPLETE_SETTING, "always")
+            .expect("set turn complete");
+        assert!(text.contains("notifications.agentTurnComplete = always"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["app"]["newWorkspacePlacement"], "end");
+        assert_eq!(parsed["notifications"]["agentTurnComplete"], "always");
+    }
+
+    #[test]
+    fn config_notification_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_notification_set(&path, AGENT_IDLE_REMINDER_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        let err = render_config_notification_set(&path, AGENT_TURN_COMPLETE_SETTING, "idle")
+            .expect_err("invalid turn complete");
+        assert!(err
+            .to_string()
+            .contains("must be whenIdle, always, or never"));
+
+        fs::write(&path, br#"{"notifications":{"agentIdleReminder":"true"}}"#)
+            .expect("write malformed settings");
+        let err = render_config_notification_get(&path, AGENT_IDLE_REMINDER_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
     }
 
     #[test]
