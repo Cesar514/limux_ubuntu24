@@ -5209,7 +5209,12 @@ fn run_themes_command(args: &[String], json_output: bool) -> Result<CommandOutpu
         "--help" | "-h" => Ok(CommandOutput::Text(
             "Usage: limux themes [list|set|clear]".to_string(),
         )),
-        "list" => render_themes_list(&ghostty_config_path()?, json_output),
+        "list" => {
+            if args.len() > 1 {
+                bail!("themes list does not take any positional arguments");
+            }
+            render_themes_list(&ghostty_config_path()?, json_output)
+        }
         "set" => {
             let path = ghostty_config_path()?;
             run_themes_set_at(&path, &args[1..], json_output)
@@ -18907,6 +18912,15 @@ mod cli_arg_tests {
         };
         assert_eq!(payload["current"]["light"], "Gruvbox Light");
         assert_eq!(payload["catalog"], "ghostty_theme_directories");
+    }
+
+    #[test]
+    fn themes_list_rejects_extra_arguments_like_cmux() {
+        let err = run_themes_command(&args(&["list", "extra"]), false)
+            .expect_err("themes list arity should fail");
+        assert!(err
+            .to_string()
+            .contains("themes list does not take any positional arguments"));
     }
 
     #[test]
