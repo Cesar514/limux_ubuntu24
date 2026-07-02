@@ -356,7 +356,7 @@ fn full_help_text() -> &'static str {
         "  surface-health [--workspace <id|ref>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
-        "  new-workspace [--cwd <path>] [--command <text>] [--env KEY=VALUE] [--env-file <path>]\n",
+        "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--env KEY=VALUE] [--env-file <path>]\n",
         "  workspace env [<workspace>] [--workspace <id|ref|name>] [--mask]\n",
         "  select-workspace --workspace <id|ref>\n",
         "  close-workspace --workspace <id|ref>\n",
@@ -7092,19 +7092,21 @@ export default function limuxOmpSessionExtension(api) {
     )
 }
 
-async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
-    let cwd = parse_opt(args, "--cwd");
-    let command = parse_opt(args, "--command");
-    let environment = parse_workspace_env_args(args)?;
-    let original = resolve_current_workspace(client).await?;
-
+// purpose: Build CMUX-compatible workspace.create params from CLI flags.
+// inputs: Arguments after `new-workspace` or `workspace create`.
+// returns/effects: Returns validated params without contacting the host.
+fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     let mut params = Map::new();
-    if let Some(cwd_value) = cwd.as_ref() {
+    if let Some(name) = parse_opt(args, "--name").or_else(|| parse_opt(args, "--title")) {
+        params.insert("title".to_string(), Value::String(name));
+    }
+    if let Some(cwd_value) = parse_opt(args, "--cwd") {
         params.insert("cwd".to_string(), Value::String(cwd_value.clone()));
     }
-    if let Some(command) = command.clone() {
+    if let Some(command) = parse_opt(args, "--command") {
         params.insert("command".to_string(), Value::String(command));
     }
+    let environment = parse_workspace_env_args(args)?;
     if !environment.is_empty() {
         let environment = environment
             .into_iter()
@@ -7112,6 +7114,12 @@ async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value
             .collect::<Map<_, _>>();
         params.insert("workspace_env".to_string(), Value::Object(environment));
     }
+    Ok(params)
+}
+
+async fn run_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
+    let params = build_new_workspace_params(args)?;
+    let original = resolve_current_workspace(client).await?;
 
     let created = client
         .call("workspace.create", Value::Object(params))
@@ -11308,6 +11316,34 @@ mod cli_arg_tests {
 
         assert_eq!(values.get("FOO").map(String::as_str), Some("cli"));
         assert_eq!(values.get("BAR").map(String::as_str), Some("baz"));
+    }
+
+    #[test]
+    fn new_workspace_params_include_cmux_name_title_and_env() {
+        let params = build_new_workspace_params(&args(&[
+            "--name",
+            "Build Server",
+            "--cwd",
+            "/tmp/project",
+            "--command",
+            "npm test",
+            "--env",
+            "AWS_PROFILE=prod",
+        ]))
+        .expect("workspace params");
+
+        assert_eq!(params["title"], "Build Server");
+        assert_eq!(params["cwd"], "/tmp/project");
+        assert_eq!(params["command"], "npm test");
+        assert_eq!(params["workspace_env"]["AWS_PROFILE"], "prod");
+    }
+
+    #[test]
+    fn new_workspace_params_accept_title_alias() {
+        let params =
+            build_new_workspace_params(&args(&["--title", "Launch"])).expect("workspace params");
+
+        assert_eq!(params["title"], "Launch");
     }
 
     #[test]
