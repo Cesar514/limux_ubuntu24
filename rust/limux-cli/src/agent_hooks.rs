@@ -19,6 +19,7 @@ pub(crate) enum AgentKind {
     RovoDev,
     Pi,
     Omp,
+    Amp,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -27,7 +28,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 15] {
+    pub(crate) fn all() -> [Self; 16] {
         [
             Self::Claude,
             Self::Codex,
@@ -39,6 +40,7 @@ impl AgentKind {
             Self::RovoDev,
             Self::Pi,
             Self::Omp,
+            Self::Amp,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -59,6 +61,7 @@ impl AgentKind {
             "rovodev" | "rovo" | "acli" => Some(Self::RovoDev),
             "pi" | "pi-coding-agent" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
+            "amp" => Some(Self::Amp),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -80,6 +83,7 @@ impl AgentKind {
             Self::RovoDev => "rovodev",
             Self::Pi => "pi",
             Self::Omp => "omp",
+            Self::Amp => "amp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -100,6 +104,7 @@ impl AgentKind {
             Self::RovoDev => "Rovo Dev",
             Self::Pi => "Pi",
             Self::Omp => "OMP",
+            Self::Amp => "Amp",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -120,6 +125,7 @@ impl AgentKind {
             Self::RovoDev => "acli",
             Self::Pi => "pi",
             Self::Omp => "omp",
+            Self::Amp => "amp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -308,6 +314,10 @@ pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -
             index += 1;
             continue;
         }
+        if kind == AgentKind::Amp && amp_resume_subcommand_at(arguments, index) {
+            index += 3;
+            continue;
+        }
         if option_takes_secret_value(arg) {
             index += 1;
             if index < arguments.len() && !arguments[index].starts_with('-') {
@@ -411,6 +421,12 @@ pub(crate) fn build_resume_command(
         }
         AgentKind::Omp => {
             parts.push("--session".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Amp => {
+            parts.push("threads".to_string());
+            parts.push("continue".to_string());
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
@@ -594,6 +610,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
                 || arg.starts_with("--fork=")
         }
         AgentKind::Omp => arg == "--session" || arg.starts_with("--session="),
+        AgentKind::Amp => false,
         AgentKind::Claude
         | AgentKind::Cursor
         | AgentKind::Gemini
@@ -604,6 +621,12 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
             arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
     }
+}
+
+fn amp_resume_subcommand_at(arguments: &[String], index: usize) -> bool {
+    index + 2 < arguments.len()
+        && arguments[index] == "threads"
+        && arguments[index + 1] == "continue"
 }
 
 fn option_takes_secret_value(arg: &str) -> bool {
@@ -699,6 +722,7 @@ fn selected_environment() -> BTreeMap<String, String> {
         "CODEBUDDY_CONFIG_DIR",
         "PI_CODING_AGENT_DIR",
         "PI_CONFIG_DIR",
+        "AMP_CONFIG_DIR",
         "QODER_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_MODEL",
@@ -975,6 +999,34 @@ mod tests {
         assert_eq!(
             command,
             "'pi' '--session' 'new' '--model' 'fast' '--provider=anthropic'"
+        );
+    }
+
+    #[test]
+    fn amp_resume_command_uses_threads_continue_and_drops_old_session() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "amp".to_string(),
+            arguments: vec![
+                "amp".to_string(),
+                "threads".to_string(),
+                "continue".to_string(),
+                "old-thread".to_string(),
+                "--model".to_string(),
+                "fast".to_string(),
+                "--api-key".to_string(),
+                "secret".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 100.0,
+        };
+
+        let command = build_resume_command(AgentKind::Amp, "new-thread", Some(&launch), None)
+            .expect("resume");
+
+        assert_eq!(
+            command,
+            "'amp' 'threads' 'continue' 'new-thread' '--model' 'fast'"
         );
     }
 

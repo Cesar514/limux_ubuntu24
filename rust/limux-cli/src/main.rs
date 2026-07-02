@@ -4563,6 +4563,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         ),
         agent_hooks::AgentKind::Pi => install_pi_extension(),
         agent_hooks::AgentKind::Omp => install_omp_extension(),
+        agent_hooks::AgentKind::Amp => install_amp_extension(),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4641,6 +4642,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
         agent_hooks::AgentKind::RovoDev => uninstall_rovodev_hooks(&rovodev_config_path()),
         agent_hooks::AgentKind::Pi => uninstall_pi_extension(),
         agent_hooks::AgentKind::Omp => uninstall_omp_extension(),
+        agent_hooks::AgentKind::Amp => uninstall_amp_extension(),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -5245,6 +5247,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
         agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
+        agent_hooks::AgentKind::Amp => 0,
     }
 }
 
@@ -5267,6 +5270,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
         agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
+        agent_hooks::AgentKind::Amp => 0,
     }
 }
 
@@ -5343,6 +5347,23 @@ fn install_omp_extension() -> Result<()> {
 fn uninstall_omp_extension() -> Result<()> {
     let path = omp_extension_path();
     uninstall_marked_extension_file(&path, "cmux-omp-session-extension-marker")
+}
+
+// purpose: Install CMUX-compatible Amp plugin hooks.
+// inputs: None; path is resolved from AMP_CONFIG_DIR, HOME, or dirs.
+// returns/effects: Writes the generated plugin, refusing to replace non-Limux files.
+fn install_amp_extension() -> Result<()> {
+    let path = amp_extension_path();
+    let source = amp_extension_source()?;
+    install_marked_extension_file(&path, &source, "cmux-amp-session-extension-marker")
+}
+
+// purpose: Remove the installed Amp plugin only when it carries the owned marker.
+// inputs: None.
+// returns/effects: Deletes the generated plugin or leaves missing files untouched.
+fn uninstall_amp_extension() -> Result<()> {
+    let path = amp_extension_path();
+    uninstall_marked_extension_file(&path, "cmux-amp-session-extension-marker")
 }
 
 // purpose: Write a generated extension file while protecting unrelated user files.
@@ -5483,6 +5504,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::RovoDev => "hooks rovodev",
         agent_hooks::AgentKind::Pi => "hooks pi",
         agent_hooks::AgentKind::Omp => "hooks omp",
+        agent_hooks::AgentKind::Amp => "hooks amp",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -5626,6 +5648,17 @@ fn resolved_pi_agent_directory() -> PathBuf {
 
 fn omp_extension_path() -> PathBuf {
     resolved_omp_agent_directory().join("extensions/cmux-omp-session.ts")
+}
+
+fn amp_extension_path() -> PathBuf {
+    amp_config_dir().join("plugins/cmux-session.ts")
+}
+
+fn amp_config_dir() -> PathBuf {
+    env::var_os("AMP_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config/amp")))
+        .unwrap_or_else(|| PathBuf::from(".config/amp"))
 }
 
 fn resolved_omp_agent_directory() -> PathBuf {
@@ -6245,6 +6278,320 @@ fn omp_extension_source() -> Result<String> {
     omp_extension_source_with_command(&opencode_plugin_cli_command()?)
 }
 
+fn amp_extension_source() -> Result<String> {
+    amp_extension_source_with_command(&opencode_plugin_cli_command()?)
+}
+
+fn amp_extension_source_with_command(limux_command: &str) -> Result<String> {
+    let limux_command_json =
+        serde_json::to_string(limux_command).context("failed to encode Amp hook command")?;
+    Ok(
+        r##"// cmux-amp-session-extension-marker v1
+// Bridges Amp lifecycle and status events into Limux's CMUX-compatible session store.
+// Installed by `limux hooks amp install` or `limux hooks setup`.
+// DO NOT EDIT MANUALLY. Limux upgrades this file in place.
+// @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
+
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type {
+  PluginAPI,
+  AgentEndEvent,
+  AgentStartEvent,
+  SessionStartEvent,
+  ToolCallEvent,
+  ToolResultEvent,
+} from "@ampcode/plugin";
+
+const LIMUX_COMMAND = __LIMUX_COMMAND__;
+const STATUS_KEY = "amp";
+const LOG_SOURCE = "amp";
+const COLOR = {
+  idle: "#adb5bd",
+  thinking: "#ffffff",
+  active: "#ffd700",
+  done: "#50fa7b",
+  error: "#ff5555",
+  interrupted: "#ffb86c",
+} as const;
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+function resolveExecutable(name: string): string {
+  const pathEnv = process.env.PATH || "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch (_) {
+      continue;
+    }
+  }
+  return name;
+}
+
+function looksLikeAmpScript(value: string): boolean {
+  const normalized = value.replaceAll("\\", "/").toLowerCase();
+  const base = path.basename(normalized);
+  return normalized.includes("/@ampcode/") || (base === "cli.js" && normalized.includes("amp"));
+}
+
+function looksLikeJavaScriptRuntime(value: string): boolean {
+  const base = path.basename(value).toLowerCase();
+  return base === "node" || base === "bun" || base === "deno" || base === "tsx" || base === "ts-node";
+}
+
+function normalizedLaunchArgv(): string[] {
+  const raw = Array.isArray(process.argv) ? process.argv.map((value) => String(value)) : [];
+  if (raw.length === 0) return [resolveExecutable("amp")];
+  if (path.basename(raw[0]).toLowerCase() === "amp") return raw;
+  if (raw.length > 1 && (looksLikeAmpScript(raw[1]) || looksLikeJavaScriptRuntime(raw[0]))) {
+    return [resolveExecutable("amp"), ...raw.slice(2)];
+  }
+  return [resolveExecutable("amp")];
+}
+
+function base64NulSeparated(values: string[]): string {
+  const bytes: Buffer[] = [];
+  for (const value of values) {
+    bytes.push(Buffer.from(String(value), "utf8"));
+    bytes.push(Buffer.from([0]));
+  }
+  return Buffer.concat(bytes).toString("base64");
+}
+
+function sanitizedEnvironment(cwd: string, includeLaunch: boolean): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env.AMP_API_KEY;
+  if (includeLaunch && !env.LIMUX_AGENT_LAUNCH_ARGV_B64 && !env.CMUX_AGENT_LAUNCH_ARGV_B64) {
+    const argv = normalizedLaunchArgv();
+    const executable = argv[0] || resolveExecutable("amp");
+    env.LIMUX_AGENT_LAUNCH_EXECUTABLE = executable;
+    env.LIMUX_AGENT_LAUNCH_ARGV_B64 = base64NulSeparated(argv);
+    env.LIMUX_AGENT_LAUNCH_CWD = cwd || process.cwd();
+    env.CMUX_AGENT_LAUNCH_KIND = "amp";
+    env.CMUX_AGENT_LAUNCH_EXECUTABLE = executable;
+    env.CMUX_AGENT_LAUNCH_ARGV_B64 = env.LIMUX_AGENT_LAUNCH_ARGV_B64;
+    env.CMUX_AGENT_LAUNCH_CWD = env.LIMUX_AGENT_LAUNCH_CWD;
+  }
+  return env;
+}
+
+function eventName(subcommand: string): string {
+  if (subcommand === "session-start") return "SessionStart";
+  if (subcommand === "prompt-submit") return "UserPromptSubmit";
+  if (subcommand === "stop") return "Stop";
+  return subcommand;
+}
+
+function limuxExecutable(): string {
+  return process.env.LIMUX_AMP_LIMUX_BIN || process.env.CMUX_AMP_CMUX_BIN || process.env.LIMUX_BIN || LIMUX_COMMAND;
+}
+
+function hasSurface(): boolean {
+  return !!(process.env.LIMUX_SURFACE_ID || process.env.CMUX_SURFACE_ID);
+}
+
+function threadIdFrom(event?: { thread?: { id?: string } }, ctx?: { thread?: { id?: string } }): string | null {
+  return firstString(event?.thread?.id, ctx?.thread?.id);
+}
+
+function sendHook(subcommand: string, sessionId: string | null, cwd: string): void {
+  if (process.env.LIMUX_AMP_HOOKS_DISABLED === "1" || process.env.CMUX_AMP_HOOKS_DISABLED === "1") return;
+  if (!hasSurface() || !sessionId) return;
+  const payload = {
+    session_id: sessionId,
+    cwd,
+    hook_event_name: eventName(subcommand),
+    event: eventName(subcommand),
+  };
+  try {
+    const child = spawn(limuxExecutable(), ["hooks", "amp", subcommand], {
+      env: sanitizedEnvironment(cwd, true),
+      stdio: ["pipe", "ignore", "ignore"],
+      detached: true,
+    });
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(payload));
+    child.unref();
+  } catch (_) {}
+}
+
+function workspaceArgs(): string[] {
+  const workspace = firstString(process.env.LIMUX_WORKSPACE_ID, process.env.CMUX_WORKSPACE_ID);
+  return workspace ? ["--workspace", workspace] : [];
+}
+
+function runLimux(args: string[]): void {
+  if (process.env.LIMUX_AMP_HOOKS_DISABLED === "1" || process.env.CMUX_AMP_HOOKS_DISABLED === "1") return;
+  if (!hasSurface()) return;
+  try {
+    const child = spawn(limuxExecutable(), args, {
+      env: sanitizedEnvironment(process.cwd(), false),
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+    });
+    child.on("error", () => {});
+    child.unref();
+  } catch (_) {}
+}
+
+function setStatus(label: string, icon: string, color: string): void {
+  runLimux(["set-status", STATUS_KEY, label, "--icon", icon, "--color", color, ...workspaceArgs()]);
+}
+
+function clearStatus(): void {
+  runLimux(["clear-status", STATUS_KEY, ...workspaceArgs()]);
+}
+
+function wsLog(message: string, level: string = "info"): void {
+  runLimux(["log", "--level", level, "--source", LOG_SOURCE, ...workspaceArgs(), "--", message]);
+}
+
+function toolLabel(tool: string): string {
+  switch (tool) {
+    case "Read": return "reading";
+    case "edit_file":
+    case "create_file": return "editing";
+    case "Bash": return "running";
+    case "Grep":
+    case "finder":
+    case "glob": return "searching";
+    case "Task": return "subagent";
+    case "oracle": return "consulting oracle";
+    case "web_search":
+    case "read_web_page": return "browsing";
+    case "todo_write":
+    case "todo_read": return "planning";
+    default: return tool;
+  }
+}
+
+function toolIcon(tool: string): string {
+  switch (tool) {
+    case "Read": return "eye";
+    case "edit_file":
+    case "create_file": return "pencil";
+    case "Bash": return "terminal";
+    case "Grep":
+    case "finder":
+    case "glob": return "magnifyingglass";
+    case "Task": return "person.2";
+    case "oracle": return "sparkles";
+    case "web_search":
+    case "read_web_page": return "globe";
+    case "todo_write":
+    case "todo_read": return "checklist";
+    default: return "hammer";
+  }
+}
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max - 1) + "..." : value;
+}
+
+function basename(value: string): string {
+  const match = value.match(/[^/]+$/);
+  return match ? match[0] : value;
+}
+
+function detailedToolStatus(event: ToolCallEvent, helpers: unknown): { label: string; icon: string } {
+  const baseLabel = toolLabel(event.tool);
+  const icon = toolIcon(event.tool);
+  const typed = helpers as {
+    shellCommandFromToolCall?: (event: ToolCallEvent) => { command: string } | null;
+    filesModifiedByToolCall?: (event: ToolCallEvent) => string[] | null;
+    filePathFromURI?: (uri: string) => string;
+  } | undefined;
+  try {
+    const shell = typed?.shellCommandFromToolCall?.(event);
+    if (shell && typeof shell.command === "string") {
+      return { label: `${baseLabel}: ${truncate(shell.command.replace(/\s+/g, " ").trim(), 32)}`, icon };
+    }
+  } catch (_) {}
+  try {
+    const files = typed?.filesModifiedByToolCall?.(event);
+    if (files && files.length > 0) {
+      const first = typed?.filePathFromURI ? typed.filePathFromURI(files[0]) : files[0];
+      return { label: `${baseLabel}: ${truncate(basename(first), 24)}`, icon };
+    }
+  } catch (_) {}
+  if (event.tool === "Read" && typeof (event.input as { path?: unknown }).path === "string") {
+    return { label: `${baseLabel}: ${truncate(basename((event.input as { path: string }).path), 24)}`, icon };
+  }
+  return { label: baseLabel, icon };
+}
+
+export default function limuxAmpSessionPlugin(amp: PluginAPI) {
+  const cwdFromEnv = (): string => firstString(process.env.PWD, process.cwd()) || process.cwd();
+  const helpers = (amp as unknown as { helpers?: unknown }).helpers;
+  let inFlightTools = 0;
+  let turnActive = false;
+
+  process.on("exit", () => {
+    try { clearStatus(); } catch (_) {}
+  });
+
+  amp.on("session.start", async (event: SessionStartEvent, ctx) => {
+    setStatus("idle", "circle", COLOR.idle);
+    sendHook("session-start", threadIdFrom(event, ctx), cwdFromEnv());
+  });
+  amp.on("agent.start", async (event: AgentStartEvent, ctx) => {
+    inFlightTools = 0;
+    turnActive = true;
+    setStatus("thinking", "brain", COLOR.thinking);
+    wsLog("prompt received");
+    sendHook("prompt-submit", threadIdFrom(event, ctx), cwdFromEnv());
+  });
+  amp.on("tool.call", async (event: ToolCallEvent) => {
+    inFlightTools += 1;
+    const { label, icon } = detailedToolStatus(event, helpers);
+    if (turnActive) setStatus(label, icon, COLOR.active);
+    return { action: "allow" as const };
+  });
+  amp.on("tool.result", async (event: ToolResultEvent) => {
+    inFlightTools = Math.max(0, inFlightTools - 1);
+    if (event.status === "error") wsLog(`${event.tool} failed`, "error");
+    if (turnActive && inFlightTools === 0) setStatus("thinking", "brain", COLOR.thinking);
+  });
+  amp.on("agent.end", async (event: AgentEndEvent, ctx) => {
+    inFlightTools = 0;
+    turnActive = false;
+    switch (event.status) {
+      case "done":
+        setStatus("done", "checkmark.circle", COLOR.done);
+        wsLog("turn complete", "success");
+        break;
+      case "error":
+        setStatus("error", "xmark.circle", COLOR.error);
+        wsLog("turn errored", "error");
+        break;
+      case "cancelled":
+        setStatus("interrupted", "pause.circle", COLOR.interrupted);
+        wsLog("turn interrupted", "warning");
+        break;
+      default:
+        setStatus(String(event.status ?? "done"), "questionmark.circle", COLOR.interrupted);
+        wsLog(`turn ended with unexpected status: ${event.status}`, "warning");
+        break;
+    }
+    sendHook("stop", threadIdFrom(event, ctx), cwdFromEnv());
+  });
+}
+"##
+        .replace("__LIMUX_COMMAND__", &limux_command_json),
+    )
+}
+
 fn omp_extension_source_with_command(limux_command: &str) -> Result<String> {
     let limux_command_json =
         serde_json::to_string(limux_command).context("failed to encode OMP hook command")?;
@@ -6468,6 +6815,7 @@ fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
         "opencode" => Some(("opencode", "opencode".to_string())),
         "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
         "pi" | "pi-coding-agent" => Some(("pi", "pi".to_string())),
+        "amp" => Some(("amp", "amp".to_string())),
         _ => None,
     }
 }
@@ -11285,6 +11633,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Omp)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("amp"),
+            Some(agent_hooks::AgentKind::Amp)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -11304,6 +11656,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::RovoDev));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Pi));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Omp));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Amp));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -11387,6 +11740,55 @@ mod cli_arg_tests {
         assert_eq!(fs::read_to_string(&path).expect("read extension"), source);
 
         uninstall_marked_extension_file(&path, "cmux-pi-session-extension-marker")
+            .expect("uninstall extension");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn amp_extension_embeds_lifecycle_status_and_launch_capture() {
+        let source = amp_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+
+        assert!(source.contains("cmux-amp-session-extension-marker v1"));
+        assert!(source.contains("const LIMUX_COMMAND = \"/tmp/limux-cli\";"));
+        assert!(source.contains("@ampcode/plugin"));
+        assert!(source.contains("amp.on(\"session.start\""));
+        assert!(source.contains("amp.on(\"agent.start\""));
+        assert!(source.contains("amp.on(\"tool.call\""));
+        assert!(source.contains("amp.on(\"tool.result\""));
+        assert!(source.contains("amp.on(\"agent.end\""));
+        assert!(source.contains("[\"hooks\", \"amp\", subcommand]"));
+        assert!(source.contains("\"set-status\""));
+        assert!(source.contains("\"clear-status\""));
+        assert!(source.contains("\"log\""));
+        assert!(source.contains("delete env.AMP_API_KEY"));
+        assert!(source.contains("LIMUX_AGENT_LAUNCH_ARGV_B64"));
+        assert!(source.contains("CMUX_AGENT_LAUNCH_ARGV_B64"));
+    }
+
+    #[test]
+    fn amp_extension_install_refuses_unmarked_file_and_removes_marked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux-session.ts");
+
+        fs::write(&path, "export default {};\n").expect("seed user plugin");
+        let refused = install_marked_extension_file(
+            &path,
+            "// cmux-amp-session-extension-marker v1\n",
+            "cmux-amp-session-extension-marker",
+        );
+        assert!(refused.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read user plugin"),
+            "export default {};\n"
+        );
+
+        fs::write(&path, "// cmux-amp-session-extension-marker old\n").expect("seed marker");
+        let source = amp_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+        install_marked_extension_file(&path, &source, "cmux-amp-session-extension-marker")
+            .expect("install extension");
+        assert_eq!(fs::read_to_string(&path).expect("read extension"), source);
+
+        uninstall_marked_extension_file(&path, "cmux-amp-session-extension-marker")
             .expect("uninstall extension");
         assert!(!path.exists());
     }
