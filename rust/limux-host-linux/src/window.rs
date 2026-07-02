@@ -96,6 +96,18 @@ struct HostNotification {
     unread: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceEventSnapshot {
+    workspace_id: String,
+    workspace_ref: String,
+    title: String,
+    index: usize,
+    selected: bool,
+    favorite: bool,
+    group_id: Option<String>,
+    tab_count: usize,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -1322,6 +1334,116 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
     }))
+}
+
+// purpose: Snapshot workspace metadata needed for CMUX lifecycle events.
+// inputs: Current app state and a workspace index.
+// returns/effects: Returns an owned snapshot without mutating GTK state.
+fn workspace_event_snapshot(state: &AppState, index: usize) -> Option<WorkspaceEventSnapshot> {
+    let workspace = state.workspaces.get(index)?;
+    let tab_count = pane::surface_summaries_for_root(&workspace.root).len();
+    Some(WorkspaceEventSnapshot {
+        workspace_id: workspace.id.clone(),
+        workspace_ref: workspace_ref(&workspace.id),
+        title: workspace.name.clone(),
+        index,
+        selected: index == state.active_idx,
+        favorite: workspace.favorite,
+        group_id: workspace.group_id.clone(),
+        tab_count,
+    })
+}
+
+// purpose: Build a CMUX-compatible workspace lifecycle event payload.
+// inputs: Workspace snapshot and optional event-specific fields.
+// returns/effects: Returns JSON without publishing or mutating state.
+fn workspace_lifecycle_payload(
+    snapshot: &WorkspaceEventSnapshot,
+    previous_workspace_id: Option<&str>,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "workspace_id": snapshot.workspace_id,
+        "workspace_ref": snapshot.workspace_ref,
+        "title": snapshot.title,
+        "index": snapshot.index,
+        "selected": snapshot.selected,
+        "favorite": snapshot.favorite,
+        "group_id": snapshot.group_id,
+        "tab_count": snapshot.tab_count,
+        "previous_workspace_id": previous_workspace_id,
+        "previous_workspace_ref": previous_workspace_id.map(workspace_ref),
+    });
+    if let (Some(object), Some(extra_object)) = (payload.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra_object {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    payload
+}
+
+// purpose: Publish one CMUX workspace lifecycle event.
+// inputs: Event name, workspace snapshot, previous workspace id, and extra payload fields.
+// returns/effects: Appends a retained workspace event to the host event bus.
+fn publish_workspace_lifecycle_event(
+    name: &'static str,
+    snapshot: &WorkspaceEventSnapshot,
+    previous_workspace_id: Option<&str>,
+    extra: serde_json::Value,
+) -> u64 {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category: "workspace",
+        source: "workspace.lifecycle",
+        workspace_id: Some(serde_json::Value::String(snapshot.workspace_id.clone())),
+        surface_id: None,
+        pane_id: None,
+        payload: workspace_lifecycle_payload(snapshot, previous_workspace_id, extra),
+    })
+}
+
+// purpose: Build a CMUX-compatible workspace.reordered payload.
+// inputs: Ordered workspace ids, moved ids, pinned ids, and active selection metadata.
+// returns/effects: Returns JSON without publishing or mutating state.
+fn workspace_reordered_payload(
+    ordered_workspace_ids: Vec<String>,
+    moved_workspace_ids: Vec<String>,
+    pinned_workspace_ids: Vec<String>,
+    selected_index: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "workspace_ids": ordered_workspace_ids,
+        "moved_workspace_ids": moved_workspace_ids,
+        "pinned_workspace_ids": pinned_workspace_ids,
+        "selected_workspace_index": selected_index,
+        "count": ordered_workspace_ids.len(),
+    })
+}
+
+// purpose: Publish a CMUX workspace.reordered event for changed sidebar order.
+// inputs: Ordered workspace ids, moved workspace ids, pinned ids, and active index.
+// returns/effects: Appends a retained workspace event to the host event bus.
+fn publish_workspace_reordered_event(
+    ordered_workspace_ids: Vec<String>,
+    moved_workspace_ids: Vec<String>,
+    pinned_workspace_ids: Vec<String>,
+    selected_workspace_id: Option<String>,
+    selected_index: usize,
+) {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name: "workspace.reordered",
+        category: "workspace",
+        source: "workspace.lifecycle",
+        workspace_id: selected_workspace_id.map(serde_json::Value::String),
+        surface_id: None,
+        pane_id: None,
+        payload: workspace_reordered_payload(
+            ordered_workspace_ids,
+            moved_workspace_ids,
+            pinned_workspace_ids,
+            selected_index,
+        ),
+    });
 }
 
 // purpose: Select a live workspace through the same GTK stack/sidebar path as UI navigation.
@@ -4396,15 +4518,29 @@ fn begin_workspace_inline_rename(state: &State, workspace_id: &str) {
             let next_name = entry.text().trim().to_string();
             if !next_name.is_empty() {
                 label_for_commit.set_label(&next_name);
-                let mut s = state_for_commit.borrow_mut();
-                if let Some(workspace) = s
-                    .workspaces
-                    .iter_mut()
-                    .find(|workspace| workspace.id == workspace_id)
-                {
-                    workspace.name = next_name;
+                let snapshot = {
+                    let mut s = state_for_commit.borrow_mut();
+                    if let Some(workspace) = s
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == workspace_id)
+                    {
+                        workspace.name = next_name;
+                    }
+                    let index = s
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == workspace_id);
+                    index.and_then(|index| workspace_event_snapshot(&s, index))
+                };
+                if let Some(snapshot) = snapshot {
+                    publish_workspace_lifecycle_event(
+                        "workspace.renamed",
+                        &snapshot,
+                        None,
+                        serde_json::json!({ "origin": "ui" }),
+                    );
                 }
-                drop(s);
                 request_session_save(&state_for_commit);
             }
 
@@ -4439,7 +4575,7 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
-    let (sidebar_list, row_to_select) = {
+    let (sidebar_list, row_to_select, ordered_ids, pinned_ids, selected_id, selected_index) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
             .workspaces
@@ -4504,19 +4640,48 @@ fn reorder_workspace_by_id(
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        let ordered_ids = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let pinned_ids = s
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.favorite)
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let selected_id = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.id.clone());
+        (
+            s.sidebar_list.clone(),
+            row_to_select,
+            ordered_ids,
+            pinned_ids,
+            selected_id,
+            s.active_idx,
+        )
     };
 
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
     }
+    publish_workspace_reordered_event(
+        ordered_ids,
+        vec![source_id.to_string()],
+        pinned_ids,
+        selected_id,
+        selected_index,
+    );
     request_session_save(state);
 
     true
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
-    let (sidebar_list, row_to_select) = {
+    let (sidebar_list, row_to_select, ordered_ids, pinned_ids, selected_id, selected_index) = {
         let mut s = state.borrow_mut();
         let Some(idx) = s
             .workspaces
@@ -4554,12 +4719,41 @@ fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.sidebar_row.clone());
-        (s.sidebar_list.clone(), row_to_select)
+        let ordered_ids = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let pinned_ids = s
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.favorite)
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let selected_id = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.id.clone());
+        (
+            s.sidebar_list.clone(),
+            row_to_select,
+            ordered_ids,
+            pinned_ids,
+            selected_id,
+            s.active_idx,
+        )
     };
 
     if let Some(row) = row_to_select {
         sidebar_list.select_row(Some(&row));
     }
+    publish_workspace_reordered_event(
+        ordered_ids,
+        vec![workspace_id.to_string()],
+        pinned_ids,
+        selected_id,
+        selected_index,
+    );
     request_session_save(state);
 }
 
@@ -7710,11 +7904,20 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            {
+            let snapshot = {
                 let mut app_state = state.borrow_mut();
                 let workspace = &mut app_state.workspaces[index];
                 workspace.name = title.clone();
                 workspace.name_label.set_label(&title);
+                workspace_event_snapshot(&app_state, index)
+            };
+            if let Some(snapshot) = snapshot {
+                publish_workspace_lifecycle_event(
+                    "workspace.renamed",
+                    &snapshot,
+                    None,
+                    serde_json::json!({ "origin": "socket" }),
+                );
             }
             request_session_save(state);
 
@@ -8173,13 +8376,36 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         set_workspace_favorite_visual(&ws);
     }
 
-    {
+    let (snapshot, selected_snapshot, previous_workspace_id) = {
         let mut s = state.borrow_mut();
         let was_empty = s.workspaces.is_empty();
+        let previous_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
         s.workspaces.push(ws);
         if activate || was_empty {
             s.active_idx = s.workspaces.len() - 1;
         }
+        let index = s.workspaces.len() - 1;
+        let snapshot = workspace_event_snapshot(&s, index);
+        let selected_snapshot = (activate || was_empty)
+            .then(|| workspace_event_snapshot(&s, s.active_idx))
+            .flatten();
+        (snapshot, selected_snapshot, previous_workspace_id)
+    };
+    if let Some(snapshot) = snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.created",
+            &snapshot,
+            None,
+            serde_json::json!({ "origin": "model" }),
+        );
+    }
+    if let Some(snapshot) = selected_snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.selected",
+            &snapshot,
+            previous_workspace_id.as_deref(),
+            serde_json::json!({ "origin": "model" }),
+        );
     }
 
     if activate {
@@ -8411,6 +8637,9 @@ fn close_workspace_by_id_internal(
     let desired_active_workspace_id = preferred_active_workspace_id
         .map(ToOwned::to_owned)
         .or_else(|| s.active_workspace().map(|workspace| workspace.id.clone()));
+    let previous_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+    let closed_was_active = previous_workspace_id.as_deref() == Some(id);
+    let closed_snapshot = workspace_event_snapshot(&s, idx);
 
     let ws = s.workspaces.remove(idx);
     s.stack.remove(&ws.root);
@@ -8419,6 +8648,14 @@ fn close_workspace_by_id_internal(
     if s.workspaces.is_empty() {
         s.active_idx = 0;
         drop(s);
+        if let Some(snapshot) = closed_snapshot {
+            publish_workspace_lifecycle_event(
+                "workspace.closed",
+                &snapshot,
+                previous_workspace_id.as_deref(),
+                serde_json::json!({ "origin": "model" }),
+            );
+        }
         if persist {
             request_session_save(state);
         }
@@ -8442,8 +8679,27 @@ fn close_workspace_by_id_internal(
 
     let row = s.workspaces[new_idx].sidebar_row.clone();
     let sidebar_list = s.sidebar_list.clone();
+    let selected_snapshot = closed_was_active
+        .then(|| workspace_event_snapshot(&s, new_idx))
+        .flatten();
     drop(s);
 
+    if let Some(snapshot) = closed_snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.closed",
+            &snapshot,
+            previous_workspace_id.as_deref(),
+            serde_json::json!({ "origin": "model" }),
+        );
+    }
+    if let Some(snapshot) = selected_snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.selected",
+            &snapshot,
+            previous_workspace_id.as_deref(),
+            serde_json::json!({ "origin": "model" }),
+        );
+    }
     sidebar_list.select_row(Some(&row));
     if persist {
         request_session_save(state);
@@ -8451,15 +8707,16 @@ fn close_workspace_by_id_internal(
 }
 
 fn switch_workspace(state: &State, idx: usize) {
-    let (stack, stack_name, unread_handles, focus_root) = {
+    let (stack, stack_name, unread_handles, focus_root, snapshot, previous_workspace_id) = {
         let mut s = state.borrow_mut();
         if idx >= s.workspaces.len() || idx == s.active_idx {
             return;
         }
-        s.previous_workspace_id = s
+        let previous_workspace_id = s
             .workspaces
             .get(s.active_idx)
             .map(|workspace| workspace.id.clone());
+        s.previous_workspace_id = previous_workspace_id.clone();
         s.active_idx = idx;
         let stack = s.stack.clone();
         let stack_name = format!("ws-{}", s.workspaces[idx].id);
@@ -8483,7 +8740,15 @@ fn switch_workspace(state: &State, idx: usize) {
             None
         };
 
-        (stack, stack_name, unread_handles, focus_root)
+        let snapshot = workspace_event_snapshot(&s, idx);
+        (
+            stack,
+            stack_name,
+            unread_handles,
+            focus_root,
+            snapshot,
+            previous_workspace_id,
+        )
     };
 
     stack.set_visible_child_name(&stack_name);
@@ -8502,6 +8767,14 @@ fn switch_workspace(state: &State, idx: usize) {
         }
     }
 
+    if let Some(snapshot) = snapshot {
+        publish_workspace_lifecycle_event(
+            "workspace.selected",
+            &snapshot,
+            previous_workspace_id.as_deref(),
+            serde_json::json!({ "origin": "model" }),
+        );
+    }
     request_session_save(state);
 }
 
@@ -10226,7 +10499,10 @@ fn show_desktop_notification(state: &State, request: DesktopNotificationRequest)
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
     use std::rc::Rc;
+    use std::thread;
 
     use super::glib;
     use super::gtk::ffi;
@@ -10243,17 +10519,18 @@ mod tests {
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
         next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
-        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
-        run_notification_hook_command, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_notification_message, Direction,
+        publish_workspace_lifecycle_event, queue_session_save_request,
+        resolve_pane_create_source_id, resolved_system_prefers_dark, run_notification_hook_command,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, should_emit_desktop_notification, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_lifecycle_payload,
+        workspace_notification_message, workspace_reordered_payload, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
-        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceEventSnapshot,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::control_bridge::BrowserAction;
@@ -10687,6 +10964,128 @@ mod tests {
             workspace_notification_message("  ", "  "),
             "Process needs attention"
         );
+    }
+
+    #[test]
+    fn workspace_lifecycle_payload_includes_cmux_selection_fields() {
+        let snapshot = WorkspaceEventSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            workspace_ref: "workspace:workspace-a".to_string(),
+            title: "Agents".to_string(),
+            index: 2,
+            selected: true,
+            favorite: false,
+            group_id: Some("group-a".to_string()),
+            tab_count: 3,
+        };
+
+        let payload = workspace_lifecycle_payload(
+            &snapshot,
+            Some("workspace-old"),
+            serde_json::json!({ "origin": "test" }),
+        );
+
+        assert_eq!(payload["workspace_id"], "workspace-a");
+        assert_eq!(payload["workspace_ref"], "workspace:workspace-a");
+        assert_eq!(payload["title"], "Agents");
+        assert_eq!(payload["index"], 2);
+        assert_eq!(payload["selected"], true);
+        assert_eq!(payload["favorite"], false);
+        assert_eq!(payload["group_id"], "group-a");
+        assert_eq!(payload["tab_count"], 3);
+        assert_eq!(payload["previous_workspace_id"], "workspace-old");
+        assert_eq!(payload["previous_workspace_ref"], "workspace:workspace-old");
+        assert_eq!(payload["origin"], "test");
+    }
+
+    #[test]
+    fn workspace_lifecycle_publish_streams_cmux_event_frame() {
+        let snapshot = WorkspaceEventSnapshot {
+            workspace_id: "workspace-stream-test".to_string(),
+            workspace_ref: "workspace:workspace-stream-test".to_string(),
+            title: "Stream Test".to_string(),
+            index: 1,
+            selected: true,
+            favorite: false,
+            group_id: None,
+            tab_count: 2,
+        };
+        let seq = publish_workspace_lifecycle_event(
+            "workspace.selected",
+            &snapshot,
+            Some("workspace-previous"),
+            serde_json::json!({ "origin": "test" }),
+        );
+
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let handle = thread::spawn(move || {
+            crate::event_bus::bus().stream(
+                &serde_json::json!({
+                    "after_seq": seq.saturating_sub(1),
+                    "name": "workspace.selected",
+                    "category": "workspace",
+                    "include_heartbeats": false,
+                }),
+                &mut writer,
+            )
+        });
+
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("read ack");
+        let frame: serde_json::Value = serde_json::from_str(ack.trim()).expect("ack json");
+        assert_eq!(frame["type"], "ack");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("read event");
+        let frame: serde_json::Value = serde_json::from_str(event.trim()).expect("event json");
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["name"], "workspace.selected");
+        assert_eq!(frame["category"], "workspace");
+        assert_eq!(frame["source"], "workspace.lifecycle");
+        assert_eq!(frame["workspace_id"], "workspace-stream-test");
+        assert_eq!(
+            frame["payload"]["previous_workspace_id"],
+            "workspace-previous"
+        );
+        assert_eq!(frame["payload"]["tab_count"], 2);
+
+        drop(reader);
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "workspace.selected",
+            category: "workspace",
+            source: "test",
+            workspace_id: Some(serde_json::Value::String("workspace-wakeup".to_string())),
+            surface_id: None,
+            pane_id: None,
+            payload: serde_json::json!({}),
+        });
+        let _ = handle.join().expect("event stream thread");
+    }
+
+    #[test]
+    fn workspace_reordered_payload_includes_order_moved_pinned_and_count() {
+        let payload = workspace_reordered_payload(
+            vec!["workspace-a".to_string(), "workspace-b".to_string()],
+            vec!["workspace-b".to_string()],
+            vec!["workspace-a".to_string()],
+            1,
+        );
+
+        assert_eq!(
+            payload["workspace_ids"],
+            serde_json::json!(["workspace-a", "workspace-b"])
+        );
+        assert_eq!(
+            payload["moved_workspace_ids"],
+            serde_json::json!(["workspace-b"])
+        );
+        assert_eq!(
+            payload["pinned_workspace_ids"],
+            serde_json::json!(["workspace-a"])
+        );
+        assert_eq!(payload["selected_workspace_index"], 1);
+        assert_eq!(payload["count"], 2);
     }
 
     #[test]
