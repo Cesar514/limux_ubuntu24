@@ -10,10 +10,15 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Map, Value};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 const PARAM_STRING_LIMIT: usize = 4_096;
 const PARAM_COLLECTION_LIMIT: usize = 50;
@@ -199,6 +204,199 @@ pub struct SubagentLaunch<'a> {
     pub app_server_url: &'a str,
     pub launch_path: Option<&'a str>,
     pub depth: usize,
+}
+
+pub struct AppServerConnection {
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    next_request_id: u64,
+}
+
+impl AppServerConnection {
+    /// purpose: Connect to a Codex app-server websocket endpoint.
+    /// inputs: `ws://` or `wss://` app-server URL.
+    /// returns/effects: Opens the websocket or fails loudly on invalid URLs/handshake errors.
+    pub async fn connect(app_server_url: &str) -> Result<Self> {
+        let parsed = url::Url::parse(app_server_url)
+            .with_context(|| format!("Invalid Codex app-server URL: {app_server_url}"))?;
+        if !matches!(parsed.scheme(), "ws" | "wss") {
+            bail!("Codex app-server URL must use ws:// or wss://: {app_server_url}");
+        }
+        let (stream, _) = connect_async(parsed.as_str())
+            .await
+            .with_context(|| format!("failed to connect to Codex app-server {app_server_url}"))?;
+        Ok(Self {
+            stream,
+            next_request_id: 1,
+        })
+    }
+
+    /// purpose: Perform the Codex experimental app-server initialize handshake.
+    /// inputs: Client name/version, optional notification opt-out list, and response timeout.
+    /// returns/effects: Sends `initialize`, then `initialized`, failing on app-server errors.
+    pub async fn initialize(
+        &mut self,
+        client_name: &str,
+        version: &str,
+        opt_out_notification_methods: &[&str],
+        response_timeout: Duration,
+    ) -> Result<Value> {
+        let mut capabilities = Map::new();
+        capabilities.insert("experimentalApi".to_string(), json!(true));
+        if !opt_out_notification_methods.is_empty() {
+            capabilities.insert(
+                "optOutNotificationMethods".to_string(),
+                json!(opt_out_notification_methods),
+            );
+        }
+        let result = self
+            .request(
+                "initialize",
+                Some(json!({
+                    "clientInfo": {
+                        "name": client_name,
+                        "title": "limux Codex Teams",
+                        "version": version,
+                    },
+                    "capabilities": capabilities,
+                })),
+                |_| Ok(()),
+                response_timeout,
+            )
+            .await?;
+        self.send_object(json!({"method": "initialized"}))
+            .await
+            .context("failed to send Codex app-server initialized notification")?;
+        Ok(result)
+    }
+
+    /// purpose: Send a Codex app-server JSON-RPC request and wait for its matching response.
+    /// inputs: Method, optional params, notification callback, and response timeout.
+    /// returns/effects: Invokes callback for interleaved notifications and returns result payload.
+    pub async fn request<F>(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        mut notification_handler: F,
+        response_timeout: Duration,
+    ) -> Result<Value>
+    where
+        F: FnMut(Value) -> Result<()>,
+    {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        let mut request = Map::new();
+        request.insert("id".to_string(), json!(request_id));
+        request.insert("method".to_string(), json!(method));
+        if let Some(params) = params {
+            request.insert("params".to_string(), params);
+        }
+        self.send_object(Value::Object(request)).await?;
+
+        loop {
+            let message = tokio::time::timeout(response_timeout, self.receive_object())
+                .await
+                .map_err(|_| anyhow!("Timed out waiting for Codex app-server response"))??;
+            if message.get("method").and_then(Value::as_str).is_some() {
+                notification_handler(message)?;
+                continue;
+            }
+            if !message_has_id(&message, request_id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                let text = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex app-server request failed");
+                bail!("{text}");
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    /// purpose: Send a JSON-RPC response to a Codex app-server request.
+    /// inputs: Original request id and result payload.
+    /// returns/effects: Writes a websocket text frame.
+    pub async fn respond(&mut self, request_id: Value, result: Value) -> Result<()> {
+        self.send_object(json!({
+            "id": request_id,
+            "result": result,
+        }))
+        .await
+    }
+
+    /// purpose: Send a JSON-RPC error response to a Codex app-server request.
+    /// inputs: Original request id, JSON-RPC error code, and message.
+    /// returns/effects: Writes a websocket text frame.
+    pub async fn respond_error(
+        &mut self,
+        request_id: Value,
+        code: i64,
+        message: &str,
+    ) -> Result<()> {
+        self.send_object(json!({
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }))
+        .await
+    }
+
+    /// purpose: Receive the next Codex app-server JSON object from the websocket.
+    /// inputs: Current websocket stream.
+    /// returns/effects: Fails loudly for closed sockets, invalid JSON, or non-object frames.
+    pub async fn receive_object(&mut self) -> Result<Value> {
+        loop {
+            let Some(message) = self.stream.next().await else {
+                bail!("Codex app-server websocket closed");
+            };
+            match message.context("failed to receive Codex app-server websocket frame")? {
+                Message::Text(text) => return decode_object(text.as_str()),
+                Message::Binary(bytes) => return decode_object(std::str::from_utf8(&bytes)?),
+                Message::Ping(bytes) => {
+                    self.stream.send(Message::Pong(bytes)).await?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(_) => bail!("Codex app-server websocket closed"),
+                Message::Frame(_) => {}
+            }
+        }
+    }
+
+    async fn send_object(&mut self, object: Value) -> Result<()> {
+        if !object.is_object() {
+            bail!("Codex app-server JSON-RPC frame must be an object");
+        }
+        let text =
+            serde_json::to_string(&object).context("failed to encode Codex app-server frame")?;
+        self.stream
+            .send(Message::Text(text.into()))
+            .await
+            .context("failed to send Codex app-server websocket frame")
+    }
+}
+
+fn decode_object(text: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(text).context("Codex app-server sent invalid JSON")?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        bail!("Codex app-server sent non-object JSON")
+    }
+}
+
+fn message_has_id(message: &Value, request_id: u64) -> bool {
+    let Some(id) = message.get("id") else {
+        return false;
+    };
+    if id.as_u64() == Some(request_id) {
+        return true;
+    }
+    id.as_str()
+        .map(|value| value == request_id.to_string())
+        .unwrap_or(false)
 }
 
 /// purpose: Build the CMUX-shaped Feed event for a Codex app-server approval request.
@@ -899,6 +1097,121 @@ mod tests {
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().cloned().expect("object")
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_connection_handles_initialize_request_and_respond() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket server");
+        let address = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket handshake");
+
+            let initialize = next_json_object(&mut websocket).await;
+            assert_eq!(initialize["method"], "initialize");
+            assert_eq!(
+                initialize["params"]["capabilities"]["experimentalApi"],
+                true
+            );
+            websocket
+                .send(Message::Text(
+                    json!({"method": "thread/updated", "params": {"ignored": true}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send notification");
+            websocket
+                .send(Message::Text(
+                    json!({"id": initialize["id"].clone(), "result": {"ready": true}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send initialize response");
+
+            let initialized = next_json_object(&mut websocket).await;
+            assert_eq!(initialized["method"], "initialized");
+
+            let request = next_json_object(&mut websocket).await;
+            assert_eq!(request["method"], "thread/loaded/list");
+            websocket
+                .send(Message::Text(
+                    json!({"method": "thread/updated", "params": {"thread": {"id": "thread-1"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send interleaved notification");
+            websocket
+                .send(Message::Text(
+                    json!({"id": request["id"].clone(), "result": {"data": ["thread-1"]}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send request response");
+
+            let response = next_json_object(&mut websocket).await;
+            assert_eq!(response["id"], "approval-1");
+            assert_eq!(response["result"]["decision"], "accept");
+        });
+
+        let mut connection = AppServerConnection::connect(&format!("ws://{address}"))
+            .await
+            .expect("connect client");
+        let initialize_result = connection
+            .initialize(
+                "limux-codex-teams-test",
+                "0.1.0",
+                &["thread/tokenUsage/updated"],
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("initialize");
+        assert_eq!(initialize_result["ready"], true);
+
+        let mut notifications = Vec::new();
+        let response = connection
+            .request(
+                "thread/loaded/list",
+                Some(json!({"limit": 200})),
+                |message| {
+                    notifications.push(message);
+                    Ok(())
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("request");
+        assert_eq!(response["data"][0], "thread-1");
+        assert_eq!(notifications.len(), 1);
+
+        connection
+            .respond(json!("approval-1"), json!({"decision": "accept"}))
+            .await
+            .expect("respond");
+        server.await.expect("server task");
+    }
+
+    async fn next_json_object<S>(websocket: &mut S) -> Value
+    where
+        S: StreamExt<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let message = websocket
+            .next()
+            .await
+            .expect("websocket message")
+            .expect("message result");
+        match message {
+            Message::Text(text) => serde_json::from_str(text.as_str()).expect("json text"),
+            other => panic!("unexpected websocket message: {other:?}"),
+        }
     }
 
     #[test]
