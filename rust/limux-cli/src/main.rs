@@ -3253,7 +3253,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "settings" if args.first().map(String::as_str) == Some("open") => None,
         "settings" => Some(run_settings_command(args)?),
         "config" if args.first().map(String::as_str) == Some("reload") => None,
-        "config" => Some(run_config_command(args)?),
+        "config" => Some(run_config_command(args, opts.json_output)?),
         "sidebar" if matches!(args.first().map(String::as_str), Some("select" | "open")) => None,
         "sidebar" => Some(run_custom_sidebar_command(args, opts.json_output)?),
         "shortcuts" => Some(CommandOutput::Text(
@@ -4079,20 +4079,58 @@ fn settings_target_raw_value(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// purpose: Implement CMUX config path, docs, validation, and reload probes.
-/// inputs: Config subcommand arguments.
-/// returns/effects: Reads local JSON config and fails on corrupt files.
-fn run_config_command(args: &[String]) -> Result<CommandOutput> {
+// purpose: Build CMUX-shaped config path metadata for JSON path/paths output.
+// inputs: Resolved Limux config directory, settings path, and shortcuts path.
+// returns/effects: Returns local path metadata or path-resolution errors.
+fn config_paths_json(config_dir: &Path, settings: &Path, shortcuts: &Path) -> Result<Value> {
+    let ghostty_config = ghostty_config_path()?;
+    Ok(json!({
+        "primary": settings.display().to_string(),
+        "legacy": settings.display().to_string(),
+        "fallback": config_dir.display().to_string(),
+        "settings": settings.display().to_string(),
+        "shortcuts": shortcuts.display().to_string(),
+        "config_dir": config_dir.display().to_string(),
+        "docs_url": "limux docs settings",
+        "schema_url": "limux config docs",
+        "reload_command": "limux config reload",
+        "reload_scope": "Reloads settings, shortcuts, and Ghostty config in the running Limux host.",
+        "ghostty_config": {
+            "path": ghostty_config.display().to_string(),
+            "note": "Limux reads Ghostty config for terminal behavior.",
+        },
+    }))
+}
+
+// purpose: Implement CMUX config path, docs, validation, and reload probes.
+// inputs: Config subcommand arguments and global JSON-output preference.
+// returns/effects: Reads local JSON config and fails on corrupt files.
+fn run_config_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
     let sub = args.first().map(String::as_str).unwrap_or("check");
     match sub {
         "--help" | "-h" | "docs" | "documentation" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
-        "path" => Ok(CommandOutput::Text(limux_settings_path()?.display().to_string())),
-        "paths" => Ok(CommandOutput::Text(format!(
-            "config_dir: {}\nsettings: {}\nshortcuts: {}",
-            limux_config_dir()?.display(),
-            limux_settings_path()?.display(),
-            limux_shortcuts_path()?.display()
-        ))),
+        "path" | "paths" => {
+            let config_dir = limux_config_dir()?;
+            let settings = limux_settings_path()?;
+            let shortcuts = limux_shortcuts_path()?;
+            if json_output {
+                return Ok(CommandOutput::Json(config_paths_json(
+                    &config_dir,
+                    &settings,
+                    &shortcuts,
+                )?));
+            }
+            if sub == "path" {
+                Ok(CommandOutput::Text(settings.display().to_string()))
+            } else {
+                Ok(CommandOutput::Text(format!(
+                    "config_dir: {}\nsettings: {}\nshortcuts: {}",
+                    config_dir.display(),
+                    settings.display(),
+                    shortcuts.display()
+                )))
+            }
+        }
         "check" | "validate" => Ok(CommandOutput::Text(config_validation_text()?)),
         "doctor" => {
             let targets =
@@ -17839,6 +17877,54 @@ mod cli_arg_tests {
         assert!(run_local_command(&default_opts(args(&["reload-config"])))
             .expect("reload-config local check")
             .is_none());
+    }
+
+    // purpose: Verify CMUX-compatible JSON path output for config path aliases.
+    // inputs: Isolated XDG config root and local config path commands.
+    // returns/effects: Asserts JSON payload shape without touching user config.
+    #[test]
+    fn config_path_outputs_cmux_json_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_root = dir.path().join("xdg-config");
+        let _xdg_config = EnvGuard::set(
+            "XDG_CONFIG_HOME",
+            config_root.to_str().expect("utf8 xdg config path"),
+        );
+
+        let mut path_opts = default_opts(args(&["config", "path"]));
+        path_opts.json_output = true;
+        let output = run_local_command(&path_opts)
+            .expect("config path json succeeds")
+            .expect("config path is local");
+        let CommandOutput::Json(payload) = output else {
+            panic!("config path --json should render JSON");
+        };
+        assert_eq!(
+            payload["settings"],
+            config_root
+                .join("limux/settings.json")
+                .display()
+                .to_string()
+        );
+        assert_eq!(payload["primary"], payload["settings"]);
+        assert_eq!(
+            payload["config_dir"],
+            config_root.join("limux").display().to_string()
+        );
+        assert_eq!(
+            payload["ghostty_config"]["path"],
+            config_root.join("ghostty/config").display().to_string()
+        );
+        assert_eq!(payload["reload_command"], "limux config reload");
+
+        let mut paths_opts = default_opts(args(&["config", "paths"]));
+        paths_opts.json_output = true;
+        assert!(matches!(
+            run_local_command(&paths_opts)
+                .expect("config paths json succeeds")
+                .expect("config paths is local"),
+            CommandOutput::Json(_)
+        ));
     }
 
     #[test]
