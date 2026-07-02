@@ -3625,6 +3625,368 @@ fn render_list_text(command: &str, payload: &Value) -> String {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeOptions {
+    include_all: bool,
+    workspace: Option<String>,
+    window: Option<String>,
+}
+
+// purpose: Parse CMUX-compatible `tree` flags.
+// inputs: Raw tree command arguments.
+// returns/effects: Returns selected scope or a fatal usage error.
+fn parse_tree_options(args: &[String]) -> Result<TreeOptions> {
+    let mut options = TreeOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--all" => {
+                options.include_all = true;
+                index += 1;
+            }
+            "--json" => {
+                index += 1;
+            }
+            "--workspace" | "--window" => {
+                let flag = args[index].clone();
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow!("tree requires {flag} <id|ref|index>"))?
+                    .clone();
+                set_tree_scope(&mut options, &flag, value);
+                index += 2;
+            }
+            unknown if unknown.starts_with("--") => bail!(
+                "tree: unknown flag '{unknown}'. Known flags: --all --workspace <id|ref|index> --window <id|ref|index> --json"
+            ),
+            extra => bail!("tree: unexpected argument '{extra}'"),
+        }
+    }
+    if options.include_all && options.window.is_some() {
+        bail!("tree: --window cannot be combined with --all");
+    }
+    Ok(options)
+}
+
+// purpose: Store a parsed tree scope option.
+// inputs: Mutable options, flag name, and parsed value.
+// returns/effects: Updates workspace or window scope.
+fn set_tree_scope(options: &mut TreeOptions, flag: &str, value: String) {
+    if flag == "--workspace" {
+        options.workspace = Some(value);
+    } else {
+        options.window = Some(value);
+    }
+}
+
+// purpose: Build a CMUX-style tree payload from existing Limux list APIs.
+// inputs: Socket client and parsed tree command arguments.
+// returns/effects: Performs list calls and assembles a scoped tree JSON payload.
+async fn run_tree(client: &mut Client, args: &[String]) -> Result<Value> {
+    let options = parse_tree_options(args)?;
+    let windows = client.call("window.list", json!({})).await?;
+    let workspaces = client
+        .call("workspace.list", tree_workspace_params(&options))
+        .await?;
+    let panes = client
+        .call("pane.list", tree_workspace_params(&options))
+        .await?;
+    let surfaces = client
+        .call("surface.list", tree_workspace_params(&options))
+        .await?;
+    Ok(tree_payload_from_lists(
+        &options,
+        &windows,
+        &workspaces,
+        &panes,
+        &surfaces,
+    ))
+}
+
+// purpose: Build scoped params shared by tree list calls.
+// inputs: Parsed tree options.
+// returns/effects: Returns window/workspace filters when present.
+fn tree_workspace_params(options: &TreeOptions) -> Value {
+    let mut params = Map::new();
+    if let Some(workspace) = options.workspace.as_ref() {
+        params.insert("workspace_id".to_string(), Value::String(workspace.clone()));
+    }
+    if let Some(window) = options.window.as_ref() {
+        params.insert("window_id".to_string(), Value::String(window.clone()));
+    }
+    Value::Object(params)
+}
+
+// purpose: Assemble a tree payload from window, workspace, pane, and surface rows.
+// inputs: Parsed options plus list API payloads.
+// returns/effects: Returns JSON without further socket calls.
+fn tree_payload_from_lists(
+    options: &TreeOptions,
+    windows_payload: &Value,
+    workspaces_payload: &Value,
+    panes_payload: &Value,
+    surfaces_payload: &Value,
+) -> Value {
+    let panes = panes_payload
+        .get("panes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let surfaces = surfaces_payload
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let workspaces = tree_workspace_nodes(workspaces_payload, &panes, &surfaces);
+    let windows = tree_window_nodes(options, windows_payload, workspaces);
+    json!({ "source": "limux_legacy_list_tree", "windows": windows })
+}
+
+// purpose: Attach pane and surface rows to workspace rows.
+// inputs: Workspace list payload plus current workspace pane/surface rows.
+// returns/effects: Returns workspace tree nodes.
+fn tree_workspace_nodes(payload: &Value, panes: &[Value], surfaces: &[Value]) -> Vec<Value> {
+    let rows = payload
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.into_iter()
+        .map(|workspace| tree_workspace_node(workspace, panes, surfaces))
+        .collect()
+}
+
+// purpose: Attach pane nodes to one workspace row.
+// inputs: Workspace row plus current workspace pane/surface rows.
+// returns/effects: Returns a workspace JSON node.
+fn tree_workspace_node(mut workspace: Value, panes: &[Value], surfaces: &[Value]) -> Value {
+    let pane_nodes = panes
+        .iter()
+        .cloned()
+        .map(|pane| tree_pane_node(pane, surfaces))
+        .collect::<Vec<_>>();
+    if let Some(map) = workspace.as_object_mut() {
+        map.insert("panes".to_string(), Value::Array(pane_nodes));
+    }
+    workspace
+}
+
+// purpose: Attach matching surface rows to one pane row.
+// inputs: Pane row and all current workspace surface rows.
+// returns/effects: Returns a pane JSON node.
+fn tree_pane_node(mut pane: Value, surfaces: &[Value]) -> Value {
+    let pane_handle = handle_from_payload(&pane, "pane_id", "pane_ref");
+    let surface_nodes = surfaces
+        .iter()
+        .filter(|surface| tree_related_pane_matches(surface, &pane_handle))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(map) = pane.as_object_mut() {
+        map.insert("surfaces".to_string(), Value::Array(surface_nodes));
+    }
+    pane
+}
+
+// purpose: Check whether a surface row belongs under a pane handle.
+// inputs: Surface row and pane handle/ref.
+// returns/effects: Returns true for id or ref matches.
+fn tree_related_pane_matches(surface: &Value, pane_handle: &str) -> bool {
+    get_string(surface, &["pane_id", "pane_ref", "pane"])
+        .as_deref()
+        .is_some_and(|value| value == pane_handle)
+}
+
+// purpose: Attach workspace nodes to matching window rows.
+// inputs: Parsed options, window list payload, and workspace nodes.
+// returns/effects: Returns scoped window tree nodes.
+fn tree_window_nodes(options: &TreeOptions, payload: &Value, workspaces: Vec<Value>) -> Vec<Value> {
+    let rows = payload
+        .get("windows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter(|row| tree_window_in_scope(row, options))
+        .map(|window| tree_window_node(window, &workspaces))
+        .collect()
+}
+
+// purpose: Check whether a window row is inside the selected scope.
+// inputs: Window row and parsed options.
+// returns/effects: Returns true for all/current/explicit scope.
+fn tree_window_in_scope(row: &Value, options: &TreeOptions) -> bool {
+    options.include_all
+        || options
+            .window
+            .as_deref()
+            .map(|window| tree_row_matches_handle(row, window))
+            .unwrap_or_else(|| row.get("focused").and_then(Value::as_bool).unwrap_or(true))
+}
+
+// purpose: Attach workspace rows to one window row.
+// inputs: Window row plus workspace nodes.
+// returns/effects: Returns a window JSON node.
+fn tree_window_node(mut window: Value, workspaces: &[Value]) -> Value {
+    if let Some(map) = window.as_object_mut() {
+        map.insert("workspaces".to_string(), Value::Array(workspaces.to_vec()));
+        map.insert("workspace_count".to_string(), json!(workspaces.len()));
+    }
+    window
+}
+
+// purpose: Compare a list row against a handle/ref/index string.
+// inputs: JSON row and raw handle.
+// returns/effects: Returns true when known id/ref/index fields match.
+fn tree_row_matches_handle(row: &Value, handle: &str) -> bool {
+    get_string(row, &["id", "ref", "window_id", "window_ref"])
+        .as_deref()
+        .is_some_and(|value| value == handle)
+        || row
+            .get("index")
+            .and_then(Value::as_u64)
+            .is_some_and(|index| index.to_string() == handle)
+}
+
+// purpose: Render a compact CMUX-compatible tree text view.
+// inputs: Tree JSON payload.
+// returns/effects: Returns stable text suitable for terminal output.
+fn render_tree_text(payload: &Value) -> String {
+    let windows = payload
+        .get("windows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if windows.is_empty() {
+        return "No windows".to_string();
+    }
+    windows
+        .iter()
+        .map(render_tree_window_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// purpose: Render one window subtree.
+// inputs: Window JSON node.
+// returns/effects: Returns text rows for a window and children.
+fn render_tree_window_text(window: &Value) -> String {
+    let mut lines = vec![format!(
+        "window {}",
+        handle_from_payload(window, "window_id", "window_ref")
+    )];
+    for workspace in window
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        append_tree_workspace_text(&mut lines, workspace);
+    }
+    lines.join("\n")
+}
+
+// purpose: Append one workspace subtree to tree text.
+// inputs: Output lines and workspace JSON node.
+// returns/effects: Appends workspace, pane, and surface rows.
+fn append_tree_workspace_text(lines: &mut Vec<String>, workspace: &Value) {
+    lines.push(format!(
+        "  workspace {} {}",
+        handle_from_payload(workspace, "workspace_id", "workspace_ref"),
+        get_string(workspace, &["title", "name"]).unwrap_or_default()
+    ));
+    for pane in workspace
+        .get("panes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        append_tree_pane_text(lines, pane);
+    }
+}
+
+// purpose: Append one pane subtree to tree text.
+// inputs: Output lines and pane JSON node.
+// returns/effects: Appends pane and surface rows.
+fn append_tree_pane_text(lines: &mut Vec<String>, pane: &Value) {
+    lines.push(format!(
+        "    pane {}",
+        handle_from_payload(pane, "pane_id", "pane_ref")
+    ));
+    for surface in pane
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        lines.push(format!(
+            "      surface {} {}",
+            handle_from_payload(surface, "surface_id", "surface_ref"),
+            get_string(surface, &["title"]).unwrap_or_default()
+        ));
+    }
+}
+
+// purpose: Run CMUX `top` through Limux process diagnostics.
+// inputs: Raw top arguments.
+// returns/effects: Returns system.memory payload tagged with top compatibility metadata.
+async fn run_top(client: &mut Client, args: &[String]) -> Result<Value> {
+    parse_top_options(args)?;
+    let mut payload = run_memory(client, &[]).await?;
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("source".to_string(), json!("limux_system_memory"));
+        map.insert("cmux_command".to_string(), json!("top"));
+    }
+    Ok(payload)
+}
+
+// purpose: Validate CMUX-compatible `top` flags Limux can safely accept.
+// inputs: Raw top command arguments.
+// returns/effects: Fails loudly for unsupported or malformed flags.
+fn parse_top_options(args: &[String]) -> Result<()> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" | "--processes" => index += 1,
+            "--format" => index = validate_top_format_arg(args, index)?,
+            "--all" | "--workspace" | "--window" | "--sort" => {
+                let flag = args[index].as_str();
+                bail!(
+                    "top: {flag} requires CMUX system.top scoped diagnostics, which Limux does not implement yet"
+                );
+            }
+            "--flat" => bail!("top: --flat requires CMUX system.top TSV output, which Limux does not implement yet"),
+            unknown if unknown.starts_with("--") => {
+                let known = concat!(
+                    "--all --workspace <id|ref|index> --window <id|ref|index> ",
+                    "--processes --sort <cpu|mem|proc> --format <tree|tsv> --json"
+                );
+                bail!("top: unknown flag '{unknown}'. Known flags: {known}");
+            }
+            extra => bail!("top: unexpected argument '{extra}'"),
+        }
+    }
+    Ok(())
+}
+
+// purpose: Validate the CMUX top format flag.
+// inputs: Raw args and current flag index.
+// returns/effects: Returns the next parse index or a usage error.
+fn validate_top_format_arg(args: &[String], index: usize) -> Result<usize> {
+    let flag = args[index].as_str();
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| anyhow!("top requires {flag} <value>"))?;
+    if matches!(value.as_str(), "tree") {
+        return Ok(index + 2);
+    }
+    if matches!(value.as_str(), "tsv" | "tab" | "tabs") {
+        bail!(
+            "top: --format tsv requires CMUX system.top TSV output, which Limux does not implement yet"
+        );
+    }
+    bail!("top: invalid --format value '{value}'. Use tree or tsv")
+}
+
 async fn run_memory(client: &mut Client, args: &[String]) -> Result<Value> {
     let group_limit = parse_opt(args, "--groups")
         .map(|raw| {
@@ -12366,6 +12728,22 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 bail!("unsupported workspace command");
             }
         }
+        "tree" => {
+            let payload = run_tree(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_tree_text(&payload))
+            }
+        }
+        "top" => {
+            let payload = run_top(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_memory_text(&payload, opts.id_format))
+            }
+        }
         "memory" => {
             let payload = run_memory(client, args).await?;
             if opts.json_output {
@@ -14495,6 +14873,49 @@ mod cli_arg_tests {
             .expect("selectw maps");
         assert_eq!(selected.0, "workspace.select");
         assert_eq!(selected.1["workspace_id"], "workspace:9");
+    }
+
+    #[test]
+    fn cmux_tree_options_validate_scope_and_flags() {
+        let options = parse_tree_options(&args(&["--all", "--json", "--workspace", "workspace:7"]))
+            .expect("tree options parse");
+
+        assert!(options.include_all);
+        assert_eq!(options.workspace.as_deref(), Some("workspace:7"));
+        assert!(parse_tree_options(&args(&["--all", "--window", "window:2"])).is_err());
+        assert!(parse_tree_options(&args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn cmux_tree_payload_renders_window_workspace_pane_surface_rows() {
+        let payload = tree_payload_from_lists(
+            &TreeOptions::default(),
+            &json!({"windows": [{"window_id": "window:1", "focused": true}]}),
+            &json!({"workspaces": [{"workspace_id": "workspace:1", "title": "main"}]}),
+            &json!({"panes": [{"pane_id": "pane:1"}]}),
+            &json!({"surfaces": [{"surface_id": "surface:1:tab-a", "pane_id": "pane:1", "title": "shell"}]}),
+        );
+
+        assert_eq!(payload["source"], "limux_legacy_list_tree");
+        let text = render_tree_text(&payload);
+        assert!(text.contains("window window:1"));
+        assert!(text.contains("workspace workspace:1 main"));
+        assert!(text.contains("pane pane:1"));
+        assert!(text.contains("surface surface:1:tab-a shell"));
+    }
+
+    #[test]
+    fn cmux_top_options_accept_safe_flags_and_reject_unimplemented_scopes() {
+        parse_top_options(&args(&["--processes", "--format", "tree"]))
+            .expect("safe top flags parse");
+
+        let err = parse_top_options(&args(&["--format", "tsv"]))
+            .expect_err("tsv output is not silently faked");
+        assert!(err.to_string().contains("system.top TSV output"));
+
+        let scoped =
+            parse_top_options(&args(&["--workspace", "workspace:7"])).expect_err("scope fails");
+        assert!(scoped.to_string().contains("system.top scoped diagnostics"));
     }
 
     #[test]
