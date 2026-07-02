@@ -4480,6 +4480,20 @@ fn custom_sidebar_dispatcher_action(
         "window.focus" | "focus-window" => Ok(Some(CustomSidebarDispatcherAction::WindowFocus(
             custom_sidebar_action_optional_window_id(action)?,
         ))),
+        "workspace.create" | "new-workspace" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceCreate {
+                name: custom_sidebar_action_optional_string_any(
+                    action,
+                    &["name", "title", "template"],
+                )?,
+                cwd: custom_sidebar_action_optional_string_any(
+                    action,
+                    &["cwd", "working_directory", "workingDirectory"],
+                )?,
+                command: custom_sidebar_action_optional_string_any(action, &["command", "text"])?,
+                focus: custom_sidebar_action_optional_bool(action, "focus")?.unwrap_or(false),
+            }))
+        }
         "workspace.select" | "workspace.focus" | "selectWorkspace" | "select-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceSelect(
                 custom_sidebar_action_workspace_id(action)?,
@@ -4679,6 +4693,37 @@ fn custom_sidebar_action_optional_command(
     Ok(None)
 }
 
+/// purpose: Read an optional non-empty string from any accepted CMUX parameter alias.
+/// inputs: Parsed action metadata and ordered parameter aliases.
+/// returns/effects: Returns the first present non-empty string or validates malformed values loudly.
+fn custom_sidebar_action_optional_string_any(
+    action: &CustomSidebarNodeAction,
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    for key in keys {
+        if action.params.contains_key(*key) {
+            return custom_sidebar_action_param_string(action, key).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// purpose: Read an optional boolean parameter from a CMUX sidebar action.
+/// inputs: Parsed action metadata and parameter key.
+/// returns/effects: Returns a boolean, None, or a loud validation error for non-booleans.
+fn custom_sidebar_action_optional_bool(
+    action: &CustomSidebarNodeAction,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    let Some(value) = action.params.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| format!("{} requires boolean `{key}`", action.action_type))
+}
+
 /// purpose: Read a required non-empty string parameter from a CMUX sidebar action.
 /// inputs: Parsed action metadata and parameter key.
 /// returns/effects: Returns the parameter or a loud validation error.
@@ -4778,6 +4823,12 @@ enum CustomSidebarDispatcherAction {
     WorkspaceLast,
     JumpToUnread,
     WindowFocus(Option<String>),
+    WorkspaceCreate {
+        name: Option<String>,
+        cwd: Option<String>,
+        command: Option<String>,
+        focus: bool,
+    },
     WorkspaceSelect(String),
     SurfaceFocus(String),
     SurfaceRun {
@@ -4844,6 +4895,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspaceLast => "workspace.last",
             CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
             CustomSidebarDispatcherAction::WindowFocus(_) => "window.focus",
+            CustomSidebarDispatcherAction::WorkspaceCreate { .. } => "workspace.create",
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
             CustomSidebarDispatcherAction::SurfaceRun { .. } => "surface.run",
@@ -4880,6 +4932,18 @@ fn apply_custom_sidebar_dispatcher_action(
         CustomSidebarDispatcherAction::WindowFocus(window_id) => {
             focus_window_payload(state, window_id.as_deref())
         }
+        CustomSidebarDispatcherAction::WorkspaceCreate {
+            name,
+            cwd,
+            command,
+            focus,
+        } => create_workspace_for_custom_sidebar(
+            state,
+            name.as_deref(),
+            cwd.as_deref(),
+            command.as_deref(),
+            focus,
+        ),
         CustomSidebarDispatcherAction::WorkspaceSelect(workspace_id) => {
             select_workspace_for_custom_sidebar(state, &workspace_id)
         }
@@ -4956,6 +5020,78 @@ fn select_relative_workspace_for_custom_sidebar(
         return Err(BridgeError::not_found("workspace not found"));
     };
     select_workspace_for_control(state, index)
+}
+
+/// purpose: Create a workspace from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state, optional title/cwd/command, and focus preference.
+/// returns/effects: Creates a real workspace, optionally starts a command, persists, and returns CMUX metadata.
+fn create_workspace_for_custom_sidebar(
+    state: &State,
+    name: Option<&str>,
+    cwd: Option<&str>,
+    command: Option<&str>,
+    focus: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    let working_directory = workspace_creation_directory_from_state(state, cwd);
+    let title = name
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| workspace_title_from_directory(working_directory.as_deref()));
+    let workspace = WorkspaceState {
+        id: None,
+        name: title,
+        description: None,
+        favorite: false,
+        cwd: working_directory.clone(),
+        folder_path: working_directory.clone(),
+        group_id: None,
+        environment: BTreeMap::new(),
+        layout: LayoutNodeState::Pane(PaneState::fallback(working_directory.as_deref())),
+    };
+    add_workspace_from_state_internal(state, &workspace, focus);
+    request_session_save(state);
+
+    let result = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .len()
+            .checked_sub(1)
+            .and_then(|index| workspace_payload(&app_state, index))
+    };
+    let Some(payload) = result else {
+        return Err(BridgeError::internal(
+            "workspace.create did not produce a workspace",
+        ));
+    };
+    if let (Some(command), Some(workspace_id)) = (
+        command.map(str::to_string),
+        payload["workspace_id"].as_str().map(ToOwned::to_owned),
+    ) {
+        schedule_workspace_create_command(state, workspace_id, command);
+    }
+    Ok(payload)
+}
+
+/// purpose: Send startup text to the first terminal in a freshly-created workspace.
+/// inputs: Live host state, workspace id, and command text.
+/// returns/effects: Schedules delayed terminal injection after GTK/Ghostty surface creation.
+fn schedule_workspace_create_command(state: &State, workspace_id: String, command: String) {
+    let state = state.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+        let target = {
+            let app_state = state.borrow();
+            app_state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .and_then(|workspace| pane::terminal_handle_for_surface(&workspace.root, None))
+        };
+        if let Some((_surface_id, handle)) = target {
+            handle.send_text(&command);
+            handle.send_text("\n");
+        }
+    });
 }
 
 /// purpose: Select a workspace from a parameterized JSON custom-sidebar action.
@@ -18896,6 +19032,23 @@ mod tests {
             message: None,
             params: window_params,
         };
+        let mut workspace_create_params = serde_json::Map::new();
+        workspace_create_params.insert("template".to_string(), json!("design-export"));
+        workspace_create_params.insert("cwd".to_string(), json!("/tmp/design"));
+        workspace_create_params.insert("command".to_string(), json!("npm run export"));
+        workspace_create_params.insert("focus".to_string(), json!(true));
+        let workspace_create = CustomSidebarNodeAction {
+            action_type: "workspace.create".to_string(),
+            message: None,
+            params: workspace_create_params,
+        };
+        let mut bad_workspace_create_params = serde_json::Map::new();
+        bad_workspace_create_params.insert("focus".to_string(), json!("yes"));
+        let bad_workspace_create = CustomSidebarNodeAction {
+            action_type: "workspace.create".to_string(),
+            message: None,
+            params: bad_workspace_create_params,
+        };
         let mut url_param = serde_json::Map::new();
         url_param.insert("url".to_string(), json!("https://example.test/pr/1"));
         let open_url_dot = CustomSidebarNodeAction {
@@ -19057,6 +19210,31 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&window_focus),
             "cmux dispatcher: window.focus"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.create")),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceCreate {
+                name: None,
+                cwd: None,
+                command: None,
+                focus: false,
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_create),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceCreate {
+                name: Some("design-export".to_string()),
+                cwd: Some("/tmp/design".to_string()),
+                command: Some("npm run export".to_string()),
+                focus: true,
+            }))
+        );
+        assert!(custom_sidebar_dispatcher_action(&bad_workspace_create)
+            .expect_err("string focus is invalid")
+            .contains("focus"));
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_create),
+            "cmux dispatcher: workspace.create"
         );
         assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_select),
