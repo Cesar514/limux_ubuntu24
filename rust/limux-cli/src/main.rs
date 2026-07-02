@@ -457,6 +457,169 @@ fn cmux_sidebars_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("XDG config directory is unavailable"))
 }
 
+struct DocsResource {
+    label: &'static str,
+    url: &'static str,
+}
+
+struct DocsReference {
+    topic: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+    web_url: &'static str,
+    raw_resources: &'static [DocsResource],
+    commands: &'static [&'static str],
+}
+
+const SETTINGS_SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux.schema.json";
+
+const DOCS_REFERENCES: &[DocsReference] = &[
+    DocsReference {
+        topic: "settings",
+        aliases: &[
+            "configuration",
+            "config",
+            "cmux-json",
+            "settings-json",
+            "settingsjson",
+            "schema",
+        ],
+        summary: "cmux-owned settings, cmux.json locations, schema, and reload flow.",
+        web_url: "https://cmux.com/docs/configuration#cmux-json",
+        raw_resources: &[
+            DocsResource {
+                label: "settings schema",
+                url: SETTINGS_SCHEMA_URL,
+            },
+            DocsResource {
+                label: "cmux skill",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/skills/cmux/SKILL.md",
+            },
+        ],
+        commands: &[
+            "cmux settings path",
+            "cmux settings cmux-json",
+            "cmux config doctor",
+            "cmux reload-config",
+        ],
+    },
+    DocsReference {
+        topic: "shortcuts",
+        aliases: &["keyboard", "keybindings", "keys"],
+        summary: "cmux-owned keyboard shortcuts and two-step chord syntax.",
+        web_url: "https://cmux.com/docs/keyboard-shortcuts",
+        raw_resources: &[
+            DocsResource {
+                label: "shortcut data",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux-shortcuts.ts",
+            },
+            DocsResource {
+                label: "settings schema",
+                url: SETTINGS_SCHEMA_URL,
+            },
+        ],
+        commands: &["cmux shortcuts", "cmux settings shortcuts", "cmux docs settings"],
+    },
+    DocsReference {
+        topic: "api",
+        aliases: &["cli", "socket", "automation", "handles"],
+        summary: "CLI/socket API, handle model, windows, workspaces, panes, and surfaces.",
+        web_url: "https://cmux.com/docs/api",
+        raw_resources: &[
+            DocsResource {
+                label: "CLI contract",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/cli-contract.md",
+            },
+            DocsResource {
+                label: "cmux skill",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/skills/cmux/SKILL.md",
+            },
+        ],
+        commands: &["cmux identify --json", "cmux tree --all"],
+    },
+    DocsReference {
+        topic: "browser",
+        aliases: &["browser-automation", "webview"],
+        summary: "Browser panel automation commands and snapshot-driven web interaction.",
+        web_url: "https://cmux.com/docs/browser-automation",
+        raw_resources: &[
+            DocsResource {
+                label: "browser skill",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/skills/cmux-browser/SKILL.md",
+            },
+            DocsResource {
+                label: "browser commands",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/skills/cmux-browser/references/commands.md",
+            },
+        ],
+        commands: &["cmux browser --help", "cmux browser snapshot"],
+    },
+    DocsReference {
+        topic: "agents",
+        aliases: &["integrations", "agent-integrations"],
+        summary: "Agent hook integrations, Feed approvals, notifications, and session restore.",
+        web_url: "https://cmux.com/docs/agent-integrations/oh-my-codex",
+        raw_resources: &[
+            DocsResource {
+                label: "agent hook docs",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/agent-hooks.md",
+            },
+            DocsResource {
+                label: "feed docs",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/feed.md",
+            },
+            DocsResource {
+                label: "notifications docs",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/notifications.md",
+            },
+        ],
+        commands: &[
+            "cmux hooks setup",
+            "cmux hooks setup <agent>",
+            "cmux hooks hermes-agent install",
+            "cmux hooks hermes-agent uninstall",
+            "cmux hooks <agent> uninstall",
+        ],
+    },
+    DocsReference {
+        topic: "dock",
+        aliases: &["doc", "controls", "right-sidebar", "dock-json"],
+        summary: "Custom right-sidebar terminal controls from .cmux/dock.json or ~/.config/cmux/dock.json.",
+        web_url: "https://cmux.com/docs/dock",
+        raw_resources: &[
+            DocsResource {
+                label: "dock docs",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/dock.md",
+            },
+            DocsResource {
+                label: "dock web copy",
+                url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/messages/en.json",
+            },
+        ],
+        commands: &[
+            "cmux docs dock",
+            "cmux docs dock --json",
+            "python3 -m json.tool .cmux/dock.json",
+        ],
+    },
+    DocsReference {
+        topic: "sidebars",
+        aliases: &["sidebar", "custom-sidebar", "custom-sidebars", "vibe-sidebar"],
+        summary: "Vibe-code a custom sidebar: a runtime-interpreted SwiftUI-style file in ~/.config/cmux/sidebars/ (beta).",
+        web_url: "https://cmux.com/docs/custom-sidebars",
+        raw_resources: &[DocsResource {
+            label: "custom sidebar authoring guide",
+            url: "https://raw.githubusercontent.com/manaflow-ai/cmux/main/docs/custom-sidebars.md",
+        }],
+        commands: &[
+            "mkdir -p ~/.config/cmux/sidebars",
+            "cat > ~/.config/cmux/sidebars/mine.swift",
+            "cmux docs api",
+        ],
+    },
+];
+
 // purpose: Produce CMUX-compatible docs pointers for local command families.
 // inputs: Optional docs topic from the CLI.
 // returns/effects: Returns text only; never contacts the Limux socket.
@@ -493,6 +656,115 @@ fn docs_text(topic: Option<&str>) -> Result<String> {
         "dock" | "doc" | "controls" | "right-sidebar" | "dock-json" => Ok(dock_docs_text()),
         "sidebars" | "custom-sidebars" | "custom-sidebar" => custom_sidebar_docs_text(),
         _ => bail!("unknown docs topic `{topic}`; expected one of {topics}"),
+    }
+}
+
+// purpose: Resolve CMUX docs topics and aliases to canonical reference metadata.
+// inputs: A docs topic or alias as typed by the user.
+// returns/effects: Returns the matching reference or None without touching the socket.
+fn docs_reference(topic: &str) -> Option<&'static DocsReference> {
+    let normalized = topic.replace('_', "-");
+    DOCS_REFERENCES.iter().find(|reference| {
+        reference.topic == normalized || reference.aliases.contains(&normalized.as_str())
+    })
+}
+
+// purpose: Build a CMUX-shaped JSON docs payload for one docs reference.
+// inputs: Docs reference metadata plus local Limux path resolvers for settings topic extras.
+// returns/effects: Returns JSON metadata or a fatal local path-resolution error.
+fn docs_payload(reference: &DocsReference) -> Result<Value> {
+    let mut payload = json!({
+        "topic": reference.topic,
+        "aliases": reference.aliases,
+        "summary": reference.summary,
+        "web_url": reference.web_url,
+        "raw_resources": reference.raw_resources.iter().map(|resource| {
+            json!({
+                "label": resource.label,
+                "url": resource.url,
+                "fetch": format!("curl -fsSL {}", resource.url),
+            })
+        }).collect::<Vec<_>>(),
+        "commands": reference.commands,
+    });
+    if reference.topic == "settings" {
+        insert_settings_docs_payload(&mut payload)?;
+    }
+    Ok(payload)
+}
+
+// purpose: Add CMUX settings-docs fields that depend on local Limux path resolution.
+// inputs: Mutable docs JSON payload object.
+// returns/effects: Inserts settings path/reload metadata or fails on malformed payload/path resolution.
+fn insert_settings_docs_payload(payload: &mut Value) -> Result<()> {
+    let settings_path = limux_settings_path()?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("docs payload object construction failed"))?;
+    object.insert(
+        "settings_files".to_string(),
+        json!({
+            "primary": settings_path.display().to_string(),
+            "legacy": settings_path.display().to_string(),
+            "fallback": limux_config_dir()?.display().to_string(),
+        }),
+    );
+    object.insert(
+        "ghostty_config".to_string(),
+        json!({
+            "path": ghostty_config_path()?.display().to_string(),
+            "note": "Limux reads Ghostty config for terminal behavior.",
+        }),
+    );
+    object.insert(
+        "backup".to_string(),
+        json!(
+            "Back up any existing Limux settings file to a timestamped .bak copy before editing."
+        ),
+    );
+    object.insert("reload_command".to_string(), json!("limux reload-config"));
+    object.insert(
+        "reload_scope".to_string(),
+        json!("Reloads Ghostty config, Limux settings, and shortcuts in place."),
+    );
+    Ok(())
+}
+
+// purpose: Implement CMUX docs command text and JSON probes that run without a host.
+// inputs: Docs command arguments and global JSON-output preference.
+// returns/effects: Returns local docs metadata or fails loudly for unknown topics.
+fn run_docs_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    match args {
+        [] if json_output => Ok(CommandOutput::Json(json!({
+            "topics": DOCS_REFERENCES
+                .iter()
+                .map(docs_payload)
+                .collect::<Result<Vec<_>>>()?,
+        }))),
+        [] => Ok(CommandOutput::Text(docs_text(None)?)),
+        [topic] if topic == "list" || topic == "all" => {
+            if json_output {
+                Ok(CommandOutput::Json(json!({
+                    "topics": DOCS_REFERENCES
+                        .iter()
+                        .map(docs_payload)
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            } else {
+                Ok(CommandOutput::Text(docs_text(None)?))
+            }
+        }
+        [topic] => {
+            if json_output {
+                let reference = docs_reference(topic).ok_or_else(|| {
+                    anyhow!("Unknown docs topic `{topic}`. Run `limux docs` for topics.")
+                })?;
+                Ok(CommandOutput::Json(docs_payload(reference)?))
+            } else {
+                Ok(CommandOutput::Text(docs_text(Some(topic))?))
+            }
+        }
+        _ => bail!("Usage: limux docs [settings|shortcuts|api|browser|agents|dock]"),
     }
 }
 
@@ -3247,9 +3519,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         );
     }
     let out = match command {
-        "docs" => Some(CommandOutput::Text(docs_text(
-            args.first().map(String::as_str),
-        )?)),
+        "docs" => Some(run_docs_command(args, opts.json_output)?),
         "settings" if settings_command_is_local(args) => {
             Some(run_settings_command(args, opts.json_output)?)
         }
@@ -4053,9 +4323,13 @@ fn settings_command_is_local(args: &[String]) -> bool {
 fn run_settings_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
     let sub = args.first().map(String::as_str).unwrap_or("open");
     match sub {
-        "--help" | "-h" | "docs" | "documentation" => {
-            Ok(CommandOutput::Text(docs_text(Some("settings"))?))
+        "--help" | "-h" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
+        "docs" | "documentation" if json_output => {
+            let reference = docs_reference("settings")
+                .ok_or_else(|| anyhow!("settings docs metadata is unavailable"))?;
+            Ok(CommandOutput::Json(docs_payload(reference)?))
         }
+        "docs" | "documentation" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
         "path" | "paths" => {
             let config_dir = limux_config_dir()?;
             let settings = limux_settings_path()?;
@@ -17063,6 +17337,20 @@ mod cli_arg_tests {
         let sidebars = docs_text(Some("sidebars")).expect("sidebars docs");
         assert!(sidebars.contains("cmux/sidebars"));
         assert!(sidebars.contains("sidebar validate"));
+
+        let settings = docs_reference("cmux_json").expect("settings docs alias");
+        assert_eq!(settings.topic, "settings");
+        let payload = docs_payload(settings).expect("settings docs payload");
+        assert_eq!(payload["topic"], "settings");
+        assert!(payload["raw_resources"]
+            .as_array()
+            .expect("raw resources")
+            .iter()
+            .any(|resource| resource["label"] == "settings schema"));
+        assert!(payload["settings_files"]["primary"]
+            .as_str()
+            .expect("primary settings path")
+            .ends_with("limux/settings.json"));
     }
 
     #[test]
@@ -17536,6 +17824,34 @@ mod cli_arg_tests {
             CommandOutput::Json(_) => panic!("docs should render text"),
             CommandOutput::Exit { .. } => panic!("docs should render text"),
         }
+
+        let mut json_opts = default_opts(args(&["docs", "browser"]));
+        json_opts.json_output = true;
+        let json_output = run_local_command(&json_opts)
+            .expect("local docs json command runs")
+            .expect("docs json is local");
+        let CommandOutput::Json(payload) = json_output else {
+            panic!("docs --json should render JSON");
+        };
+        assert_eq!(payload["topic"], "browser");
+        assert!(payload["aliases"]
+            .as_array()
+            .expect("browser aliases")
+            .contains(&json!("webview")));
+
+        let mut list_opts = default_opts(args(&["docs"]));
+        list_opts.json_output = true;
+        let list_output = run_local_command(&list_opts)
+            .expect("local docs list json command runs")
+            .expect("docs list json is local");
+        let CommandOutput::Json(payload) = list_output else {
+            panic!("docs list --json should render JSON");
+        };
+        assert!(payload["topics"]
+            .as_array()
+            .expect("docs topics")
+            .iter()
+            .any(|topic| topic["topic"] == "settings"));
     }
 
     // purpose: Verify CMUX command help probes do not require a running socket.
@@ -18004,6 +18320,16 @@ mod cli_arg_tests {
             .as_str()
             .expect("settings path")
             .ends_with("limux/settings.json"));
+        let mut docs_opts = default_opts(args(&["settings", "docs"]));
+        docs_opts.json_output = true;
+        let docs_output = run_local_command(&docs_opts)
+            .expect("settings docs json local check")
+            .expect("settings docs stays local");
+        let CommandOutput::Json(payload) = docs_output else {
+            panic!("settings docs --json should render JSON");
+        };
+        assert_eq!(payload["topic"], "settings");
+        assert_eq!(payload["reload_command"], "limux reload-config");
         assert_eq!(settings_target_raw_value("general"), Some("app"));
         assert_eq!(
             settings_target_raw_value("shortcuts"),
