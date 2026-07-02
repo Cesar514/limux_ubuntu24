@@ -157,6 +157,9 @@ pub(crate) struct AppState {
     sidebar_list: gtk::ListBox,
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
+    right_sidebar_shell: gtk::Box,
+    right_sidebar_title_label: gtk::Label,
+    right_sidebar_body: gtk::Box,
     new_ws_btn: gtk::Button,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
@@ -2741,7 +2744,231 @@ fn apply_right_sidebar_action(
         }
         RightSidebarAction::GetState => {}
     }
+    sync_right_sidebar_panel(&mut app_state);
     Ok(right_sidebar_state_payload(&app_state, workspace_id))
+}
+
+/// purpose: Convert right-sidebar mode to the visible panel heading.
+/// inputs: CMUX right-sidebar mode.
+/// returns/effects: Returns a human-readable label without mutating state.
+fn right_sidebar_mode_title(mode: &RightSidebarMode) -> &'static str {
+    match mode {
+        RightSidebarMode::Files => "Files",
+        RightSidebarMode::Find => "Find",
+        RightSidebarMode::Vault => "Vault",
+        RightSidebarMode::Sessions => "Sessions",
+        RightSidebarMode::Feed => "Feed",
+        RightSidebarMode::Dock => "Dock",
+    }
+}
+
+/// purpose: Describe what the current right-sidebar panel can render.
+/// inputs: CMUX right-sidebar mode.
+/// returns/effects: Returns mode-specific visible text.
+fn right_sidebar_mode_description(mode: &RightSidebarMode) -> &'static str {
+    match mode {
+        RightSidebarMode::Files => "Workspace files",
+        RightSidebarMode::Find => "Workspace find",
+        RightSidebarMode::Vault => "Vault",
+        RightSidebarMode::Sessions => "Session diagnostics",
+        RightSidebarMode::Feed => "Feed",
+        RightSidebarMode::Dock => "Dock",
+    }
+}
+
+/// purpose: Synchronize the visible right sidebar with host-owned CMUX metadata.
+/// inputs: Mutable app state containing widgets and active workspace metadata.
+/// returns/effects: Rebuilds the right-sidebar body and toggles shell visibility.
+fn sync_right_sidebar_panel(state: &mut AppState) {
+    state
+        .right_sidebar_shell
+        .set_visible(state.right_sidebar_visible);
+    state
+        .right_sidebar_title_label
+        .set_label(&right_sidebar_panel_title(state));
+    clear_right_sidebar_body(&state.right_sidebar_body);
+    let Some(workspace) = state.active_workspace() else {
+        append_right_sidebar_muted(&state.right_sidebar_body, "No workspace");
+        return;
+    };
+    append_right_sidebar_section(&state.right_sidebar_body, "Mode");
+    append_right_sidebar_row(
+        &state.right_sidebar_body,
+        &format!(
+            "{} - {}",
+            right_sidebar_mode_title(&state.right_sidebar_mode),
+            right_sidebar_mode_description(&state.right_sidebar_mode)
+        ),
+    );
+    append_right_sidebar_section(&state.right_sidebar_body, "Workspace");
+    append_right_sidebar_row(&state.right_sidebar_body, &workspace.name);
+    sync_right_sidebar_status_rows(&state.right_sidebar_body, workspace);
+    sync_right_sidebar_progress_row(&state.right_sidebar_body, workspace);
+    sync_right_sidebar_log_rows(&state.right_sidebar_body, workspace);
+}
+
+/// purpose: Build the right-sidebar title from current mode/focus state.
+/// inputs: App state with right-sidebar mode and focus metadata.
+/// returns/effects: Returns a title string without mutating widgets.
+fn right_sidebar_panel_title(state: &AppState) -> String {
+    let suffix = if state.right_sidebar_focused {
+        " focused"
+    } else {
+        ""
+    };
+    format!(
+        "{}{}",
+        right_sidebar_mode_title(&state.right_sidebar_mode),
+        suffix
+    )
+}
+
+/// purpose: Remove all rendered rows from the right-sidebar body.
+/// inputs: GTK box used as the right-sidebar body.
+/// returns/effects: Mutates child widgets only.
+fn clear_right_sidebar_body(body: &gtk::Box) {
+    while let Some(child) = body.first_child() {
+        body.remove(&child);
+    }
+}
+
+/// purpose: Append a right-sidebar section header.
+/// inputs: Body widget and section text.
+/// returns/effects: Adds one label widget.
+fn append_right_sidebar_section(body: &gtk::Box, text: &str) {
+    append_right_sidebar_label(body, text, "limux-right-sidebar-section");
+}
+
+/// purpose: Append a normal right-sidebar row.
+/// inputs: Body widget and row text.
+/// returns/effects: Adds one wrapping label widget.
+fn append_right_sidebar_row(body: &gtk::Box, text: &str) {
+    append_right_sidebar_label(body, text, "limux-right-sidebar-row");
+}
+
+/// purpose: Append a muted right-sidebar row.
+/// inputs: Body widget and row text.
+/// returns/effects: Adds one wrapping label widget.
+fn append_right_sidebar_muted(body: &gtk::Box, text: &str) {
+    append_right_sidebar_label(body, text, "limux-right-sidebar-muted");
+}
+
+/// purpose: Append one styled right-sidebar label.
+/// inputs: Body widget, label text, and CSS class.
+/// returns/effects: Adds one wrapping label widget.
+fn append_right_sidebar_label(body: &gtk::Box, text: &str, css_class: &str) {
+    let label = gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .build();
+    label.add_css_class(css_class);
+    body.append(&label);
+}
+
+/// purpose: Render sidebar status rows in the visible panel.
+/// inputs: Body widget and active workspace metadata.
+/// returns/effects: Adds status section rows to the right sidebar.
+fn sync_right_sidebar_status_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Status");
+    let rows = sidebar_status_preview_lines(workspace);
+    if rows.is_empty() {
+        append_right_sidebar_muted(body, "none");
+        return;
+    }
+    for row in rows {
+        append_right_sidebar_row(body, &row);
+    }
+}
+
+/// purpose: Render sidebar progress state in the visible panel.
+/// inputs: Body widget and active workspace metadata.
+/// returns/effects: Adds one progress row to the right sidebar.
+fn sync_right_sidebar_progress_row(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Progress");
+    match workspace.sidebar_progress.as_ref() {
+        Some(progress) => append_right_sidebar_row(body, &sidebar_progress_preview_line(progress)),
+        None => append_right_sidebar_muted(body, "none"),
+    }
+}
+
+/// purpose: Render recent sidebar log entries in the visible panel.
+/// inputs: Body widget and active workspace metadata.
+/// returns/effects: Adds newest retained log rows up to the preview cap.
+fn sync_right_sidebar_log_rows(body: &gtk::Box, workspace: &Workspace) {
+    append_right_sidebar_section(body, "Log");
+    let rows = sidebar_log_preview_lines(workspace, RIGHT_SIDEBAR_LOG_PREVIEW_LIMIT);
+    if rows.is_empty() {
+        append_right_sidebar_muted(body, "none");
+        return;
+    }
+    for row in rows {
+        append_right_sidebar_row(body, &row);
+    }
+}
+
+/// purpose: Format status rows for the right-sidebar preview.
+/// inputs: Active workspace metadata.
+/// returns/effects: Returns rows sorted by priority then key.
+fn sidebar_status_preview_lines(workspace: &Workspace) -> Vec<String> {
+    sidebar_status_preview_lines_from_entries(workspace.sidebar_status.values())
+}
+
+/// purpose: Format status preview rows from arbitrary retained entries.
+/// inputs: Sidebar status entries.
+/// returns/effects: Returns rows sorted by priority then key.
+fn sidebar_status_preview_lines_from_entries<'a>(
+    entries: impl Iterator<Item = &'a SidebarStatusEntry>,
+) -> Vec<String> {
+    let mut entries = entries.collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    entries
+        .into_iter()
+        .map(|entry| format!("{} = {} ({})", entry.key, entry.value, entry.priority))
+        .collect()
+}
+
+/// purpose: Format progress state for the right-sidebar preview.
+/// inputs: Retained progress metadata.
+/// returns/effects: Returns one visible row string.
+fn sidebar_progress_preview_line(progress: &SidebarProgress) -> String {
+    let percent = (progress.value * 100.0).round() as i64;
+    match progress.label.as_deref() {
+        Some(label) if !label.is_empty() => format!("{percent}% - {label}"),
+        _ => format!("{percent}%"),
+    }
+}
+
+/// purpose: Format recent log entries for the right-sidebar preview.
+/// inputs: Active workspace metadata and maximum number of rows.
+/// returns/effects: Returns oldest-to-newest rows within the retained tail.
+fn sidebar_log_preview_lines(workspace: &Workspace, limit: usize) -> Vec<String> {
+    sidebar_log_preview_lines_from_entries(&workspace.sidebar_log, limit)
+}
+
+/// purpose: Format recent log preview rows from retained entries.
+/// inputs: Sidebar log entries and maximum number of rows.
+/// returns/effects: Returns oldest-to-newest rows within the retained tail.
+fn sidebar_log_preview_lines_from_entries(
+    entries: &[SidebarLogEntry],
+    limit: usize,
+) -> Vec<String> {
+    let start = entries.len().saturating_sub(limit);
+    entries[start..]
+        .iter()
+        .map(|entry| match entry.source.as_deref() {
+            Some(source) if !source.is_empty() => {
+                format!("[{}] {}: {}", entry.level, source, entry.message)
+            }
+            _ => format!("[{}] {}", entry.level, entry.message),
+        })
+        .collect()
 }
 
 /// purpose: Resolve a CMUX sidebar metadata workspace selector.
@@ -2906,7 +3133,7 @@ fn apply_sidebar_action(
     let mut app_state = state.borrow_mut();
     let index = sidebar_workspace_index(&app_state, &target)?;
     let workspace_id = app_state.workspaces[index].id.clone();
-    match action {
+    let result = match action {
         SidebarAction::SetStatus {
             key,
             value,
@@ -2947,7 +3174,11 @@ fn apply_sidebar_action(
             "log": sidebar_log_rows(&app_state.workspaces[index], limit),
         })),
         SidebarAction::State => Ok(sidebar_state_payload(&app_state.workspaces[index])),
+    };
+    if result.is_ok() {
+        sync_right_sidebar_panel(&mut app_state);
     }
+    result
 }
 
 /// purpose: Store or replace one sidebar status entry.
@@ -3219,6 +3450,8 @@ const WORKSPACE_RENAME_ENTRY_CSS_CLASSES: [&str; 2] =
 const SIDEBAR_HANDLE_CSS_CLASS: &str = "limux-sidebar-handle";
 const SIDEBAR_HANDLE_CURSOR_NAME: &str = "col-resize";
 const SIDEBAR_RESIZE_HANDLE_WIDTH_PX: i32 = 3;
+const RIGHT_SIDEBAR_WIDTH: i32 = 280;
+const RIGHT_SIDEBAR_LOG_PREVIEW_LIMIT: usize = 8;
 
 const BASE_CSS: &str = r#"
 .limux-host-entry {
@@ -3245,6 +3478,33 @@ const BASE_CSS: &str = r#"
     background-color: @window_bg_color;
     color: @window_fg_color;
     border-right: 1px solid alpha(@window_fg_color, 0.08);
+}
+.limux-right-sidebar {
+    background-color: @window_bg_color;
+    color: @window_fg_color;
+    border-left: 1px solid alpha(@window_fg_color, 0.1);
+    padding: 10px;
+}
+.limux-right-sidebar-title {
+    color: @window_fg_color;
+    font-size: 15px;
+    font-weight: 700;
+}
+.limux-right-sidebar-section {
+    color: alpha(@window_fg_color, 0.64);
+    font-size: 11px;
+    font-weight: 700;
+    margin-top: 12px;
+}
+.limux-right-sidebar-row {
+    color: alpha(@window_fg_color, 0.82);
+    font-size: 12px;
+    margin-top: 4px;
+}
+.limux-right-sidebar-muted {
+    color: alpha(@window_fg_color, 0.52);
+    font-size: 12px;
+    margin-top: 4px;
 }
 .limux-sidebar-row-box {
     padding: 8px 6px 8px 3px;
@@ -3575,7 +3835,10 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_scroll);
     sidebar.append(&new_ws_btn);
 
-    let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
+    let (right_sidebar_shell, right_sidebar_title_label, right_sidebar_body) =
+        build_right_sidebar_panel();
+    let (main_split, sidebar_shell, sidebar_handle) =
+        build_sidebar_split(&sidebar, &stack, &right_sidebar_shell);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     if let Some(ref header) = header {
@@ -3600,6 +3863,9 @@ pub fn build_window(app: &adw::Application) {
         sidebar_list: sidebar_list.clone(),
         sidebar_shell: sidebar_shell.clone(),
         sidebar_handle: sidebar_handle.clone(),
+        right_sidebar_shell: right_sidebar_shell.clone(),
+        right_sidebar_title_label: right_sidebar_title_label.clone(),
+        right_sidebar_body: right_sidebar_body.clone(),
         new_ws_btn: new_ws_btn.clone(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
@@ -3621,6 +3887,10 @@ pub fn build_window(app: &adw::Application) {
         _desktop_notification_action_signal: None,
         _desktop_notification_closed_signal: None,
     }));
+    {
+        let mut app_state = state.borrow_mut();
+        sync_right_sidebar_panel(&mut app_state);
+    }
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
@@ -3776,7 +4046,48 @@ fn build_window_css(background_opacity: f64) -> String {
     )
 }
 
-fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk::Box, gtk::Box) {
+/// purpose: Build the CMUX-compatible right sidebar shell and retained-metadata body.
+/// inputs: None.
+/// returns/effects: Returns shell/title/body widgets for host state ownership.
+fn build_right_sidebar_panel() -> (gtk::Box, gtk::Label, gtk::Box) {
+    let title = gtk::Label::builder()
+        .label("RIGHT SIDEBAR")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    title.add_css_class("limux-right-sidebar-title");
+
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .vexpand(true)
+        .build();
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .child(&body)
+        .build();
+
+    let shell = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(RIGHT_SIDEBAR_WIDTH)
+        .hexpand(false)
+        .vexpand(true)
+        .build();
+    shell.add_css_class("limux-right-sidebar");
+    shell.append(&title);
+    shell.append(&scroll);
+    shell.set_visible(false);
+    (shell, title, body)
+}
+
+fn build_sidebar_split(
+    sidebar: &gtk::Box,
+    stack: &gtk::Stack,
+    right_sidebar: &gtk::Box,
+) -> (gtk::Box, gtk::Box, gtk::Box) {
     let sidebar_shell = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(false)
@@ -3802,6 +4113,7 @@ fn build_sidebar_split(sidebar: &gtk::Box, stack: &gtk::Stack) -> (gtk::Box, gtk
     main_split.append(&sidebar_shell);
     main_split.append(&sidebar_handle);
     main_split.append(stack);
+    main_split.append(right_sidebar);
 
     (main_split, sidebar_shell, sidebar_handle)
 }
@@ -5683,6 +5995,7 @@ fn create_workspace_for_tab_payload(
             sidebar_log: Vec::new(),
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
+        sync_right_sidebar_panel(&mut app_state);
         app_state.stack.set_visible_child_name(&stack_name);
     }
 
@@ -8864,6 +9177,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let mut app_state = state.borrow_mut();
                 app_state.workspaces.len().checked_sub(1).map(|last_index| {
                     app_state.active_idx = last_index;
+                    sync_right_sidebar_panel(&mut app_state);
                     let workspace = &app_state.workspaces[last_index];
                     (
                         app_state.stack.clone(),
@@ -9466,6 +9780,7 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         s.workspaces.push(ws);
         if activate || was_empty {
             s.active_idx = s.workspaces.len() - 1;
+            sync_right_sidebar_panel(&mut s);
         }
         let index = s.workspaces.len() - 1;
         let snapshot = workspace_event_snapshot(&s, index);
@@ -9730,6 +10045,7 @@ fn close_workspace_by_id_internal(
 
     if s.workspaces.is_empty() {
         s.active_idx = 0;
+        sync_right_sidebar_panel(&mut s);
         drop(s);
         if let Some(snapshot) = closed_snapshot {
             publish_workspace_lifecycle_event(
@@ -9756,6 +10072,7 @@ fn close_workspace_by_id_internal(
         idx,
     );
     s.active_idx = new_idx;
+    sync_right_sidebar_panel(&mut s);
 
     let stack_name = format!("ws-{}", s.workspaces[new_idx].id);
     s.stack.set_visible_child_name(&stack_name);
@@ -9801,6 +10118,7 @@ fn switch_workspace(state: &State, idx: usize) {
             .map(|workspace| workspace.id.clone());
         s.previous_workspace_id = previous_workspace_id.clone();
         s.active_idx = idx;
+        sync_right_sidebar_panel(&mut s);
         let stack = s.stack.clone();
         let stack_name = format!("ws-{}", s.workspaces[idx].id);
         let focus_root = s.workspaces[idx].root.clone();
@@ -11605,21 +11923,23 @@ mod tests {
         publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
         queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
-        run_notification_hook_command, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, surface_input_event_payload, surface_key_event_payload,
-        surface_lifecycle_event_payload, tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_lifecycle_payload,
+        right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, should_emit_desktop_notification,
+        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
+        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
+        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_lifecycle_payload,
         workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceEventSnapshot,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
+        SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
+        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
-    use crate::control_bridge::BrowserAction;
+    use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
@@ -11870,6 +12190,82 @@ mod tests {
             [HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS]
         );
         assert!(BASE_CSS.contains(".limux-ws-rename-entry"));
+    }
+
+    #[test]
+    fn right_sidebar_preview_helpers_format_mode_and_progress() {
+        assert_eq!(right_sidebar_mode_title(&RightSidebarMode::Find), "Find");
+        assert!(
+            right_sidebar_mode_description(&RightSidebarMode::Feed).contains("Feed"),
+            "feed mode description should be readable in the rendered panel"
+        );
+        assert_eq!(
+            sidebar_progress_preview_line(&SidebarProgress {
+                value: 0.625,
+                label: Some("Building".to_string()),
+            }),
+            "63% - Building"
+        );
+    }
+
+    #[test]
+    fn right_sidebar_status_preview_sorts_by_priority_then_key() {
+        let entries = [
+            SidebarStatusEntry {
+                key: "test".to_string(),
+                value: "queued".to_string(),
+                icon: None,
+                color: None,
+                url: None,
+                priority: 10,
+            },
+            SidebarStatusEntry {
+                key: "build".to_string(),
+                value: "running".to_string(),
+                icon: None,
+                color: None,
+                url: None,
+                priority: 80,
+            },
+            SidebarStatusEntry {
+                key: "agent".to_string(),
+                value: "waiting".to_string(),
+                icon: None,
+                color: None,
+                url: None,
+                priority: 80,
+            },
+        ];
+
+        assert_eq!(
+            sidebar_status_preview_lines_from_entries(entries.iter()),
+            vec![
+                "agent = waiting (80)".to_string(),
+                "build = running (80)".to_string(),
+                "test = queued (10)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn right_sidebar_log_preview_limits_to_recent_entries() {
+        let entries = (0..3)
+            .map(|id| SidebarLogEntry {
+                id,
+                created_at: "2026-07-02T04:00:00Z".to_string(),
+                level: "info".to_string(),
+                source: Some("build".to_string()),
+                message: format!("message {id}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sidebar_log_preview_lines_from_entries(&entries, 2),
+            vec![
+                "[info] build: message 1".to_string(),
+                "[info] build: message 2".to_string()
+            ]
+        );
     }
 
     #[test]
