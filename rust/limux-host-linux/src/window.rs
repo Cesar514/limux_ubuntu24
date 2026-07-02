@@ -6267,6 +6267,45 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     send_browser_object_response(browser, script, payload, reply);
                     return;
                 }
+                BrowserAction::FrameSelect { selector } => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    browser.select_frame(selector, move |result| match result {
+                        Ok(frame_id) => {
+                            payload["frame_id"] = serde_json::Value::String(frame_id);
+                            let _ = reply.send(Ok(payload));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::not_found(error)));
+                        }
+                    });
+                    return;
+                }
+                BrowserAction::FrameMain => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    browser.reset_frame();
+                    payload["frame_id"] = serde_json::Value::String("main".to_string());
+                    let _ = reply.send(Ok(payload));
+                    return;
+                }
+                BrowserAction::DownloadWait { path, timeout_ms } => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let path = path.as_ref().map(PathBuf::from);
+                    browser.wait_for_download(path, *timeout_ms, move |result| match result {
+                        Ok(path) => {
+                            payload["downloaded"] = serde_json::Value::Bool(true);
+                            payload["path"] =
+                                serde_json::Value::String(path.to_string_lossy().into_owned());
+                            let _ = reply.send(Ok(payload));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::not_found(error)));
+                        }
+                    });
+                    return;
+                }
                 BrowserAction::Screenshot { path, full_page } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
@@ -6579,6 +6618,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::IsVisible { .. }
                 | BrowserAction::Screenshot { .. }
                 | BrowserAction::Find { .. }
+                | BrowserAction::FrameSelect { .. }
+                | BrowserAction::FrameMain
+                | BrowserAction::DownloadWait { .. }
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::Wait { .. }
                 | BrowserAction::AddScript { .. }

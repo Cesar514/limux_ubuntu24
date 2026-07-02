@@ -5033,7 +5033,8 @@ async fn run_browser(
         }
         match arg.as_str() {
             "--workspace" | "--surface" | "--id-format" | "--timeout-ms" | "--load-state"
-            | "--url-contains" | "--function" | "--max-depth" | "--out" => {
+            | "--url-contains" | "--function" | "--max-depth" | "--out" | "--path"
+            | "--timeout" => {
                 if idx + 1 < browser_args.len() {
                     skip = true;
                 }
@@ -5384,6 +5385,39 @@ async fn run_browser(
                 })
                 .await?
             };
+            CommandOutput::Json(payload)
+        }
+        "download" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser download requires a surface"))?;
+            let download_args = if rest.first().is_some_and(|arg| arg == "wait") {
+                rest[1..].to_vec()
+            } else {
+                rest.clone()
+            };
+            let mut p = Map::new();
+            if let Some(path) = parse_opt(&browser_args, "--path").or_else(|| {
+                download_args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .cloned()
+            }) {
+                p.insert("path".to_string(), Value::String(path));
+            }
+            if let Some(timeout_ms) = parse_opt(&browser_args, "--timeout-ms") {
+                let value = timeout_ms
+                    .parse::<u64>()
+                    .with_context(|| "--timeout-ms must be an integer")?;
+                p.insert("timeout_ms".to_string(), Value::Number(value.into()));
+            } else if let Some(timeout) = parse_opt(&browser_args, "--timeout") {
+                let seconds = timeout
+                    .parse::<f64>()
+                    .with_context(|| "--timeout must be a number")?;
+                let millis = (seconds * 1000.0).max(1.0) as u64;
+                p.insert("timeout_ms".to_string(), Value::Number(millis.into()));
+            }
+            let payload = browser_call(client, Some(sid), "browser.download.wait", p).await?;
             CommandOutput::Json(payload)
         }
         "click" | "dblclick" | "hover" | "focus" | "check" | "uncheck" | "scroll_into_view" => {

@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use gtk::glib;
 #[allow(unused_imports)]
@@ -332,6 +333,30 @@ impl BrowserSurfaceTarget {
         F: FnOnce(Result<Value, String>) + 'static,
     {
         self.target.evaluate_javascript(script, callback)
+    }
+
+    // purpose: Select an iframe as the browser automation context.
+    // inputs: CSS selector or frame id plus a completion callback.
+    // returns/effects: Stores the selected frame only after WebKit confirms it exists.
+    pub fn select_frame<F>(&self, selector: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        self.target.select_frame(selector, callback)
+    }
+
+    pub fn reset_frame(&self) -> bool {
+        self.target.reset_frame()
+    }
+
+    // purpose: Wait for a download target path to appear without busy spinning.
+    // inputs: Optional destination path, timeout, and completion callback.
+    // returns/effects: Polls locally on the GTK main loop and reports the resolved file path.
+    pub fn wait_for_download<F>(&self, path: Option<PathBuf>, timeout_ms: u64, callback: F) -> bool
+    where
+        F: FnOnce(Result<PathBuf, String>) + 'static,
+    {
+        self.target.wait_for_download(path, timeout_ms, callback)
     }
 
     // purpose: Save the browser surface as a PNG screenshot.
@@ -3579,6 +3604,7 @@ struct BrowserHandles {
     search_entry: gtk::SearchEntry,
     find_controller: webkit6::FindController,
     dom_editable: Rc<Cell<bool>>,
+    frame_selector: Rc<RefCell<Option<String>>>,
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -3659,6 +3685,27 @@ impl BrowserShortcutTarget {
         F: FnOnce(Result<Value, String>) + 'static,
     {
         self.handles.evaluate_javascript(script, callback)
+    }
+
+    // purpose: Select an iframe for subsequent browser automation commands.
+    // inputs: CSS selector or frame id plus a completion callback.
+    // returns/effects: Persists the selected frame in this browser target.
+    pub fn select_frame<F>(&self, selector: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        self.handles.select_frame(selector, callback)
+    }
+
+    pub fn reset_frame(&self) -> bool {
+        self.handles.reset_frame()
+    }
+
+    pub fn wait_for_download<F>(&self, path: Option<PathBuf>, timeout_ms: u64, callback: F) -> bool
+    where
+        F: FnOnce(Result<PathBuf, String>) + 'static,
+    {
+        self.handles.wait_for_download(path, timeout_ms, callback)
     }
 
     // purpose: Save the browser shortcut target as a PNG screenshot.
@@ -3811,8 +3858,14 @@ impl BrowserHandles {
     where
         F: FnOnce(Result<Value, String>) + 'static,
     {
+        let wrapped = self
+            .frame_selector
+            .borrow()
+            .as_deref()
+            .map(|selector| browser_frame_script(selector, script))
+            .unwrap_or_else(|| script.to_string());
         self.webview.evaluate_javascript(
-            script,
+            &wrapped,
             None,
             None,
             None::<&gtk::gio::Cancellable>,
@@ -3821,6 +3874,74 @@ impl BrowserHandles {
                 Err(error) => callback(Err(error.to_string())),
             },
         );
+        true
+    }
+
+    // purpose: Validate and store a selected iframe for CMUX browser.frame.select parity.
+    // inputs: CSS selector or frame id plus completion callback.
+    // returns/effects: Future JavaScript automation runs against the selected frame document.
+    fn select_frame<F>(&self, selector: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        let selector = selector.trim().to_string();
+        if selector.is_empty() {
+            callback(Err(
+                "browser.frame.select requires non-empty selector".to_string()
+            ));
+            return true;
+        }
+        let frame_selector = self.frame_selector.clone();
+        let script = browser_frame_probe_script(&selector);
+        self.webview.evaluate_javascript(
+            &script,
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            move |result| match result {
+                Ok(_) => {
+                    *frame_selector.borrow_mut() = Some(selector.clone());
+                    callback(Ok(selector));
+                }
+                Err(error) => callback(Err(error.to_string())),
+            },
+        );
+        true
+    }
+
+    fn reset_frame(&self) -> bool {
+        *self.frame_selector.borrow_mut() = None;
+        true
+    }
+
+    // purpose: Wait until a requested download path exists, using GTK timeouts instead of busy loops.
+    // inputs: Optional path and timeout in milliseconds.
+    // returns/effects: Calls back with the existing path or a timeout error.
+    fn wait_for_download<F>(&self, path: Option<PathBuf>, timeout_ms: u64, callback: F) -> bool
+    where
+        F: FnOnce(Result<PathBuf, String>) + 'static,
+    {
+        let path = path.unwrap_or_else(|| std::env::temp_dir().join("download.bin"));
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let callback = Rc::new(RefCell::new(Some(callback)));
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            if path.exists() {
+                if let Some(callback) = callback.borrow_mut().take() {
+                    callback(Ok(path.clone()));
+                }
+                return glib::ControlFlow::Break;
+            }
+            if Instant::now() >= deadline {
+                if let Some(callback) = callback.borrow_mut().take() {
+                    callback(Err(format!(
+                        "timed out waiting for download: {}",
+                        path.display()
+                    )));
+                }
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
         true
     }
 
@@ -3860,6 +3981,50 @@ impl BrowserHandles {
             u32::MAX,
         );
     }
+}
+
+#[cfg(feature = "webkit")]
+// purpose: Build a JavaScript probe for CMUX browser.frame.select.
+// inputs: Frame CSS selector or element id.
+// returns/effects: Returns script that throws when the frame cannot be automated.
+fn browser_frame_probe_script(selector: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("json frame selector");
+    format!(
+        r#"(() => {{
+  const selector = {selector};
+  const frame = document.querySelector(selector) || document.getElementById(selector);
+  if (!frame || !frame.contentWindow || !frame.contentDocument) {{
+    throw new Error(`frame not found: ${{selector}}`);
+  }}
+  return {{ frame_id: selector, url: frame.contentWindow.location.href || "about:blank" }};
+}})()"#
+    )
+}
+
+#[cfg(feature = "webkit")]
+// purpose: Wrap browser automation JavaScript so it executes inside the selected iframe.
+// inputs: Selected frame selector and existing JavaScript source.
+// returns/effects: Returns script that evaluates against the frame document/window or throws loudly.
+fn browser_frame_script(selector: &str, script: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("json frame selector");
+    let source = serde_json::to_string(script).expect("json frame script");
+    format!(
+        r#"(() => {{
+  const selector = {selector};
+  const frame = document.querySelector(selector) || document.getElementById(selector);
+  if (!frame || !frame.contentWindow || !frame.contentDocument) {{
+    throw new Error(`frame not found: ${{selector}}`);
+  }}
+  const source = {source};
+  const frameWindow = frame.contentWindow;
+  const frameDocument = frame.contentDocument;
+  try {{
+    return frameWindow.Function("document", "window", `return (${{source}});`)(frameDocument, frameWindow);
+  }} catch (expressionError) {{
+    return frameWindow.Function("document", "window", source)(frameDocument, frameWindow);
+  }}
+}})()"#
+    )
 }
 
 #[cfg(feature = "webkit")]
@@ -3951,6 +4116,30 @@ impl BrowserHandles {
     {
         _callback(Err(
             "browser JavaScript evaluation requires webkit support".to_string()
+        ));
+        false
+    }
+
+    fn select_frame<F>(&self, _selector: &str, callback: F) -> bool
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        callback(Err(
+            "browser frame selection requires webkit support".to_string()
+        ));
+        false
+    }
+
+    fn reset_frame(&self) -> bool {
+        false
+    }
+
+    fn wait_for_download<F>(&self, _path: Option<PathBuf>, _timeout_ms: u64, callback: F) -> bool
+    where
+        F: FnOnce(Result<PathBuf, String>) + 'static,
+    {
+        callback(Err(
+            "browser download wait requires webkit support".to_string()
         ));
         false
     }
@@ -4291,6 +4480,7 @@ fn create_browser_widget(
         search_entry: search_entry.clone(),
         find_controller: find_controller.clone(),
         dom_editable,
+        frame_selector: Rc::new(RefCell::new(None)),
     };
 
     {

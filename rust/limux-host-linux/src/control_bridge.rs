@@ -113,6 +113,9 @@ const METHODS: &[&str] = &[
     "browser.find.first",
     "browser.find.last",
     "browser.find.nth",
+    "browser.frame.main",
+    "browser.frame.select",
+    "browser.download.wait",
     "browser.snapshot",
     "browser.wait",
     "browser.addscript",
@@ -297,6 +300,14 @@ pub enum BrowserAction {
         role: Option<String>,
         name: Option<String>,
         index: Option<usize>,
+    },
+    FrameMain,
+    FrameSelect {
+        selector: String,
+    },
+    DownloadWait {
+        path: Option<String>,
+        timeout_ms: u64,
     },
     Snapshot {
         interactive: bool,
@@ -1731,6 +1742,9 @@ fn handle_method(
         | "browser.find.first"
         | "browser.find.last"
         | "browser.find.nth"
+        | "browser.frame.main"
+        | "browser.frame.select"
+        | "browser.download.wait"
         | "browser.snapshot"
         | "browser.wait"
         | "browser.addscript"
@@ -1995,6 +2009,25 @@ fn handle_method(
                 | "browser.find.nth" => match parse_browser_find_action(method, params) {
                     Ok(action) => action,
                     Err(error) => return error_response(id, error),
+                },
+                "browser.frame.main" => BrowserAction::FrameMain,
+                "browser.frame.select" => {
+                    let Some(selector) = optional_string(params, &["selector", "frame_id"]) else {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(
+                                "browser.frame.select requires selector or frame_id",
+                            ),
+                        );
+                    };
+                    BrowserAction::FrameSelect { selector }
+                }
+                "browser.download.wait" => BrowserAction::DownloadWait {
+                    path: optional_string(params, &["path"]),
+                    timeout_ms: match optional_u64(params, &["timeout_ms", "timeoutMs"]) {
+                        Ok(value) => value.unwrap_or(10_000).min(120_000),
+                        Err(error) => return error_response(id, error),
+                    },
                 },
                 "browser.snapshot" => BrowserAction::Snapshot {
                     interactive: match optional_bool(params, "interactive") {
@@ -4300,6 +4333,53 @@ mod tests {
             },
         );
         assert_eq!(wait.error, None);
+
+        let frame_select = dispatch_request(
+            r##"{"id":1,"method":"browser.frame.select","params":{"surface_id":"surface:9:browser","selector":"iframe.docs"}}"##,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::FrameSelect {
+                            selector: "iframe.docs".to_string()
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "frame_id": "iframe.docs" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(frame_select.error, None);
+
+        let frame_main = dispatch_request(
+            r#"{"id":1,"method":"browser.frame.main","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(action, BrowserAction::FrameMain);
+                    let _ = reply.send(Ok(json!({ "frame_id": "main" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(frame_main.error, None);
+
+        let download_wait = dispatch_request(
+            r#"{"id":1,"method":"browser.download.wait","params":{"surface_id":"surface:9:browser","path":"/tmp/file.bin","timeout_ms":25}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::DownloadWait {
+                            path: Some("/tmp/file.bin".to_string()),
+                            timeout_ms: 25
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "downloaded": true, "path": "/tmp/file.bin" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(download_wait.error, None);
 
         let invalid_wait = dispatch_request(
             r#"{"id":1,"method":"browser.wait","params":{"surface_id":"surface:9:browser"}}"#,
