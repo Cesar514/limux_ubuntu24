@@ -96,8 +96,34 @@ impl FeedCoordinator {
         while state.items.len() > MAX_FEED_ITEMS {
             state.items.pop_front();
         }
+        let event_payload = feed_event_payload(
+            &item_id,
+            request_id.as_deref(),
+            state.items.back().expect("just pushed feed item"),
+            "received",
+            None,
+        );
+        publish_feed_bus_event(
+            "feed.item.received",
+            "feed",
+            "feed.coordinator",
+            event_payload.clone(),
+        );
+        publish_agent_hook_event(&event_payload);
 
         if !should_wait {
+            publish_feed_bus_event(
+                "feed.item.completed",
+                "feed",
+                "feed.coordinator",
+                feed_event_payload(
+                    &item_id,
+                    request_id.as_deref(),
+                    state.items.back().expect("just pushed feed item"),
+                    "acknowledged",
+                    None,
+                ),
+            );
             return Ok(json!({ "status": "acknowledged", "item_id": item_id }));
         }
 
@@ -106,6 +132,18 @@ impl FeedCoordinator {
         loop {
             if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
                 if item.status == FeedStatus::Resolved {
+                    publish_feed_bus_event(
+                        "feed.item.completed",
+                        "feed",
+                        "feed.coordinator",
+                        feed_event_payload(
+                            &item_id,
+                            Some(&request_id),
+                            item,
+                            "resolved",
+                            item.decision.as_ref(),
+                        ),
+                    );
                     return Ok(json!({
                         "status": "resolved",
                         "item_id": item_id,
@@ -128,6 +166,14 @@ impl FeedCoordinator {
                     if item.status == FeedStatus::Pending {
                         item.status = FeedStatus::Expired;
                     }
+                }
+                if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
+                    publish_feed_bus_event(
+                        "feed.item.completed",
+                        "feed",
+                        "feed.coordinator",
+                        feed_event_payload(&item_id, Some(&request_id), item, "timed_out", None),
+                    );
                 }
                 self.changed.notify_all();
                 return Ok(json!({ "status": "timed_out", "item_id": item_id }));
@@ -220,6 +266,18 @@ impl FeedCoordinator {
         };
         item.status = FeedStatus::Resolved;
         item.decision = Some(decision);
+        publish_feed_bus_event(
+            "feed.item.resolved",
+            "feed",
+            "feed.coordinator",
+            feed_event_payload(
+                &item.id,
+                item.request_id.as_deref(),
+                item,
+                "resolved",
+                item.decision.as_ref(),
+            ),
+        );
         self.changed.notify_all();
         Ok(json!({ "delivered": true }))
     }
@@ -290,12 +348,7 @@ fn kind_from_event(event: &Value) -> String {
 }
 
 fn feed_item_row(item: &FeedItem) -> Value {
-    let status = match item.status {
-        FeedStatus::Pending => "pending",
-        FeedStatus::Resolved => "resolved",
-        FeedStatus::Expired => "expired",
-        FeedStatus::Telemetry => "telemetry",
-    };
+    let status = status_text(&item.status);
     let mut row = json!({
         "id": item.id,
         "workstream_id": format!("{}-{}", item.source, session_id(&item.event)),
@@ -321,6 +374,74 @@ fn feed_item_row(item: &FeedItem) -> Value {
         row["tool_input"] = tool_input.clone();
     }
     row
+}
+
+fn feed_event_payload(
+    item_id: &str,
+    request_id: Option<&str>,
+    item: &FeedItem,
+    phase: &str,
+    decision: Option<&Value>,
+) -> Value {
+    let mut payload = json!({
+        "item_id": item_id,
+        "request_id": request_id,
+        "source": item.source,
+        "_source": item.source,
+        "kind": item.kind,
+        "hook_event_name": hook_event_name(&item.event),
+        "phase": phase,
+        "status": status_text(&item.status),
+    });
+    if let Some(tool_name) = string_field(&item.event, &["tool_name", "toolName", "name"]) {
+        payload["tool_name"] = Value::String(tool_name.to_string());
+    }
+    if let Some(decision) = decision {
+        payload["result"] = decision.clone();
+    }
+    payload
+}
+
+fn publish_agent_hook_event(payload: &Value) {
+    let source = payload
+        .get("_source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let hook_event_name = payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown");
+    publish_feed_bus_event(
+        &format!("agent.hook.{hook_event_name}"),
+        "agent",
+        source,
+        payload.clone(),
+    );
+}
+
+fn hook_event_name(event: &Value) -> Option<String> {
+    string_field(event, &["hook_event_name", "hookEventName"]).map(str::to_string)
+}
+
+fn publish_feed_bus_event(name: &str, category: &str, source: &str, payload: Value) {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category,
+        source,
+        workspace_id: None,
+        surface_id: None,
+        pane_id: None,
+        payload,
+    });
+}
+
+fn status_text(status: &FeedStatus) -> &'static str {
+    match status {
+        FeedStatus::Pending => "pending",
+        FeedStatus::Resolved => "resolved",
+        FeedStatus::Expired => "expired",
+        FeedStatus::Telemetry => "telemetry",
+    }
 }
 
 fn session_id(event: &Value) -> String {

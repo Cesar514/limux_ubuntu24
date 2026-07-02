@@ -9155,6 +9155,37 @@ fn host_notification_row(notification: &HostNotification) -> serde_json::Value {
     })
 }
 
+fn publish_notification_event(name: &str, notification: &HostNotification) {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category: "notification",
+        source: "notification.store",
+        workspace_id: Some(serde_json::Value::String(notification.workspace_id.clone())),
+        surface_id: None,
+        pane_id: None,
+        payload: serde_json::json!({
+            "notification_id": notification.id,
+            "title_length": notification.title.len(),
+            "subtitle_length": notification.subtitle.len(),
+            "body_length": notification.body.len(),
+            "message_length": notification.message.len(),
+            "redacted_fields": ["title", "subtitle", "body", "message"],
+        }),
+    });
+}
+
+fn publish_notification_bulk_event(name: &str, count: usize) {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name,
+        category: "notification",
+        source: "notification.store",
+        workspace_id: None,
+        surface_id: None,
+        pane_id: None,
+        payload: serde_json::json!({ "count": count }),
+    });
+}
+
 /// purpose: Store a notification in the live host's bounded inbox.
 /// inputs: state plus normalized notification fields.
 /// returns/effects: Mutates the in-memory inbox and returns the stored notification.
@@ -9182,6 +9213,7 @@ fn push_host_notification(
     if s.notifications.len() > MAX_HOST_NOTIFICATIONS {
         s.notifications.remove(0);
     }
+    publish_notification_event("notification.created", &notification);
     notification
 }
 
@@ -9277,9 +9309,11 @@ fn dismiss_host_notifications(
                 "dismiss requires id or all_read",
             ));
         };
+        let removed_count = affected.len();
         for workspace_id in affected {
             clear_workspace_unread_if_empty(&mut s, &workspace_id);
         }
+        publish_notification_bulk_event("notification.removed", removed_count);
         s.notifications
             .iter()
             .map(host_notification_row)
@@ -9309,6 +9343,7 @@ fn mark_host_notification_read(
         s.notifications[index].unread = false;
         let workspace_id = s.notifications[index].workspace_id.clone();
         clear_workspace_unread_if_empty(&mut s, &workspace_id);
+        publish_notification_event("notification.read", &s.notifications[index]);
         host_notification_row(&s.notifications[index])
     };
     Ok(serde_json::json!({ "notification": row }))
@@ -9332,6 +9367,7 @@ fn mark_workspace_notifications_read(
         for notification in &mut s.notifications {
             if notification.workspace_id == workspace_id {
                 notification.unread = false;
+                publish_notification_event("notification.read", notification);
             }
         }
         clear_workspace_unread_visual(&mut s.workspaces[index]);
@@ -9352,6 +9388,7 @@ fn mark_all_host_notifications_read(state: &State) -> serde_json::Value {
         let mut s = state.borrow_mut();
         for notification in &mut s.notifications {
             notification.unread = false;
+            publish_notification_event("notification.read", notification);
         }
         for workspace in &mut s.workspaces {
             clear_workspace_unread_visual(workspace);
@@ -9385,6 +9422,7 @@ fn open_host_notification(
         s.notifications[index].unread = false;
         let workspace_id = s.notifications[index].workspace_id.clone();
         clear_workspace_unread_if_empty(&mut s, &workspace_id);
+        publish_notification_event("notification.read", &s.notifications[index]);
         (workspace_id, host_notification_row(&s.notifications[index]))
     };
     let target_index = {
@@ -9468,11 +9506,13 @@ fn clear_host_notifications(
             .filter(|notification| notification.unread)
             .map(|notification| notification.workspace_id.clone())
             .collect::<Vec<_>>();
+        let cleared_count = affected.len();
         for workspace in &mut s.workspaces {
             if affected.contains(&workspace.id) && !still_unread.contains(&workspace.id) {
                 clear_workspace_unread_visual(workspace);
             }
         }
+        publish_notification_bulk_event("notification.cleared", cleared_count);
         s.notifications
             .iter()
             .map(host_notification_row)

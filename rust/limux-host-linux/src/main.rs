@@ -1,5 +1,6 @@
 mod app_config;
 mod control_bridge;
+mod event_bus;
 mod feed;
 mod ghostty_config;
 mod keybind_editor;

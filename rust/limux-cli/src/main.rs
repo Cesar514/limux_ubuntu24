@@ -4254,55 +4254,69 @@ fn update_events_cursor(args: &[String], frame: &Value) -> Result<()> {
 /// inputs: Socket client metadata and events command arguments.
 /// returns/effects: Prints JSONL frames from the stream and updates cursor files for event frames.
 async fn run_events(client: &Client, args: &[String]) -> Result<CommandOutput> {
-    if parse_flag(args, "--reconnect") {
-        bail!("events --reconnect requires the live event bus; retry without --reconnect");
-    }
-
-    let request = V2Request {
-        id: Some(Value::String("events-cli".to_string())),
-        method: "events.stream".to_string(),
-        params: build_events_stream_params(args)?,
-    };
-    let mut payload = serde_json::to_string(&request).context("failed to encode events request")?;
-    payload.push('\n');
-
-    let stream = UnixStream::connect(&client.socket)
-        .await
-        .with_context(|| format!("failed to connect to socket {}", client.socket.display()))?;
-    let (reader_half, mut writer_half) = stream.into_split();
-    writer_half
-        .write_all(payload.as_bytes())
-        .await
-        .context("failed to write events request")?;
-    writer_half
-        .flush()
-        .await
-        .context("failed to flush events request")?;
-
-    let mut reader = BufReader::new(reader_half);
-    let mut line = String::new();
+    let reconnect = parse_flag(args, "--reconnect");
     let mut printed = Vec::new();
     let limit = parse_events_limit(args)?;
     let hide_ack = parse_flag(args, "--no-ack");
-    while reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read events frame")?
-        > 0
-    {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if !trimmed.is_empty() {
-            let frame: Value = serde_json::from_str(trimmed).context("event frame was not JSON")?;
-            update_events_cursor(args, &frame)?;
-            let is_ack = frame.get("type").and_then(Value::as_str) == Some("ack");
-            if !(hide_ack && is_ack) {
-                printed.push(trimmed.to_string());
-                if limit.is_some_and(|max| printed.len() >= max) {
-                    break;
+    let mut resume_after_seq: Option<u64> = None;
+
+    loop {
+        let mut params = build_events_stream_params(args)?;
+        if let Some(seq) = resume_after_seq {
+            params["after_seq"] = Value::Number(seq.into());
+        }
+        let request = V2Request {
+            id: Some(Value::String("events-cli".to_string())),
+            method: "events.stream".to_string(),
+            params,
+        };
+        let mut payload =
+            serde_json::to_string(&request).context("failed to encode events request")?;
+        payload.push('\n');
+
+        let stream = UnixStream::connect(&client.socket)
+            .await
+            .with_context(|| format!("failed to connect to socket {}", client.socket.display()))?;
+        let (reader_half, mut writer_half) = stream.into_split();
+        writer_half
+            .write_all(payload.as_bytes())
+            .await
+            .context("failed to write events request")?;
+        writer_half
+            .flush()
+            .await
+            .context("failed to flush events request")?;
+
+        let mut reader = BufReader::new(reader_half);
+        let mut line = String::new();
+        while reader
+            .read_line(&mut line)
+            .await
+            .context("failed to read events frame")?
+            > 0
+        {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if !trimmed.is_empty() {
+                let frame: Value =
+                    serde_json::from_str(trimmed).context("event frame was not JSON")?;
+                update_events_cursor(args, &frame)?;
+                if let Some(seq) = frame.get("seq").and_then(Value::as_u64) {
+                    resume_after_seq = Some(seq);
+                }
+                let is_ack = frame.get("type").and_then(Value::as_str) == Some("ack");
+                if !(hide_ack && is_ack) {
+                    printed.push(trimmed.to_string());
+                    if limit.is_some_and(|max| printed.len() >= max) {
+                        return Ok(CommandOutput::Text(printed.join("\n")));
+                    }
                 }
             }
+            line.clear();
         }
-        line.clear();
+        if !reconnect {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     Ok(CommandOutput::Text(printed.join("\n")))
 }

@@ -7,8 +7,8 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
 use gtk::glib;
 use gtk4 as gtk;
@@ -165,8 +165,6 @@ const INTERNAL_ERROR_CODE: i64 = -32603;
 const NOT_SUPPORTED_CODE: i64 = -32001;
 const NOT_FOUND_CODE: i64 = -32004;
 const CONFLICT_CODE: i64 = -32009;
-
-static EVENT_BOOT_ID: OnceLock<String> = OnceLock::new();
 
 type BridgeResult = Result<Value, BridgeError>;
 
@@ -3089,81 +3087,9 @@ fn dispatch_request(input: &str, dispatch: &dyn Fn(ControlCommand)) -> V2Respons
     }
 }
 
-/// purpose: Return a process-stable CMUX-compatible event boot identifier.
-/// inputs: Process id and current system time on first use.
-/// returns/effects: Initializes a stable id for this host process.
-fn event_boot_id() -> &'static str {
-    EVENT_BOOT_ID.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        format!("limux-{}-{nanos}", std::process::id())
-    })
-}
-
-/// purpose: Normalize CMUX event stream filter fields from a v2 request.
-/// inputs: Request params that may contain singular or array filter aliases.
-/// returns/effects: Returns string arrays for ack metadata; invalid shapes are ignored by design.
-fn event_filter_strings(params: &Value, singular: &str, plural: &str) -> Vec<String> {
-    fn push_value(out: &mut Vec<String>, value: &Value) {
-        match value {
-            Value::String(text) if !text.is_empty() => out.push(text.clone()),
-            Value::Array(items) => {
-                for item in items {
-                    push_value(out, item);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut values = Vec::new();
-    if let Some(value) = params.get(plural) {
-        push_value(&mut values, value);
-    }
-    if let Some(value) = params.get(singular) {
-        push_value(&mut values, value);
-    }
-    values
-}
-
-/// purpose: Build the initial CMUX event stream ack frame for the current process.
-/// inputs: Event stream request params.
-/// returns/effects: Returns a JSON frame; no replay or live events are emitted yet.
-fn event_stream_ack(params: &Value) -> Value {
-    let requested_after_seq = params
-        .get("after_seq")
-        .or_else(|| params.get("after"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    json!({
-        "type": "ack",
-        "protocol": "cmux-events",
-        "version": 1,
-        "boot_id": event_boot_id(),
-        "subscription_id": format!("{}-sub-0", event_boot_id()),
-        "heartbeat_interval_seconds": 15,
-        "replay_count": 0,
-        "resume": {
-            "after_seq": requested_after_seq,
-            "requested_after_seq": requested_after_seq,
-            "oldest_seq": 0,
-            "latest_seq": 0,
-            "next_seq": 1,
-            "gap": requested_after_seq > 0
-        },
-        "filters": {
-            "names": event_filter_strings(params, "name", "names"),
-            "categories": event_filter_strings(params, "category", "categories")
-        },
-        "limux_status": "event_ack_only"
-    })
-}
-
 /// purpose: Handle CMUX event stream takeover requests outside JSON-RPC response framing.
 /// inputs: Raw request line and the socket writer.
-/// returns/effects: Writes one ack JSONL frame and returns true when the stream was handled.
+/// returns/effects: Streams retained/live JSONL frames and returns true when the stream was handled.
 fn try_handle_event_stream(input: &str, writer: &mut UnixStream) -> io::Result<bool> {
     let request = match parse_request(input) {
         Ok(request) => request,
@@ -3173,11 +3099,7 @@ fn try_handle_event_stream(input: &str, writer: &mut UnixStream) -> io::Result<b
         return Ok(false);
     }
 
-    let mut payload = serde_json::to_string(&event_stream_ack(&request.params))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes())?;
-    writer.flush()?;
+    crate::event_bus::bus().stream(&request.params, writer)?;
     Ok(true)
 }
 
@@ -3315,8 +3237,9 @@ pub fn start(dispatch: fn(ControlCommand)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{BufRead, BufReader};
     use std::sync::{Mutex, OnceLock};
+    use std::thread;
 
     fn feed_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static FEED_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3576,43 +3499,53 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_ack_preserves_filters_and_resume_gap() {
-        let ack = event_stream_ack(&json!({
-            "after_seq": 7,
-            "names": ["notification.created"],
-            "category": "notification"
-        }));
+    fn event_stream_takeover_writes_jsonl_ack_and_replay() {
+        let category = "notification.test.event_stream_takeover";
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "notification.created",
+            category,
+            source: "test",
+            workspace_id: Some(Value::String("workspace-a".to_string())),
+            surface_id: None,
+            pane_id: None,
+            payload: json!({ "notification_id": 1 }),
+        });
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let handle = thread::spawn(move || {
+            try_handle_event_stream(
+                r#"{"id":"events-1","method":"events.stream","params":{"category":"notification.test.event_stream_takeover","include_heartbeats":false}}"#,
+                &mut writer,
+            )
+        });
 
-        assert_eq!(ack["type"], "ack");
-        assert_eq!(ack["protocol"], "cmux-events");
-        assert_eq!(ack["version"], 1);
-        assert_eq!(ack["resume"]["after_seq"], 7);
-        assert_eq!(ack["resume"]["requested_after_seq"], 7);
-        assert_eq!(ack["resume"]["gap"], true);
-        assert_eq!(ack["filters"]["names"], json!(["notification.created"]));
-        assert_eq!(ack["filters"]["categories"], json!(["notification"]));
-    }
-
-    #[test]
-    fn event_stream_takeover_writes_jsonl_ack() {
-        let (mut writer, mut reader) = UnixStream::pair().expect("socket pair");
-        let handled = try_handle_event_stream(
-            r#"{"id":"events-1","method":"events.stream","params":{"category":"notification"}}"#,
-            &mut writer,
-        )
-        .expect("event stream handled");
-        writer
-            .shutdown(std::net::Shutdown::Write)
-            .expect("shutdown");
-
-        let mut raw = String::new();
-        reader.read_to_string(&mut raw).expect("read ack");
-        let frame: Value = serde_json::from_str(raw.trim()).expect("ack json");
-
-        assert!(handled);
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("read ack");
+        let frame: Value = serde_json::from_str(ack.trim()).expect("ack json");
         assert_eq!(frame["type"], "ack");
-        assert!(frame.get("ok").is_none());
-        assert_eq!(frame["filters"]["categories"], json!(["notification"]));
+        assert_eq!(frame["replay_count"], 1);
+        assert_eq!(
+            frame["filters"]["categories"],
+            json!(["notification.test.event_stream_takeover"])
+        );
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("read event");
+        let frame: Value = serde_json::from_str(event.trim()).expect("event json");
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["name"], "notification.created");
+
+        drop(reader);
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "notification.created",
+            category,
+            source: "test",
+            workspace_id: Some(Value::String("workspace-b".to_string())),
+            surface_id: None,
+            pane_id: None,
+            payload: json!({ "notification_id": 2 }),
+        });
+        let _ = handle.join().expect("event stream thread");
     }
 
     #[test]
