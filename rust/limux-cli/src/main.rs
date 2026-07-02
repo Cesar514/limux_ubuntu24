@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 mod agent_hooks;
+mod sessions;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
@@ -310,6 +311,7 @@ fn full_help_text() -> &'static str {
         "  config surface-tab-bar-font-size [points]\n",
         "  shortcuts\n",
         "  themes [list|set|clear]\n",
+        "  sessions list [--agent <name>] [--state-dir <path>] [--json]\n",
         "  new-window | current-window | list-windows | focus-window | close-window\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
         "  move-surface | split-off | drag-surface-to-split | reorder-surface\n",
@@ -650,10 +652,35 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
             limux_shortcuts_path()?.display().to_string(),
         )),
         "themes" => Some(run_themes_command(args)?),
+        "sessions" => Some(run_sessions_local_command(args, opts.json_output)?),
+        "session-debug" => {
+            let mut debug_args = vec!["debug".to_string()];
+            debug_args.extend(args.iter().cloned());
+            Some(run_sessions_local_command(&debug_args, opts.json_output)?)
+        }
         "reload-config" => None,
         _ => None,
     };
     Ok(out)
+}
+
+// purpose: Adapt the no-socket CMUX sessions command module to CLI output.
+// inputs: Session command args plus global JSON preference.
+// returns/effects: Reads hook store files and returns text or JSON diagnostics.
+fn run_sessions_local_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    let input = sessions::SessionCommandInput {
+        args: args.to_vec(),
+        global_json: json_output,
+    };
+    match sessions::SessionCommandResult::from(input) {
+        sessions::SessionCommandResult::Output(sessions::SessionCommandOutput::Text(text)) => {
+            Ok(CommandOutput::Text(text))
+        }
+        sessions::SessionCommandResult::Output(sessions::SessionCommandOutput::Json(value)) => {
+            Ok(CommandOutput::Json(value))
+        }
+        sessions::SessionCommandResult::Error(error) => Err(error.into()),
+    }
 }
 
 /// purpose: Implement CMUX settings command probes that can run without the app.

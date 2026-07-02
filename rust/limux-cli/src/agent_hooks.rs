@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-#[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +16,10 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
+    pub(crate) fn all() -> [Self; 4] {
+        [Self::Claude, Self::Codex, Self::OpenCode, Self::Gemini]
+    }
+
     pub(crate) fn from_hook_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
@@ -91,6 +94,15 @@ pub(crate) struct AgentHookSessionStore {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentHookSessionSnapshot {
+    pub(crate) agent: AgentKind,
+    pub(crate) path: PathBuf,
+    pub(crate) exists: bool,
+    pub(crate) session_count: usize,
+    pub(crate) records: Vec<AgentHookSessionRecord>,
+}
+
 impl AgentHookSessionStore {
     pub(crate) fn new(agent: AgentKind) -> Self {
         Self::new_for_agent_name(agent.store_name())
@@ -114,6 +126,25 @@ impl AgentHookSessionStore {
         Self {
             path: dir.join(format!("{}-hook-sessions.json", safe_store_name(agent))),
         }
+    }
+
+    pub(crate) fn snapshot_for_dir(
+        agent: AgentKind,
+        dir: &Path,
+    ) -> Result<AgentHookSessionSnapshot> {
+        let store = Self {
+            path: dir.join(format!("{}-hook-sessions.json", agent.store_name())),
+        };
+        let exists = store.path.exists();
+        let file = store.load()?;
+        let session_count = file.sessions.len();
+        Ok(AgentHookSessionSnapshot {
+            agent,
+            path: store.path,
+            exists,
+            session_count,
+            records: file.sessions.into_values().collect(),
+        })
     }
 
     pub(crate) fn lookup(&self, session_id: &str) -> Result<Option<AgentHookSessionRecord>> {
@@ -342,6 +373,13 @@ fn state_dir() -> PathBuf {
         return home.join(".local/state/limux");
     }
     PathBuf::from(".limux")
+}
+
+pub(crate) fn default_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LIMUX_AGENT_HOOK_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    state_dir()
 }
 
 fn safe_store_name(agent: &str) -> String {
