@@ -5,6 +5,7 @@
 //! All on one line. Tabs left-justified, icons right-justified.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -299,6 +300,15 @@ pub struct BrowserScreenshotResult {
     pub bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserDialogResult {
+    pub kind: String,
+    pub message: String,
+    pub default_text: Option<String>,
+    pub accepted: bool,
+    pub text: Option<String>,
+}
+
 impl BrowserSurfaceTarget {
     pub fn current_uri(&self) -> Option<String> {
         self.target.current_uri()
@@ -357,6 +367,16 @@ impl BrowserSurfaceTarget {
         F: FnOnce(Result<PathBuf, String>) + 'static,
     {
         self.target.wait_for_download(path, timeout_ms, callback)
+    }
+
+    // purpose: Respond to the oldest pending JavaScript dialog on this browser surface.
+    // inputs: Accept/dismiss flag, optional prompt text, and completion callback.
+    // returns/effects: Unblocks WebKit's script dialog or reports an empty queue.
+    pub fn respond_to_dialog<F>(&self, accept: bool, text: Option<String>, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
+    {
+        self.target.respond_to_dialog(accept, text, callback)
     }
 
     // purpose: Save the browser surface as a PNG screenshot.
@@ -3605,6 +3625,16 @@ struct BrowserHandles {
     find_controller: webkit6::FindController,
     dom_editable: Rc<Cell<bool>>,
     frame_selector: Rc<RefCell<Option<String>>>,
+    pending_dialogs: Rc<RefCell<VecDeque<BrowserPendingDialog>>>,
+}
+
+#[cfg(feature = "webkit")]
+#[derive(Clone)]
+struct BrowserPendingDialog {
+    dialog: webkit6::ScriptDialog,
+    kind: String,
+    message: String,
+    default_text: Option<String>,
 }
 
 #[cfg(not(feature = "webkit"))]
@@ -3706,6 +3736,13 @@ impl BrowserShortcutTarget {
         F: FnOnce(Result<PathBuf, String>) + 'static,
     {
         self.handles.wait_for_download(path, timeout_ms, callback)
+    }
+
+    pub fn respond_to_dialog<F>(&self, accept: bool, text: Option<String>, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
+    {
+        self.handles.respond_to_dialog(accept, text, callback)
     }
 
     // purpose: Save the browser shortcut target as a PNG screenshot.
@@ -3945,6 +3982,36 @@ impl BrowserHandles {
         true
     }
 
+    // purpose: Accept or dismiss the oldest queued WebKit JavaScript dialog.
+    // inputs: Accept flag, optional prompt text, and completion callback.
+    // returns/effects: Sets confirm/prompt values, closes the WebKit dialog, and reports metadata.
+    fn respond_to_dialog<F>(&self, accept: bool, text: Option<String>, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
+    {
+        let Some(pending) = self.pending_dialogs.borrow_mut().pop_front() else {
+            callback(Err("dialog queue empty".to_string()));
+            return true;
+        };
+        if pending.kind == "confirm" || pending.kind == "beforeunload" {
+            pending.dialog.confirm_set_confirmed(accept);
+        }
+        if pending.kind == "prompt" && accept {
+            if let Some(text) = text.as_deref() {
+                pending.dialog.prompt_set_text(text);
+            }
+        }
+        pending.dialog.close();
+        callback(Ok(BrowserDialogResult {
+            kind: pending.kind,
+            message: pending.message,
+            default_text: pending.default_text,
+            accepted: accept,
+            text,
+        }));
+        true
+    }
+
     fn save_screenshot<F>(&self, path: PathBuf, full_page: bool, callback: F) -> bool
     where
         F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
@@ -4025,6 +4092,21 @@ fn browser_frame_script(selector: &str, script: &str) -> String {
   }}
 }})()"#
     )
+}
+
+#[cfg(feature = "webkit")]
+// purpose: Normalize WebKit dialog enum values into CMUX-compatible names.
+// inputs: WebKit script dialog type.
+// returns/effects: Returns stable string names for JSON responses.
+fn browser_dialog_kind(kind: webkit6::ScriptDialogType) -> &'static str {
+    match kind {
+        webkit6::ScriptDialogType::Alert => "alert",
+        webkit6::ScriptDialogType::Confirm => "confirm",
+        webkit6::ScriptDialogType::Prompt => "prompt",
+        webkit6::ScriptDialogType::BeforeUnloadConfirm => "beforeunload",
+        webkit6::ScriptDialogType::__Unknown(_) => "unknown",
+        _ => "unknown",
+    }
 }
 
 #[cfg(feature = "webkit")]
@@ -4140,6 +4222,16 @@ impl BrowserHandles {
     {
         callback(Err(
             "browser download wait requires webkit support".to_string()
+        ));
+        false
+    }
+
+    fn respond_to_dialog<F>(&self, _accept: bool, _text: Option<String>, callback: F) -> bool
+    where
+        F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
+    {
+        callback(Err(
+            "browser dialog response requires webkit support".to_string()
         ));
         false
     }
@@ -4461,6 +4553,26 @@ fn create_browser_widget(
             dom_editable.set(false);
         });
     }
+    let pending_dialogs = Rc::new(RefCell::new(VecDeque::new()));
+    {
+        let pending_dialogs = pending_dialogs.clone();
+        webview.connect_script_dialog(move |_, dialog| {
+            pending_dialogs
+                .borrow_mut()
+                .push_back(BrowserPendingDialog {
+                    dialog: dialog.clone(),
+                    kind: browser_dialog_kind(dialog.dialog_type()).to_string(),
+                    message: dialog
+                        .message()
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    default_text: dialog
+                        .prompt_get_default_text()
+                        .map(|value| value.to_string()),
+                });
+            true
+        });
+    }
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&nav_bar);
@@ -4481,6 +4593,7 @@ fn create_browser_widget(
         find_controller: find_controller.clone(),
         dom_editable,
         frame_selector: Rc::new(RefCell::new(None)),
+        pending_dialogs,
     };
 
     {

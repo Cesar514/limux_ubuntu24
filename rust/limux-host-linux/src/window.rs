@@ -6289,6 +6289,46 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     let _ = reply.send(Ok(payload));
                     return;
                 }
+                BrowserAction::DialogAccept { text } => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    browser.respond_to_dialog(true, text.clone(), move |result| match result {
+                        Ok(result) => {
+                            payload["accepted"] = serde_json::Value::Bool(result.accepted);
+                            payload["dialog"] = serde_json::json!({
+                                "type": result.kind,
+                                "message": result.message,
+                                "default_text": result.default_text,
+                                "text": result.text,
+                            });
+                            let _ = reply.send(Ok(payload));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::not_found(error)));
+                        }
+                    });
+                    return;
+                }
+                BrowserAction::DialogDismiss => {
+                    let mut payload =
+                        browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    browser.respond_to_dialog(false, None, move |result| match result {
+                        Ok(result) => {
+                            payload["accepted"] = serde_json::Value::Bool(result.accepted);
+                            payload["dialog"] = serde_json::json!({
+                                "type": result.kind,
+                                "message": result.message,
+                                "default_text": result.default_text,
+                                "text": result.text,
+                            });
+                            let _ = reply.send(Ok(payload));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(BridgeError::not_found(error)));
+                        }
+                    });
+                    return;
+                }
                 BrowserAction::DownloadWait { path, timeout_ms } => {
                     let mut payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
@@ -6620,6 +6660,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 | BrowserAction::Find { .. }
                 | BrowserAction::FrameSelect { .. }
                 | BrowserAction::FrameMain
+                | BrowserAction::DialogAccept { .. }
+                | BrowserAction::DialogDismiss
                 | BrowserAction::DownloadWait { .. }
                 | BrowserAction::Snapshot { .. }
                 | BrowserAction::Wait { .. }

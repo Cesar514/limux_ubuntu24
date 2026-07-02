@@ -5387,6 +5387,29 @@ async fn run_browser(
             };
             CommandOutput::Json(payload)
         }
+        "dialog" => {
+            let sid = surface
+                .clone()
+                .ok_or_else(|| anyhow!("browser dialog requires a surface"))?;
+            let verb = rest
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("browser dialog requires accept or dismiss"))?;
+            let (method, p) = match verb.as_str() {
+                "accept" => {
+                    let text = rest[1..].join(" ");
+                    let mut p = Map::new();
+                    if !text.trim().is_empty() {
+                        p.insert("text".to_string(), Value::String(text));
+                    }
+                    ("browser.dialog.accept", p)
+                }
+                "dismiss" => ("browser.dialog.dismiss", Map::new()),
+                other => bail!("Unsupported browser dialog subcommand: {}", other),
+            };
+            let payload = browser_call(client, Some(sid), method, p).await?;
+            CommandOutput::Json(payload)
+        }
         "download" => {
             let sid = surface
                 .clone()

@@ -115,6 +115,8 @@ const METHODS: &[&str] = &[
     "browser.find.nth",
     "browser.frame.main",
     "browser.frame.select",
+    "browser.dialog.accept",
+    "browser.dialog.dismiss",
     "browser.download.wait",
     "browser.snapshot",
     "browser.wait",
@@ -305,6 +307,10 @@ pub enum BrowserAction {
     FrameSelect {
         selector: String,
     },
+    DialogAccept {
+        text: Option<String>,
+    },
+    DialogDismiss,
     DownloadWait {
         path: Option<String>,
         timeout_ms: u64,
@@ -1744,6 +1750,8 @@ fn handle_method(
         | "browser.find.nth"
         | "browser.frame.main"
         | "browser.frame.select"
+        | "browser.dialog.accept"
+        | "browser.dialog.dismiss"
         | "browser.download.wait"
         | "browser.snapshot"
         | "browser.wait"
@@ -2022,6 +2030,10 @@ fn handle_method(
                     };
                     BrowserAction::FrameSelect { selector }
                 }
+                "browser.dialog.accept" => BrowserAction::DialogAccept {
+                    text: optional_string(params, &["text", "value"]),
+                },
+                "browser.dialog.dismiss" => BrowserAction::DialogDismiss,
                 "browser.download.wait" => BrowserAction::DownloadWait {
                     path: optional_string(params, &["path"]),
                     timeout_ms: match optional_u64(params, &["timeout_ms", "timeoutMs"]) {
@@ -4362,6 +4374,35 @@ mod tests {
             },
         );
         assert_eq!(frame_main.error, None);
+
+        let dialog_accept = dispatch_request(
+            r#"{"id":1,"method":"browser.dialog.accept","params":{"surface_id":"surface:9:browser","text":"yes"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(
+                        action,
+                        BrowserAction::DialogAccept {
+                            text: Some("yes".to_string())
+                        }
+                    );
+                    let _ = reply.send(Ok(json!({ "accepted": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(dialog_accept.error, None);
+
+        let dialog_dismiss = dispatch_request(
+            r#"{"id":1,"method":"browser.dialog.dismiss","params":{"surface_id":"surface:9:browser"}}"#,
+            &|command| match command {
+                ControlCommand::BrowserAction { action, reply, .. } => {
+                    assert_eq!(action, BrowserAction::DialogDismiss);
+                    let _ = reply.send(Ok(json!({ "accepted": false })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(dialog_dismiss.error, None);
 
         let download_wait = dispatch_request(
             r#"{"id":1,"method":"browser.download.wait","params":{"surface_id":"surface:9:browser","path":"/tmp/file.bin","timeout_ms":25}}"#,
