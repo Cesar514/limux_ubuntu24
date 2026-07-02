@@ -1044,6 +1044,8 @@ fn is_unsupported_remote_cli_command(command: &str) -> bool {
             | "ssh-session-cleanup"
             | "ssh-session-end"
             | "remote-daemon-status"
+            | "remote"
+            | "remotes"
             | "vm-ssh-attach"
     )
 }
@@ -1115,6 +1117,11 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "Usage: limux ssh-session-end --relay-port <port> --workspace <id>",
     ),
     ("remote-daemon-status", "Usage: limux remote-daemon-status"),
+    ("remote", "Usage: limux remotes <list|add|remove> [options]"),
+    (
+        "remotes",
+        "Usage: limux remotes <list|add|remove> [options]",
+    ),
     ("vm-ssh-attach", "Usage: limux vm-ssh-attach --id <vm-id>"),
     ("new-split", "Usage: limux new-split"),
     ("list-panes", "Usage: limux list-panes"),
@@ -8653,6 +8660,8 @@ mod cli_arg_tests {
             "ssh-session-attach",
             "ssh-session-cleanup",
             "remote-daemon-status",
+            "remote",
+            "remotes",
         ] {
             assert!(is_unsupported_remote_cli_command(command));
             let opts = default_opts(args(&[command]));
@@ -8667,6 +8676,14 @@ mod cli_arg_tests {
             panic!("help should render text");
         };
         assert!(text.contains("Usage: limux ssh-session-list"));
+
+        let remote_help = run_local_command(&default_opts(args(&["remotes", "--help"])))
+            .expect("help probe")
+            .expect("help output");
+        let CommandOutput::Text(text) = remote_help else {
+            panic!("help should render text");
+        };
+        assert!(text.contains("Usage: limux remotes <list|add|remove>"));
     }
 
     // purpose: Verify normal command arguments still use the socket-backed path.

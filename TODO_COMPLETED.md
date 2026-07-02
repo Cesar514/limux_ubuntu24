@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T05:38:17Z Implement and verify explicit CMUX `remote`/`remotes` cloud device-registry command `not_supported` surfacing while preserving no-socket help probes. \
 [x] 2026-07-02T05:31:48Z Implement and verify CMUX-compatible socket password auth semantics for CLI `--password`, `CMUX_SOCKET_PASSWORD`, password file lookup, password socket mode, JSON `auth.login`, and legacy `auth <password>`. \
 [x] 2026-07-02T05:21:10Z Implement and verify CMUX `settings open [target]` target alias parsing, bridge validation, activate parsing, and target echo output. \
 [x] 2026-07-02T05:12:19Z Implement and verify CMUX `themes list/set/clear` Ghostty managed theme block parity with light/dark selections and JSON output. \
