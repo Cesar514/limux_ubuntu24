@@ -4547,6 +4547,11 @@ fn custom_sidebar_dispatcher_action(
                 custom_sidebar_action_workspace_id(action)?,
             )))
         }
+        "workspace.sort" | "sort-workspaces" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSort(
+                custom_sidebar_workspace_sort_mode(action)?,
+            )))
+        }
         "tab.togglePin" | "tab.toggle-pin" | "toggle-tab-pin" => Ok(Some(
             CustomSidebarDispatcherAction::TabTogglePin(custom_sidebar_action_tab_id(action)?),
         )),
@@ -4823,6 +4828,29 @@ enum CustomSidebarWorkspaceReorderTarget {
     After(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustomSidebarWorkspaceSortMode {
+    Unread,
+    Recent,
+}
+
+/// purpose: Parse CMUX workspace.sort mode params from a sidebar action.
+/// inputs: Parsed action metadata with `mode`, `sort`, `param`, or `value`.
+/// returns/effects: Returns the strict sort mode or a loud validation error.
+fn custom_sidebar_workspace_sort_mode(
+    action: &CustomSidebarNodeAction,
+) -> Result<CustomSidebarWorkspaceSortMode, String> {
+    let mode = custom_sidebar_action_param_string_any(action, &["mode", "sort", "param", "value"])?;
+    match mode.as_str() {
+        "unread" => Ok(CustomSidebarWorkspaceSortMode::Unread),
+        "recent" => Ok(CustomSidebarWorkspaceSortMode::Recent),
+        _ => Err(format!(
+            "{} sort mode must be unread or recent",
+            action.action_type
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CustomSidebarDispatcherAction {
     WorkspaceNext,
@@ -4852,6 +4880,7 @@ enum CustomSidebarDispatcherAction {
     WorkspaceMarkRead(String),
     WorkspaceMarkAllRead,
     WorkspaceCopyBranch(String),
+    WorkspaceSort(CustomSidebarWorkspaceSortMode),
     TabTogglePin(String),
     WorkspaceReorder {
         workspace_id: String,
@@ -4914,6 +4943,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspaceMarkRead(_) => "workspace.markRead",
             CustomSidebarDispatcherAction::WorkspaceMarkAllRead => "workspace.markAllRead",
             CustomSidebarDispatcherAction::WorkspaceCopyBranch(_) => "workspace.copyBranch",
+            CustomSidebarDispatcherAction::WorkspaceSort(_) => "workspace.sort",
             CustomSidebarDispatcherAction::TabTogglePin(_) => "tab.togglePin",
             CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
@@ -4984,6 +5014,9 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::WorkspaceCopyBranch(workspace_id) => {
             copy_workspace_branch_for_custom_sidebar(state, &workspace_id)
+        }
+        CustomSidebarDispatcherAction::WorkspaceSort(mode) => {
+            sort_workspaces_for_custom_sidebar(state, mode)
         }
         CustomSidebarDispatcherAction::TabTogglePin(tab_id) => {
             toggle_tab_pin_for_custom_sidebar(state, &tab_id)
@@ -5461,6 +5494,213 @@ fn workspace_branch_for_custom_sidebar(
         ));
     }
     Ok((resolved_id, branch))
+}
+
+/// purpose: Sort live workspaces from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state and strict CMUX sort mode.
+/// returns/effects: Reorders workspace rows, emits reorder events when changed, and persists.
+fn sort_workspaces_for_custom_sidebar(
+    state: &State,
+    mode: CustomSidebarWorkspaceSortMode,
+) -> Result<serde_json::Value, BridgeError> {
+    let result = {
+        let mut app_state = state.borrow_mut();
+        let previous_order = workspace_order_ids(&app_state);
+        let active_id = app_state
+            .active_workspace()
+            .map(|workspace| workspace.id.clone());
+        let latest_by_workspace = latest_notification_ids_by_workspace(&app_state.notifications);
+        let original_index = previous_order
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.clone(), index))
+            .collect::<HashMap<_, _>>();
+        app_state.workspaces.sort_by(|left, right| {
+            compare_workspaces_for_custom_sidebar_sort(
+                left,
+                right,
+                mode,
+                &latest_by_workspace,
+                &original_index,
+            )
+        });
+        let desired_ids = workspace_order_ids(&app_state);
+        normalize_workspace_group_runs_preserving_order(&mut app_state, &desired_ids);
+        if let Some(active_id) = active_id {
+            if let Some(index) = app_state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_id)
+            {
+                app_state.active_idx = index;
+            }
+        }
+        sort_workspace_result_from_state(&mut app_state, mode, previous_order)
+    };
+    if let Some(row) = result.row_to_select.clone() {
+        result.sidebar_list.select_row(Some(&row));
+    }
+    publish_and_persist_workspace_sort(state, &result);
+    Ok(result.payload())
+}
+
+/// purpose: Compare two workspaces for CMUX custom-sidebar sort modes.
+/// inputs: Workspace rows, mode, latest-notification ids, and original indexes.
+/// returns/effects: Returns a stable ordering without mutating state.
+fn compare_workspaces_for_custom_sidebar_sort(
+    left: &Workspace,
+    right: &Workspace,
+    mode: CustomSidebarWorkspaceSortMode,
+    latest_by_workspace: &HashMap<String, u64>,
+    original_index: &HashMap<String, usize>,
+) -> std::cmp::Ordering {
+    let left_latest = latest_by_workspace.get(&left.id).copied().unwrap_or(0);
+    let right_latest = latest_by_workspace.get(&right.id).copied().unwrap_or(0);
+    let left_index = original_index.get(&left.id).copied().unwrap_or(usize::MAX);
+    let right_index = original_index.get(&right.id).copied().unwrap_or(usize::MAX);
+    right
+        .favorite
+        .cmp(&left.favorite)
+        .then_with(|| match mode {
+            CustomSidebarWorkspaceSortMode::Unread => right
+                .unread
+                .cmp(&left.unread)
+                .then_with(|| right_latest.cmp(&left_latest)),
+            CustomSidebarWorkspaceSortMode::Recent => right_latest
+                .cmp(&left_latest)
+                .then_with(|| right.unread.cmp(&left.unread)),
+        })
+        .then_with(|| left_index.cmp(&right_index))
+}
+
+/// purpose: Return newest notification ids for each workspace.
+/// inputs: Retained host notifications.
+/// returns/effects: Returns an in-memory map without mutating notification state.
+fn latest_notification_ids_by_workspace(
+    notifications: &[HostNotification],
+) -> HashMap<String, u64> {
+    let mut latest: HashMap<String, u64> = HashMap::new();
+    for notification in notifications {
+        latest
+            .entry(notification.workspace_id.clone())
+            .and_modify(|id| *id = (*id).max(notification.id))
+            .or_insert(notification.id);
+    }
+    latest
+}
+
+struct CustomSidebarWorkspaceSortResult {
+    mode: CustomSidebarWorkspaceSortMode,
+    changed: bool,
+    ordered_workspace_ids: Vec<String>,
+    moved_workspace_ids: Vec<String>,
+    pinned_workspace_ids: Vec<String>,
+    selected_workspace_id: Option<String>,
+    selected_index: usize,
+    sidebar_list: gtk::ListBox,
+    row_to_select: Option<gtk::ListBoxRow>,
+}
+
+impl CustomSidebarWorkspaceSortResult {
+    fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mode": self.mode.as_str(),
+            "changed": self.changed,
+            "ordered_workspace_ids": self.ordered_workspace_ids,
+            "moved_workspace_ids": self.moved_workspace_ids,
+            "pinned_workspace_ids": self.pinned_workspace_ids,
+            "selected_workspace_id": self.selected_workspace_id,
+            "selected_index": self.selected_index,
+        })
+    }
+}
+
+impl CustomSidebarWorkspaceSortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CustomSidebarWorkspaceSortMode::Unread => "unread",
+            CustomSidebarWorkspaceSortMode::Recent => "recent",
+        }
+    }
+}
+
+/// purpose: Build CMUX workspace.sort result metadata after state mutation.
+/// inputs: Mutated host state, sort mode, and previous order.
+/// returns/effects: Syncs sidebar rows and returns publishable metadata.
+fn sort_workspace_result_from_state(
+    state: &mut AppState,
+    mode: CustomSidebarWorkspaceSortMode,
+    previous_order: Vec<String>,
+) -> CustomSidebarWorkspaceSortResult {
+    sync_sidebar_row_order(state);
+    let ordered_workspace_ids = workspace_order_ids(state);
+    let moved_workspace_ids = moved_workspace_ids(&previous_order, &ordered_workspace_ids);
+    CustomSidebarWorkspaceSortResult {
+        mode,
+        changed: previous_order != ordered_workspace_ids,
+        pinned_workspace_ids: pinned_workspace_ids(state),
+        selected_workspace_id: state
+            .workspaces
+            .get(state.active_idx)
+            .map(|workspace| workspace.id.clone()),
+        selected_index: state.active_idx,
+        sidebar_list: state.sidebar_list.clone(),
+        row_to_select: sidebar_row_for_workspace_index(state, state.active_idx),
+        ordered_workspace_ids,
+        moved_workspace_ids,
+    }
+}
+
+/// purpose: Publish and persist a successful CMUX workspace.sort mutation.
+/// inputs: Live host state and sort result metadata.
+/// returns/effects: Emits a workspace.reordered event and queues session save when order changed.
+fn publish_and_persist_workspace_sort(state: &State, result: &CustomSidebarWorkspaceSortResult) {
+    if !result.changed {
+        return;
+    }
+    publish_workspace_reordered_event(
+        result.ordered_workspace_ids.clone(),
+        result.moved_workspace_ids.clone(),
+        result.pinned_workspace_ids.clone(),
+        result.selected_workspace_id.clone(),
+        result.selected_index,
+    );
+    request_session_save(state);
+}
+
+/// purpose: Return workspace ids in current host order.
+/// inputs: Host app state.
+/// returns/effects: Returns ids without mutating state.
+fn workspace_order_ids(state: &AppState) -> Vec<String> {
+    state
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect()
+}
+
+/// purpose: Return workspace ids whose index changed after sorting.
+/// inputs: Previous and current workspace id order.
+/// returns/effects: Returns changed ids without mutating state.
+fn moved_workspace_ids(previous: &[String], current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .enumerate()
+        .filter(|(index, id)| previous.get(*index) != Some(id))
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
+/// purpose: Return pinned workspace ids in current host order.
+/// inputs: Host app state.
+/// returns/effects: Returns ids without mutating state.
+fn pinned_workspace_ids(state: &AppState) -> Vec<String> {
+    state
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.favorite)
+        .map(|workspace| workspace.id.clone())
+        .collect()
 }
 
 /// purpose: Resolve custom-sidebar workspace arguments with the same semantics as selection.
@@ -18396,13 +18636,14 @@ mod tests {
         workspace_reordered_payload, workspace_sidebar_render_items,
         workspace_title_from_directory, workspace_top_level_ids, BrowserEvent,
         CustomSidebarDispatcherAction, CustomSidebarNodeAction,
-        CustomSidebarWorkspaceReorderTarget, Direction, EditableCaptureContext, HostNotification,
-        NeighborScore, NotificationPolicyContext, NotificationPolicyEffects, PaneBounds,
-        PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess,
-        SessionSaveRequest, SidebarLogEntry, SidebarProgress, SidebarStatusEntry,
-        SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceOrderRow,
-        WorkspaceSeedSource, WorkspaceSidebarRenderItem, WorkspaceSidebarRenderSource, BASE_CSS,
-        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        CustomSidebarWorkspaceReorderTarget, CustomSidebarWorkspaceSortMode, Direction,
+        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
+        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
+        SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport,
+        WorkspaceEventSnapshot, WorkspaceOrderRow, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
+        WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode, WorkspaceGroupAction};
@@ -19095,6 +19336,27 @@ mod tests {
             message: None,
             params: workspace_copy_branch_params,
         };
+        let mut workspace_sort_params = serde_json::Map::new();
+        workspace_sort_params.insert("param".to_string(), json!("unread"));
+        let workspace_sort_unread = CustomSidebarNodeAction {
+            action_type: "workspace.sort".to_string(),
+            message: None,
+            params: workspace_sort_params,
+        };
+        let mut workspace_sort_recent_params = serde_json::Map::new();
+        workspace_sort_recent_params.insert("mode".to_string(), json!("recent"));
+        let workspace_sort_recent = CustomSidebarNodeAction {
+            action_type: "sort-workspaces".to_string(),
+            message: None,
+            params: workspace_sort_recent_params,
+        };
+        let mut workspace_sort_bad_params = serde_json::Map::new();
+        workspace_sort_bad_params.insert("param".to_string(), json!("alphabetical"));
+        let workspace_sort_bad = CustomSidebarNodeAction {
+            action_type: "workspace.sort".to_string(),
+            message: None,
+            params: workspace_sort_bad_params,
+        };
         let mut window_params = serde_json::Map::new();
         window_params.insert("window_id".to_string(), json!("window:1"));
         let window_focus = CustomSidebarNodeAction {
@@ -19453,6 +19715,30 @@ mod tests {
                 .expect_err("missing copy-branch workspace id is invalid")
                 .contains("workspace_id")
         );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_sort_unread),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSort(
+                CustomSidebarWorkspaceSortMode::Unread
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_sort_recent),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceSort(
+                CustomSidebarWorkspaceSortMode::Recent
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_sort_unread),
+            "cmux dispatcher: workspace.sort"
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.sort"))
+                .expect_err("missing sort mode is invalid")
+                .contains("param")
+        );
+        assert!(custom_sidebar_dispatcher_action(&workspace_sort_bad)
+            .expect_err("bad sort mode is invalid")
+            .contains("unread or recent"));
         assert_eq!(
             custom_sidebar_action_tooltip(&open_url_dot),
             "https://example.test/pr/1"
