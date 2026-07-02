@@ -17,6 +17,7 @@ pub(crate) enum AgentKind {
     Kiro,
     Antigravity,
     RovoDev,
+    Pi,
     Omp,
     Gemini,
     Copilot,
@@ -26,7 +27,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 14] {
+    pub(crate) fn all() -> [Self; 15] {
         [
             Self::Claude,
             Self::Codex,
@@ -36,6 +37,7 @@ impl AgentKind {
             Self::Kiro,
             Self::Antigravity,
             Self::RovoDev,
+            Self::Pi,
             Self::Omp,
             Self::Gemini,
             Self::Copilot,
@@ -55,6 +57,7 @@ impl AgentKind {
             "kiro" | "kiro-cli" => Some(Self::Kiro),
             "antigravity" | "agy" => Some(Self::Antigravity),
             "rovodev" | "rovo" | "acli" => Some(Self::RovoDev),
+            "pi" | "pi-coding-agent" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
@@ -75,6 +78,7 @@ impl AgentKind {
             Self::Kiro => "kiro",
             Self::Antigravity => "antigravity",
             Self::RovoDev => "rovodev",
+            Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
@@ -94,6 +98,7 @@ impl AgentKind {
             Self::Kiro => "Kiro",
             Self::Antigravity => "Antigravity",
             Self::RovoDev => "Rovo Dev",
+            Self::Pi => "Pi",
             Self::Omp => "OMP",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
@@ -113,6 +118,7 @@ impl AgentKind {
             Self::Kiro => "kiro-cli",
             Self::Antigravity => "agy",
             Self::RovoDev => "acli",
+            Self::Pi => "pi",
             Self::Omp => "omp",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
@@ -398,6 +404,11 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::Pi => {
+            parts.push("--session".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
         AgentKind::Omp => {
             parts.push("--session".to_string());
             parts.push(session_id);
@@ -573,6 +584,15 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Kiro => arg == "--resume-id" || arg.starts_with("--resume-id="),
         AgentKind::Antigravity => false,
         AgentKind::RovoDev => arg == "--restore" || arg.starts_with("--restore="),
+        AgentKind::Pi => {
+            arg == "--session"
+                || arg == "-s"
+                || arg == "--resume"
+                || arg == "--fork"
+                || arg.starts_with("--session=")
+                || arg.starts_with("--resume=")
+                || arg.starts_with("--fork=")
+        }
         AgentKind::Omp => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Claude
         | AgentKind::Cursor
@@ -619,6 +639,16 @@ fn option_takes_safe_value(arg: &str) -> bool {
             | "-c"
             | "--profile"
             | "--sandbox"
+            | "--thinking"
+            | "--provider"
+            | "--extension"
+            | "-e"
+            | "--skill"
+            | "--mcp-config"
+            | "--permission-mode"
+            | "--session-dir"
+            | "--dir"
+            | "--trust"
             | "--approval-policy"
             | "--cwd"
             | "--cd"
@@ -916,6 +946,36 @@ mod tests {
             build_resume_command(AgentKind::Omp, "new", Some(&launch), None).expect("resume");
 
         assert_eq!(command, "'omp' '--session' 'new' '--model' 'fast'");
+    }
+
+    #[test]
+    fn pi_resume_command_uses_session_flag_and_keeps_safe_options() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "pi".to_string(),
+            arguments: vec![
+                "pi".to_string(),
+                "--session".to_string(),
+                "old".to_string(),
+                "--model".to_string(),
+                "fast".to_string(),
+                "--provider=anthropic".to_string(),
+                "--api-key".to_string(),
+                "secret".to_string(),
+                "--prompt".to_string(),
+                "do work".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 90.0,
+        };
+
+        let command =
+            build_resume_command(AgentKind::Pi, "new", Some(&launch), None).expect("resume");
+
+        assert_eq!(
+            command,
+            "'pi' '--session' 'new' '--model' 'fast' '--provider=anthropic'"
+        );
     }
 
     #[test]

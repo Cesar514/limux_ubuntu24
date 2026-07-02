@@ -4561,6 +4561,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
                 ("on_tool_permission", "prompt-submit"),
             ],
         ),
+        agent_hooks::AgentKind::Pi => install_pi_extension(),
         agent_hooks::AgentKind::Omp => install_omp_extension(),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
@@ -4638,6 +4639,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             uninstall_antigravity_hooks(&antigravity_hooks_path(), agent)
         }
         agent_hooks::AgentKind::RovoDev => uninstall_rovodev_hooks(&rovodev_config_path()),
+        agent_hooks::AgentKind::Pi => uninstall_pi_extension(),
         agent_hooks::AgentKind::Omp => uninstall_omp_extension(),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
@@ -5241,6 +5243,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 5000,
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
+        agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
     }
 }
@@ -5262,6 +5265,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
         | agent_hooks::AgentKind::Factory
         | agent_hooks::AgentKind::Qoder => 120_000,
         agent_hooks::AgentKind::OpenCode | agent_hooks::AgentKind::RovoDev => 0,
+        agent_hooks::AgentKind::Pi => 0,
         agent_hooks::AgentKind::Omp => 0,
     }
 }
@@ -5305,6 +5309,23 @@ fn install_opencode_plugin() -> Result<()> {
     }
     fs::write(&path, opencode_plugin_source()?).context("failed to write OpenCode plugin")?;
     opencode_config_register_plugin(&path)
+}
+
+// purpose: Install CMUX-compatible Pi extension hooks.
+// inputs: None; path is resolved from PI_CODING_AGENT_DIR, PI_CONFIG_DIR, HOME, or dirs.
+// returns/effects: Writes the generated extension, refusing to replace non-Limux files.
+fn install_pi_extension() -> Result<()> {
+    let path = pi_extension_path();
+    let source = pi_extension_source()?;
+    install_marked_extension_file(&path, &source, "cmux-pi-session-extension-marker")
+}
+
+// purpose: Remove the installed Pi extension only when it carries the owned marker.
+// inputs: None.
+// returns/effects: Deletes the generated extension or leaves missing files untouched.
+fn uninstall_pi_extension() -> Result<()> {
+    let path = pi_extension_path();
+    uninstall_marked_extension_file(&path, "cmux-pi-session-extension-marker")
 }
 
 // purpose: Install CMUX-compatible OMP extension hooks.
@@ -5460,6 +5481,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Kiro => "hooks kiro",
         agent_hooks::AgentKind::Antigravity => "hooks antigravity",
         agent_hooks::AgentKind::RovoDev => "hooks rovodev",
+        agent_hooks::AgentKind::Pi => "hooks pi",
         agent_hooks::AgentKind::Omp => "hooks omp",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
@@ -5579,6 +5601,27 @@ fn rovodev_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".rovodev/config.yml")
+}
+
+fn pi_extension_path() -> PathBuf {
+    resolved_pi_agent_directory().join("extensions/cmux-session.ts")
+}
+
+fn resolved_pi_agent_directory() -> PathBuf {
+    if let Some(root) = env::var_os("PI_CODING_AGENT_DIR") {
+        return expand_tilde_path(PathBuf::from(root));
+    }
+    let config_dir = env::var_os("PI_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".pi"));
+    let expanded = expand_tilde_path(config_dir);
+    if expanded.is_absolute() {
+        return expanded.join("agent");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(expanded)
+        .join("agent")
 }
 
 fn omp_extension_path() -> PathBuf {
@@ -5802,6 +5845,397 @@ const limuxSessionRestore = async (ctx) => {
 
 export const LimuxSessionRestore = limuxSessionRestore;
 export default limuxSessionRestore;
+"#
+        .replace("__LIMUX_COMMAND__", &limux_command_json),
+    )
+}
+
+fn pi_extension_source() -> Result<String> {
+    pi_extension_source_with_command(&opencode_plugin_cli_command()?)
+}
+
+fn pi_extension_source_with_command(limux_command: &str) -> Result<String> {
+    let limux_command_json =
+        serde_json::to_string(limux_command).context("failed to encode Pi hook command")?;
+    Ok(
+        r#"// cmux-pi-session-extension-marker v1
+// Bridges Pi lifecycle, tool telemetry, notifications, and resume bindings into Limux.
+// Installed by `limux hooks pi install` or `limux hooks setup`.
+// DO NOT EDIT MANUALLY. Limux upgrades this file in place.
+
+import { spawn, spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+const LIMUX_COMMAND = __LIMUX_COMMAND__;
+const states = new Map();
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+function objectValue(value, keys) {
+  if (!value || typeof value !== "object") return undefined;
+  for (const key of keys) {
+    if (value[key] !== undefined && value[key] !== null) return value[key];
+  }
+  return undefined;
+}
+
+function warn(message, details = {}) {
+  console.warn(JSON.stringify({ source: "limux-pi-extension", level: "warning", message, ...details }));
+}
+
+function resolveExecutable(name) {
+  const pathEnv = process.env.PATH || "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch (_) {
+      continue;
+    }
+  }
+  return name;
+}
+
+function looksLikePiScript(value) {
+  const normalized = String(value).replaceAll("\\", "/").toLowerCase();
+  const base = path.basename(normalized);
+  return normalized.includes("/@earendil-works/pi-coding-agent/") ||
+    normalized.includes("/@mariozechner/pi-coding-agent/") ||
+    normalized.includes("/packages/coding-agent/") ||
+    ((base === "cli.js" || base === "cli.ts") && normalized.includes("coding-agent"));
+}
+
+function normalizedLaunchArgv() {
+  const raw = Array.isArray(process.argv) ? process.argv.map((value) => String(value)) : [];
+  if (raw.length === 0) return [resolveExecutable("pi")];
+  const first = path.basename(raw[0]).toLowerCase();
+  if (first === "pi" || first === "pi-coding-agent") return raw;
+  if (raw.length > 1 && looksLikePiScript(raw[1])) return [resolveExecutable("pi"), ...raw.slice(2)];
+  return [resolveExecutable("pi"), ...raw.slice(1)];
+}
+
+function base64NulSeparated(values) {
+  const bytes = [];
+  for (const value of values) {
+    bytes.push(Buffer.from(String(value), "utf8"));
+    bytes.push(Buffer.from([0]));
+  }
+  return Buffer.concat(bytes).toString("base64");
+}
+
+function secretLikeEnvKey(key) {
+  return /(TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|AUTHORIZATION|COOKIE)/i.test(key);
+}
+
+function shouldPreserveEnvKey(key) {
+  if (key.startsWith("LIMUX_AGENT_LAUNCH_") || key.startsWith("CMUX_AGENT_LAUNCH_")) return !secretLikeEnvKey(key);
+  if (key === "LIMUX_SURFACE_ID" || key === "LIMUX_WORKSPACE_ID" || key === "LIMUX_SOCKET") return true;
+  if (key === "CMUX_SURFACE_ID" || key === "CMUX_WORKSPACE_ID" || key === "CMUX_SOCKET_PATH") return true;
+  if (key === "LIMUX_BIN" || key === "CMUX_PI_CMUX_BIN") return true;
+  if (key === "LIMUX_PI_HOOKS_DISABLED" || key === "CMUX_PI_HOOKS_DISABLED") return true;
+  if (key === "LIMUX_AGENT_HOOK_STATE_DIR" || key === "CMUX_AGENT_HOOK_STATE_DIR") return true;
+  if (key === "PI_CODING_AGENT_DIR" || key === "PI_CONFIG_DIR") return true;
+  if (key.startsWith("PI_CODING_AGENT_") || key.startsWith("PI_")) return !secretLikeEnvKey(key);
+  if (key === "PATH" || key === "HOME" || key === "PWD" || key === "SHELL") return true;
+  if (key === "USER" || key === "LOGNAME" || key === "TMPDIR" || key === "TZ") return true;
+  if (key === "LANG" || key.startsWith("LC_")) return true;
+  if (key === "TERM" || key === "COLORTERM" || key === "SSH_AUTH_SOCK") return true;
+  if (key === "NODE_ENV" || key === "NODE_OPTIONS" || key === "NODE_PATH") return true;
+  return false;
+}
+
+function hookEnvironment(cwd, includeSocketPassword = false) {
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && shouldPreserveEnvKey(key)) env[key] = value;
+  }
+  if (includeSocketPassword && process.env.LIMUX_SOCKET_PASSWORD) {
+    env.LIMUX_SOCKET_PASSWORD = process.env.LIMUX_SOCKET_PASSWORD;
+  }
+  if (includeSocketPassword && process.env.CMUX_SOCKET_PASSWORD) {
+    env.CMUX_SOCKET_PASSWORD = process.env.CMUX_SOCKET_PASSWORD;
+  }
+  if (!env.LIMUX_AGENT_LAUNCH_ARGV_B64 && !env.CMUX_AGENT_LAUNCH_ARGV_B64) {
+    const argv = normalizedLaunchArgv();
+    const executable = argv[0] || resolveExecutable("pi");
+    env.LIMUX_AGENT_LAUNCH_EXECUTABLE = executable;
+    env.LIMUX_AGENT_LAUNCH_ARGV_B64 = base64NulSeparated(argv);
+    env.LIMUX_AGENT_LAUNCH_CWD = cwd || process.cwd();
+    env.CMUX_AGENT_LAUNCH_KIND = "pi";
+    env.CMUX_AGENT_LAUNCH_EXECUTABLE = executable;
+    env.CMUX_AGENT_LAUNCH_ARGV_B64 = env.LIMUX_AGENT_LAUNCH_ARGV_B64;
+    env.CMUX_AGENT_LAUNCH_CWD = env.LIMUX_AGENT_LAUNCH_CWD;
+  }
+  return env;
+}
+
+function limuxExecutable() {
+  return process.env.LIMUX_BIN || process.env.CMUX_PI_CMUX_BIN || LIMUX_COMMAND;
+}
+
+function eventName(subcommand) {
+  if (subcommand === "session-start") return "SessionStart";
+  if (subcommand === "prompt-submit") return "UserPromptSubmit";
+  if (subcommand === "stop") return "Stop";
+  if (subcommand === "notification") return "Notification";
+  return subcommand;
+}
+
+function sessionIdFrom(ctx) {
+  return firstString(ctx && ctx.sessionManager && ctx.sessionManager.getSessionId && ctx.sessionManager.getSessionId());
+}
+
+function cwdFrom(ctx) {
+  return firstString(ctx && ctx.cwd, process.cwd()) || process.cwd();
+}
+
+function stateFor(sessionId) {
+  let state = states.get(sessionId);
+  if (!state) {
+    state = { nextTurn: 0, activeTurnId: null, stopped: false };
+    states.set(sessionId, state);
+  }
+  return state;
+}
+
+function eventTurnId(event) {
+  return firstString(objectValue(event, ["turn_id", "turnId", "turnID"]));
+}
+
+function beginTurn(sessionId, event) {
+  const state = stateFor(sessionId);
+  const explicit = eventTurnId(event);
+  const turnId = explicit || `${sessionId}:turn-${state.nextTurn + 1}`;
+  if (!explicit) state.nextTurn += 1;
+  state.activeTurnId = turnId;
+  state.stopped = false;
+  return turnId;
+}
+
+function currentTurnId(sessionId, event) {
+  const state = stateFor(sessionId);
+  const explicit = eventTurnId(event);
+  if (explicit) return explicit;
+  if (state.activeTurnId) return state.activeTurnId;
+  state.nextTurn += 1;
+  return `${sessionId}:turn-${state.nextTurn}`;
+}
+
+function finishTurn(sessionId, event) {
+  const state = stateFor(sessionId);
+  const turnId = eventTurnId(event) || state.activeTurnId || `${sessionId}:turn-${state.nextTurn + 1}`;
+  if (!eventTurnId(event) && !state.activeTurnId) state.nextTurn += 1;
+  state.activeTurnId = null;
+  state.stopped = true;
+  return turnId;
+}
+
+function sendHook(subcommand, ctx, extra = {}) {
+  if (process.env.LIMUX_PI_HOOKS_DISABLED === "1" || process.env.CMUX_PI_HOOKS_DISABLED === "1") return true;
+  if (!process.env.LIMUX_SURFACE_ID && !process.env.CMUX_SURFACE_ID) return true;
+  const sessionId = sessionIdFrom(ctx);
+  if (!sessionId) return true;
+  const cwd = cwdFrom(ctx);
+  const payload = {
+    session_id: sessionId,
+    cwd,
+    hook_event_name: eventName(subcommand),
+    event: eventName(subcommand),
+    ...extra,
+  };
+  const result = spawnSync(limuxExecutable(), ["--json", "hooks", "pi", subcommand], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    stdio: ["pipe", "ignore", "pipe"],
+    timeout: 5000,
+    env: hookEnvironment(cwd, true),
+  });
+  if (result.error || result.status !== 0) {
+    warn("limux hook command failed", { subcommand, status: result.status, error: String(result.error || "") });
+    return false;
+  }
+  return true;
+}
+
+function surfaceTargetArgs() {
+  const surfaceId = firstString(process.env.LIMUX_SURFACE_ID, process.env.CMUX_SURFACE_ID);
+  if (!surfaceId) return null;
+  const args = [];
+  const workspaceId = firstString(process.env.LIMUX_WORKSPACE_ID, process.env.CMUX_WORKSPACE_ID);
+  if (workspaceId) args.push("--workspace", workspaceId);
+  args.push("--surface", surfaceId);
+  return args;
+}
+
+function sanitizedResumeArgv(sessionId) {
+  const raw = normalizedLaunchArgv();
+  const out = [raw[0] || resolveExecutable("pi"), "--session", sessionId];
+  const withValue = new Set([
+    "--model", "-m", "--thinking", "--provider", "--extension", "-e", "--skill",
+    "--mcp-config", "--permission-mode", "--session-dir", "--config", "--profile",
+    "--system-prompt", "--append-system-prompt", "--cwd", "--dir", "--trust", "--sandbox",
+  ]);
+  const withoutValue = new Set(["--no-color", "--dangerously-skip-permissions", "--yolo"]);
+  const drop = new Set(["--session", "-s", "--resume", "--fork", "--api-key", "--prompt", "--print"]);
+  for (let index = 1; index < raw.length; index += 1) {
+    const arg = raw[index];
+    if (drop.has(arg)) {
+      if (index + 1 < raw.length && !raw[index + 1].startsWith("-")) index += 1;
+      continue;
+    }
+    if (arg.startsWith("--session=") || arg.startsWith("--resume=") || arg.startsWith("--fork=")) continue;
+    if (arg.startsWith("--api-key=") || arg.startsWith("--prompt=")) continue;
+    if (withValue.has(arg)) {
+      out.push(arg);
+      if (index + 1 < raw.length) {
+        out.push(raw[index + 1]);
+        index += 1;
+      }
+      continue;
+    }
+    if ([...withValue].some((option) => arg.startsWith(`${option}=`)) || withoutValue.has(arg)) out.push(arg);
+  }
+  return out;
+}
+
+function runLimux(args, cwd, input) {
+  const result = spawnSync(limuxExecutable(), args, {
+    cwd,
+    input,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 5000,
+    env: hookEnvironment(cwd, true),
+  });
+  return { ok: !result.error && result.status === 0, stdout: result.stdout || "", status: result.status, error: result.error };
+}
+
+function ensureResumeBinding(ctx, sessionId, cwd) {
+  const target = surfaceTargetArgs();
+  if (!target) return;
+  const result = runLimux([
+    "--json", "surface", "resume", "set", ...target,
+    "--name", "Pi", "--kind", "pi", "--checkpoint-id", sessionId,
+    "--source", "agent-hook", "--cwd", cwd, "--", ...sanitizedResumeArgv(sessionId),
+  ], cwd);
+  if (!result.ok) warn("failed to set Pi resume binding", { status: result.status, error: String(result.error || "") });
+}
+
+function clearResumeBinding(ctx, sessionId, cwd) {
+  const target = surfaceTargetArgs();
+  if (!target) return true;
+  const result = runLimux([
+    "--json", "surface", "resume", "clear", ...target,
+    "--checkpoint-id", sessionId, "--source", "agent-hook",
+  ], cwd);
+  if (!result.ok) warn("failed to clear Pi resume binding", { status: result.status, error: String(result.error || "") });
+  return result.ok;
+}
+
+function sendFeed(eventName, ctx, event, extra = {}) {
+  if (process.env.LIMUX_PI_HOOKS_DISABLED === "1" || process.env.CMUX_PI_HOOKS_DISABLED === "1") return;
+  if (!process.env.LIMUX_SURFACE_ID && !process.env.CMUX_SURFACE_ID) return;
+  const sessionId = sessionIdFrom(ctx);
+  if (!sessionId) return;
+  const cwd = cwdFrom(ctx);
+  const payload = {
+    session_id: sessionId,
+    cwd,
+    hook_event_name: eventName,
+    event: eventName,
+    turn_id: currentTurnId(sessionId, event),
+    tool_call_id: firstString(objectValue(event, ["toolCallId", "tool_call_id", "id"])),
+    tool_name: firstString(objectValue(event, ["toolName", "tool_name", "name"])),
+    tool_input: objectValue(event, ["args", "input"]),
+    ...extra,
+  };
+  try {
+    const child = spawn(limuxExecutable(), ["hooks", "feed", "--source", "pi", "--event", eventName], {
+      env: hookEnvironment(cwd, true),
+      stdio: ["pipe", "ignore", "ignore"],
+      detached: true,
+    });
+    child.on("error", (error) => warn("failed to spawn Pi Feed hook", { error: String(error) }));
+    child.stdin.on("error", (error) => warn("failed to write Pi Feed payload", { error: String(error) }));
+    child.stdin.end(JSON.stringify(payload));
+    child.unref();
+  } catch (error) {
+    warn("failed to start Pi Feed hook", { error: String(error) });
+  }
+}
+
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts = [];
+  for (const block of content) {
+    if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("\n") || null;
+}
+
+function lastAssistantMessage(event) {
+  const messages = Array.isArray(event && event.messages) ? event.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== "object" || message.role !== "assistant") continue;
+    const text = firstString(textFromContent(message.content));
+    if (text) return text;
+  }
+  return undefined;
+}
+
+export default function limuxPiSessionExtension(pi: ExtensionAPI) {
+  pi.on("session_start", async (_event: unknown, ctx: ExtensionContext) => {
+    const sessionId = sessionIdFrom(ctx);
+    const cwd = cwdFrom(ctx);
+    if (sessionId) stateFor(sessionId).stopped = false;
+    if (sendHook("session-start", ctx) && sessionId) ensureResumeBinding(ctx, sessionId, cwd);
+  });
+  pi.on("before_agent_start", async (event: any, ctx: ExtensionContext) => {
+    const sessionId = sessionIdFrom(ctx);
+    const turnId = sessionId ? beginTurn(sessionId, event) : undefined;
+    sendHook("prompt-submit", ctx, { prompt: event && event.prompt, turn_id: turnId });
+  });
+  pi.on("tool_execution_start", async (event: unknown, ctx: ExtensionContext) => sendFeed("PreToolUse", ctx, event));
+  pi.on("tool_execution_end", async (event: unknown, ctx: ExtensionContext) => {
+    sendFeed("PostToolUse", ctx, event, {
+      tool_result: objectValue(event, ["result", "details", "content"]),
+      is_error: objectValue(event, ["isError", "is_error"]),
+    });
+  });
+  pi.on("agent_end", async (event: unknown, ctx: ExtensionContext) => {
+    const sessionId = sessionIdFrom(ctx);
+    const turnId = sessionId ? finishTurn(sessionId, event) : undefined;
+    const message = lastAssistantMessage(event);
+    const routed = sendHook("notification", ctx, {
+      message: message || "Task completed",
+      turn_id: turnId,
+      notification: { type: firstString(objectValue(event, ["stopReason", "reason", "terminationReason"])) || "completed" },
+    });
+    sendHook("stop", ctx, { last_assistant_message: message, turn_id: turnId, limux_notification_routed: routed });
+  });
+  pi.on("session_shutdown", async (event: unknown, ctx: ExtensionContext) => {
+    const sessionId = sessionIdFrom(ctx);
+    if (!sessionId) return;
+    const state = stateFor(sessionId);
+    const cwd = cwdFrom(ctx);
+    if (!state.stopped) {
+      const turnId = finishTurn(sessionId, event);
+      sendHook("stop", ctx, { turn_id: turnId, terminationReason: firstString(objectValue(event, ["reason"])) || "session_shutdown" });
+    }
+    if (clearResumeBinding(ctx, sessionId, cwd)) states.delete(sessionId);
+  });
+}
 "#
         .replace("__LIMUX_COMMAND__", &limux_command_json),
     )
@@ -6033,6 +6467,7 @@ fn agent_launch_command(agent: &str) -> Option<(&'static str, String)> {
         "claude" | "claude-code" => Some(("claude", "claude".to_string())),
         "opencode" => Some(("opencode", "opencode".to_string())),
         "gemini" | "gemini-cli" => Some(("gemini", "gemini".to_string())),
+        "pi" | "pi-coding-agent" => Some(("pi", "pi".to_string())),
         _ => None,
     }
 }
@@ -10842,6 +11277,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::RovoDev)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("pi-coding-agent"),
+            Some(agent_hooks::AgentKind::Pi)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("omp"),
             Some(agent_hooks::AgentKind::Omp)
         );
@@ -10863,6 +11302,7 @@ mod cli_arg_tests {
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Kiro));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Antigravity));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::RovoDev));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Pi));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Omp));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
@@ -10900,6 +11340,55 @@ mod cli_arg_tests {
         assert!(source.contains("[\"hooks\", \"omp\", subcommand]"));
         assert!(source.contains("LIMUX_AGENT_LAUNCH_ARGV_B64"));
         assert!(source.contains("CMUX_AGENT_LAUNCH_ARGV_B64"));
+    }
+
+    #[test]
+    fn pi_extension_embeds_lifecycle_feed_and_resume_hooks() {
+        let source = pi_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+
+        assert!(source.contains("cmux-pi-session-extension-marker v1"));
+        assert!(source.contains("const LIMUX_COMMAND = \"/tmp/limux-cli\";"));
+        assert!(source.contains("@earendil-works/pi-coding-agent"));
+        assert!(source.contains("pi.on(\"session_start\""));
+        assert!(source.contains("pi.on(\"before_agent_start\""));
+        assert!(source.contains("pi.on(\"tool_execution_start\""));
+        assert!(source.contains("pi.on(\"tool_execution_end\""));
+        assert!(source.contains("pi.on(\"agent_end\""));
+        assert!(source.contains("pi.on(\"session_shutdown\""));
+        assert!(source.contains("\"hooks\", \"feed\", \"--source\", \"pi\""));
+        assert!(source.contains("\"surface\", \"resume\", \"set\""));
+        assert!(source.contains("\"surface\", \"resume\", \"clear\""));
+        assert!(source.contains("LIMUX_AGENT_LAUNCH_ARGV_B64"));
+        assert!(source.contains("CMUX_AGENT_LAUNCH_ARGV_B64"));
+        assert!(source.contains("secretLikeEnvKey"));
+    }
+
+    #[test]
+    fn pi_extension_install_refuses_unmarked_file_and_removes_marked_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux-session.ts");
+
+        fs::write(&path, "export default {};\n").expect("seed user extension");
+        let refused = install_marked_extension_file(
+            &path,
+            "// cmux-pi-session-extension-marker v1\n",
+            "cmux-pi-session-extension-marker",
+        );
+        assert!(refused.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read user extension"),
+            "export default {};\n"
+        );
+
+        fs::write(&path, "// cmux-pi-session-extension-marker old\n").expect("seed marker");
+        let source = pi_extension_source_with_command("/tmp/limux-cli").expect("extension source");
+        install_marked_extension_file(&path, &source, "cmux-pi-session-extension-marker")
+            .expect("install extension");
+        assert_eq!(fs::read_to_string(&path).expect("read extension"), source);
+
+        uninstall_marked_extension_file(&path, "cmux-pi-session-extension-marker")
+            .expect("uninstall extension");
+        assert!(!path.exists());
     }
 
     #[test]

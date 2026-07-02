@@ -151,3 +151,4 @@
 [x] 2026-07-02T03:24:41Z Implement and verify retained CMUX browser navigation, interaction, and redacted input event emission for successful live browser actions. \
 [x] 2026-07-02T03:38:12Z Implement and verify CMUX `read-screen`/`capture-pane` `--lines` and `--scrollback` request plumbing, last-N visible text limiting, and explicit scrollback capability metadata. \
 [x] 2026-07-02T03:48:03Z Implement and verify CMUX `workspace reconnect`/`workspace disconnect` CLI/API routing with explicit `not_supported` errors until remote daemon support exists. \
+[x] 2026-07-02T06:58:31Z Implement and verify CMUX-compatible Pi hook parity: first-class `pi` agent kind, native `pi --session <id>` resume command, protected Pi extension install/uninstall, lifecycle hook bridge, Feed tool telemetry bridge, launch argv capture, docs update, focused tests, and CLI clippy. \

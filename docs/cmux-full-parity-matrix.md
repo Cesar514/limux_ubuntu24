@@ -32,6 +32,10 @@ Status values:
 
 Primary upstream references:
 
+Recent verified parity updates:
+
+- 2026-07-02: Added CMUX-compatible Pi hook parity in `limux-cli`: `AgentKind::Pi` aliases, session-store coverage, native `pi --session <id>` restore command construction, `limux hooks pi install/uninstall`, protected `~/.pi/agent/extensions/cmux-session.ts` or `$PI_CODING_AGENT_DIR/extensions/cmux-session.ts` writes, generated TypeScript extension support for `session_start`, `before_agent_start`, `tool_execution_start`, `tool_execution_end`, `agent_end`, and `session_shutdown`, CMUX/Limux base64 launch capture, Pi Feed forwarding for `PreToolUse` and `PostToolUse`, and resume-binding set/clear calls. Verified by `cargo test -p limux-cli pi -- --nocapture`, `cargo test -p limux-cli feed_hook -- --nocapture`, and `cargo clippy -p limux-cli --all-targets -- -D warnings`.
+
 - `/tmp/cmux-audit/docs/cli-contract.md`
 - `/tmp/cmux-audit/docs/events.md`
 - `/tmp/cmux-audit/docs/feed.md`
