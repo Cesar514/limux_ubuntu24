@@ -5762,9 +5762,40 @@ fn sync_sidebar_row_order(state: &mut AppState) {
     while let Some(child) = state.sidebar_list.first_child() {
         state.sidebar_list.remove(&child);
     }
-    for workspace in &state.workspaces {
+    for (index, workspace) in state.workspaces.iter().enumerate() {
+        if workspace_hidden_by_collapsed_group_id(
+            &workspace.id,
+            workspace.group_id.as_deref(),
+            index == state.active_idx,
+            &state.workspace_groups,
+        ) {
+            continue;
+        }
         state.sidebar_list.append(&workspace.sidebar_row);
     }
+}
+
+/// purpose: Decide whether a workspace row is hidden by collapsed group state.
+/// inputs: Workspace id, optional group id, active selection flag, and known groups.
+/// returns/effects: Returns true for non-active non-anchor members of collapsed groups.
+fn workspace_hidden_by_collapsed_group_id(
+    workspace_id: &str,
+    group_id: Option<&str>,
+    active: bool,
+    groups: &[WorkspaceGroupState],
+) -> bool {
+    if active {
+        return false;
+    }
+    let Some(group_id) = group_id else {
+        return false;
+    };
+    groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .is_some_and(|group| {
+            group.is_collapsed && group.anchor_workspace_id.as_deref() != Some(workspace_id)
+        })
 }
 
 fn set_workspace_favorite_visual(workspace: &Workspace) {
@@ -6851,6 +6882,7 @@ fn create_workspace_group(
             s.workspaces[index].group_id = Some(group_id.clone());
         }
         s.workspace_groups.push(group.clone());
+        sync_sidebar_row_order(&mut s);
     }
     request_session_save(state);
 
@@ -6879,6 +6911,7 @@ fn ungroup_workspace_group(
                 workspace.group_id = None;
             }
         }
+        sync_sidebar_row_order(&mut s);
         group
     };
     request_session_save(state);
@@ -6910,6 +6943,7 @@ fn delete_workspace_group(state: &State, group_id: &str) -> Result<serde_json::V
         let mut s = state.borrow_mut();
         s.workspace_groups
             .retain(|candidate| candidate.id != group.id);
+        sync_sidebar_row_order(&mut s);
     }
     request_session_save(state);
     Ok(serde_json::json!({
@@ -6933,7 +6967,9 @@ fn update_workspace_group(
             return Err(BridgeError::not_found("workspace group not found"));
         };
         mutate(&mut s.workspace_groups[index]);
-        s.workspace_groups[index].clone()
+        let group = s.workspace_groups[index].clone();
+        sync_sidebar_row_order(&mut s);
+        group
     };
     request_session_save(state);
     Ok(workspace_group_payload(&group))
@@ -6957,6 +6993,7 @@ fn add_workspace_to_group(
         };
         let group_id = s.workspace_groups[group_index].id.clone();
         s.workspaces[workspace_index].group_id = Some(group_id);
+        sync_sidebar_row_order(&mut s);
         (
             s.workspace_groups[group_index].clone(),
             workspace_row(
@@ -6983,6 +7020,7 @@ fn remove_workspace_from_group(
             return Err(BridgeError::not_found("workspace not found"));
         };
         s.workspaces[workspace_index].group_id = None;
+        sync_sidebar_row_order(&mut s);
         workspace_row(
             workspace_index,
             s.active_idx,
@@ -7013,6 +7051,7 @@ fn set_workspace_group_anchor(
         let workspace_id = s.workspaces[workspace_index].id.clone();
         s.workspaces[workspace_index].group_id = Some(group_id);
         s.workspace_groups[group_index].anchor_workspace_id = Some(workspace_id);
+        sync_sidebar_row_order(&mut s);
         (
             s.workspace_groups[group_index].clone(),
             workspace_row(
@@ -12188,7 +12227,8 @@ mod tests {
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_lifecycle_payload,
+        workspace_drop_layout_path, workspace_folder_path_from_input,
+        workspace_hidden_by_collapsed_group_id, workspace_lifecycle_payload,
         workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
@@ -12197,7 +12237,9 @@ mod tests {
         HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
-    use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
+    use crate::layout_state::{
+        LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
+    };
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
     };
@@ -12409,6 +12451,41 @@ mod tests {
             resolve_pane_create_source_id(None, None, None, true, &[], &[]),
             Err(PaneCreateTargetError::NoPanes)
         );
+    }
+
+    #[test]
+    fn collapsed_workspace_groups_hide_only_inactive_non_anchor_members() {
+        let groups = [WorkspaceGroupState {
+            id: "group-1".to_string(),
+            name: "Agents".to_string(),
+            is_collapsed: true,
+            is_pinned: false,
+            anchor_workspace_id: Some("ws-anchor".to_string()),
+            custom_color: None,
+            icon_symbol: None,
+        }];
+
+        assert!(!workspace_hidden_by_collapsed_group_id(
+            "ws-anchor",
+            Some("group-1"),
+            false,
+            &groups
+        ));
+        assert!(!workspace_hidden_by_collapsed_group_id(
+            "ws-member",
+            Some("group-1"),
+            true,
+            &groups
+        ));
+        assert!(workspace_hidden_by_collapsed_group_id(
+            "ws-member",
+            Some("group-1"),
+            false,
+            &groups
+        ));
+        assert!(!workspace_hidden_by_collapsed_group_id(
+            "ws-free", None, false, &groups
+        ));
     }
 
     #[test]
