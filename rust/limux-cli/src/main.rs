@@ -10793,6 +10793,58 @@ fn render_tmux_rows(
         .join("\n")
 }
 
+// purpose: Resolve CMUX/tmux pipe-pane shell command text.
+// inputs: Raw pipe-pane args with optional --command or trailing command tokens.
+// returns/effects: Returns a non-empty shell command or fails loudly.
+fn tmux_pipe_pane_command(args: &[String]) -> Result<String> {
+    let command = parse_opt(args, "--command").unwrap_or_else(|| {
+        tmux_positionals_after_flags(args, &["--workspace", "--surface", "--window"], &[])
+            .join(" ")
+            .trim()
+            .to_string()
+    });
+    if command.trim().is_empty() {
+        bail!("pipe-pane requires --command <shell-command>");
+    }
+    Ok(command)
+}
+
+// purpose: Parse CMUX/tmux wait-for timeout.
+// inputs: Raw wait-for args with optional --timeout seconds.
+// returns/effects: Returns a duration and rejects invalid timeout values.
+fn tmux_wait_timeout(args: &[String]) -> Result<Duration> {
+    let Some(raw) = parse_opt(args, "--timeout") else {
+        return Ok(Duration::from_secs(30));
+    };
+    let seconds = raw
+        .parse::<f64>()
+        .with_context(|| "wait-for --timeout must be a non-negative number of seconds")?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        bail!("wait-for --timeout must be a non-negative number of seconds");
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+// purpose: Resolve CMUX/tmux wait-for token name.
+// inputs: Raw wait-for args with signal and timeout flags.
+// returns/effects: Returns the first positional token or fails loudly.
+fn tmux_wait_name(args: &[String]) -> Result<String> {
+    tmux_positionals_after_flags(args, &["--timeout"], &["-S", "--signal"])
+        .first()
+        .cloned()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow!("wait-for requires a name"))
+}
+
+// purpose: Build one CMUX/tmux find-window text row.
+// inputs: Workspace payload row.
+// returns/effects: Returns the text handle plus quoted title.
+fn tmux_find_window_row(row: &Value) -> String {
+    let handle = handle_from_payload(row, "workspace_id", "workspace_ref");
+    let title = get_string(row, &["title", "name"]).unwrap_or_default();
+    format!("{handle}  \"{title}\"")
+}
+
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
     let command = canonical_tmux_command(command);
     if is_unsupported_tmux_cmd(command) {
@@ -10852,8 +10904,7 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
         "pipe-pane" => {
             let capture = run_read_screen(client, args).await?;
             let text = get_string(&capture, &["text"]).unwrap_or_default();
-            let shell_cmd = parse_opt(args, "--command")
-                .ok_or_else(|| anyhow!("pipe-pane requires --command"))?;
+            let shell_cmd = tmux_pipe_pane_command(args)?;
             let mut child = Command::new("bash")
                 .arg("-lc")
                 .arg(shell_cmd)
@@ -10878,16 +10929,14 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
         }
         "wait-for" => {
             let signal = parse_flag(args, "-S") || parse_flag(args, "--signal");
-            let name = trailing_title(args).ok_or_else(|| anyhow!("wait-for requires a name"))?;
-            let timeout = parse_opt(args, "--timeout")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5);
+            let name = tmux_wait_name(args)?;
+            let timeout = tmux_wait_timeout(args)?;
             let path = wait_signal_path(&client.socket, &name);
             if signal {
                 create_wait_signal(&path)?;
                 Ok(json!({"ok": true, "name": name}))
             } else {
-                let deadline = Instant::now() + Duration::from_secs(timeout);
+                let deadline = Instant::now() + timeout;
                 loop {
                     if path.exists() {
                         remove_wait_signal(&path)?;
@@ -10901,22 +10950,72 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             }
         }
         "find-window" => {
-            let needle = trailing_title(args).unwrap_or_default();
-            let listed = client.call("workspace.list", json!({})).await?;
+            let include_content = parse_flag(args, "--content");
+            let should_select = parse_flag(args, "--select");
+            let needle =
+                tmux_positionals_after_flags(args, &["--window"], &["--content", "--select"])
+                    .join(" ")
+                    .trim()
+                    .to_string();
+            let mut list_params = Map::new();
+            if let Some(window) =
+                parse_opt(args, "--window").filter(|value| !value.trim().is_empty())
+            {
+                list_params.insert("window_id".to_string(), Value::String(window));
+            }
+            let listed = client
+                .call("workspace.list", Value::Object(list_params.clone()))
+                .await?;
             let rows = listed
                 .get("workspaces")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let mut out = String::new();
-            for row in rows {
-                let title = get_string(&row, &["title", "name"]).unwrap_or_default();
-                if title.contains(&needle) {
-                    let handle = handle_from_payload(&row, "workspace_id", "workspace_ref");
-                    out = format!("{} {}", handle, title);
-                    break;
+            let mut matches = Vec::new();
+            let needle_lower = needle.to_lowercase();
+            for row in &rows {
+                let title = get_string(row, &["title", "name"]).unwrap_or_default();
+                let title_match = needle.is_empty() || title.to_lowercase().contains(&needle_lower);
+                let content_match = if include_content && !needle.is_empty() {
+                    if let Some(workspace_id) = get_string(row, &["workspace_id", "id"]) {
+                        let text_payload = client
+                            .call("surface.read_text", json!({"workspace_id": workspace_id}))
+                            .await?;
+                        get_string(&text_payload, &["text"])
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&needle_lower)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if title_match || content_match {
+                    matches.push(row.clone());
                 }
             }
+            if should_select {
+                if let Some(first) = matches
+                    .first()
+                    .and_then(|row| get_string(row, &["workspace_id", "id"]))
+                {
+                    let mut select_params = list_params;
+                    select_params.insert("workspace_id".to_string(), Value::String(first));
+                    let _ = client
+                        .call("workspace.select", Value::Object(select_params))
+                        .await?;
+                }
+            }
+            let out = if matches.is_empty() {
+                "No matches".to_string()
+            } else {
+                matches
+                    .iter()
+                    .map(tmux_find_window_row)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             Ok(json!({"text": out}))
         }
         "last-window" => client.call("workspace.last", json!({})).await,
@@ -13931,6 +14030,58 @@ mod cli_arg_tests {
 
         let tiled = build_tmux_select_layout_request(&args(&["tiled"])).expect("tiled parses");
         assert!(tiled.get("orientation").is_none());
+    }
+
+    #[test]
+    fn tmux_pipe_pane_accepts_positional_command() {
+        assert_eq!(
+            tmux_pipe_pane_command(&args(&[
+                "--workspace",
+                "workspace:7",
+                "--surface",
+                "surface:7:tab",
+                "cat",
+                ">",
+                "/tmp/out",
+            ]))
+            .expect("positional command"),
+            "cat > /tmp/out"
+        );
+        assert_eq!(
+            tmux_pipe_pane_command(&args(&["--command", "cat >/tmp/out"])).expect("flag command"),
+            "cat >/tmp/out"
+        );
+        let err = tmux_pipe_pane_command(&args(&["--workspace", "workspace:7"]))
+            .expect_err("missing command should fail");
+        assert!(err.to_string().contains("pipe-pane requires --command"));
+    }
+
+    #[test]
+    fn tmux_wait_for_parses_name_and_timeout_loudly() {
+        assert_eq!(
+            tmux_wait_name(&args(&["--timeout", "0.25", "build-ready"])).expect("name"),
+            "build-ready"
+        );
+        assert_eq!(
+            tmux_wait_timeout(&args(&[])).expect("default timeout"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            tmux_wait_timeout(&args(&["--timeout", "0.25"])).expect("fractional timeout"),
+            Duration::from_millis(250)
+        );
+        let err = tmux_wait_timeout(&args(&["--timeout", "nope"]))
+            .expect_err("invalid timeout should fail");
+        assert!(err.to_string().contains("wait-for --timeout"));
+    }
+
+    #[test]
+    fn tmux_find_window_row_matches_cmux_text_shape() {
+        let row = json!({"workspace_id": "workspace:alpha", "title": "Build Logs"});
+        assert_eq!(
+            tmux_find_window_row(&row),
+            "workspace:alpha  \"Build Logs\""
+        );
     }
 
     #[test]
