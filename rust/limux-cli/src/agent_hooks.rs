@@ -11,19 +11,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) enum AgentKind {
     Claude,
     Codex,
+    Grok,
     OpenCode,
     Gemini,
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 4] {
-        [Self::Claude, Self::Codex, Self::OpenCode, Self::Gemini]
+    pub(crate) fn all() -> [Self; 5] {
+        [
+            Self::Claude,
+            Self::Codex,
+            Self::Grok,
+            Self::OpenCode,
+            Self::Gemini,
+        ]
     }
 
     pub(crate) fn from_hook_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "grok" => Some(Self::Grok),
             "opencode" | "open-code" => Some(Self::OpenCode),
             "gemini" => Some(Self::Gemini),
             _ => None,
@@ -34,6 +42,7 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
         }
@@ -43,6 +52,7 @@ impl AgentKind {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Grok => "Grok",
             Self::OpenCode => "OpenCode",
             Self::Gemini => "Gemini",
         }
@@ -52,6 +62,7 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Grok => "grok",
             Self::OpenCode => "opencode",
             Self::Gemini => "gemini",
         }
@@ -304,6 +315,11 @@ pub(crate) fn build_resume_command(
             parts.push(session_id);
             parts.extend(preserved_tail);
         }
+        AgentKind::Grok => {
+            parts.push("-r".to_string());
+            parts.push(session_id);
+            parts.extend(preserved_tail);
+        }
         AgentKind::Claude | AgentKind::Gemini => {
             parts.push("--resume".to_string());
             parts.push(session_id);
@@ -403,6 +419,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
     match kind {
         AgentKind::Codex => arg == "resume" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
+        AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::Claude | AgentKind::Gemini => {
             arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
@@ -484,6 +501,7 @@ fn selected_environment() -> BTreeMap<String, String> {
     let allowlist: BTreeSet<&'static str> = [
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
+        "GROK_HOME",
         "OPENCODE_CONFIG_DIR",
         "GEMINI_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
@@ -590,5 +608,27 @@ mod tests {
             command,
             "cd '/tmp/project one' && 'codex' 'resume' '--model' 'gpt-5.5' '--config' 'profile=work' 'sess-123'"
         );
+    }
+
+    #[test]
+    fn grok_resume_command_uses_native_resume_flag() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "grok".to_string(),
+            arguments: vec![
+                "grok".to_string(),
+                "-r".to_string(),
+                "old-session".to_string(),
+                "--model".to_string(),
+                "fast".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 30.0,
+        };
+
+        let command = build_resume_command(AgentKind::Grok, "new-session", Some(&launch), None)
+            .expect("resume command");
+
+        assert_eq!(command, "'grok' '-r' 'new-session' '--model' 'fast'");
     }
 }

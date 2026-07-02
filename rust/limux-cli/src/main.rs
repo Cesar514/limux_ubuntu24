@@ -4492,6 +4492,18 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             ],
             codex_feed_hook_events(),
         ),
+        agent_hooks::AgentKind::Grok => install_json_hooks_with_feed(
+            &grok_hooks_path(),
+            agent,
+            &[
+                ("SessionStart", "session-start"),
+                ("UserPromptSubmit", "prompt-submit"),
+                ("Stop", "stop"),
+                ("Notification", "notification"),
+                ("SessionEnd", "session-end"),
+            ],
+            grok_feed_hook_events(),
+        ),
         agent_hooks::AgentKind::Claude => install_json_hooks_with_feed(
             &claude_settings_path(),
             agent,
@@ -4522,6 +4534,7 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
 fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
     match agent {
         agent_hooks::AgentKind::Codex => uninstall_json_hooks(&codex_hooks_path(), agent),
+        agent_hooks::AgentKind::Grok => uninstall_json_hooks(&grok_hooks_path(), agent),
         agent_hooks::AgentKind::Claude => uninstall_json_hooks(&claude_settings_path(), agent),
         agent_hooks::AgentKind::OpenCode => {
             let path = opencode_plugin_path();
@@ -4634,6 +4647,13 @@ fn codex_feed_hook_events() -> &'static [&'static str] {
     ]
 }
 
+// purpose: List the Grok hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Grok hook event names without side effects.
+fn grok_feed_hook_events() -> &'static [&'static str] {
+    &["PreToolUse"]
+}
+
 // purpose: List the Gemini hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Gemini hook event names without side effects.
@@ -4643,7 +4663,7 @@ fn gemini_feed_hook_events() -> &'static [&'static str] {
 
 fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
-        agent_hooks::AgentKind::Claude => 5,
+        agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Grok => 5,
         agent_hooks::AgentKind::Codex | agent_hooks::AgentKind::Gemini => 5000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
@@ -4655,6 +4675,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
 fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Codex => 5,
+        agent_hooks::AgentKind::Grok => 120,
         agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Gemini => 120_000,
         agent_hooks::AgentKind::OpenCode => 0,
     }
@@ -4792,6 +4813,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
     match agent {
         agent_hooks::AgentKind::Claude => "hooks claude",
         agent_hooks::AgentKind::Codex => "hooks codex",
+        agent_hooks::AgentKind::Grok => "hooks grok",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
     }
@@ -4849,6 +4871,14 @@ fn codex_hooks_path() -> PathBuf {
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"))
         .join("hooks.json")
+}
+
+fn grok_hooks_path() -> PathBuf {
+    env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
+        .unwrap_or_else(|| PathBuf::from(".grok"))
+        .join("hooks/cmux-session.json")
 }
 
 fn claude_settings_path() -> PathBuf {
@@ -9833,7 +9863,12 @@ mod cli_arg_tests {
                 agent_hooks::AgentKind::Gemini,
             ]
         );
+        assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("grok"),
+            Some(agent_hooks::AgentKind::Grok)
+        );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
     }
 
     #[test]
@@ -9976,6 +10011,46 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks codex session-start"));
+    }
+
+    /// purpose: Verify Grok setup writes CMUX lifecycle hooks and a Feed PreToolUse hook.
+    /// inputs: Temporary hook JSON file and the Grok hook installer.
+    /// returns/effects: Asserts installed hook shape, timeout units, and command markers.
+    #[test]
+    fn grok_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux-session.json");
+
+        install_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Grok,
+            &[
+                ("SessionStart", "session-start"),
+                ("Notification", "notification"),
+            ],
+            grok_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        let feed = &root["hooks"]["PreToolUse"][0];
+
+        assert!(feed.get("matcher").is_none());
+        assert_eq!(feed["hooks"][0]["timeout"], 120);
+        assert!(feed["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source grok --event 'PreToolUse'"));
+        assert_eq!(root["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5);
+        assert!(root["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks grok session-start"));
+        assert!(root["hooks"]["Notification"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks grok notification"));
     }
 
     /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.
