@@ -1067,6 +1067,7 @@ fn trailing_title(args: &[String]) -> Option<String> {
             || arg == "--value"
             || arg == "--amount"
             || arg == "--unset"
+            || arg == "-b"
         {
             skip = true;
             continue;
@@ -6146,7 +6147,33 @@ fn is_unsupported_tmux_cmd(cmd: &str) -> bool {
     matches!(cmd, "popup" | "bind-key" | "unbind-key" | "copy-mode")
 }
 
+// purpose: Map CMUX/tmux short aliases onto the single Limux implementation path.
+// inputs: Raw tmux compatibility command name.
+// returns/effects: Returns the canonical command used by run_tmux_compat.
+fn canonical_tmux_command(command: &str) -> &str {
+    match command {
+        "capturep" => "capture-pane",
+        "display" | "displayp" => "display-message",
+        "resizep" => "resize-pane",
+        "respawnp" => "respawn-pane",
+        "setb" => "set-buffer",
+        "pasteb" => "paste-buffer",
+        "showb" => "show-buffer",
+        _ => command,
+    }
+}
+
+// purpose: Resolve a tmux buffer name from CMUX and tmux spellings.
+// inputs: Raw args with optional --name or -b value.
+// returns/effects: Returns the requested name or the CMUX default buffer name.
+fn tmux_buffer_name_arg(args: &[String]) -> String {
+    parse_opt(args, "--name")
+        .or_else(|| parse_opt(args, "-b"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
 async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) -> Result<Value> {
+    let command = canonical_tmux_command(command);
     if is_unsupported_tmux_cmd(command) {
         bail!("not supported");
     }
@@ -6363,7 +6390,7 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             .await
         }
         "set-buffer" => {
-            let name = parse_opt(args, "--name").unwrap_or_else(|| "default".to_string());
+            let name = tmux_buffer_name_arg(args);
             let body = trailing_title(args).ok_or_else(|| anyhow!("set-buffer requires text"))?;
             with_locked_json_map(&client.socket, "buffers", |buffers, path| {
                 buffers.insert(name, body);
@@ -6379,8 +6406,15 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
                 .join("\n");
             Ok(json!({"text": text}))
         }),
+        "show-buffer" => {
+            let name = tmux_buffer_name_arg(args);
+            with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
+                let text = buffers.get(&name).cloned().unwrap_or_default();
+                Ok(json!({"text": text, "name": name}))
+            })
+        }
         "paste-buffer" => {
-            let name = parse_opt(args, "--name").unwrap_or_else(|| "default".to_string());
+            let name = tmux_buffer_name_arg(args);
             let workspace = parse_opt(args, "--workspace");
             let surface = parse_opt(args, "--surface");
             let text = with_locked_json_map(&client.socket, "buffers", |buffers, _path| {
@@ -6796,9 +6830,10 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "pipe-pane" | "wait-for" | "find-window" | "last-window" | "next-window"
         | "previous-window" | "swap-pane" | "break-pane" | "join-pane" | "last-pane"
-        | "clear-history" | "set-hook" | "resize-pane" | "set-buffer" | "list-buffers"
-        | "paste-buffer" | "respawn-pane" | "display-message" | "popup" | "bind-key"
-        | "unbind-key" | "copy-mode" => {
+        | "clear-history" | "set-hook" | "resize-pane" | "resizep" | "set-buffer" | "setb"
+        | "list-buffers" | "show-buffer" | "showb" | "paste-buffer" | "pasteb" | "respawn-pane"
+        | "respawnp" | "display-message" | "display" | "displayp" | "capturep" | "popup"
+        | "bind-key" | "unbind-key" | "copy-mode" => {
             let payload = run_tmux_compat(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -7291,6 +7326,35 @@ mod cli_arg_tests {
         assert!(error.to_string().contains("Buffer not found: missing"));
     }
 
+    // purpose: Verify CMUX/tmux aliases use the canonical Limux implementation.
+    // inputs: Short aliases used by CMUX tmux compatibility.
+    // returns/effects: Asserts each alias maps to the expected command path.
+    #[test]
+    fn tmux_aliases_map_to_canonical_commands() {
+        assert_eq!(canonical_tmux_command("capturep"), "capture-pane");
+        assert_eq!(canonical_tmux_command("display"), "display-message");
+        assert_eq!(canonical_tmux_command("displayp"), "display-message");
+        assert_eq!(canonical_tmux_command("resizep"), "resize-pane");
+        assert_eq!(canonical_tmux_command("respawnp"), "respawn-pane");
+        assert_eq!(canonical_tmux_command("setb"), "set-buffer");
+        assert_eq!(canonical_tmux_command("pasteb"), "paste-buffer");
+        assert_eq!(canonical_tmux_command("showb"), "show-buffer");
+    }
+
+    // purpose: Verify buffer commands accept CMUX/tmux buffer-name spellings.
+    // inputs: --name, -b, and no explicit buffer option.
+    // returns/effects: Asserts CMUX default-buffer behavior and explicit names.
+    #[test]
+    fn tmux_buffer_name_accepts_name_and_b_flags() {
+        assert_eq!(tmux_buffer_name_arg(&args(&["--name", "build"])), "build");
+        assert_eq!(tmux_buffer_name_arg(&args(&["-b", "logs"])), "logs");
+        assert_eq!(tmux_buffer_name_arg(&args(&[])), "default");
+        assert_eq!(
+            trailing_title(&args(&["-b", "build", "cargo test"])).as_deref(),
+            Some("cargo test")
+        );
+    }
+
     // purpose: Verify CMUX/tmux display-message flags prefer positional text.
     // inputs: Short tmux -p/-t/-F flags and positional message text.
     // returns/effects: Asserts print flag, target, and selected format.
@@ -7370,6 +7434,7 @@ mod cli_arg_tests {
             assert!(is_unsupported_tmux_cmd(command));
         }
         assert!(!is_unsupported_tmux_cmd("display-message"));
+        assert_eq!(canonical_tmux_command("displayp"), "display-message");
     }
 
     #[test]
