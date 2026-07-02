@@ -4452,6 +4452,14 @@ fn custom_sidebar_dispatcher_action(
         "surface.focus" | "focus-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceFocus(
             custom_sidebar_action_param_string(action, "surface_id")?,
         ))),
+        "workspace.close" | "close-workspace" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceClose(
+                custom_sidebar_action_param_string(action, "workspace_id")?,
+            )))
+        }
+        "surface.close" | "close-surface" => Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
+            custom_sidebar_action_param_string(action, "surface_id")?,
+        ))),
         "workspace.reorder" | "reorder-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: custom_sidebar_action_param_string(action, "workspace_id")?,
@@ -4553,6 +4561,8 @@ enum CustomSidebarDispatcherAction {
     JumpToUnread,
     WorkspaceSelect(String),
     SurfaceFocus(String),
+    WorkspaceClose(String),
+    SurfaceClose(String),
     WorkspaceReorder {
         workspace_id: String,
         target: CustomSidebarWorkspaceReorderTarget,
@@ -4604,6 +4614,8 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::JumpToUnread => "notification.jump_to_unread",
             CustomSidebarDispatcherAction::WorkspaceSelect(_) => "workspace.select",
             CustomSidebarDispatcherAction::SurfaceFocus(_) => "surface.focus",
+            CustomSidebarDispatcherAction::WorkspaceClose(_) => "workspace.close",
+            CustomSidebarDispatcherAction::SurfaceClose(_) => "surface.close",
             CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
     }
@@ -4632,6 +4644,12 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::SurfaceFocus(surface_id) => {
             focus_surface_for_custom_sidebar(state, &surface_id)
+        }
+        CustomSidebarDispatcherAction::WorkspaceClose(workspace_id) => {
+            close_workspace_for_custom_sidebar(state, &workspace_id)
+        }
+        CustomSidebarDispatcherAction::SurfaceClose(surface_id) => {
+            close_surface_for_custom_sidebar(state, &surface_id)
         }
         CustomSidebarDispatcherAction::WorkspaceReorder {
             workspace_id,
@@ -4754,6 +4772,76 @@ fn focus_surface_in_workspace_for_custom_sidebar(
         })
     };
     result.ok_or_else(|| BridgeError::not_found("surface not found"))
+}
+
+/// purpose: Close a workspace from a parameterized JSON custom-sidebar action.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Reuses the host workspace close path, publishes events, and persists.
+fn close_workspace_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let workspace_id = {
+        let app_state = state.borrow();
+        let target = WorkspaceTarget::Handle(workspace_id.to_string());
+        let index = workspace_index_for_target(&app_state, &target).or_else(|| {
+            workspace_id.parse::<usize>().ok().and_then(|index| {
+                workspace_index_for_target(&app_state, &WorkspaceTarget::Index(index))
+            })
+        });
+        let Some(index) = index else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        app_state.workspaces[index].id.clone()
+    };
+    close_workspace_by_id(state, &workspace_id);
+    Ok(serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(&workspace_id),
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "closed": true,
+    }))
+}
+
+/// purpose: Close a surface from a parameterized JSON custom-sidebar action.
+/// inputs: Live host state and CMUX surface id/ref/tab id parameter.
+/// returns/effects: Removes the target tab, emits a surface.closed event, and persists.
+fn close_surface_for_custom_sidebar(
+    state: &State,
+    surface_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let target = {
+        let app_state = state.borrow();
+        let requested = normalize_surface_handle(surface_id);
+        app_state.workspaces.iter().find_map(|workspace| {
+            let found = pane::surface_summaries_for_root(&workspace.root)
+                .iter()
+                .any(|surface| surface_hint_matches(&surface.surface_id, requested));
+            found.then(|| {
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            })
+        })
+    };
+    let Some((workspace_id, workspace_name, workspace_root)) = target else {
+        return Err(BridgeError::not_found("surface not found"));
+    };
+    let surface = pane::close_surface_for_root(&workspace_root, surface_id)
+        .map_err(|_| BridgeError::not_found("surface not found"))?;
+    publish_surface_lifecycle_event(
+        "surface.closed",
+        &workspace_id,
+        &surface,
+        serde_json::json!({ "origin": "custom_sidebar.surface.close" }),
+    );
+    let mut payload = pane_create_response_payload(&workspace_id, &workspace_name, surface);
+    payload["closed"] = serde_json::Value::Bool(true);
+    request_session_save(state);
+    Ok(payload)
 }
 
 /// purpose: Reorder a workspace from a JSON custom-sidebar dispatcher action.
@@ -18109,7 +18197,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
             dir.path().join("build-board.json"),
-            r#"{"version":1,"root":{"type":"vstack","children":[{"type":"text","text":"Builds"},{"type":"button","title":"Build","action":{"type":"workspace.select","params":{"workspace_id":"workspace:build"}}}]}}"#,
+            r#"{
+                "version": 1,
+                "root": {
+                    "type": "vstack",
+                    "children": [
+                        { "type": "text", "text": "Builds" },
+                        {
+                            "type": "button",
+                            "title": "Build",
+                            "action": {
+                                "type": "workspace.select",
+                                "params": { "workspace_id": "workspace:build" }
+                            }
+                        }
+                    ]
+                }
+            }"#,
         )
         .expect("write json sidebar");
 
@@ -18261,6 +18365,20 @@ mod tests {
             message: None,
             params: surface_params,
         };
+        let mut workspace_close_params = serde_json::Map::new();
+        workspace_close_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        let workspace_close = CustomSidebarNodeAction {
+            action_type: "workspace.close".to_string(),
+            message: None,
+            params: workspace_close_params,
+        };
+        let mut surface_close_params = serde_json::Map::new();
+        surface_close_params.insert("surface_id".to_string(), json!("surface:7:tab-a"));
+        let surface_close = CustomSidebarNodeAction {
+            action_type: "surface.close".to_string(),
+            message: None,
+            params: surface_close_params,
+        };
         let mut reorder_params = serde_json::Map::new();
         reorder_params.insert("workspace_id".to_string(), json!("workspace:build"));
         reorder_params.insert("index".to_string(), json!(2));
@@ -18325,6 +18443,26 @@ mod tests {
             "cmux dispatcher: surface.focus"
         );
         assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_close),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceClose(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_close),
+            "cmux dispatcher: workspace.close"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&surface_close),
+            Ok(Some(CustomSidebarDispatcherAction::SurfaceClose(
+                "surface:7:tab-a".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&surface_close),
+            "cmux dispatcher: surface.close"
+        );
+        assert_eq!(
             custom_sidebar_dispatcher_action(&workspace_reorder),
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: "workspace:build".to_string(),
@@ -18353,6 +18491,16 @@ mod tests {
             custom_sidebar_dispatcher_action(&no_param_action("workspace.select"))
                 .expect_err("missing workspace id is invalid")
                 .contains("workspace_id")
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.close"))
+                .expect_err("missing close workspace id is invalid")
+                .contains("workspace_id")
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("surface.close"))
+                .expect_err("missing close surface id is invalid")
+                .contains("surface_id")
         );
         assert!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.reorder"))
