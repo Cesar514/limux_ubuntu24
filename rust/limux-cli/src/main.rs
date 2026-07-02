@@ -22,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 mod agent_hooks;
+mod codex_teams;
 mod sessions;
 
 const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
