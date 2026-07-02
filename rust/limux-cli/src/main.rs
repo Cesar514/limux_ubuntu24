@@ -1541,6 +1541,13 @@ const APP_KEEP_WORKSPACE_OPEN_SETTING: BooleanSetting = BooleanSetting {
     default: false,
 };
 
+const APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING: BooleanSetting = BooleanSetting {
+    key: "app.workspaceInheritWorkingDirectory",
+    section: "app",
+    json_key: "workspaceInheritWorkingDirectory",
+    default: true,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1552,6 +1559,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.appearance|",
+    "app.workspaceInheritWorkingDirectory|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement>"
 );
@@ -1560,6 +1568,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|app.appearance|",
+    "app.workspaceInheritWorkingDirectory|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
@@ -1618,6 +1627,9 @@ fn appearance_setting(raw: &str) -> Option<AppearanceSetting> {
 fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
     match raw {
         "app.keepWorkspaceOpenWhenClosingLastSurface" => Some(APP_KEEP_WORKSPACE_OPEN_SETTING),
+        "app.workspaceInheritWorkingDirectory" => {
+            Some(APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
+        }
         _ => None,
     }
 }
@@ -15566,6 +15578,62 @@ mod cli_arg_tests {
         )
         .expect("write malformed bool");
         let err = render_config_boolean_get(&path, APP_KEEP_WORKSPACE_OPEN_SETTING)
+            .expect_err("invalid existing bool");
+        assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify the CMUX workspace cwd inheritance key defaults and preserves siblings.
+    // inputs: Temporary settings file and the local config renderer helpers.
+    // returns/effects: Writes test settings JSON and asserts the nested boolean update.
+    #[test]
+    fn config_app_workspace_inherit_working_directory_get_defaults_and_writes_nested_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text =
+            render_config_boolean_get(&path, APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
+                .expect("get default workspace inherit cwd");
+        assert!(text.contains("app.workspaceInheritWorkingDirectory = true"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark"},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_boolean_set(
+            &path,
+            APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING,
+            "false",
+        )
+        .expect("set workspace inherit cwd");
+        assert!(text.contains("app.workspaceInheritWorkingDirectory = false"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["app"]["workspaceInheritWorkingDirectory"], false);
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed CMUX workspace cwd inheritance values fail loudly.
+    // inputs: Invalid CLI value and malformed persisted settings JSON.
+    // returns/effects: Asserts errors instead of accepting silent defaults.
+    #[test]
+    fn config_app_workspace_inherit_working_directory_rejects_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err =
+            render_config_boolean_set(&path, APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING, "no")
+                .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(
+            &path,
+            br#"{"app":{"workspaceInheritWorkingDirectory":"false"}}"#,
+        )
+        .expect("write malformed bool");
+        let err = render_config_boolean_get(&path, APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
     }

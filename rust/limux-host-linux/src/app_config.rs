@@ -71,9 +71,28 @@ pub struct FocusConfig {
     pub hover_terminal_focus: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppBehaviorConfig {
     pub keep_workspace_open_when_closing_last_surface: bool,
+    pub workspace_inherit_working_directory: bool,
+}
+
+impl Default for AppBehaviorConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl AppBehaviorConfig {
+    // purpose: Return CMUX app behavior defaults that differ from Rust primitive defaults.
+    // inputs: None.
+    // returns/effects: Defaults workspace cwd inheritance on and keep-last-surface off.
+    fn cmux_default() -> Self {
+        Self {
+            keep_workspace_open_when_closing_last_surface: false,
+            workspace_inherit_working_directory: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -497,7 +516,11 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("newWorkspacePlacement"))
         .map(|value| parse_workspace_new_placement(value, "app.newWorkspacePlacement"))
         .unwrap_or_default();
-    let app_defaults = AppBehaviorConfig::default();
+    let app_defaults = AppBehaviorConfig::cmux_default();
+    let workspace_inherit_working_directory = app
+        .and_then(|app| app.get("workspaceInheritWorkingDirectory"))
+        .map(|value| parse_bool_setting(value, "app.workspaceInheritWorkingDirectory"))
+        .unwrap_or(app_defaults.workspace_inherit_working_directory);
     let keep_workspace_open_when_closing_last_surface = app
         .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
         .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
@@ -554,6 +577,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         app: AppBehaviorConfig {
             keep_workspace_open_when_closing_last_surface,
+            workspace_inherit_working_directory,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -915,6 +939,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!(config.appearance.color_scheme.as_str()),
     );
     app.as_object_mut().expect("app object").insert(
+        "workspaceInheritWorkingDirectory".to_string(),
+        json!(config.app.workspace_inherit_working_directory),
+    );
+    app.as_object_mut().expect("app object").insert(
         "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
         json!(config.app.keep_workspace_open_when_closing_last_surface),
     );
@@ -1239,6 +1267,48 @@ mod tests {
         fs::write(
             &path,
             r#"{"app":{"keepWorkspaceOpenWhenClosingLastSurface":"true"}}"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host config loading accepts the CMUX workspace cwd inheritance key.
+    // inputs: Temporary settings JSON with app.workspaceInheritWorkingDirectory.
+    // returns/effects: Asserts explicit false overrides the CMUX true default.
+    #[test]
+    fn load_from_path_reads_workspace_inherit_working_directory() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "workspaceInheritWorkingDirectory": false
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert!(!loaded.config.app.workspace_inherit_working_directory);
+    }
+
+    // purpose: Verify host config loading rejects malformed workspace cwd inheritance values.
+    // inputs: Temporary settings JSON with a string instead of a boolean.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "app.workspaceInheritWorkingDirectory must be a boolean")]
+    fn load_from_path_rejects_invalid_workspace_inherit_working_directory() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"app":{"workspaceInheritWorkingDirectory":"false"}}"#,
         )
         .expect("write config");
 
@@ -1580,6 +1650,7 @@ mod tests {
         config.appearance.color_scheme = ColorScheme::Light;
         config.appearance.ghostty_color_scheme = ColorScheme::Dark;
         config.app.keep_workspace_open_when_closing_last_surface = true;
+        config.app.workspace_inherit_working_directory = false;
         save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -1599,6 +1670,10 @@ mod tests {
         assert_eq!(
             parsed["app"]["keepWorkspaceOpenWhenClosingLastSurface"],
             Value::Bool(true)
+        );
+        assert_eq!(
+            parsed["app"]["workspaceInheritWorkingDirectory"],
+            Value::Bool(false)
         );
     }
 

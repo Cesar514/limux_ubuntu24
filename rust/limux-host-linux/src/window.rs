@@ -7371,6 +7371,65 @@ fn workspace_folder_path_from_input(
     }
 }
 
+// purpose: Resolve the effective cwd for a new CMUX-compatible workspace.
+// inputs: App config, explicit cwd, and active workspace cwd/folder snapshot.
+// returns/effects: Returns explicit cwd first, inherited cwd when enabled, or None.
+fn resolve_workspace_creation_directory(
+    config: &app_config::AppConfig,
+    requested_cwd: Option<&str>,
+    active_workspace_directory: Option<&str>,
+) -> Option<String> {
+    requested_cwd.map(ToOwned::to_owned).or_else(|| {
+        config
+            .app
+            .workspace_inherit_working_directory
+            .then(|| active_workspace_directory.map(ToOwned::to_owned))
+            .flatten()
+    })
+}
+
+// purpose: Snapshot the active workspace directory used for CMUX cwd inheritance.
+// inputs: Current app state.
+// returns/effects: Prefers folder_path over mutable terminal-reported cwd.
+fn active_workspace_directory(state: &AppState) -> Option<String> {
+    state
+        .active_workspace()
+        .and_then(|workspace| {
+            workspace
+                .folder_path
+                .clone()
+                .or_else(|| workspace.cwd.borrow().clone())
+        })
+        .filter(|directory| !directory.trim().is_empty())
+}
+
+// purpose: Resolve workspace-create cwd from current live state and explicit params.
+// inputs: Shared host state and optional explicit cwd.
+// returns/effects: Borrows state briefly and returns owned cwd or None.
+fn workspace_creation_directory_from_state(
+    state: &State,
+    requested_cwd: Option<&str>,
+) -> Option<String> {
+    let s = state.borrow();
+    let config = s.config.borrow();
+    let active_directory = active_workspace_directory(&s);
+    resolve_workspace_creation_directory(&config, requested_cwd, active_directory.as_deref())
+}
+
+// purpose: Derive a default workspace title from an optional cwd.
+// inputs: Effective workspace directory.
+// returns/effects: Uses the final path segment or "workspace" when cwd is unset.
+fn workspace_title_from_directory(directory: Option<&str>) -> String {
+    directory
+        .and_then(|directory| {
+            std::path::Path::new(directory)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
 // purpose: Resolve the CMUX Cmd-N target for folder-created workspaces.
 // inputs: Current host state and active workspace/group selection.
 // returns/effects: Returns group placement metadata or None for ungrouped active workspaces.
@@ -10369,17 +10428,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let _ = reply.send(Err(error));
                 return;
             }
-            let home = dirs::home_dir()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let folder_path = cwd.as_deref().unwrap_or(&home);
-            let title = name.unwrap_or_else(|| {
-                std::path::Path::new(folder_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "workspace".to_string())
-            });
+            let working_directory = workspace_creation_directory_from_state(state, cwd.as_deref());
+            let title = name
+                .unwrap_or_else(|| workspace_title_from_directory(working_directory.as_deref()));
+            let folder_path = working_directory.as_deref();
 
             let has_layout = layout.is_some();
             let workspace = WorkspaceState {
@@ -10387,16 +10439,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 name: title,
                 description,
                 favorite: false,
-                cwd: Some(folder_path.to_string()),
-                folder_path: Some(folder_path.to_string()),
+                cwd: working_directory.clone(),
+                folder_path: working_directory.clone(),
                 group_id: group_id
                     .as_deref()
                     .map(normalize_workspace_group_handle)
                     .map(ToOwned::to_owned),
                 environment,
-                layout: layout.unwrap_or_else(|| {
-                    LayoutNodeState::Pane(PaneState::fallback(Some(folder_path)))
-                }),
+                layout: layout
+                    .unwrap_or_else(|| LayoutNodeState::Pane(PaneState::fallback(folder_path))),
             };
             add_workspace_from_state_internal(state, &workspace, focus);
 
@@ -10477,10 +10528,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             terminals_per_workspace,
             reply,
         } => {
-            let home = dirs::home_dir()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let folder_path = cwd.as_deref().unwrap_or(&home);
+            let working_directory = workspace_creation_directory_from_state(state, cwd.as_deref());
+            let folder_path = working_directory.as_deref();
 
             let mut created = Vec::with_capacity(count);
             for index in 1..=count {
@@ -10489,14 +10538,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     name: format!("{name_prefix}-{index}"),
                     description: None,
                     favorite: false,
-                    cwd: Some(folder_path.to_string()),
-                    folder_path: Some(folder_path.to_string()),
+                    cwd: working_directory.clone(),
+                    folder_path: working_directory.clone(),
                     group_id: None,
                     environment: BTreeMap::new(),
                     layout: mixed_workspace_layout(
                         panes_per_workspace,
                         terminals_per_workspace,
-                        Some(folder_path),
+                        folder_path,
                     ),
                 };
                 add_workspace_from_state_internal(state, &workspace, false);
@@ -13359,7 +13408,8 @@ mod tests {
         pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
         publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
-        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
+        queue_session_save_request, resolve_pane_create_source_id,
+        resolve_workspace_creation_directory, resolved_system_prefers_dark,
         right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
@@ -13373,12 +13423,12 @@ mod tests {
         workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
-        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
-        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
+        HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
+        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
+        SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
+        SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
+        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
@@ -14041,6 +14091,45 @@ mod tests {
             crate::pane::PaneEmptyReason::MovedLastTabOut,
             0
         ));
+    }
+
+    // purpose: Verify CMUX workspace cwd inheritance resolution for workspace creation.
+    // inputs: App config, explicit cwd, and active workspace cwd snapshot.
+    // returns/effects: Asserts explicit cwd wins and disabled inheritance returns None.
+    #[test]
+    fn workspace_creation_directory_follows_cmux_inheritance_setting() {
+        let mut config = crate::app_config::AppConfig::default();
+
+        assert_eq!(
+            resolve_workspace_creation_directory(&config, Some("/explicit"), Some("/active")),
+            Some("/explicit".to_string())
+        );
+        assert_eq!(
+            resolve_workspace_creation_directory(&config, None, Some("/active")),
+            Some("/active".to_string())
+        );
+
+        config.app.workspace_inherit_working_directory = false;
+        assert_eq!(
+            resolve_workspace_creation_directory(&config, None, Some("/active")),
+            None
+        );
+        assert_eq!(
+            resolve_workspace_creation_directory(&config, Some("/explicit"), Some("/active")),
+            Some("/explicit".to_string())
+        );
+    }
+
+    // purpose: Verify default workspace names when cwd is inherited or intentionally unset.
+    // inputs: Optional effective workspace directory.
+    // returns/effects: Asserts path basename or generic workspace title.
+    #[test]
+    fn workspace_title_from_directory_uses_basename_or_generic_title() {
+        assert_eq!(
+            workspace_title_from_directory(Some("/tmp/project")),
+            "project"
+        );
+        assert_eq!(workspace_title_from_directory(None), "workspace");
     }
 
     #[test]
