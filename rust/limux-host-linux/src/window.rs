@@ -4324,7 +4324,7 @@ fn custom_sidebar_dispatcher_action(
         "workspace.reorder" | "reorder-workspace" => {
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: custom_sidebar_action_param_string(action, "workspace_id")?,
-                index: custom_sidebar_action_param_usize(action, "index")?,
+                target: custom_sidebar_workspace_reorder_target(action)?,
             }))
         }
         _ => Ok(None),
@@ -4375,6 +4375,45 @@ fn custom_sidebar_action_param_usize(
         .map_err(|_| format!("{} integer `{key}` is out of range", action.action_type))
 }
 
+/// purpose: Parse CMUX workspace.reorder target params from a sidebar action.
+/// inputs: Parsed action metadata.
+/// returns/effects: Enforces exactly one of index, before_workspace_id, or after_workspace_id.
+fn custom_sidebar_workspace_reorder_target(
+    action: &CustomSidebarNodeAction,
+) -> Result<CustomSidebarWorkspaceReorderTarget, String> {
+    let index = action.params.get("index").map(|_| {
+        custom_sidebar_action_param_usize(action, "index")
+            .map(CustomSidebarWorkspaceReorderTarget::Index)
+    });
+    let before = action.params.get("before_workspace_id").map(|_| {
+        custom_sidebar_action_param_string(action, "before_workspace_id")
+            .map(CustomSidebarWorkspaceReorderTarget::Before)
+    });
+    let after = action.params.get("after_workspace_id").map(|_| {
+        custom_sidebar_action_param_string(action, "after_workspace_id")
+            .map(CustomSidebarWorkspaceReorderTarget::After)
+    });
+    let target_count =
+        usize::from(index.is_some()) + usize::from(before.is_some()) + usize::from(after.is_some());
+    if target_count != 1 {
+        return Err(format!(
+            "{} requires exactly one target: index, before_workspace_id, or after_workspace_id",
+            action.action_type
+        ));
+    }
+    index
+        .or(before)
+        .or(after)
+        .expect("workspace.reorder target count is exactly one")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CustomSidebarWorkspaceReorderTarget {
+    Index(usize),
+    Before(String),
+    After(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CustomSidebarDispatcherAction {
     WorkspaceNext,
@@ -4383,7 +4422,10 @@ enum CustomSidebarDispatcherAction {
     JumpToUnread,
     WorkspaceSelect(String),
     SurfaceFocus(String),
-    WorkspaceReorder { workspace_id: String, index: usize },
+    WorkspaceReorder {
+        workspace_id: String,
+        target: CustomSidebarWorkspaceReorderTarget,
+    },
 }
 
 /// purpose: Execute a supported CMUX dispatcher action from a JSON custom-sidebar button.
@@ -4462,8 +4504,8 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::WorkspaceReorder {
             workspace_id,
-            index,
-        } => reorder_workspace_for_custom_sidebar(state, &workspace_id, index),
+            target,
+        } => reorder_workspace_for_custom_sidebar(state, &workspace_id, target),
     }
 }
 
@@ -4589,13 +4631,15 @@ fn focus_surface_in_workspace_for_custom_sidebar(
 fn reorder_workspace_for_custom_sidebar(
     state: &State,
     workspace_id: &str,
-    target_index: usize,
+    target: CustomSidebarWorkspaceReorderTarget,
 ) -> Result<serde_json::Value, BridgeError> {
     let result = {
         let mut app_state = state.borrow_mut();
         let Some(from_index) = workspace_index_for_raw_id(&app_state, workspace_id) else {
             return Err(BridgeError::not_found("workspace not found"));
         };
+        let target_index =
+            custom_sidebar_workspace_reorder_target_index(&app_state, from_index, &target)?;
         reorder_workspace_to_index_in_state(&mut app_state, from_index, target_index)
     };
     if let Some(row) = result.row_to_select.clone() {
@@ -4612,6 +4656,57 @@ fn reorder_workspace_for_custom_sidebar(
         request_session_save(state);
     }
     Ok(result.payload())
+}
+
+/// purpose: Resolve CMUX workspace.reorder target params against live state.
+/// inputs: Host state, source index, and parsed reorder target.
+/// returns/effects: Returns the absolute insertion index or a not_found error.
+fn custom_sidebar_workspace_reorder_target_index(
+    state: &AppState,
+    from_index: usize,
+    target: &CustomSidebarWorkspaceReorderTarget,
+) -> Result<usize, BridgeError> {
+    match target {
+        CustomSidebarWorkspaceReorderTarget::Index(index) => Ok(*index),
+        CustomSidebarWorkspaceReorderTarget::Before(workspace_id) => {
+            let Some(index) = workspace_index_for_raw_id(state, workspace_id) else {
+                return Err(BridgeError::not_found("before workspace not found"));
+            };
+            Ok(custom_sidebar_workspace_reorder_before_index(
+                from_index, index,
+            ))
+        }
+        CustomSidebarWorkspaceReorderTarget::After(workspace_id) => {
+            let Some(index) = workspace_index_for_raw_id(state, workspace_id) else {
+                return Err(BridgeError::not_found("after workspace not found"));
+            };
+            Ok(custom_sidebar_workspace_reorder_after_index(
+                from_index, index,
+            ))
+        }
+    }
+}
+
+/// purpose: Convert a before_workspace_id target into an absolute post-removal index.
+/// inputs: Source and peer indexes before removal.
+/// returns/effects: Returns target index for the existing reorder mutation path.
+fn custom_sidebar_workspace_reorder_before_index(from_index: usize, before_index: usize) -> usize {
+    if from_index < before_index {
+        before_index.saturating_sub(1)
+    } else {
+        before_index
+    }
+}
+
+/// purpose: Convert an after_workspace_id target into an absolute post-removal index.
+/// inputs: Source and peer indexes before removal.
+/// returns/effects: Returns target index for the existing reorder mutation path.
+fn custom_sidebar_workspace_reorder_after_index(from_index: usize, after_index: usize) -> usize {
+    if from_index < after_index {
+        after_index
+    } else {
+        after_index.saturating_add(1)
+    }
 }
 
 /// purpose: Move one workspace inside AppState using CMUX absolute index semantics.
@@ -17336,9 +17431,10 @@ mod tests {
         custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action, custom_sidebar_font_size,
         custom_sidebar_is_hex_color, custom_sidebar_markup_attrs, custom_sidebar_pango_color,
         custom_sidebar_pango_weight, custom_sidebar_report_payload_at_with_beta,
-        custom_sidebar_workspace_reorder_to_index, desktop_notification_action_entries,
-        desktop_notification_action_from_signal, desktop_notification_actions,
-        desktop_notification_activation_token_from_signal,
+        custom_sidebar_workspace_reorder_after_index,
+        custom_sidebar_workspace_reorder_before_index, custom_sidebar_workspace_reorder_to_index,
+        desktop_notification_action_entries, desktop_notification_action_from_signal,
+        desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -17373,14 +17469,14 @@ mod tests {
         workspace_notification_message, workspace_reorder_uses_top_level_rows,
         workspace_reordered_payload, workspace_sidebar_render_items,
         workspace_title_from_directory, workspace_top_level_ids, BrowserEvent,
-        CustomSidebarDispatcherAction, CustomSidebarNodeAction, Direction, EditableCaptureContext,
-        HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
-        PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
-        SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
-        SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot,
-        WorkspaceOrderRow, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
-        WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        CustomSidebarDispatcherAction, CustomSidebarNodeAction,
+        CustomSidebarWorkspaceReorderTarget, Direction, EditableCaptureContext, HostNotification,
+        NeighborScore, NotificationPolicyContext, NotificationPolicyEffects, PaneBounds,
+        PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess,
+        SessionSaveRequest, SidebarLogEntry, SidebarProgress, SidebarStatusEntry,
+        SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceOrderRow,
+        WorkspaceSeedSource, WorkspaceSidebarRenderItem, WorkspaceSidebarRenderSource, BASE_CSS,
+        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::{BrowserAction, RightSidebarMode, WorkspaceGroupAction};
@@ -18038,6 +18134,32 @@ mod tests {
             message: None,
             params: reorder_params,
         };
+        let mut reorder_before_params = serde_json::Map::new();
+        reorder_before_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        reorder_before_params.insert("before_workspace_id".to_string(), json!("workspace:alpha"));
+        let workspace_reorder_before = CustomSidebarNodeAction {
+            action_type: "workspace.reorder".to_string(),
+            message: None,
+            params: reorder_before_params,
+        };
+        let mut reorder_after_params = serde_json::Map::new();
+        reorder_after_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        reorder_after_params.insert("after_workspace_id".to_string(), json!("workspace:omega"));
+        let workspace_reorder_after = CustomSidebarNodeAction {
+            action_type: "workspace.reorder".to_string(),
+            message: None,
+            params: reorder_after_params,
+        };
+        let mut conflicting_reorder_params = serde_json::Map::new();
+        conflicting_reorder_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        conflicting_reorder_params.insert("index".to_string(), json!(1));
+        conflicting_reorder_params
+            .insert("before_workspace_id".to_string(), json!("workspace:alpha"));
+        let conflicting_workspace_reorder = CustomSidebarNodeAction {
+            action_type: "workspace.reorder".to_string(),
+            message: None,
+            params: conflicting_reorder_params,
+        };
 
         assert_eq!(
             custom_sidebar_dispatcher_action(&no_param_action("workspace.next")),
@@ -18071,7 +18193,21 @@ mod tests {
             custom_sidebar_dispatcher_action(&workspace_reorder),
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
                 workspace_id: "workspace:build".to_string(),
-                index: 2,
+                target: CustomSidebarWorkspaceReorderTarget::Index(2),
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_reorder_before),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
+                workspace_id: "workspace:build".to_string(),
+                target: CustomSidebarWorkspaceReorderTarget::Before("workspace:alpha".to_string()),
+            }))
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_reorder_after),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceReorder {
+                workspace_id: "workspace:build".to_string(),
+                target: CustomSidebarWorkspaceReorderTarget::After("workspace:omega".to_string()),
             }))
         );
         assert_eq!(
@@ -18088,6 +18224,11 @@ mod tests {
                 .expect_err("missing reorder params are invalid")
                 .contains("workspace_id")
         );
+        assert!(
+            custom_sidebar_dispatcher_action(&conflicting_workspace_reorder)
+                .expect_err("conflicting reorder targets are invalid")
+                .contains("exactly one target")
+        );
     }
 
     #[test]
@@ -18097,6 +18238,10 @@ mod tests {
         assert_eq!(custom_sidebar_workspace_reorder_to_index(0, 99, 4), 3);
         assert_eq!(custom_sidebar_workspace_reorder_to_index(0, 0, 1), 0);
         assert_eq!(custom_sidebar_workspace_reorder_to_index(7, 0, 0), 0);
+        assert_eq!(custom_sidebar_workspace_reorder_before_index(0, 3), 2);
+        assert_eq!(custom_sidebar_workspace_reorder_before_index(3, 0), 0);
+        assert_eq!(custom_sidebar_workspace_reorder_after_index(0, 3), 3);
+        assert_eq!(custom_sidebar_workspace_reorder_after_index(3, 0), 1);
     }
 
     #[test]
