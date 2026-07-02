@@ -491,6 +491,46 @@ struct ConfigDoctorFinding {
     byte_count: Option<usize>,
 }
 
+#[derive(Default)]
+struct JsoncStringState {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl JsoncStringState {
+    // purpose: Track JSON string state for JSONC preprocessing.
+    // inputs: One source character.
+    // returns/effects: Returns true when the caller should copy the character as string content.
+    fn consume(&mut self, ch: char) -> bool {
+        if self.in_string {
+            self.consume_inside_string(ch);
+            return true;
+        }
+        if ch == '"' {
+            self.in_string = true;
+            return true;
+        }
+        false
+    }
+
+    // purpose: Advance state while inside a JSON string.
+    // inputs: One character already known to be in a string.
+    // returns/effects: Updates escape and closing-quote state.
+    fn consume_inside_string(&mut self, ch: char) {
+        if self.escaped {
+            self.escaped = false;
+            return;
+        }
+        if ch == '\\' {
+            self.escaped = true;
+            return;
+        }
+        if ch == '"' {
+            self.in_string = false;
+        }
+    }
+}
+
 /// purpose: Validate Limux local config files for CMUX-compatible config commands.
 /// inputs: The current XDG config directory.
 /// returns/effects: Reads settings and shortcuts JSON; does not create or modify files.
@@ -647,7 +687,9 @@ fn config_doctor_finding(target: &ConfigDoctorTarget) -> Result<ConfigDoctorFind
             byte_count: Some(0),
         });
     }
-    let value: Value = serde_json::from_slice(&raw)
+    let sanitized = jsonc_preprocess(&raw)
+        .with_context(|| format!("failed to preprocess JSONC {}", target.path.display()))?;
+    let value: Value = serde_json::from_slice(&sanitized)
         .with_context(|| format!("{} is not valid JSON", target.path.display()))?;
     let Some(object) = value.as_object() else {
         return Ok(ConfigDoctorFinding {
@@ -663,10 +705,144 @@ fn config_doctor_finding(target: &ConfigDoctorTarget) -> Result<ConfigDoctorFind
         label: target.label.clone(),
         path: target.path.clone(),
         status: "ok",
-        message: "JSON syntax is valid".to_string(),
+        message: "JSONC syntax is valid".to_string(),
         keys: object.keys().cloned().collect(),
         byte_count: Some(raw.len()),
     })
+}
+
+// purpose: Strip JSONC comments and trailing commas before strict JSON parsing.
+// inputs: UTF-8 JSONC bytes from a config file.
+// returns/effects: Preserves string contents and fails loudly on invalid UTF-8.
+fn jsonc_preprocess(raw: &[u8]) -> Result<Vec<u8>> {
+    let source = std::str::from_utf8(raw).context("config file must be UTF-8")?;
+    let without_comments = jsonc_strip_comments(source)?;
+    Ok(jsonc_strip_trailing_commas(&without_comments).into_bytes())
+}
+
+// purpose: Remove JSONC line and block comments outside strings.
+// inputs: UTF-8 JSONC source.
+// returns/effects: Preserves newlines for useful parse locations and errors on unclosed blocks.
+fn jsonc_strip_comments(source: &str) -> Result<String> {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut string_state = JsoncStringState::default();
+    while let Some(ch) = chars.next() {
+        if string_state.consume(ch) {
+            output.push(ch);
+            continue;
+        }
+        match ch {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                skip_jsonc_line_comment(&mut chars, &mut output);
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                skip_jsonc_block_comment(&mut chars, &mut output)?;
+            }
+            _ => output.push(ch),
+        }
+    }
+    Ok(output)
+}
+
+// purpose: Skip a JSONC line annotation.
+// inputs: Comment iterator positioned after a line-comment marker.
+// returns/effects: Emits the line break that ends the comment, if any.
+fn skip_jsonc_line_comment<I>(chars: &mut std::iter::Peekable<I>, output: &mut String)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        if push_jsonc_line_break(ch, chars, output) {
+            break;
+        }
+    }
+}
+
+// purpose: Preserve a line break found while skipping ignored JSONC text.
+// inputs: Current character plus the remaining iterator for CRLF detection.
+// returns/effects: Writes the line break and returns true when the skipped text ended.
+fn push_jsonc_line_break<I>(
+    ch: char,
+    chars: &mut std::iter::Peekable<I>,
+    output: &mut String,
+) -> bool
+where
+    I: Iterator<Item = char>,
+{
+    match ch {
+        '\n' => {
+            output.push('\n');
+            true
+        }
+        '\r' => {
+            output.push('\r');
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+                output.push('\n');
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+// purpose: Skip a JSONC block annotation.
+// inputs: Comment iterator positioned after `/*`.
+// returns/effects: Emits contained newlines and errors on unclosed comments.
+fn skip_jsonc_block_comment<I>(
+    chars: &mut std::iter::Peekable<I>,
+    output: &mut String,
+) -> Result<()>
+where
+    I: Iterator<Item = char>,
+{
+    let mut previous = '\0';
+    for ch in chars.by_ref() {
+        if ch == '\n' || ch == '\r' {
+            output.push(ch);
+        }
+        if previous == '*' && ch == '/' {
+            return Ok(());
+        }
+        previous = ch;
+    }
+    bail!("unterminated JSONC block comment")
+}
+
+// purpose: Remove commas before object and array closing delimiters outside strings.
+// inputs: Comment-free JSONC source.
+// returns/effects: Returns strict JSON-compatible source.
+fn jsonc_strip_trailing_commas(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut string_state = JsoncStringState::default();
+    while let Some(ch) = chars.next() {
+        if string_state.consume(ch) {
+            output.push(ch);
+            continue;
+        }
+        if ch == ',' && next_non_ws_is_closing(&chars) {
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+// purpose: Check whether a comma is followed only by whitespace before `]` or `}`.
+// inputs: The remaining source iterator after a comma.
+// returns/effects: Does not consume the iterator.
+fn next_non_ws_is_closing<I>(chars: &std::iter::Peekable<I>) -> bool
+where
+    I: Iterator<Item = char> + Clone,
+{
+    let mut clone = chars.clone();
+    clone
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| ch == ']' || ch == '}')
 }
 
 /// purpose: Render text config doctor output.
@@ -11531,6 +11707,55 @@ mod cli_arg_tests {
 
         assert!(text.contains("OK custom 1"));
         assert!(text.contains("keys: commands"));
+    }
+
+    #[test]
+    fn config_doctor_accepts_jsonc_comments_and_trailing_commas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux.json");
+        fs::write(
+            &path,
+            br#"{
+                // project commands
+                "commands": [
+                    {
+                        "name": "Build",
+                        "command": "echo ok", // trailing line comment
+                    },
+                ],
+                /* grouped workspace config */
+                "workspaceGroups": {
+                    "newWorkspacePlacement": "afterCurrent",
+                },
+            }"#,
+        )
+        .expect("write jsonc config");
+
+        let text = config_validation_text_for_targets(vec![ConfigDoctorTarget {
+            label: "project".to_string(),
+            path,
+            missing_is_error: false,
+        }])
+        .expect("jsonc doctor output");
+
+        assert!(text.contains("OK project"));
+        assert!(text.contains("JSONC syntax is valid"));
+        assert!(text.contains("commands"));
+        assert!(text.contains("workspaceGroups"));
+    }
+
+    #[test]
+    fn jsonc_preprocess_preserves_comment_like_text_inside_strings() {
+        let raw = br#"{
+            "url": "https://example.com/a//b",
+            "pattern": "not /* a comment */",
+        }"#;
+
+        let sanitized = jsonc_preprocess(raw).expect("preprocess jsonc");
+        let value: Value = serde_json::from_slice(&sanitized).expect("strict json");
+
+        assert_eq!(value["url"], "https://example.com/a//b");
+        assert_eq!(value["pattern"], "not /* a comment */");
     }
 
     #[test]

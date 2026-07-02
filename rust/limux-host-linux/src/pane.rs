@@ -6,7 +6,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -31,6 +34,46 @@ use crate::terminal::{self, TerminalCallbacks};
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
 const BROWSER_DIAGNOSTIC_BUFFER_LIMIT: usize = 512;
 const LIMUX_BROWSER_DIAGNOSTICS_HANDLER: &str = "limuxBrowserDiagnostics";
+const CODEX_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+shim="$0"
+shim_dir="${CMUX_CODEX_WRAPPER_SHIM_ROOT:-$(dirname "$shim")}"
+old_ifs="$IFS"
+IFS=:
+clean_path=""
+for path_entry in ${PATH:-}
+do
+  if [ "$path_entry" = "$shim_dir" ]
+  then
+    continue
+  fi
+  if [ -z "$clean_path" ]
+  then
+    clean_path="$path_entry"
+  else
+    clean_path="$clean_path:$path_entry"
+  fi
+done
+IFS="$old_ifs"
+PATH="$clean_path"
+if ! real_codex="$(PATH="$PATH" command -v codex)"
+then
+  printf '%s\n' "limux: real codex executable not found after wrapper shim" >&2
+  exit 127
+fi
+if [ "$real_codex" = "$shim" ]
+then
+  printf '%s\n' "limux: codex wrapper resolved to itself" >&2
+  exit 127
+fi
+export LIMUX_AGENT_LAUNCH_EXECUTABLE="codex"
+export CMUX_AGENT_LAUNCH_EXECUTABLE="codex"
+export LIMUX_AGENT_LAUNCH_ARGV="codex $*"
+export CMUX_AGENT_LAUNCH_ARGV="codex $*"
+export LIMUX_AGENT_LAUNCH_CWD="$(pwd -P)"
+export CMUX_AGENT_LAUNCH_CWD="$LIMUX_AGENT_LAUNCH_CWD"
+exec "$real_codex" "$@"
+"#;
 
 fn next_pane_id() -> u32 {
     NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
@@ -60,6 +103,58 @@ fn pane_id_for_initial_state(initial_state: Option<&PaneState>) -> u32 {
         return id;
     }
     next_pane_id()
+}
+
+// purpose: Build a per-surface PATH shim that routes typed `codex` through Limux tracking.
+// inputs: Surface id and current terminal environment vector.
+// returns/effects: Writes an executable shim and appends CMUX/Limux wrapper variables.
+fn install_codex_wrapper_env(surface_id: &str, extra_env: &mut Vec<(String, String)>) {
+    let shim_root = codex_wrapper_root(surface_id);
+    fs::create_dir_all(&shim_root).expect("failed to create Limux Codex wrapper directory");
+    let shim_path = shim_root.join("codex");
+    write_executable_file(&shim_path, CODEX_WRAPPER_SCRIPT)
+        .expect("failed to write Limux Codex wrapper shim");
+    prepend_env_path(extra_env, &shim_root);
+    let shim = shim_path.to_string_lossy().to_string();
+    let root = shim_root.to_string_lossy().to_string();
+    extra_env.push(("CMUX_CODEX_WRAPPER_SHIM".to_string(), shim.clone()));
+    extra_env.push(("LIMUX_CODEX_WRAPPER_SHIM".to_string(), shim));
+    extra_env.push(("CMUX_CODEX_WRAPPER_SHIM_ROOT".to_string(), root.clone()));
+    extra_env.push(("LIMUX_CODEX_WRAPPER_SHIM_ROOT".to_string(), root));
+}
+
+// purpose: Resolve the shim directory for one terminal surface.
+// inputs: CMUX/Limux surface id.
+// returns/effects: Returns a private temp path without touching disk.
+fn codex_wrapper_root(surface_id: &str) -> PathBuf {
+    let safe_surface = surface_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    std::env::temp_dir()
+        .join("limux-codex-wrapper")
+        .join(safe_surface)
+}
+
+// purpose: Write an executable text file, replacing stale contents if present.
+// inputs: Destination path and full script contents.
+// returns/effects: Creates parent-owned executable file or returns an IO error.
+fn write_executable_file(path: &Path, contents: &str) -> io::Result<()> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+// purpose: Prepend one directory to the terminal PATH environment.
+// inputs: Mutable terminal env vector and directory to prepend.
+// returns/effects: Adds or updates PATH for the spawned shell.
+fn prepend_env_path(extra_env: &mut Vec<(String, String)>, directory: &Path) {
+    let directory = directory.to_string_lossy();
+    if let Some((_, path)) = extra_env.iter_mut().find(|(key, _)| key == "PATH") {
+        *path = format!("{directory}:{path}");
+        return;
+    }
+    let base_path = std::env::var("PATH").expect("PATH is required to install Codex wrapper shim");
+    extra_env.push(("PATH".to_string(), format!("{directory}:{base_path}")));
 }
 
 type TabDragCallback = dyn Fn(bool);
@@ -1455,6 +1550,7 @@ fn add_terminal_tab_inner(
     extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
     extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
     extra_env.push(("CMUX_TAB_ID".to_string(), tab_id.clone()));
+    install_codex_wrapper_env(&surface_id_for_env, &mut extra_env);
     if let Some(sock) = limux_control::socket_path::resolve_socket_path(
         None,
         limux_control::socket_path::SocketMode::Runtime,
@@ -4939,14 +5035,15 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_diagnostics_snapshot, classify_content_drop_zone, content_drop_preview_rect,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        push_browser_diagnostic, surface_hint_matches, BrowserDiagnosticsBuffer, ContentDropZone,
+        browser_diagnostics_snapshot, classify_content_drop_zone, codex_wrapper_root,
+        content_drop_preview_rect, effective_drop_target_dimensions, install_codex_wrapper_env,
+        is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, push_browser_diagnostic,
+        surface_hint_matches, write_executable_file, BrowserDiagnosticsBuffer, ContentDropZone,
         TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT, BROWSER_SEARCH_ENTRY_CSS_CLASS,
         BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
-        TAB_RENAME_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASSES, CODEX_WRAPPER_SCRIPT, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
@@ -4954,6 +5051,8 @@ mod tests {
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
     use serde_json::json;
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn browser_diagnostics_buffer_routes_caps_and_snapshots_entries() {
@@ -5045,6 +5144,84 @@ mod tests {
             BROWSER_SEARCH_ENTRY_CSS_CLASSES,
             [HOST_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASS]
         );
+    }
+
+    #[test]
+    fn codex_wrapper_root_sanitizes_surface_id() {
+        let root = codex_wrapper_root("10:tab/a b");
+        assert!(root.ends_with("10-tab-a-b"));
+    }
+
+    #[test]
+    fn codex_wrapper_env_installs_shim_and_exports_cmux_vars() {
+        let surface_id = format!("test:{}:codex", std::process::id());
+        let root = codex_wrapper_root(&surface_id);
+        let _ = fs::remove_dir_all(&root);
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+
+        install_codex_wrapper_env(&surface_id, &mut env);
+
+        let shim = root.join("codex");
+        let script = fs::read_to_string(&shim).expect("read wrapper shim");
+        assert_eq!(script, CODEX_WRAPPER_SCRIPT);
+        assert_eq!(
+            env_value(&env, "PATH"),
+            format!("{}:/usr/bin", root.display())
+        );
+        assert_eq!(
+            env_value(&env, "CMUX_CODEX_WRAPPER_SHIM"),
+            shim.display().to_string()
+        );
+        assert_eq!(
+            env_value(&env, "LIMUX_CODEX_WRAPPER_SHIM_ROOT"),
+            root.display().to_string()
+        );
+    }
+
+    #[test]
+    fn codex_wrapper_executes_real_codex_with_launch_metadata() {
+        let surface_id = format!("exec:{}:codex", std::process::id());
+        let root = codex_wrapper_root(&surface_id);
+        let _ = fs::remove_dir_all(&root);
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        install_codex_wrapper_env(&surface_id, &mut env);
+
+        let real_dir = tempfile::tempdir().expect("real codex dir");
+        let real_codex = real_dir.path().join("codex");
+        write_executable_file(
+            &real_codex,
+            r#"#!/bin/sh
+set -eu
+printf 'exe=%s\n' "$LIMUX_AGENT_LAUNCH_EXECUTABLE"
+printf 'argv=%s\n' "$CMUX_AGENT_LAUNCH_ARGV"
+printf 'cwd=%s\n' "$CMUX_AGENT_LAUNCH_CWD"
+printf 'arg1=%s\n' "$1"
+"#,
+        )
+        .expect("write fake codex");
+
+        let shim = root.join("codex");
+        let path = format!("{}:{}", root.display(), real_dir.path().display());
+        let output = Command::new(&shim)
+            .arg("run")
+            .env("PATH", path)
+            .env("CMUX_CODEX_WRAPPER_SHIM_ROOT", root.as_os_str())
+            .output()
+            .expect("execute wrapper");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("wrapper stdout utf8");
+        assert!(stdout.contains("exe=codex"));
+        assert!(stdout.contains("argv=codex run"));
+        assert!(stdout.contains("arg1=run"));
+        assert!(stdout.contains("cwd="));
+    }
+
+    fn env_value(env: &[(String, String)], key: &str) -> String {
+        env.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("missing env key {key}"))
     }
 
     #[cfg(feature = "webkit")]
