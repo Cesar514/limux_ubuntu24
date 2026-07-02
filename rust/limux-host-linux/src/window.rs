@@ -1446,6 +1446,92 @@ fn publish_workspace_reordered_event(
     });
 }
 
+// purpose: Build a redacted CMUX surface input event payload.
+// inputs: Workspace/surface ids, optional pane id, and input metadata.
+// returns/effects: Returns JSON without including raw terminal text.
+fn surface_input_event_payload(
+    workspace_id: &str,
+    surface_id: &str,
+    pane_id: Option<u32>,
+    text_length: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(surface_id),
+        "pane_id": pane_id.map(|pane_id| pane_id.to_string()),
+        "pane_ref": pane_id.map(pane_ref),
+        "text_length": text_length,
+        "redacted_fields": ["text"],
+    })
+}
+
+// purpose: Build a CMUX surface key event payload.
+// inputs: Workspace/surface ids, optional pane id, and the sent key name.
+// returns/effects: Returns JSON describing the key command without mutating state.
+fn surface_key_event_payload(
+    workspace_id: &str,
+    surface_id: &str,
+    pane_id: Option<u32>,
+    key: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(surface_id),
+        "pane_id": pane_id.map(|pane_id| pane_id.to_string()),
+        "pane_ref": pane_id.map(pane_ref),
+        "key": key,
+    })
+}
+
+// purpose: Derive the live pane id embedded in Limux surface ids.
+// inputs: Surface id in the host `pane_id:tab_id` shape.
+// returns/effects: Returns None when the id is not in the host pane-prefixed shape.
+fn pane_id_from_surface_id(surface_id: &str) -> Option<u32> {
+    surface_id
+        .split_once(':')
+        .and_then(|(pane_id, _)| pane_id.parse::<u32>().ok())
+}
+
+// purpose: Publish a CMUX surface input event after socket text injection succeeds.
+// inputs: Workspace id, surface id, and sent text length.
+// returns/effects: Appends a retained redacted surface.input_sent event.
+fn publish_surface_input_sent_event(
+    workspace_id: &str,
+    surface_id: &str,
+    text_length: usize,
+) -> u64 {
+    let pane_id = pane_id_from_surface_id(surface_id);
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name: "surface.input_sent",
+        category: "surface",
+        source: "surface.io",
+        workspace_id: Some(serde_json::Value::String(workspace_id.to_string())),
+        surface_id: Some(serde_json::Value::String(surface_id.to_string())),
+        pane_id: pane_id.map(|pane_id| serde_json::Value::String(pane_id.to_string())),
+        payload: surface_input_event_payload(workspace_id, surface_id, pane_id, text_length),
+    })
+}
+
+// purpose: Publish a CMUX surface key event after socket key injection succeeds.
+// inputs: Workspace id, surface id, and sent key.
+// returns/effects: Appends a retained surface.key_sent event.
+fn publish_surface_key_sent_event(workspace_id: &str, surface_id: &str, key: &str) -> u64 {
+    let pane_id = pane_id_from_surface_id(surface_id);
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name: "surface.key_sent",
+        category: "surface",
+        source: "surface.io",
+        workspace_id: Some(serde_json::Value::String(workspace_id.to_string())),
+        surface_id: Some(serde_json::Value::String(surface_id.to_string())),
+        pane_id: pane_id.map(|pane_id| serde_json::Value::String(pane_id.to_string())),
+        payload: surface_key_event_payload(workspace_id, surface_id, pane_id, key),
+    })
+}
+
 // purpose: Select a live workspace through the same GTK stack/sidebar path as UI navigation.
 // inputs: Shared app state and target workspace index.
 // returns/effects: Changes active workspace when needed and returns the CMUX-shaped payload.
@@ -7988,6 +8074,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     surface_hint.as_deref().or(focused_surface_id.as_deref());
                 pane::terminal_handle_for_root(&workspace.root, resolved_surface_hint).map(
                     |(surface_id, handle)| {
+                        let workspace_id = workspace.id.clone();
                         (
                             serde_json::json!({
                                 "workspace_id": workspace.id.as_str(),
@@ -7995,13 +8082,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                                 "surface_id": surface_id.as_str(),
                                 "surface_ref": surface_ref(&surface_id),
                             }),
+                            workspace_id,
+                            surface_id,
                             handle,
                         )
                     },
                 )
             };
 
-            let Some((mut payload, handle)) = target else {
+            let Some((mut payload, workspace_id, surface_id, handle)) = target else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "terminal surface not found",
                 )));
@@ -8009,6 +8098,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             };
 
             handle.send_text(&text);
+            publish_surface_input_sent_event(&workspace_id, &surface_id, text.len());
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }
@@ -8090,6 +8180,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 let workspace = &app_state.workspaces[index];
                 pane::terminal_handle_for_root(&workspace.root, surface_hint.as_deref()).map(
                     |(surface_id, handle)| {
+                        let workspace_id = workspace.id.clone();
                         (
                             serde_json::json!({
                                 "workspace_id": workspace.id.as_str(),
@@ -8097,13 +8188,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                                 "surface_id": surface_id.as_str(),
                                 "surface_ref": surface_ref(&surface_id),
                             }),
+                            workspace_id,
+                            surface_id,
                             handle,
                         )
                     },
                 )
             };
 
-            let Some((mut payload, handle)) = target else {
+            let Some((mut payload, workspace_id, surface_id, handle)) = target else {
                 let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
                     "terminal surface not found",
                 )));
@@ -8116,6 +8209,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 )));
                 return;
             }
+            publish_surface_key_sent_event(&workspace_id, &surface_id, &key);
             if let Some(map) = payload.as_object_mut() {
                 map.insert("ok".to_string(), serde_json::Value::Bool(true));
             }
@@ -10519,11 +10613,13 @@ mod tests {
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
         next_active_workspace_index, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
+        publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_workspace_lifecycle_event, queue_session_save_request,
         resolve_pane_create_source_id, resolved_system_prefers_dark, run_notification_hook_command,
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
-        shortcut_dispatch_propagation, should_emit_desktop_notification, tab_drag_workspace_seed,
+        shortcut_dispatch_propagation, should_emit_desktop_notification,
+        surface_input_event_payload, surface_key_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
         workspace_drop_layout_path, workspace_folder_path_from_input, workspace_lifecycle_payload,
         workspace_notification_message, workspace_reordered_payload, Direction,
@@ -10964,6 +11060,132 @@ mod tests {
             workspace_notification_message("  ", "  "),
             "Process needs attention"
         );
+    }
+
+    #[test]
+    fn surface_io_payloads_redact_text_and_include_key_metadata() {
+        let input_payload = surface_input_event_payload("workspace-a", "7:tab-a", Some(7), 42);
+
+        assert_eq!(input_payload["workspace_id"], "workspace-a");
+        assert_eq!(input_payload["workspace_ref"], "workspace:workspace-a");
+        assert_eq!(input_payload["surface_id"], "7:tab-a");
+        assert_eq!(input_payload["surface_ref"], "surface:7:tab-a");
+        assert_eq!(input_payload["pane_id"], "7");
+        assert_eq!(input_payload["pane_ref"], "pane:7");
+        assert_eq!(input_payload["text_length"], 42);
+        assert_eq!(
+            input_payload["redacted_fields"],
+            serde_json::json!(["text"])
+        );
+        assert!(input_payload.get("text").is_none());
+
+        let key_payload = surface_key_event_payload("workspace-a", "7:tab-a", Some(7), "Enter");
+
+        assert_eq!(key_payload["workspace_id"], "workspace-a");
+        assert_eq!(key_payload["surface_id"], "7:tab-a");
+        assert_eq!(key_payload["pane_id"], "7");
+        assert_eq!(key_payload["key"], "Enter");
+    }
+
+    #[test]
+    fn surface_input_publish_streams_redacted_cmux_event_frame() {
+        let seq = publish_surface_input_sent_event("workspace-io-test", "9:tab-io", 13);
+
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let handle = thread::spawn(move || {
+            crate::event_bus::bus().stream(
+                &serde_json::json!({
+                    "after_seq": seq.saturating_sub(1),
+                    "name": "surface.input_sent",
+                    "category": "surface",
+                    "include_heartbeats": false,
+                }),
+                &mut writer,
+            )
+        });
+
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("read ack");
+        let frame: serde_json::Value = serde_json::from_str(ack.trim()).expect("ack json");
+        assert_eq!(frame["type"], "ack");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("read event");
+        let frame: serde_json::Value = serde_json::from_str(event.trim()).expect("event json");
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["name"], "surface.input_sent");
+        assert_eq!(frame["category"], "surface");
+        assert_eq!(frame["source"], "surface.io");
+        assert_eq!(frame["workspace_id"], "workspace-io-test");
+        assert_eq!(frame["surface_id"], "9:tab-io");
+        assert_eq!(frame["pane_id"], "9");
+        assert_eq!(frame["payload"]["text_length"], 13);
+        assert_eq!(
+            frame["payload"]["redacted_fields"],
+            serde_json::json!(["text"])
+        );
+        assert!(frame["payload"].get("text").is_none());
+
+        drop(reader);
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "surface.input_sent",
+            category: "surface",
+            source: "test",
+            workspace_id: Some(serde_json::Value::String("workspace-wakeup".to_string())),
+            surface_id: Some(serde_json::Value::String("1:wakeup".to_string())),
+            pane_id: Some(serde_json::Value::String("1".to_string())),
+            payload: serde_json::json!({}),
+        });
+        let _ = handle.join().expect("event stream thread");
+    }
+
+    #[test]
+    fn surface_key_publish_streams_cmux_event_frame() {
+        let seq = publish_surface_key_sent_event("workspace-key-test", "10:tab-key", "Enter");
+
+        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
+        let handle = thread::spawn(move || {
+            crate::event_bus::bus().stream(
+                &serde_json::json!({
+                    "after_seq": seq.saturating_sub(1),
+                    "name": "surface.key_sent",
+                    "category": "surface",
+                    "include_heartbeats": false,
+                }),
+                &mut writer,
+            )
+        });
+
+        let mut reader = BufReader::new(reader);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("read ack");
+        let frame: serde_json::Value = serde_json::from_str(ack.trim()).expect("ack json");
+        assert_eq!(frame["type"], "ack");
+
+        let mut event = String::new();
+        reader.read_line(&mut event).expect("read event");
+        let frame: serde_json::Value = serde_json::from_str(event.trim()).expect("event json");
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["name"], "surface.key_sent");
+        assert_eq!(frame["category"], "surface");
+        assert_eq!(frame["source"], "surface.io");
+        assert_eq!(frame["workspace_id"], "workspace-key-test");
+        assert_eq!(frame["surface_id"], "10:tab-key");
+        assert_eq!(frame["pane_id"], "10");
+        assert_eq!(frame["payload"]["key"], "Enter");
+
+        drop(reader);
+        crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+            name: "surface.key_sent",
+            category: "surface",
+            source: "test",
+            workspace_id: Some(serde_json::Value::String("workspace-wakeup".to_string())),
+            surface_id: Some(serde_json::Value::String("1:wakeup".to_string())),
+            pane_id: Some(serde_json::Value::String("1".to_string())),
+            payload: serde_json::json!({}),
+        });
+        let _ = handle.join().expect("event stream thread");
     }
 
     #[test]
