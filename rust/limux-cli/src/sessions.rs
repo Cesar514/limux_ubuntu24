@@ -381,6 +381,8 @@ fn base_session_payload(
 ) -> Value {
     let pid_exists = record.pid.map(stored_pid_exists);
     let launch = record.launch_command.as_ref();
+    let fork_command =
+        agent_hooks::build_fork_command(snapshot.agent, &record.session_id, launch, None);
     json!({
         "agent": snapshot.agent.store_name(),
         "agent_display_name": snapshot.agent.label(),
@@ -401,8 +403,9 @@ fn base_session_payload(
         "active_prompt_turn_id": Value::Null,
         "launch_working_directory": launch.and_then(|launch| launch.cwd.clone()),
         "launch_arguments": launch.map(|launch| launch.arguments.clone()).unwrap_or_default(),
-        "fork_command_available": launch.is_some(),
-        "fork_supported": launch.is_some(),
+        "fork_command": fork_command,
+        "fork_command_available": fork_command.is_some(),
+        "fork_supported": fork_command.is_some(),
         "fork_risk": pid_exists == Some(false),
         "active_for_workspace": false,
         "active_for_surface": false,
@@ -686,7 +689,12 @@ fn render_session_line(payload: &Value) -> String {
     push_codex_line_parts(payload, &mut parts);
     parts.push(format!(
         "fork_command={}",
-        yes_no(payload_bool(payload, "fork_command_available"))
+        yes_no(
+            payload
+                .get("fork_command")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        )
     ));
     parts.push(format!(
         "fork={}",
@@ -850,11 +858,18 @@ mod tests {
                     executable: "codex".to_string(),
                     arguments: vec![
                         "codex".to_string(),
+                        "resume".to_string(),
+                        "old-session".to_string(),
                         "--model".to_string(),
                         "gpt-5".to_string(),
+                        "--api-key".to_string(),
+                        "SECRET".to_string(),
                     ],
                     cwd: Some("/tmp/project".to_string()),
-                    environment: Default::default(),
+                    environment: BTreeMap::from([(
+                        "CODEX_HOME".to_string(),
+                        "/tmp/codex home".to_string(),
+                    )]),
                     captured_at: 1.0,
                 }),
                 updated_at: 20.0,
@@ -892,6 +907,48 @@ mod tests {
     #[test]
     fn sessions_list_filters_and_reports_stale_pid() {
         assert_sessions_list_filters_and_reports_stale_pid();
+    }
+
+    // purpose: Exercise JSON session-list output for CMUX-compatible fork command diagnostics.
+    // inputs: Temporary hook state directory with one Codex launch record.
+    // returns/effects: Asserts JSON exposes the concrete fork command and strips secrets.
+    fn assert_sessions_list_json_includes_fork_command() {
+        let dir = tempdir().expect("tempdir");
+        seed_stale_codex_record(dir.path());
+        let output = SessionCommandResult::from(SessionCommandInput {
+            args: vec![
+                "list".to_string(),
+                "--agent".to_string(),
+                "codex".to_string(),
+                "--state-dir".to_string(),
+                dir.path().display().to_string(),
+                "--json".to_string(),
+            ],
+            global_json: false,
+        });
+
+        let SessionCommandResult::Output(SessionCommandOutput::Json(value)) = output else {
+            panic!("expected json");
+        };
+        let command = value["sessions"][0]["fork_command"]
+            .as_str()
+            .expect("fork command");
+        assert_eq!(
+            command,
+            concat!(
+                "cd -- '/tmp/project' 2>/dev/null || [ ! -d '/tmp/project' ] && ",
+                "'env' 'CODEX_HOME=/tmp/codex home' 'codex' 'fork' ",
+                "'session-a' '--model' 'gpt-5'"
+            )
+        );
+        assert_eq!(value["sessions"][0]["fork_command_available"], true);
+        assert_eq!(value["sessions"][0]["fork_supported"], true);
+        assert!(!command.contains("SECRET"));
+    }
+
+    #[test]
+    fn sessions_list_json_includes_fork_command() {
+        assert_sessions_list_json_includes_fork_command();
     }
 
     // purpose: Exercise JSON output for empty session-list stores.

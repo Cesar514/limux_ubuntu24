@@ -470,6 +470,136 @@ pub(crate) fn build_resume_command(
     })
 }
 
+// purpose: Build a CMUX-compatible fork command from a saved launch record.
+// inputs: Agent kind, session id, optional launch metadata, and optional cwd override.
+// returns/effects: Returns a shell command that starts a forked/restored agent conversation.
+pub(crate) fn build_fork_command(
+    kind: AgentKind,
+    session_id: &str,
+    launch: Option<&AgentLaunchCommandRecord>,
+    cwd: Option<&str>,
+) -> Option<String> {
+    let session_id = normalized(session_id)?;
+    let command = fork_command_parts(kind, &session_id, launch)?;
+    Some(wrap_command_with_cwd(command, launch, cwd))
+}
+
+// purpose: Construct the executable, environment, and argument vector for agent fork commands.
+// inputs: Agent kind, normalized session id, and optional launch metadata.
+// returns/effects: Returns quoted shell command text or None when the agent cannot fork.
+fn fork_command_parts(
+    kind: AgentKind,
+    session_id: &str,
+    launch: Option<&AgentLaunchCommandRecord>,
+) -> Option<String> {
+    let fallback = kind.fallback_executable().to_string();
+    let raw_args = launch
+        .map(|launch| launch.arguments.clone())
+        .filter(|args| !args.is_empty())
+        .unwrap_or_else(|| vec![fallback.clone()]);
+    let sanitized = sanitize_launch_arguments(kind, &raw_args);
+    let executable = launch
+        .and_then(|launch| normalized(&launch.executable))
+        .or_else(|| sanitized.first().cloned())
+        .unwrap_or(fallback);
+    let preserved_tail = sanitized
+        .get(1..)
+        .map(|tail| tail.to_vec())
+        .unwrap_or_default();
+
+    let mut parts = vec![executable];
+    match kind {
+        AgentKind::Codex => {
+            parts.push("fork".to_string());
+            parts.push(session_id.to_string());
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Claude => {
+            parts.push("--resume".to_string());
+            parts.push(session_id.to_string());
+            parts.push("--fork-session".to_string());
+            parts.extend(preserved_tail);
+        }
+        AgentKind::OpenCode => {
+            parts.push("--session".to_string());
+            parts.push(session_id.to_string());
+            parts.push("--fork".to_string());
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Pi => {
+            parts.push("--session".to_string());
+            parts.push(session_id.to_string());
+            parts.push("--fork".to_string());
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Omp => {
+            parts.push("--session".to_string());
+            parts.push(session_id.to_string());
+            parts.push("--fork".to_string());
+            parts.extend(preserved_tail);
+        }
+        AgentKind::Cursor
+        | AgentKind::Grok
+        | AgentKind::Kiro
+        | AgentKind::Antigravity
+        | AgentKind::RovoDev
+        | AgentKind::Amp
+        | AgentKind::HermesAgent
+        | AgentKind::Gemini
+        | AgentKind::Copilot
+        | AgentKind::CodeBuddy
+        | AgentKind::Factory
+        | AgentKind::Qoder => return None,
+    }
+
+    let environment = launch
+        .map(|launch| launch.environment.clone())
+        .unwrap_or_default();
+    Some(shell_command_with_environment(&environment, &parts))
+}
+
+// purpose: Quote a command vector and selected environment for shell execution.
+// inputs: Preserved safe environment values plus command parts.
+// returns/effects: Returns shell text without executing it.
+fn shell_command_with_environment(
+    environment: &BTreeMap<String, String>,
+    parts: &[String],
+) -> String {
+    let mut quoted = Vec::new();
+    if !environment.is_empty() {
+        quoted.push(shell_single_quote("env"));
+        quoted.extend(
+            environment
+                .iter()
+                .map(|(key, value)| shell_single_quote(&format!("{key}={value}"))),
+        );
+    }
+    quoted.extend(parts.iter().map(|part| shell_single_quote(part)));
+    quoted.join(" ")
+}
+
+// purpose: Prefix a fork/resume command with CMUX-style working-directory restoration.
+// inputs: Quoted command text, optional launch metadata, and optional cwd override.
+// returns/effects: Returns shell text; no filesystem access is performed.
+fn wrap_command_with_cwd(
+    command: String,
+    launch: Option<&AgentLaunchCommandRecord>,
+    cwd: Option<&str>,
+) -> String {
+    let cwd = cwd.and_then(normalized).or_else(|| {
+        launch
+            .and_then(|launch| launch.cwd.as_deref())
+            .and_then(normalized)
+    });
+    match cwd {
+        Some(cwd) => {
+            let quoted = shell_single_quote(&cwd);
+            format!("cd -- {quoted} 2>/dev/null || [ ! -d {quoted} ] && {command}")
+        }
+        None => command,
+    }
+}
+
 pub(crate) fn launch_record_from_env(
     kind: AgentKind,
     payload_cwd: Option<&str>,
@@ -598,7 +728,6 @@ fn normalized(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-#[cfg(test)]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -842,6 +971,41 @@ mod tests {
         assert_eq!(
             command,
             "cd '/tmp/project one' && 'codex' 'resume' '--model' 'gpt-5.5' '--config' 'profile=work' 'sess-123'"
+        );
+    }
+
+    #[test]
+    fn fork_command_uses_agent_native_fork_form_and_preserved_environment() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "/usr/local/bin/codex".to_string(),
+            arguments: vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "old-session".to_string(),
+                "--model".to_string(),
+                "gpt-5.4".to_string(),
+                "--api-key".to_string(),
+                "SECRET".to_string(),
+                "--search".to_string(),
+            ],
+            cwd: Some("/tmp/fork repo".to_string()),
+            environment: BTreeMap::from([(
+                "CODEX_HOME".to_string(),
+                "/tmp/codex home".to_string(),
+            )]),
+            captured_at: 1.0,
+        };
+
+        let command = build_fork_command(AgentKind::Codex, "new-session", Some(&launch), None)
+            .expect("fork command");
+
+        assert_eq!(
+            command,
+            concat!(
+                "cd -- '/tmp/fork repo' 2>/dev/null || [ ! -d '/tmp/fork repo' ] && ",
+                "'env' 'CODEX_HOME=/tmp/codex home' '/usr/local/bin/codex' 'fork' ",
+                "'new-session' '--model' 'gpt-5.4' '--search'"
+            )
         );
     }
 
