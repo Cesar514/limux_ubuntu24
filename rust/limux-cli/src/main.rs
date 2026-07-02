@@ -1522,6 +1522,12 @@ const AGENT_IDLE_REMINDER_SETTING: NotificationSetting = NotificationSetting {
     kind: NotificationSettingKind::Bool { default: true },
 };
 
+const SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.suppressOnlyFocusedSurface",
+    json_key: "suppressOnlyFocusedSurface",
+    kind: NotificationSettingKind::Bool { default: false },
+};
+
 const APP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "app.newWorkspacePlacement",
     section: "app",
@@ -1572,7 +1578,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.appearance|",
+    "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
@@ -1582,7 +1588,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
-    "notifications.agentIdleReminder|app.appearance|",
+    "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
@@ -1610,6 +1616,7 @@ fn notification_setting(raw: &str) -> Option<NotificationSetting> {
         "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
         "notifications.agentTurnComplete" => Some(AGENT_TURN_COMPLETE_SETTING),
         "notifications.agentIdleReminder" => Some(AGENT_IDLE_REMINDER_SETTING),
+        "notifications.suppressOnlyFocusedSurface" => Some(SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING),
         _ => None,
     }
 }
@@ -15560,6 +15567,9 @@ mod cli_arg_tests {
         let text = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
             .expect("get default notification sound");
         assert!(text.contains("notifications.sound = default"));
+        let text = render_config_notification_get(&path, SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING)
+            .expect("get default focused-surface suppression");
+        assert!(text.contains("notifications.suppressOnlyFocusedSurface = false"));
 
         fs::write(&path, br#"{"app":{"newWorkspacePlacement":"end"}}"#).expect("write settings");
         let text = render_config_notification_set(&path, AGENT_TURN_COMPLETE_SETTING, "always")
@@ -15575,6 +15585,10 @@ mod cli_arg_tests {
         )
         .expect("set custom sound path");
         assert!(text.contains("notifications.customSoundFilePath = /tmp/notify.wav"));
+        let text =
+            render_config_notification_set(&path, SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING, "true")
+                .expect("set focused-surface suppression");
+        assert!(text.contains("notifications.suppressOnlyFocusedSurface = true"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
@@ -15584,6 +15598,10 @@ mod cli_arg_tests {
         assert_eq!(
             parsed["notifications"]["customSoundFilePath"],
             "/tmp/notify.wav"
+        );
+        assert_eq!(
+            parsed["notifications"]["suppressOnlyFocusedSurface"],
+            Value::Bool(true)
         );
     }
 

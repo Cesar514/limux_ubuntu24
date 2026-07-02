@@ -11254,6 +11254,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     app_focused,
                     workspace_is_active,
                     false,
+                    notification_config.suppress_only_focused_surface,
                 )
             {
                 show_desktop_notification(
@@ -12816,8 +12817,12 @@ fn should_emit_desktop_notification(
     window_active: bool,
     workspace_is_active: bool,
     source_focused: bool,
+    suppress_only_focused_surface: bool,
 ) -> bool {
-    desktop_notifications_enabled && (!window_active || !workspace_is_active || !source_focused)
+    desktop_notifications_enabled
+        && (!window_active
+            || !workspace_is_active
+            || (suppress_only_focused_surface && !source_focused))
 }
 
 fn mark_workspace_unread(
@@ -13467,6 +13472,7 @@ fn mark_workspace_unread_with_message(
             window_active,
             workspace_is_active,
             source_focused,
+            notifications.suppress_only_focused_surface,
         )
         .then(|| DesktopNotificationRequest {
             summary: ws.name.clone(),
@@ -14997,13 +15003,31 @@ mod tests {
 
     #[test]
     fn desktop_notifications_only_fire_for_background_workspaces() {
-        assert!(should_emit_desktop_notification(true, false, false, false));
-        assert!(should_emit_desktop_notification(true, true, false, false));
-        assert!(should_emit_desktop_notification(true, true, true, false));
-        assert!(!should_emit_desktop_notification(
-            false, false, false, false
+        assert!(should_emit_desktop_notification(
+            true, false, false, false, false
         ));
-        assert!(!should_emit_desktop_notification(true, true, true, true));
+        assert!(should_emit_desktop_notification(
+            true, true, false, false, false
+        ));
+        assert!(!should_emit_desktop_notification(
+            true, true, true, false, false
+        ));
+        assert!(!should_emit_desktop_notification(
+            false, false, false, false, false
+        ));
+        assert!(!should_emit_desktop_notification(
+            true, true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn desktop_notifications_can_suppress_only_focused_surface() {
+        assert!(should_emit_desktop_notification(
+            true, true, true, false, true
+        ));
+        assert!(!should_emit_desktop_notification(
+            true, true, true, true, true
+        ));
     }
 
     #[test]

@@ -386,6 +386,7 @@ pub struct NotificationConfig {
     pub agent_permission_prompt: bool,
     pub agent_turn_complete: AgentTurnCompleteMode,
     pub agent_idle_reminder: bool,
+    pub suppress_only_focused_surface: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -453,6 +454,7 @@ impl Default for NotificationConfig {
             agent_permission_prompt: true,
             agent_turn_complete: AgentTurnCompleteMode::WhenIdle,
             agent_idle_reminder: true,
+            suppress_only_focused_surface: false,
         }
     }
 }
@@ -596,6 +598,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("agentIdleReminder"))
         .map(|value| parse_bool_setting(value, "notifications.agentIdleReminder"))
         .unwrap_or(notification_defaults.agent_idle_reminder);
+    let suppress_only_focused_surface = notifications
+        .and_then(|notifications| notifications.get("suppressOnlyFocusedSurface"))
+        .map(|value| parse_bool_setting(value, "notifications.suppressOnlyFocusedSurface"))
+        .unwrap_or(notification_defaults.suppress_only_focused_surface);
     let workspace_groups = root
         .get("workspaceGroups")
         .map(parse_workspace_groups_config)
@@ -631,6 +637,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             agent_permission_prompt,
             agent_turn_complete,
             agent_idle_reminder,
+            suppress_only_focused_surface,
         },
         workspace_groups,
         new_workspace_placement,
@@ -1013,6 +1020,7 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "agentPermissionPrompt": config.notifications.agent_permission_prompt,
             "agentTurnComplete": config.notifications.agent_turn_complete.as_str(),
             "agentIdleReminder": config.notifications.agent_idle_reminder,
+            "suppressOnlyFocusedSurface": config.notifications.suppress_only_focused_surface,
             "hooks": config.notifications.hooks.iter().map(|hook| json!({
                 "id": hook.id,
                 "command": hook.command,
@@ -1115,7 +1123,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
         },
         "notifications": {
             "enabled": true,
-            "sound": "default"
+            "sound": "default",
+            "suppressOnlyFocusedSurface": false
         }
     });
     let serialized = serde_json::to_string_pretty(&default_root)
@@ -1193,6 +1202,10 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("default".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["suppressOnlyFocusedSurface"],
+            Value::Bool(false)
         );
     }
 
@@ -1484,7 +1497,8 @@ mod tests {
     "customSoundFilePath": "/tmp/notify.wav",
     "agentPermissionPrompt": false,
     "agentTurnComplete": "always",
-    "agentIdleReminder": false
+    "agentIdleReminder": false,
+    "suppressOnlyFocusedSurface": true
   }
 }
 "#,
@@ -1506,6 +1520,7 @@ mod tests {
             AgentTurnCompleteMode::Always
         );
         assert!(!loaded.config.notifications.agent_idle_reminder);
+        assert!(loaded.config.notifications.suppress_only_focused_surface);
     }
 
     #[test]
@@ -1541,6 +1556,21 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"notifications":{"sound":"Loud"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "notifications.suppressOnlyFocusedSurface must be a boolean")]
+    fn load_from_path_rejects_invalid_focused_surface_suppression() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"notifications":{"suppressOnlyFocusedSurface":"true"}}"#,
+        )
+        .expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -1915,6 +1945,7 @@ mod tests {
         config.notifications.agent_permission_prompt = false;
         config.notifications.agent_turn_complete = AgentTurnCompleteMode::Never;
         config.notifications.agent_idle_reminder = false;
+        config.notifications.suppress_only_focused_surface = true;
         save_to_path(&path, &config).expect("save notifications");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -1939,6 +1970,10 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["agentIdleReminder"],
             Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["notifications"]["suppressOnlyFocusedSurface"],
+            Value::Bool(true)
         );
     }
 
