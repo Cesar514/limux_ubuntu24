@@ -1672,6 +1672,78 @@ impl ControlState {
         Some(moved.info(target_pane.id))
     }
 
+    // purpose: Remove a surface from its current pane before creating a destination workspace.
+    // inputs: Surface id resolved in the current workspace/window scope.
+    // returns/effects: Mutates the source pane and returns the removed surface.
+    fn take_surface_for_workspace_move(&mut self, surface_id: u64) -> Option<SurfaceState> {
+        let (workspace_idx, window_idx, encoded) =
+            self.find_surface_in_current_window(surface_id)?;
+        let (pane_idx, surface_idx) = Self::decode_surface_index(encoded);
+        let fallback_surface = self.make_surface(None);
+        let window = self
+            .workspaces
+            .get_mut(workspace_idx)?
+            .windows
+            .get_mut(window_idx)?;
+        let pane = window.panes.get_mut(pane_idx)?;
+        let surface = pane.surfaces.remove(surface_idx);
+        if pane.surfaces.is_empty() {
+            pane.current_surface_id = Some(fallback_surface.id);
+            pane.surfaces.push(fallback_surface);
+        } else {
+            let fallback_idx = surface_idx.min(pane.surfaces.len().saturating_sub(1));
+            pane.current_surface_id = pane.surfaces.get(fallback_idx).map(|surface| surface.id);
+        }
+        Some(surface)
+    }
+
+    // purpose: Replace a new workspace's default surface with the moved surface.
+    // inputs: Destination workspace id and moved surface state.
+    // returns/effects: Mutates the destination pane and returns public surface info.
+    fn install_moved_surface_in_workspace(
+        &mut self,
+        workspace_id: u64,
+        surface: SurfaceState,
+    ) -> Option<SurfaceInfo> {
+        let workspace_idx = self
+            .workspaces
+            .iter()
+            .position(|candidate| candidate.id == workspace_id)?;
+        let window_idx = self.current_window_idx(workspace_idx)?;
+        let pane_idx = self.current_pane_idx(workspace_idx, window_idx)?;
+        let window = self
+            .workspaces
+            .get_mut(workspace_idx)?
+            .windows
+            .get_mut(window_idx)?;
+        let pane = window.panes.get_mut(pane_idx)?;
+        let surface_id = surface.id;
+        pane.surfaces.clear();
+        pane.surfaces.push(surface);
+        pane.current_surface_id = Some(surface_id);
+        pane.surfaces.first().map(|surface| surface.info(pane.id))
+    }
+
+    // purpose: Move one surface into a newly created workspace.
+    // inputs: Surface id, optional workspace title, focus policy, and previous workspace id.
+    // returns/effects: Creates a workspace, installs the surface there, and restores focus if requested.
+    fn move_surface_to_new_workspace(
+        &mut self,
+        surface_id: u64,
+        title: Option<String>,
+        focus: bool,
+        previous_workspace_id: u64,
+    ) -> Option<(WorkspaceInfo, SurfaceInfo)> {
+        let moved_surface = self.take_surface_for_workspace_move(surface_id)?;
+        let workspace_title = title.unwrap_or_else(|| moved_surface.title.clone());
+        let workspace = self.create_workspace(Some(workspace_title), None);
+        let surface = self.install_moved_surface_in_workspace(workspace.id, moved_surface)?;
+        if !focus {
+            let _ = self.select_workspace(Some(previous_workspace_id), None);
+        }
+        Some((workspace, surface))
+    }
+
     fn reorder_surface(&mut self, surface_id: u64, index: usize) -> Option<SurfaceInfo> {
         let (workspace_idx, window_idx, encoded) =
             self.find_surface_in_current_window(surface_id)?;
@@ -6131,6 +6203,37 @@ fn handle_command(
             let (workspace_id, surface_id) =
                 resolve_surface_target(state, workspace_hint, tab_hint)?;
 
+            if action_key == "move_to_new_workspace" {
+                let focus = optional_bool_param(params, "focus")?.unwrap_or(false);
+                let previous_workspace_id = state.current_workspace_id;
+                state
+                    .select_workspace(Some(workspace_id), None)
+                    .ok_or_else(|| CommandError::not_found("workspace not found"))?;
+                let (workspace, surface) = state
+                    .move_surface_to_new_workspace(
+                        surface_id,
+                        title.clone(),
+                        focus,
+                        previous_workspace_id,
+                    )
+                    .ok_or_else(|| CommandError::not_found("tab not found"))?;
+                return Ok(json!({
+                    "ok": true,
+                    "action": action,
+                    "workspace_id": encode_handle_id(workspace_id),
+                    "workspace_ref": workspace_ref(workspace_id),
+                    "surface_id": encode_handle_id(surface.id),
+                    "surface_ref": surface_ref(surface.id),
+                    "tab_ref": format!("tab:{}", surface.id),
+                    "pane_id": encode_handle_id(surface.pane_id),
+                    "pane_ref": pane_ref(surface.pane_id),
+                    "created_workspace_id": encode_handle_id(workspace.id),
+                    "created_workspace_ref": workspace_ref(workspace.id),
+                    "workspace": workspace,
+                    "surface": surface,
+                }));
+            }
+
             let updated = update_surface_metadata(state, workspace_id, surface_id, |surface| {
                 apply_named_surface_action(surface, &action_key, title.as_deref())
             })
@@ -6164,6 +6267,28 @@ mod tests {
             method: method.to_string(),
             params,
         }
+    }
+
+    // purpose: Create a named workspace and return its active surface.
+    // inputs: Dispatcher under test.
+    // returns/effects: Mutates dispatcher state and returns workspace/surface ids.
+    async fn create_target_workspace_surface(dispatcher: &Dispatcher) -> (u64, u64) {
+        let created_workspace = dispatcher
+            .dispatch(request("workspace.create", json!({ "name": "target" })))
+            .await;
+        let workspace_id = created_workspace.result.expect("workspace create")["workspace"]["id"]
+            .as_u64()
+            .expect("workspace id");
+        let current_surface = dispatcher
+            .dispatch(request(
+                "surface.current",
+                json!({ "workspace_id": workspace_id }),
+            ))
+            .await;
+        let surface_id = current_surface.result.expect("surface current")["surface"]["id"]
+            .as_u64()
+            .expect("surface id");
+        (workspace_id, surface_id)
     }
 
     #[tokio::test]
@@ -6466,22 +6591,7 @@ mod tests {
     async fn dispatcher_handles_surface_and_tab_actions_with_workspace_resolution() {
         let dispatcher = Dispatcher::new();
 
-        let created_workspace = dispatcher
-            .dispatch(request("workspace.create", json!({ "name": "target" })))
-            .await;
-        let workspace_id = created_workspace.result.expect("workspace create")["workspace"]["id"]
-            .as_u64()
-            .expect("workspace id");
-
-        let current_surface = dispatcher
-            .dispatch(request(
-                "surface.current",
-                json!({ "workspace_id": workspace_id }),
-            ))
-            .await;
-        let surface_id = current_surface.result.expect("surface current")["surface"]["id"]
-            .as_u64()
-            .expect("surface id");
+        let (workspace_id, surface_id) = create_target_workspace_surface(&dispatcher).await;
 
         // Switch away so tab_id-only lookups must resolve across workspaces.
         let _ = dispatcher
@@ -6518,6 +6628,39 @@ mod tests {
         assert_eq!(
             renamed.result.expect("surface action rename")["title"],
             "renamed-from-test"
+        );
+    }
+
+    // purpose: Verify CMUX tab.action move-to-new-workspace creates a detached workspace.
+    // inputs: Dispatcher with one extra workspace and target surface.
+    // returns/effects: Asserts moved-surface payload and unchanged active workspace.
+    #[tokio::test]
+    async fn tab_action_move_to_new_workspace_creates_detached_workspace() {
+        let dispatcher = Dispatcher::new();
+        let (_workspace_id, surface_id) = create_target_workspace_surface(&dispatcher).await;
+        let _ = dispatcher
+            .dispatch(request("workspace.previous", json!({})))
+            .await;
+        let moved = dispatcher
+            .dispatch(request(
+                "tab.action",
+                json!({
+                    "tab_id": format!("tab:{surface_id}"),
+                    "action": "move-to-new-workspace",
+                    "title": "build logs"
+                }),
+            ))
+            .await;
+        let moved_result = moved.result.expect("tab action move-to-new-workspace");
+        assert_eq!(moved_result["created_workspace_ref"], "workspace:3");
+        assert_eq!(moved_result["workspace"]["name"], "build logs");
+        assert_eq!(moved_result["surface_ref"], format!("surface:{surface_id}"));
+        let current = dispatcher
+            .dispatch(request("workspace.current", json!({})))
+            .await;
+        assert_eq!(
+            current.result.expect("current workspace")["workspace_ref"],
+            "workspace:1"
         );
     }
 

@@ -2003,9 +2003,11 @@ fn pane_create_split_placement(direction: PaneCreateDirection) -> PaneCreateSpli
 }
 
 fn normalize_surface_handle(raw: &str) -> &str {
-    raw.trim()
+    let trimmed = raw.trim();
+    trimmed
         .strip_prefix("surface:")
-        .unwrap_or_else(|| raw.trim())
+        .or_else(|| trimmed.strip_prefix("tab:"))
+        .unwrap_or(trimmed)
 }
 
 fn surface_hint_matches(surface_id: &str, hint: &str) -> bool {
@@ -6844,15 +6846,17 @@ fn handle_tab_drop_to_workspace(state: &State, target_workspace_id: &str, payloa
 }
 
 fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
-    create_workspace_for_tab_payload(state, payload).is_ok()
+    create_workspace_for_tab_payload(state, payload, None, true).is_ok()
 }
 
 // purpose: Move a tab into a newly-created workspace and return its control payload.
-// inputs: Shared app state and a `<pane_id>:<tab_id>` tab drag/control payload.
-// returns/effects: Creates a workspace, moves the tab there, selects it, and persists session state.
+// inputs: Shared app state, a `<pane_id>:<tab_id>` tab payload, optional title, and focus policy.
+// returns/effects: Creates a workspace, moves the tab there, optionally selects it, and persists state.
 fn create_workspace_for_tab_payload(
     state: &State,
     payload: &str,
+    title_override: Option<&str>,
+    focus: bool,
 ) -> Result<serde_json::Value, BridgeError> {
     let Some((pane_id, tab_id)) = payload.split_once(':') else {
         return Err(BridgeError::invalid_params("invalid tab payload"));
@@ -6880,7 +6884,7 @@ fn create_workspace_for_tab_payload(
                 workspace_cwd: None,
                 workspace_folder_path: None,
             });
-        tab_drag_workspace_seed(source, &title, tab_cwd)
+        tab_drag_workspace_seed(source, title_override.unwrap_or(&title), tab_cwd)
     };
     let previous_active_workspace_id = {
         let app_state = state.borrow();
@@ -6938,12 +6942,14 @@ fn create_workspace_for_tab_payload(
             sidebar_progress: None,
             sidebar_log: Vec::new(),
         });
-        app_state.active_idx = app_state.workspaces.len() - 1;
-        sync_right_sidebar_panel(&mut app_state);
-        app_state.stack.set_visible_child_name(&stack_name);
+        if focus {
+            app_state.active_idx = app_state.workspaces.len() - 1;
+            sync_right_sidebar_panel(&mut app_state);
+            app_state.stack.set_visible_child_name(&stack_name);
+        }
     }
 
-    {
+    if focus {
         let sidebar_list = state.borrow().sidebar_list.clone();
         sidebar_list.select_row(Some(&row_clone));
     }
@@ -8750,7 +8756,60 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 )));
                 return;
             };
-            let payload = match create_workspace_for_tab_payload(state, &source_surface) {
+            let payload = match create_workspace_for_tab_payload(state, &source_surface, None, true)
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::MoveTabToNewWorkspace {
+            target,
+            surface_hint,
+            title,
+            focus,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let source_surface = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                surface_hint
+                    .as_deref()
+                    .and_then(|surface_hint| {
+                        pane::surface_summaries_for_root(&workspace.root)
+                            .into_iter()
+                            .find(|surface| surface_hint_matches(&surface.surface_id, surface_hint))
+                            .map(|surface| surface.surface_id)
+                    })
+                    .or_else(|| focused_ids_for_workspace(state, &workspace.id).1)
+            };
+            let Some(source_surface) = source_surface else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+            let payload = match create_workspace_for_tab_payload(
+                state,
+                &source_surface,
+                title.as_deref(),
+                focus,
+            ) {
                 Ok(payload) => payload,
                 Err(error) => {
                     let _ = reply.send(Err(error));

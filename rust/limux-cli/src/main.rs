@@ -11419,6 +11419,49 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
     Ok(payload)
 }
 
+// purpose: Implement CMUX `move-tab-to-new-workspace` as a strict tab-action wrapper.
+// inputs: CLI flags for tab/surface/workspace/window/title/focus.
+// returns/effects: Calls the live host with action `move-to-new-workspace`.
+async fn run_move_tab_to_new_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_opt(args, "--action").is_some() || parse_flag(args, "--action") {
+        bail!("move-tab-to-new-workspace does not accept --action");
+    }
+
+    let mut params = Map::new();
+    params.insert(
+        "action".to_string(),
+        Value::String("move-to-new-workspace".to_string()),
+    );
+    if let Some(workspace) = parse_opt(args, "--workspace")
+        .or_else(|| parse_opt(args, "-t"))
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+    }
+    if let Some(window) = parse_opt(args, "--window") {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    if let Some(tab) = parse_opt(args, "--tab")
+        .or_else(|| parse_opt(args, "--surface"))
+        .or_else(|| context_env_value("LIMUX_TAB_ID"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+    {
+        params.insert("surface_id".to_string(), Value::String(tab));
+    }
+    if let Some(title) = parse_opt(args, "--title") {
+        params.insert("title".to_string(), Value::String(title));
+    }
+    if let Some(raw_focus) = parse_opt(args, "--focus") {
+        let focus =
+            parse_bool_string(&raw_focus).ok_or_else(|| anyhow!("--focus must be true|false"))?;
+        params.insert("focus".to_string(), Value::Bool(focus));
+    } else {
+        params.insert("focus".to_string(), Value::Bool(false));
+    }
+
+    client.call("tab.action", Value::Object(params)).await
+}
+
 async fn run_browser(
     client: &mut Client,
     args: &[String],
@@ -14281,6 +14324,14 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Json(payload)
             } else if let Some(help) = get_string(&payload, &["help"]) {
                 CommandOutput::Text(help)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
+        "move-tab-to-new-workspace" => {
+            let payload = run_move_tab_to_new_workspace(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
             } else {
                 CommandOutput::Text("OK".to_string())
             }

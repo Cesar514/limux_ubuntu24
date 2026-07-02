@@ -163,6 +163,7 @@ const METHODS: &[&str] = &[
     "surface.close",
     "surface.move",
     "surface.reorder",
+    "tab.action",
     "surface.drag_to_split",
     "surface.refresh",
     "surface.clear_history",
@@ -746,6 +747,13 @@ pub enum ControlCommand {
         index: Option<usize>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    MoveTabToNewWorkspace {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        title: Option<String>,
+        focus: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReorderSurface {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -928,6 +936,7 @@ impl ControlCommand {
             | Self::FocusSurface { reply, .. }
             | Self::CloseSurface { reply, .. }
             | Self::MoveSurface { reply, .. }
+            | Self::MoveTabToNewWorkspace { reply, .. }
             | Self::ReorderSurface { reply, .. }
             | Self::DragSurfaceToSplit { reply, .. }
             | Self::RefreshSurfaces { reply, .. }
@@ -3620,6 +3629,56 @@ fn handle_method(
                     surface_hint,
                     target_pane_id,
                     index,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "tab.action" => {
+            let action = match optional_string(params, &["action"]) {
+                Some(action) if !action.trim().is_empty() => action,
+                _ => {
+                    return error_response(
+                        id,
+                        BridgeError::invalid_params("tab.action requires action"),
+                    );
+                }
+            };
+            let action_key = action.to_ascii_lowercase().replace('-', "_");
+            if action_key != "move_to_new_workspace" {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(format!("tab.action unsupported action: {action}")),
+                );
+            }
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["tab_id", "surface_id", "panel_id", "id"],
+                "surface:",
+            ) {
+                Ok(value) => value.map(|hint| {
+                    hint.strip_prefix("tab:")
+                        .unwrap_or(hint.as_str())
+                        .to_string()
+                }),
+                Err(error) => return error_response(id, error),
+            };
+            let focus = match optional_bool(params, "focus") {
+                Ok(focus) => focus.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let title = optional_string(params, &["title"]);
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::MoveTabToNewWorkspace {
+                    target,
+                    surface_hint,
+                    title,
+                    focus,
                     reply,
                 },
                 rx,
@@ -7190,6 +7249,48 @@ mod tests {
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn tab_action_move_to_new_workspace_routes_to_live_command() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"tab.action","params":{"workspace_id":"codex","#,
+                r#""tab_id":"tab:4:tab","title":"build logs","focus":false,"#,
+                r#""action":"move-to-new-workspace"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::MoveTabToNewWorkspace {
+                    target,
+                    surface_hint,
+                    title,
+                    focus,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(title, Some("build logs".to_string()));
+                    assert!(!focus);
+                    let _ = reply.send(Ok(json!({ "created_workspace_ref": "workspace:new" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("tab.action result")["created_workspace_ref"],
+            "workspace:new"
+        );
+
+        let unsupported = dispatch_request(
+            r#"{"id":2,"method":"tab.action","params":{"action":"pin","tab_id":"tab:4:tab"}}"#,
+            &|command| panic!("unsupported tab.action should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            unsupported.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }
