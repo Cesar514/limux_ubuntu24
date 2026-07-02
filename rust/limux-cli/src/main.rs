@@ -4852,6 +4852,23 @@ enum FeedEventSemantic {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentNotifyCategory {
+    TurnComplete,
+    NeedsPermission,
+    IdleReminder,
+}
+
+impl AgentNotifyCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TurnComplete => "turn-complete",
+            Self::NeedsPermission => "needs-permission",
+            Self::IdleReminder => "idle-reminder",
+        }
+    }
+}
+
 // purpose: Classify raw agent hook events into CMUX Feed wire events.
 // inputs: Source agent name, raw hook event name, and optional tool name.
 // returns/effects: Returns hook_event_name plus whether feed.push should wait for a user decision.
@@ -5600,7 +5617,10 @@ async fn run_agent_hook(
 
     // Build a human-friendly title + body depending on event + agent.
     let agent_label = agent.label();
+    let existing_hook_record = existing_agent_hook_session(agent, &payload)?;
     persist_agent_hook_session(agent, args, &payload, &event)?;
+    let notify_gate =
+        agent_notification_gate(agent, &event, &payload, existing_hook_record.as_ref());
     let (title, body) = match event.as_str() {
         "Notification" => (
             format!("{agent_label} needs you"),
@@ -5668,6 +5688,13 @@ async fn run_agent_hook(
     if !body.is_empty() {
         params.insert("body".to_string(), Value::String(body));
     }
+    if let Some((category, pending)) = notify_gate {
+        params.insert(
+            "agent_category".to_string(),
+            Value::String(category.as_str().to_string()),
+        );
+        params.insert("agent_pending".to_string(), Value::Bool(pending));
+    }
 
     let _ = call_in_workspace_scope(
         client,
@@ -5678,6 +5705,101 @@ async fn run_agent_hook(
     .await;
 
     Ok(agent_hook_output(&event, &payload))
+}
+
+// purpose: Load an existing hook-session record for notification classification.
+// inputs: Agent kind and raw hook payload.
+// returns/effects: Reads local hook-session state when the payload has a session id.
+fn existing_agent_hook_session(
+    agent: agent_hooks::AgentKind,
+    payload: &Value,
+) -> Result<Option<agent_hooks::AgentHookSessionRecord>> {
+    let Some(session_id) = hook_session_id(payload) else {
+        return Ok(None);
+    };
+    agent_hooks::AgentHookSessionStore::new(agent).lookup(&session_id)
+}
+
+// purpose: Classify agent notifications for CMUX-style notification gating.
+// inputs: Agent, hook event, payload, and existing stored session metadata.
+// returns/effects: Returns category plus pending-work flag, or None for untagged agents/events.
+fn agent_notification_gate(
+    agent: agent_hooks::AgentKind,
+    event: &str,
+    payload: &Value,
+    existing: Option<&agent_hooks::AgentHookSessionRecord>,
+) -> Option<(AgentNotifyCategory, bool)> {
+    if agent != agent_hooks::AgentKind::Claude {
+        return None;
+    }
+    match event {
+        "Stop" | "stop" | "SubagentStop" => Some((
+            AgentNotifyCategory::TurnComplete,
+            claude_has_pending_background_work(payload),
+        )),
+        "Notification" | "notification" => claude_notification_gate(payload, existing),
+        _ => None,
+    }
+}
+
+// purpose: Classify a Claude Notification hook into CMUX notification settings.
+// inputs: Raw notification payload and prior session record.
+// returns/effects: Returns None for unclassified attention alerts that should stay ungated.
+fn claude_notification_gate(
+    payload: &Value,
+    existing: Option<&agent_hooks::AgentHookSessionRecord>,
+) -> Option<(AgentNotifyCategory, bool)> {
+    let cached_pending = existing
+        .and_then(|record| record.had_pending_background_work_at_stop)
+        .unwrap_or(false);
+    match hook_str(payload, &["notification_type", "notificationType"]) {
+        Some("permission_prompt") => Some((AgentNotifyCategory::NeedsPermission, false)),
+        Some("idle_prompt") => Some((AgentNotifyCategory::IdleReminder, cached_pending)),
+        Some(_) => None,
+        None => claude_notification_gate_from_text(payload, cached_pending),
+    }
+}
+
+// purpose: Fall back to text cues for older Claude Notification payloads.
+// inputs: Raw payload and cached pending-work state.
+// returns/effects: Returns best-effort CMUX category or None for unclassified alerts.
+fn claude_notification_gate_from_text(
+    payload: &Value,
+    cached_pending: bool,
+) -> Option<(AgentNotifyCategory, bool)> {
+    let text = hook_str(payload, &["message", "notification"])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if text.contains("permission") {
+        Some((AgentNotifyCategory::NeedsPermission, false))
+    } else if text.contains("waiting") || text.contains("idle") {
+        Some((AgentNotifyCategory::IdleReminder, cached_pending))
+    } else if text.contains("completed") || text.contains("complete") || text.contains("finished") {
+        Some((AgentNotifyCategory::TurnComplete, cached_pending))
+    } else {
+        None
+    }
+}
+
+// purpose: Match CMUX's Claude background-work pending heuristic.
+// inputs: Raw Claude Stop hook payload.
+// returns/effects: Returns true for running background_tasks or any session_crons entry.
+fn claude_has_pending_background_work(payload: &Value) -> bool {
+    if payload
+        .get("session_crons")
+        .and_then(Value::as_array)
+        .is_some_and(|crons| !crons.is_empty())
+    {
+        return true;
+    }
+    payload
+        .get("background_tasks")
+        .and_then(Value::as_array)
+        .is_some_and(|tasks| {
+            tasks
+                .iter()
+                .any(|task| task.get("status").and_then(Value::as_str) == Some("running"))
+        })
 }
 
 fn agent_hook_output(event: &str, payload: &Value) -> Value {
@@ -5825,6 +5947,15 @@ fn persist_agent_hook_session(
             .as_ref()
             .and_then(|record| record.launch_command.clone())
     });
+    let had_pending_background_work_at_stop = if agent == agent_hooks::AgentKind::Claude
+        && matches!(event, "Stop" | "stop" | "SubagentStop")
+    {
+        Some(claude_has_pending_background_work(payload))
+    } else {
+        existing
+            .as_ref()
+            .and_then(|record| record.had_pending_background_work_at_stop)
+    };
 
     let record = agent_hooks::AgentHookSessionRecord {
         session_id,
@@ -5843,6 +5974,7 @@ fn persist_agent_hook_session(
                 .as_ref()
                 .and_then(|record| record.transcript_path.clone())
         }),
+        had_pending_background_work_at_stop,
         launch_command,
         updated_at: agent_hooks::now_seconds(),
     };
@@ -15663,6 +15795,95 @@ mod cli_arg_tests {
         let payload = json!({ "hook_event_name": "Notification" });
 
         assert_eq!(parse_hook_event(&args, &payload), "Stop");
+    }
+
+    #[test]
+    fn claude_notification_gate_tags_turn_complete_pending_work_and_old_clients() {
+        let running = json!({
+            "hook_event_name": "Stop",
+            "background_tasks": [
+                { "id": "t1", "status": "completed" },
+                { "id": "t2", "status": "running" }
+            ],
+            "session_crons": []
+        });
+        assert!(claude_has_pending_background_work(&running));
+        assert_eq!(
+            agent_notification_gate(agent_hooks::AgentKind::Claude, "Stop", &running, None),
+            Some((AgentNotifyCategory::TurnComplete, true))
+        );
+
+        let cron = json!({ "hook_event_name": "Stop", "session_crons": [{ "id": "c1" }] });
+        assert!(claude_has_pending_background_work(&cron));
+
+        let old_client = json!({ "hook_event_name": "Stop" });
+        assert!(!claude_has_pending_background_work(&old_client));
+        assert_eq!(
+            agent_notification_gate(agent_hooks::AgentKind::Claude, "Stop", &old_client, None),
+            Some((AgentNotifyCategory::TurnComplete, false))
+        );
+
+        assert_eq!(
+            agent_notification_gate(agent_hooks::AgentKind::Codex, "Stop", &running, None),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_notification_gate_classifies_permission_and_idle_prompts() {
+        let permission = json!({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+        });
+        assert_eq!(
+            agent_notification_gate(
+                agent_hooks::AgentKind::Claude,
+                "Notification",
+                &permission,
+                None
+            ),
+            Some((AgentNotifyCategory::NeedsPermission, false))
+        );
+
+        let existing = agent_hooks::AgentHookSessionRecord {
+            session_id: "s1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            surface_id: "7:tab-a".to_string(),
+            cwd: None,
+            pid: None,
+            is_restorable: None,
+            transcript_path: None,
+            had_pending_background_work_at_stop: Some(true),
+            launch_command: None,
+            updated_at: 1.0,
+        };
+        let idle = json!({
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt"
+        });
+        assert_eq!(
+            agent_notification_gate(
+                agent_hooks::AgentKind::Claude,
+                "Notification",
+                &idle,
+                Some(&existing)
+            ),
+            Some((AgentNotifyCategory::IdleReminder, true))
+        );
+
+        let waiting_text = json!({
+            "hook_event_name": "Notification",
+            "message": "Claude is waiting for input"
+        });
+        assert_eq!(
+            agent_notification_gate(
+                agent_hooks::AgentKind::Claude,
+                "Notification",
+                &waiting_text,
+                Some(&existing)
+            ),
+            Some((AgentNotifyCategory::IdleReminder, true))
+        );
     }
 
     #[test]

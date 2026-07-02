@@ -218,6 +218,9 @@ pub struct NotificationConfig {
     pub enabled: bool,
     pub sound: NotificationSound,
     pub hooks: Vec<NotificationHookConfig>,
+    pub agent_permission_prompt: bool,
+    pub agent_turn_complete: AgentTurnCompleteMode,
+    pub agent_idle_reminder: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,12 +231,62 @@ pub struct NotificationHookConfig {
     pub timeout_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentTurnCompleteMode {
+    #[default]
+    WhenIdle,
+    Always,
+    Never,
+}
+
+impl AgentTurnCompleteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WhenIdle => "whenIdle",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "whenIdle" => Some(Self::WhenIdle),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentNotifyCategory {
+    TurnComplete,
+    NeedsPermission,
+    IdleReminder,
+    Other,
+}
+
+impl AgentNotifyCategory {
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "turn-complete" => Some(Self::TurnComplete),
+            "needs-permission" => Some(Self::NeedsPermission),
+            "idle-reminder" => Some(Self::IdleReminder),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             sound: NotificationSound::Default,
             hooks: Vec::new(),
+            agent_permission_prompt: true,
+            agent_turn_complete: AgentTurnCompleteMode::WhenIdle,
+            agent_idle_reminder: true,
         }
     }
 }
@@ -337,6 +390,18 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("hooks"))
         .map(parse_notification_hooks)
         .unwrap_or_default();
+    let agent_permission_prompt = notifications
+        .and_then(|notifications| notifications.get("agentPermissionPrompt"))
+        .map(|value| parse_bool_setting(value, "notifications.agentPermissionPrompt"))
+        .unwrap_or(notification_defaults.agent_permission_prompt);
+    let agent_turn_complete = notifications
+        .and_then(|notifications| notifications.get("agentTurnComplete"))
+        .map(|value| parse_agent_turn_complete_mode(value, "notifications.agentTurnComplete"))
+        .unwrap_or(notification_defaults.agent_turn_complete);
+    let agent_idle_reminder = notifications
+        .and_then(|notifications| notifications.get("agentIdleReminder"))
+        .map(|value| parse_bool_setting(value, "notifications.agentIdleReminder"))
+        .unwrap_or(notification_defaults.agent_idle_reminder);
     let workspace_groups = root
         .get("workspaceGroups")
         .map(parse_workspace_groups_config)
@@ -360,10 +425,53 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             enabled: notifications_enabled,
             sound: notification_sound,
             hooks: notification_hooks,
+            agent_permission_prompt,
+            agent_turn_complete,
+            agent_idle_reminder,
         },
         workspace_groups,
         new_workspace_placement,
         font_size,
+    }
+}
+
+// purpose: Parse a required boolean setting value without silent coercion.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns bool or panics for malformed existing config.
+fn parse_bool_setting(value: &Value, path: &str) -> bool {
+    value
+        .as_bool()
+        .unwrap_or_else(|| panic!("{path} must be a boolean"))
+}
+
+// purpose: Parse CMUX's agent turn-complete notification mode.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns mode or panics for malformed existing config.
+fn parse_agent_turn_complete_mode(value: &Value, path: &str) -> AgentTurnCompleteMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    AgentTurnCompleteMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be one of whenIdle, always, or never"))
+}
+
+// purpose: Decide whether an agent-tagged notification should deliver.
+// inputs: Optional category, pending-work flag, and current notification config.
+// returns/effects: Returns false when CMUX agent notification settings suppress it.
+pub fn agent_notification_should_deliver(
+    category: Option<AgentNotifyCategory>,
+    pending: bool,
+    config: &NotificationConfig,
+) -> bool {
+    match category.unwrap_or(AgentNotifyCategory::Other) {
+        AgentNotifyCategory::NeedsPermission => config.agent_permission_prompt,
+        AgentNotifyCategory::TurnComplete => match config.agent_turn_complete {
+            AgentTurnCompleteMode::Always => true,
+            AgentTurnCompleteMode::Never => false,
+            AgentTurnCompleteMode::WhenIdle => !pending,
+        },
+        AgentNotifyCategory::IdleReminder => config.agent_idle_reminder && !pending,
+        AgentNotifyCategory::Other => true,
     }
 }
 
@@ -637,6 +745,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         json!({
             "enabled": config.notifications.enabled,
             "sound": config.notifications.sound.as_str(),
+            "agentPermissionPrompt": config.notifications.agent_permission_prompt,
+            "agentTurnComplete": config.notifications.agent_turn_complete.as_str(),
+            "agentIdleReminder": config.notifications.agent_idle_reminder,
             "hooks": config.notifications.hooks.iter().map(|hook| json!({
                 "id": hook.id,
                 "command": hook.command,
@@ -898,7 +1009,10 @@ mod tests {
             r#"{
   "notifications": {
     "enabled": false,
-    "sound": "bell"
+    "sound": "bell",
+    "agentPermissionPrompt": false,
+    "agentTurnComplete": "always",
+    "agentIdleReminder": false
   }
 }
 "#,
@@ -910,6 +1024,72 @@ mod tests {
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.config.notifications.enabled);
         assert_eq!(loaded.config.notifications.sound, NotificationSound::Bell);
+        assert!(!loaded.config.notifications.agent_permission_prompt);
+        assert_eq!(
+            loaded.config.notifications.agent_turn_complete,
+            AgentTurnCompleteMode::Always
+        );
+        assert!(!loaded.config.notifications.agent_idle_reminder);
+    }
+
+    #[test]
+    fn agent_notification_gate_follows_cmux_decision_table() {
+        let mut config = NotificationConfig::default();
+        assert!(agent_notification_should_deliver(
+            Some(AgentNotifyCategory::NeedsPermission),
+            true,
+            &config
+        ));
+        config.agent_permission_prompt = false;
+        assert!(!agent_notification_should_deliver(
+            Some(AgentNotifyCategory::NeedsPermission),
+            false,
+            &config
+        ));
+
+        config.agent_turn_complete = AgentTurnCompleteMode::WhenIdle;
+        assert!(agent_notification_should_deliver(
+            Some(AgentNotifyCategory::TurnComplete),
+            false,
+            &config
+        ));
+        assert!(!agent_notification_should_deliver(
+            Some(AgentNotifyCategory::TurnComplete),
+            true,
+            &config
+        ));
+
+        config.agent_turn_complete = AgentTurnCompleteMode::Always;
+        assert!(agent_notification_should_deliver(
+            Some(AgentNotifyCategory::TurnComplete),
+            true,
+            &config
+        ));
+        config.agent_turn_complete = AgentTurnCompleteMode::Never;
+        assert!(!agent_notification_should_deliver(
+            Some(AgentNotifyCategory::TurnComplete),
+            false,
+            &config
+        ));
+
+        config.agent_idle_reminder = true;
+        assert!(agent_notification_should_deliver(
+            Some(AgentNotifyCategory::IdleReminder),
+            false,
+            &config
+        ));
+        assert!(!agent_notification_should_deliver(
+            Some(AgentNotifyCategory::IdleReminder),
+            true,
+            &config
+        ));
+        config.agent_idle_reminder = false;
+        assert!(!agent_notification_should_deliver(
+            Some(AgentNotifyCategory::IdleReminder),
+            false,
+            &config
+        ));
+        assert!(agent_notification_should_deliver(None, true, &config));
     }
 
     #[test]
@@ -1202,6 +1382,9 @@ mod tests {
         let mut config = AppConfig::default();
         config.notifications.enabled = false;
         config.notifications.sound = NotificationSound::Alert;
+        config.notifications.agent_permission_prompt = false;
+        config.notifications.agent_turn_complete = AgentTurnCompleteMode::Never;
+        config.notifications.agent_idle_reminder = false;
         save_to_path(&path, &config).expect("save notifications");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -1210,6 +1393,18 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("alert".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["agentPermissionPrompt"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["notifications"]["agentTurnComplete"],
+            Value::String("never".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["agentIdleReminder"],
+            Value::Bool(false)
         );
     }
 

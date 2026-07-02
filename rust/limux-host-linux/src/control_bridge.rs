@@ -853,6 +853,8 @@ pub enum ControlCommand {
         title: String,
         subtitle: String,
         body: String,
+        agent_category: Option<String>,
+        agent_pending: bool,
         feed_actions: Vec<crate::feed::FeedNotificationAction>,
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -4063,6 +4065,15 @@ fn handle_method(
             let subtitle = optional_string(params, &["subtitle"]).unwrap_or_default();
             let body = optional_string(params, &["body", "message"]).unwrap_or_default();
             let surface_hint = optional_string(params, &["surface_id", "surface", "tab_id", "tab"]);
+            let agent_category = optional_string(params, &["agent_category", "agentCategory"]);
+            let agent_pending = match optional_bool(params, "agent_pending") {
+                Ok(Some(value)) => value,
+                Ok(None) => match optional_bool(params, "agentPending") {
+                    Ok(value) => value.unwrap_or(false),
+                    Err(error) => return error_response(id, error),
+                },
+                Err(error) => return error_response(id, error),
+            };
             // allow_name = true: lets agent hooks target a peer by name.
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -4076,6 +4087,8 @@ fn handle_method(
                     title,
                     subtitle,
                     body,
+                    agent_category,
+                    agent_pending,
                     feed_actions: Vec::new(),
                     reply,
                 },
@@ -4231,6 +4244,8 @@ fn feed_notification_command(
         title: notification.title.clone(),
         subtitle: "Feed".to_string(),
         body: notification.body.clone(),
+        agent_category: None,
+        agent_pending: false,
         feed_actions: notification.actions.clone(),
         reply,
     }
@@ -4951,6 +4966,7 @@ mod tests {
                     body,
                     feed_actions,
                     reply,
+                    ..
                 } => {
                     assert_eq!(target, WorkspaceTarget::Handle("workspace-a".to_string()));
                     assert_eq!(surface_hint.as_deref(), Some("7:tab-a"));
@@ -7463,22 +7479,44 @@ mod tests {
     #[test]
     fn notification_list_and_clear_routes_validate_params() {
         let created = dispatch_request(
-            r#"{"id":1,"method":"notification.create","params":{"title":"Done","surface_id":"2:tab-a"}}"#,
+            r#"{"id":1,"method":"notification.create","params":{"title":"Done","surface_id":"2:tab-a","agent_category":"turn-complete","agent_pending":true}}"#,
             &|command| match command {
                 ControlCommand::CreateNotification {
                     surface_hint,
                     title,
+                    agent_category,
+                    agent_pending,
                     reply,
                     ..
                 } => {
                     assert_eq!(surface_hint.as_deref(), Some("2:tab-a"));
                     assert_eq!(title, "Done");
+                    assert_eq!(agent_category.as_deref(), Some("turn-complete"));
+                    assert!(agent_pending);
                     let _ = reply.send(Ok(json!({ "notification_id": 1 })));
                 }
                 other => panic!("unexpected command: {other:?}"),
             },
         );
         assert_eq!(created.error, None);
+
+        let camel = dispatch_request(
+            r#"{"id":11,"method":"notification.create","params":{"title":"Waiting","agentCategory":"idle-reminder","agentPending":true}}"#,
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    agent_category,
+                    agent_pending,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(agent_category.as_deref(), Some("idle-reminder"));
+                    assert!(agent_pending);
+                    let _ = reply.send(Ok(json!({ "notification_id": 11 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(camel.error, None);
 
         let listed = dispatch_request(
             r#"{"id":1,"method":"notification.list","params":{"unread_only":true}}"#,

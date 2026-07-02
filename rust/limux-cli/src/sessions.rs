@@ -1518,6 +1518,7 @@ mod tests {
                 pid: Some(999_999),
                 is_restorable: None,
                 transcript_path: None,
+                had_pending_background_work_at_stop: None,
                 launch_command: Some(AgentLaunchCommandRecord {
                     executable: "codex".to_string(),
                     arguments: vec![
@@ -1931,6 +1932,7 @@ mod tests {
                 pid: None,
                 is_restorable: Some(true),
                 transcript_path: None,
+                had_pending_background_work_at_stop: None,
                 launch_command: Some(AgentLaunchCommandRecord {
                     executable: executable.clone(),
                     arguments: vec![executable],
@@ -1957,6 +1959,7 @@ mod tests {
                 pid: None,
                 is_restorable: seed.is_restorable,
                 transcript_path: seed.transcript_path,
+                had_pending_background_work_at_stop: None,
                 launch_command: Some(AgentLaunchCommandRecord {
                     executable: "claude".to_string(),
                     arguments: vec!["claude".to_string()],

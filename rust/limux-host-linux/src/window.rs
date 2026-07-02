@@ -10846,6 +10846,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             title,
             subtitle,
             body,
+            agent_category,
+            agent_pending,
             feed_actions,
             reply,
         } => {
@@ -10900,6 +10902,29 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 (false, false) => format!("{subtitle} — {body}"),
             };
             let message = workspace_notification_message(&title, &combined_body);
+            let parsed_agent_category = agent_category
+                .as_deref()
+                .and_then(app_config::AgentNotifyCategory::from_str);
+            if agent_category.is_some() && parsed_agent_category.is_none() {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "invalid agent notification category",
+                )));
+                return;
+            }
+            if !app_config::agent_notification_should_deliver(
+                parsed_agent_category,
+                agent_pending,
+                &notification_config,
+            ) {
+                let category = parsed_agent_category.map(agent_notify_category_str);
+                let _ = reply.send(Ok(serde_json::json!({
+                    "notification_id": serde_json::Value::Null,
+                    "delivered": false,
+                    "agent_category": category,
+                    "agent_pending": agent_pending,
+                })));
+                return;
+            }
             let desktop_target = DesktopNotificationTarget {
                 workspace_id: ws_id.clone(),
                 pane_id: surface.as_ref().map(|surface| surface.pane_id),
@@ -12459,6 +12484,18 @@ fn find_leaf_pane(widget: &gtk::Widget, axis: gtk::Orientation, prefer_start: bo
     } else {
         // Leaf pane — this is a pane gtk::Box
         widget.clone()
+    }
+}
+
+// purpose: Serialize agent notification category for API responses.
+// inputs: Parsed category from notification request params.
+// returns/effects: Returns CMUX category spelling.
+fn agent_notify_category_str(category: app_config::AgentNotifyCategory) -> &'static str {
+    match category {
+        app_config::AgentNotifyCategory::TurnComplete => "turn-complete",
+        app_config::AgentNotifyCategory::NeedsPermission => "needs-permission",
+        app_config::AgentNotifyCategory::IdleReminder => "idle-reminder",
+        app_config::AgentNotifyCategory::Other => "other",
     }
 }
 

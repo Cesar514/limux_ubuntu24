@@ -170,6 +170,8 @@ pub(crate) struct AgentHookSessionRecord {
     pub(crate) is_restorable: Option<bool>,
     #[serde(default, alias = "transcriptPath")]
     pub(crate) transcript_path: Option<String>,
+    #[serde(default, alias = "hadPendingBackgroundWorkAtStop")]
+    pub(crate) had_pending_background_work_at_stop: Option<bool>,
     #[serde(default, alias = "launchCommand")]
     pub(crate) launch_command: Option<AgentLaunchCommandRecord>,
     #[serde(alias = "updatedAt")]
@@ -934,6 +936,7 @@ mod tests {
             pid: Some(1234),
             is_restorable: None,
             transcript_path: None,
+            had_pending_background_work_at_stop: None,
             launch_command: Some(AgentLaunchCommandRecord {
                 executable: "codex".to_string(),
                 arguments: vec![
