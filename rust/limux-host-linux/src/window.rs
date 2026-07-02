@@ -4542,6 +4542,11 @@ fn custom_sidebar_dispatcher_action(
             ensure_custom_sidebar_no_params(action)?;
             Ok(Some(CustomSidebarDispatcherAction::WorkspaceMarkAllRead))
         }
+        "workspace.copyBranch" | "workspace.copy-branch" | "copy-workspace-branch" => {
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceCopyBranch(
+                custom_sidebar_action_workspace_id(action)?,
+            )))
+        }
         "tab.togglePin" | "tab.toggle-pin" | "toggle-tab-pin" => Ok(Some(
             CustomSidebarDispatcherAction::TabTogglePin(custom_sidebar_action_tab_id(action)?),
         )),
@@ -4846,6 +4851,7 @@ enum CustomSidebarDispatcherAction {
     WorkspaceTogglePin(String),
     WorkspaceMarkRead(String),
     WorkspaceMarkAllRead,
+    WorkspaceCopyBranch(String),
     TabTogglePin(String),
     WorkspaceReorder {
         workspace_id: String,
@@ -4907,6 +4913,7 @@ impl CustomSidebarDispatcherAction {
             CustomSidebarDispatcherAction::WorkspaceTogglePin(_) => "workspace.togglePin",
             CustomSidebarDispatcherAction::WorkspaceMarkRead(_) => "workspace.markRead",
             CustomSidebarDispatcherAction::WorkspaceMarkAllRead => "workspace.markAllRead",
+            CustomSidebarDispatcherAction::WorkspaceCopyBranch(_) => "workspace.copyBranch",
             CustomSidebarDispatcherAction::TabTogglePin(_) => "tab.togglePin",
             CustomSidebarDispatcherAction::WorkspaceReorder { .. } => "workspace.reorder",
         }
@@ -4974,6 +4981,9 @@ fn apply_custom_sidebar_dispatcher_action(
         }
         CustomSidebarDispatcherAction::WorkspaceMarkAllRead => {
             Ok(mark_all_host_notifications_read(state))
+        }
+        CustomSidebarDispatcherAction::WorkspaceCopyBranch(workspace_id) => {
+            copy_workspace_branch_for_custom_sidebar(state, &workspace_id)
         }
         CustomSidebarDispatcherAction::TabTogglePin(tab_id) => {
             toggle_tab_pin_for_custom_sidebar(state, &tab_id)
@@ -5400,6 +5410,57 @@ fn mark_workspace_read_for_custom_sidebar(
 ) -> Result<serde_json::Value, BridgeError> {
     let resolved_id = resolve_workspace_id_for_custom_sidebar(state, workspace_id)?;
     mark_workspace_notifications_read(state, &WorkspaceTarget::Handle(resolved_id))
+}
+
+/// purpose: Copy a workspace git branch from a CMUX JSON custom-sidebar action.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Writes the resolved branch to GTK clipboards or returns a loud error.
+fn copy_workspace_branch_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    let (resolved_id, branch) = workspace_branch_for_custom_sidebar(state, workspace_id)?;
+    let Some(display) = gtk::gdk::Display::default() else {
+        return Err(BridgeError::internal(
+            "workspace.copyBranch failed: no GTK display is available",
+        ));
+    };
+    display.clipboard().set_text(&branch);
+    display.primary_clipboard().set_text(&branch);
+    Ok(serde_json::json!({
+        "workspace_id": resolved_id,
+        "workspace_ref": workspace_ref(&resolved_id),
+        "branch": branch,
+        "copied": true,
+    }))
+}
+
+/// purpose: Resolve a workspace git branch for custom-sidebar clipboard actions.
+/// inputs: Live host state and CMUX workspace id/ref/name/index parameter.
+/// returns/effects: Returns canonical workspace id and branch, or a loud no-branch error.
+fn workspace_branch_for_custom_sidebar(
+    state: &State,
+    workspace_id: &str,
+) -> Result<(String, String), BridgeError> {
+    let resolved_id = resolve_workspace_id_for_custom_sidebar(state, workspace_id)?;
+    let branch = {
+        let app_state = state.borrow();
+        let Some(workspace) = app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == resolved_id)
+        else {
+            return Err(BridgeError::not_found("workspace not found"));
+        };
+        let path = right_sidebar_workspace_path(workspace);
+        sidebar_git_branch(path.as_deref())
+    };
+    if branch == "none" || branch.trim().is_empty() {
+        return Err(BridgeError::invalid_params(
+            "workspace.copyBranch requires a workspace on a named git branch",
+        ));
+    }
+    Ok((resolved_id, branch))
 }
 
 /// purpose: Resolve custom-sidebar workspace arguments with the same semantics as selection.
@@ -19027,6 +19088,13 @@ mod tests {
             message: None,
             params: workspace_param_alias,
         };
+        let mut workspace_copy_branch_params = serde_json::Map::new();
+        workspace_copy_branch_params.insert("workspace_id".to_string(), json!("workspace:build"));
+        let workspace_copy_branch = CustomSidebarNodeAction {
+            action_type: "workspace.copyBranch".to_string(),
+            message: None,
+            params: workspace_copy_branch_params,
+        };
         let mut window_params = serde_json::Map::new();
         window_params.insert("window_id".to_string(), json!("window:1"));
         let window_focus = CustomSidebarNodeAction {
@@ -19369,6 +19437,21 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&no_param_action("workspace.markAllRead")),
             "cmux dispatcher: workspace.markAllRead"
+        );
+        assert_eq!(
+            custom_sidebar_dispatcher_action(&workspace_copy_branch),
+            Ok(Some(CustomSidebarDispatcherAction::WorkspaceCopyBranch(
+                "workspace:build".to_string()
+            )))
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&workspace_copy_branch),
+            "cmux dispatcher: workspace.copyBranch"
+        );
+        assert!(
+            custom_sidebar_dispatcher_action(&no_param_action("workspace.copyBranch"))
+                .expect_err("missing copy-branch workspace id is invalid")
+                .contains("workspace_id")
         );
         assert_eq!(
             custom_sidebar_action_tooltip(&open_url_dot),
