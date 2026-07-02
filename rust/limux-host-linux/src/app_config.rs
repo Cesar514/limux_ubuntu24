@@ -386,6 +386,8 @@ pub struct NotificationConfig {
     pub pane_flash: bool,
     pub sound: NotificationSound,
     pub custom_sound_file_path: String,
+    pub command: String,
+    pub hooks_mode: NotificationHooksMode,
     pub hooks: Vec<NotificationHookConfig>,
     pub agent_permission_prompt: bool,
     pub agent_turn_complete: AgentTurnCompleteMode,
@@ -399,6 +401,30 @@ pub struct NotificationHookConfig {
     pub command: String,
     pub enabled: bool,
     pub timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NotificationHooksMode {
+    #[default]
+    Append,
+    Replace,
+}
+
+impl NotificationHooksMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Replace => "replace",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "append" => Some(Self::Append),
+            "replace" => Some(Self::Replace),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -458,6 +484,8 @@ impl Default for NotificationConfig {
             pane_flash: true,
             sound: NotificationSound::Default,
             custom_sound_file_path: String::new(),
+            command: String::new(),
+            hooks_mode: NotificationHooksMode::Append,
             hooks: Vec::new(),
             agent_permission_prompt: true,
             agent_turn_complete: AgentTurnCompleteMode::WhenIdle,
@@ -606,6 +634,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("customSoundFilePath"))
         .map(|value| parse_string_setting(value, "notifications.customSoundFilePath"))
         .unwrap_or_default();
+    let notification_command = notifications
+        .and_then(|notifications| notifications.get("command"))
+        .map(|value| parse_string_setting(value, "notifications.command"))
+        .unwrap_or_default();
+    let hooks_mode = notifications
+        .and_then(|notifications| notifications.get("hooksMode"))
+        .map(|value| parse_notification_hooks_mode(value, "notifications.hooksMode"))
+        .unwrap_or_default();
     let notification_hooks = notifications
         .and_then(|notifications| notifications.get("hooks"))
         .map(parse_notification_hooks)
@@ -661,6 +697,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             pane_flash,
             sound: notification_sound,
             custom_sound_file_path,
+            command: notification_command,
+            hooks_mode,
             hooks: notification_hooks,
             agent_permission_prompt,
             agent_turn_complete,
@@ -726,6 +764,17 @@ fn parse_agent_turn_complete_mode(value: &Value, path: &str) -> AgentTurnComplet
         .unwrap_or_else(|| panic!("{path} must be a string"));
     AgentTurnCompleteMode::from_str(raw)
         .unwrap_or_else(|| panic!("{path} must be one of whenIdle, always, or never"))
+}
+
+// purpose: Parse CMUX notification hook inheritance mode.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns mode or panics for malformed existing config.
+fn parse_notification_hooks_mode(value: &Value, path: &str) -> NotificationHooksMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    NotificationHooksMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be one of append or replace"))
 }
 
 // purpose: Decide whether an agent-tagged notification should deliver.
@@ -1049,6 +1098,8 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "paneFlash": config.notifications.pane_flash,
             "sound": config.notifications.sound.as_str(),
             "customSoundFilePath": config.notifications.custom_sound_file_path.clone(),
+            "command": config.notifications.command.clone(),
+            "hooksMode": config.notifications.hooks_mode.as_str(),
             "agentPermissionPrompt": config.notifications.agent_permission_prompt,
             "agentTurnComplete": config.notifications.agent_turn_complete.as_str(),
             "agentIdleReminder": config.notifications.agent_idle_reminder,
@@ -1160,6 +1211,8 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "unreadPaneRing": true,
             "paneFlash": true,
             "sound": "default",
+            "command": "",
+            "hooksMode": "append",
             "suppressOnlyFocusedSurface": false
         }
     });
@@ -1242,6 +1295,14 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("default".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["command"],
+            Value::String(String::new())
+        );
+        assert_eq!(
+            parsed["notifications"]["hooksMode"],
+            Value::String("append".to_string())
         );
         assert_eq!(
             parsed["notifications"]["suppressOnlyFocusedSurface"],
@@ -1539,6 +1600,8 @@ mod tests {
     "paneFlash": false,
     "sound": "bell",
     "customSoundFilePath": "/tmp/notify.wav",
+    "command": "printf done",
+    "hooksMode": "replace",
     "agentPermissionPrompt": false,
     "agentTurnComplete": "always",
     "agentIdleReminder": false,
@@ -1561,6 +1624,11 @@ mod tests {
         assert_eq!(
             loaded.config.notifications.custom_sound_file_path,
             "/tmp/notify.wav"
+        );
+        assert_eq!(loaded.config.notifications.command, "printf done");
+        assert_eq!(
+            loaded.config.notifications.hooks_mode,
+            NotificationHooksMode::Replace
         );
         assert!(!loaded.config.notifications.agent_permission_prompt);
         assert_eq!(
@@ -1630,6 +1698,17 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"notifications":{"unreadPaneRing":"true"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "notifications.hooksMode must be one of append or replace")]
+    fn load_from_path_rejects_invalid_notification_hooks_mode() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"notifications":{"hooksMode":"merge"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2005,6 +2084,8 @@ mod tests {
         config.notifications.pane_flash = false;
         config.notifications.sound = NotificationSound::Alert;
         config.notifications.custom_sound_file_path = "/tmp/notify.wav".to_string();
+        config.notifications.command = "printf done".to_string();
+        config.notifications.hooks_mode = NotificationHooksMode::Replace;
         config.notifications.agent_permission_prompt = false;
         config.notifications.agent_turn_complete = AgentTurnCompleteMode::Never;
         config.notifications.agent_idle_reminder = false;
@@ -2028,6 +2109,14 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["customSoundFilePath"],
             Value::String("/tmp/notify.wav".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["command"],
+            Value::String("printf done".to_string())
+        );
+        assert_eq!(
+            parsed["notifications"]["hooksMode"],
+            Value::String("replace".to_string())
         );
         assert_eq!(
             parsed["notifications"]["agentPermissionPrompt"],

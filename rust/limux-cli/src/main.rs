@@ -1459,6 +1459,7 @@ const SURFACE_TAB_BAR_FONT_SIZE: FontSizeSetting = FontSizeSetting {
 enum NotificationSettingKind {
     Bool { default: bool },
     TurnComplete,
+    HooksMode,
     Sound,
     String { default: &'static str },
 }
@@ -1534,6 +1535,18 @@ const NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING: NotificationSetting = Notific
     kind: NotificationSettingKind::String { default: "" },
 };
 
+const NOTIFICATION_COMMAND_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.command",
+    json_key: "command",
+    kind: NotificationSettingKind::String { default: "" },
+};
+
+const NOTIFICATION_HOOKS_MODE_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.hooksMode",
+    json_key: "hooksMode",
+    kind: NotificationSettingKind::HooksMode,
+};
+
 const AGENT_TURN_COMPLETE_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentTurnComplete",
     json_key: "agentTurnComplete",
@@ -1603,6 +1616,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "notifications.dockBadge|notifications.showInMenuBar|",
     "notifications.unreadPaneRing|notifications.paneFlash|",
     "notifications.sound|notifications.customSoundFilePath|",
+    "notifications.command|notifications.hooksMode|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
@@ -1615,6 +1629,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "notifications.dockBadge|notifications.showInMenuBar|",
     "notifications.unreadPaneRing|notifications.paneFlash|",
     "notifications.sound|notifications.customSoundFilePath|",
+    "notifications.command|notifications.hooksMode|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
     "app.workspaceInheritWorkingDirectory|",
@@ -1645,6 +1660,8 @@ fn notification_setting(raw: &str) -> Option<NotificationSetting> {
         "notifications.paneFlash" => Some(NOTIFICATION_PANE_FLASH_SETTING),
         "notifications.sound" => Some(NOTIFICATION_SOUND_SETTING),
         "notifications.customSoundFilePath" => Some(NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING),
+        "notifications.command" => Some(NOTIFICATION_COMMAND_SETTING),
+        "notifications.hooksMode" => Some(NOTIFICATION_HOOKS_MODE_SETTING),
         "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
         "notifications.agentTurnComplete" => Some(AGENT_TURN_COMPLETE_SETTING),
         "notifications.agentIdleReminder" => Some(AGENT_IDLE_REMINDER_SETTING),
@@ -2046,6 +2063,7 @@ fn default_notification_setting_value(setting: NotificationSetting) -> &'static 
         NotificationSettingKind::Bool { default: true } => "true",
         NotificationSettingKind::Bool { default: false } => "false",
         NotificationSettingKind::TurnComplete => "whenIdle",
+        NotificationSettingKind::HooksMode => "append",
         NotificationSettingKind::Sound => "default",
         NotificationSettingKind::String { default } => default,
     }
@@ -2065,6 +2083,12 @@ fn parse_notification_setting_value(setting: NotificationSetting, value: &Value)
                 .as_str()
                 .ok_or_else(|| anyhow!("{} must be whenIdle, always, or never", setting.key))?;
             parse_agent_turn_complete_value(raw, setting.key).map(str::to_string)
+        }
+        NotificationSettingKind::HooksMode => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be append or replace", setting.key))?;
+            parse_notification_hooks_mode_value(raw, setting.key).map(str::to_string)
         }
         NotificationSettingKind::Sound => {
             let raw = value
@@ -2092,6 +2116,9 @@ fn notification_setting_json_value(setting: NotificationSetting, raw: &str) -> R
         NotificationSettingKind::TurnComplete => Ok(Value::String(
             parse_agent_turn_complete_value(raw, setting.key)?.to_string(),
         )),
+        NotificationSettingKind::HooksMode => Ok(Value::String(
+            parse_notification_hooks_mode_value(raw, setting.key)?.to_string(),
+        )),
         NotificationSettingKind::Sound => Ok(Value::String(
             parse_notification_sound_value(raw, setting.key)?.to_string(),
         )),
@@ -2106,6 +2133,16 @@ fn parse_agent_turn_complete_value<'a>(raw: &'a str, key: &str) -> Result<&'a st
     match raw {
         "whenIdle" | "always" | "never" => Ok(raw),
         _ => bail!("{key} must be whenIdle, always, or never"),
+    }
+}
+
+// purpose: Validate CMUX notification hook inheritance mode values.
+// inputs: Raw setting value and key for error context.
+// returns/effects: Returns the canonical value or a loud config error.
+fn parse_notification_hooks_mode_value<'a>(raw: &'a str, key: &str) -> Result<&'a str> {
+    match raw {
+        "append" | "replace" => Ok(raw),
+        _ => bail!("{key} must be append or replace"),
     }
 }
 
@@ -15611,6 +15648,12 @@ mod cli_arg_tests {
         let text = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
             .expect("get default notification sound");
         assert!(text.contains("notifications.sound = default"));
+        let text = render_config_notification_get(&path, NOTIFICATION_COMMAND_SETTING)
+            .expect("get default notification command");
+        assert!(text.contains("notifications.command = "));
+        let text = render_config_notification_get(&path, NOTIFICATION_HOOKS_MODE_SETTING)
+            .expect("get default notification hooks mode");
+        assert!(text.contains("notifications.hooksMode = append"));
         let text = render_config_notification_get(&path, SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING)
             .expect("get default focused-surface suppression");
         assert!(text.contains("notifications.suppressOnlyFocusedSurface = false"));
@@ -15629,6 +15672,14 @@ mod cli_arg_tests {
         )
         .expect("set custom sound path");
         assert!(text.contains("notifications.customSoundFilePath = /tmp/notify.wav"));
+        let text =
+            render_config_notification_set(&path, NOTIFICATION_COMMAND_SETTING, "printf done")
+                .expect("set notification command");
+        assert!(text.contains("notifications.command = printf done"));
+        let text =
+            render_config_notification_set(&path, NOTIFICATION_HOOKS_MODE_SETTING, "replace")
+                .expect("set hooks mode");
+        assert!(text.contains("notifications.hooksMode = replace"));
         let text =
             render_config_notification_set(&path, SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING, "true")
                 .expect("set focused-surface suppression");
@@ -15650,6 +15701,8 @@ mod cli_arg_tests {
             parsed["notifications"]["customSoundFilePath"],
             "/tmp/notify.wav"
         );
+        assert_eq!(parsed["notifications"]["command"], "printf done");
+        assert_eq!(parsed["notifications"]["hooksMode"], "replace");
         assert_eq!(
             parsed["notifications"]["suppressOnlyFocusedSurface"],
             Value::Bool(true)
@@ -15680,6 +15733,10 @@ mod cli_arg_tests {
             .expect_err("invalid sound");
         assert!(err.to_string().contains("must be default"));
 
+        let err = render_config_notification_set(&path, NOTIFICATION_HOOKS_MODE_SETTING, "merge")
+            .expect_err("invalid hooks mode");
+        assert!(err.to_string().contains("must be append or replace"));
+
         fs::write(&path, br#"{"notifications":{"agentIdleReminder":"true"}}"#)
             .expect("write malformed settings");
         let err = render_config_notification_get(&path, AGENT_IDLE_REMINDER_SETTING)
@@ -15690,6 +15747,12 @@ mod cli_arg_tests {
         let err = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
             .expect_err("invalid existing sound");
         assert!(err.to_string().contains("must be a string"));
+
+        fs::write(&path, br#"{"notifications":{"hooksMode":"merge"}}"#)
+            .expect("write malformed hooks mode");
+        let err = render_config_notification_get(&path, NOTIFICATION_HOOKS_MODE_SETTING)
+            .expect_err("invalid existing hooks mode");
+        assert!(err.to_string().contains("must be append or replace"));
     }
 
     #[test]

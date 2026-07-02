@@ -2633,6 +2633,7 @@ struct NotificationPolicyEffects {
     mark_unread: bool,
     desktop: bool,
     sound: bool,
+    command: bool,
     pane_flash: bool,
 }
 
@@ -2655,6 +2656,7 @@ impl Default for NotificationPolicyEffects {
             mark_unread: true,
             desktop: true,
             sound: true,
+            command: true,
             pane_flash: true,
         }
     }
@@ -11275,6 +11277,17 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     },
                 );
             }
+            if effects.command {
+                if let Err(error) = spawn_notification_command(
+                    &notification_config.command,
+                    &title,
+                    &subtitle,
+                    &body,
+                ) {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            }
 
             let notification = effects.record.then(|| {
                 push_host_notification(
@@ -11301,6 +11314,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     "markUnread": effects.mark_unread,
                     "desktop": effects.desktop,
                     "sound": effects.sound,
+                    "command": effects.command,
                 },
             });
             let _ = reply.send(Ok(payload));
@@ -12912,7 +12926,7 @@ fn notification_hook_policy_payload(
             "reorderWorkspace": true,
             "desktop": effects.desktop,
             "sound": effects.sound,
-            "command": true,
+            "command": effects.command,
             "paneFlash": effects.pane_flash,
         }
     })
@@ -12947,6 +12961,10 @@ fn notification_policy_effects_from_value(
             .get("sound")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(previous.sound),
+        command: effects
+            .get("command")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.command),
         pane_flash: effects
             .get("paneFlash")
             .or_else(|| effects.get("pane_flash"))
@@ -13051,6 +13069,57 @@ fn notification_policy_effects(
         effects = notification_policy_effects_from_value(effects, &output)?;
     }
     Ok(effects)
+}
+
+// purpose: Build CMUX-compatible environment variables for a notification command.
+// inputs: Notification title, subtitle, and body strings.
+// returns/effects: Returns env pairs without mutating process state.
+fn notification_command_env(
+    title: &str,
+    subtitle: &str,
+    body: &str,
+) -> [(&'static str, String); 6] {
+    [
+        ("CMUX_NOTIFICATION_TITLE", title.to_string()),
+        ("CMUX_NOTIFICATION_SUBTITLE", subtitle.to_string()),
+        ("CMUX_NOTIFICATION_BODY", body.to_string()),
+        ("LIMUX_NOTIFICATION_TITLE", title.to_string()),
+        ("LIMUX_NOTIFICATION_SUBTITLE", subtitle.to_string()),
+        ("LIMUX_NOTIFICATION_BODY", body.to_string()),
+    ]
+}
+
+// purpose: Run the configured CMUX notification command without blocking the GTK loop.
+// inputs: Shell command and notification fields.
+// returns/effects: Spawns the command or returns a bridge error before reporting success.
+fn spawn_notification_command(
+    command: &str,
+    title: &str,
+    subtitle: &str,
+    body: &str,
+) -> Result<(), BridgeError> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let env = notification_command_env(title, subtitle, body);
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(trimmed)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| {
+            BridgeError::internal(format!("notification command failed to start: {err}"))
+        })?;
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("notification command exited with status {status}"),
+        Err(err) => eprintln!("notification command wait failed: {err}"),
+    });
+    Ok(())
 }
 
 /// purpose: Render one live-host notification in the public control API shape.
@@ -13656,25 +13725,25 @@ mod tests {
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
-        limit_text_to_last_lines, next_active_workspace_index, notification_hook_policy_payload,
-        notification_policy_effects_from_value, pane_create_split_placement,
-        pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
-        publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
-        publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
-        queue_session_save_request, resolve_pane_create_source_id,
-        resolve_workspace_creation_directory, resolved_system_prefers_dark,
-        right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
-        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
-        shortcut_blocked_by_editable, shortcut_command_from_key_event,
-        shortcut_dispatch_propagation, should_emit_desktop_notification,
-        should_keep_workspace_open_after_empty_pane, should_show_unread_visual,
-        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
-        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
-        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
-        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
-        tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_group_insert_index,
+        limit_text_to_last_lines, next_active_workspace_index, notification_command_env,
+        notification_hook_policy_payload, notification_policy_effects_from_value,
+        pane_create_split_placement, pending_exit_plan_request_id, pending_permission_request_id,
+        pending_question_request_id, publish_browser_event, publish_surface_input_sent_event,
+        publish_surface_key_sent_event, publish_surface_lifecycle_event,
+        publish_workspace_lifecycle_event, queue_session_save_request,
+        resolve_pane_create_source_id, resolve_workspace_creation_directory,
+        resolved_system_prefers_dark, right_sidebar_mode_description, right_sidebar_mode_title,
+        run_notification_hook_command, sanitize_background_opacity,
+        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
+        shortcut_command_from_key_event, shortcut_dispatch_propagation,
+        should_emit_desktop_notification, should_keep_workspace_open_after_empty_pane,
+        should_show_unread_visual, sidebar_feed_preview_lines_from_value,
+        sidebar_feed_visible_items, sidebar_file_preview_lines,
+        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
+        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
+        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
@@ -15067,6 +15136,7 @@ mod tests {
                 mark_unread: true,
                 desktop: false,
                 sound: true,
+                command: false,
                 pane_flash: false,
             },
         );
@@ -15082,6 +15152,7 @@ mod tests {
         assert_eq!(payload["effects"]["markUnread"], true);
         assert_eq!(payload["effects"]["desktop"], false);
         assert_eq!(payload["effects"]["sound"], true);
+        assert_eq!(payload["effects"]["command"], false);
         assert_eq!(payload["effects"]["paneFlash"], false);
     }
 
@@ -15092,6 +15163,7 @@ mod tests {
             mark_unread: true,
             desktop: true,
             sound: true,
+            command: true,
             pane_flash: true,
         };
 
@@ -15102,6 +15174,7 @@ mod tests {
                     "record": false,
                     "markUnread": false,
                     "sound": false,
+                    "command": false,
                     "paneFlash": false
                 }
             }),
@@ -15115,9 +15188,22 @@ mod tests {
                 mark_unread: false,
                 desktop: true,
                 sound: false,
+                command: false,
                 pane_flash: false,
             }
         );
+    }
+
+    #[test]
+    fn notification_command_env_uses_cmux_and_limux_names() {
+        let env = notification_command_env("Title", "Sub", "Body");
+
+        assert!(env.contains(&("CMUX_NOTIFICATION_TITLE", "Title".to_string())));
+        assert!(env.contains(&("CMUX_NOTIFICATION_SUBTITLE", "Sub".to_string())));
+        assert!(env.contains(&("CMUX_NOTIFICATION_BODY", "Body".to_string())));
+        assert!(env.contains(&("LIMUX_NOTIFICATION_TITLE", "Title".to_string())));
+        assert!(env.contains(&("LIMUX_NOTIFICATION_SUBTITLE", "Sub".to_string())));
+        assert!(env.contains(&("LIMUX_NOTIFICATION_BODY", "Body".to_string())));
     }
 
     #[test]
