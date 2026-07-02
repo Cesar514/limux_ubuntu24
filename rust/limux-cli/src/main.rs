@@ -3250,8 +3250,10 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "docs" => Some(CommandOutput::Text(docs_text(
             args.first().map(String::as_str),
         )?)),
-        "settings" if args.first().map(String::as_str) == Some("open") => None,
-        "settings" => Some(run_settings_command(args)?),
+        "settings" if settings_command_is_local(args) => {
+            Some(run_settings_command(args, opts.json_output)?)
+        }
+        "settings" => None,
         "config" if args.first().map(String::as_str) == Some("reload") => None,
         "config" => Some(run_config_command(args, opts.json_output)?),
         "sidebar" if matches!(args.first().map(String::as_str), Some("select" | "open")) => None,
@@ -4035,16 +4037,47 @@ fn run_sessions_local_command(args: &[String], json_output: bool) -> Result<Comm
     }
 }
 
-/// purpose: Implement CMUX settings command probes that can run without the app.
-/// inputs: Settings subcommand arguments.
-/// returns/effects: Prints paths/docs or fails explicitly for host-only actions.
-fn run_settings_command(args: &[String]) -> Result<CommandOutput> {
-    let sub = args.first().map(String::as_str).unwrap_or("path");
+// purpose: Decide whether a CMUX settings command is a no-socket local probe.
+// inputs: Settings subcommand arguments after the top-level `settings` token.
+// returns/effects: Returns false for host-backed open and direct target aliases.
+fn settings_command_is_local(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--help" | "-h" | "path" | "paths" | "docs" | "documentation")
+    )
+}
+
+// purpose: Implement CMUX settings command probes that can run without the app.
+// inputs: Settings subcommand arguments and global JSON-output preference.
+// returns/effects: Prints paths/docs or fails explicitly for host-only actions.
+fn run_settings_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    let sub = args.first().map(String::as_str).unwrap_or("open");
     match sub {
-        "--help" | "-h" | "docs" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
-        "path" => Ok(CommandOutput::Text(
-            limux_settings_path()?.display().to_string(),
-        )),
+        "--help" | "-h" | "docs" | "documentation" => {
+            Ok(CommandOutput::Text(docs_text(Some("settings"))?))
+        }
+        "path" | "paths" => {
+            let config_dir = limux_config_dir()?;
+            let settings = limux_settings_path()?;
+            let shortcuts = limux_shortcuts_path()?;
+            if json_output {
+                return Ok(CommandOutput::Json(config_paths_json(
+                    &config_dir,
+                    &settings,
+                    &shortcuts,
+                )?));
+            }
+            if sub == "path" {
+                Ok(CommandOutput::Text(settings.display().to_string()))
+            } else {
+                Ok(CommandOutput::Text(format!(
+                    "config_dir: {}\nsettings: {}\nshortcuts: {}",
+                    config_dir.display(),
+                    settings.display(),
+                    shortcuts.display()
+                )))
+            }
+        }
         "open" => bail!("settings open requires a running Limux host"),
         target => bail!("unsupported settings target `{target}`; expected path, docs, or open"),
     }
@@ -4077,6 +4110,29 @@ fn settings_target_raw_value(raw: &str) -> Option<&'static str> {
         "reset" => Some("reset"),
         _ => None,
     }
+}
+
+// purpose: Build a CMUX `settings.open` request payload from open/direct-target CLI forms.
+// inputs: Settings arguments after the top-level `settings` token.
+// returns/effects: Returns validated RPC params or a loud usage/target error.
+fn build_settings_open_params(args: &[String]) -> Result<Map<String, Value>> {
+    let mut params = Map::new();
+    params.insert("activate".to_string(), json!(true));
+    let target = match args {
+        [] => None,
+        [sub] if sub == "open" => None,
+        [sub, raw_target] if sub == "open" => Some(raw_target.as_str()),
+        [raw_target] => Some(raw_target.as_str()),
+        [sub, ..] if sub == "open" => bail!("Usage: limux settings open [target]"),
+        _ => bail!("Usage: limux settings [open [target]|path|docs|<target>]"),
+    };
+    if let Some(raw_target) = target {
+        let target = settings_target_raw_value(raw_target).ok_or_else(|| {
+            anyhow!("Unknown settings target `{raw_target}`. Run `limux settings --help`.")
+        })?;
+        params.insert("target".to_string(), json!(target));
+    }
+    Ok(params)
 }
 
 // purpose: Build CMUX-shaped config path metadata for JSON path/paths output.
@@ -16446,18 +16502,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_memory_text(&payload, opts.id_format))
             }
         }
-        "settings" if args.first().map(String::as_str) == Some("open") => {
-            if args.len() > 2 {
-                bail!("Usage: limux settings open [target]");
-            }
-            let mut params = Map::new();
-            params.insert("activate".to_string(), json!(true));
-            if let Some(raw_target) = args.get(1) {
-                let target = settings_target_raw_value(raw_target).ok_or_else(|| {
-                    anyhow!("Unknown settings target `{raw_target}`. Run `limux settings --help`.")
-                })?;
-                params.insert("target".to_string(), json!(target));
-            }
+        "settings" => {
+            let params = build_settings_open_params(args)?;
             let payload = client.call("settings.open", Value::Object(params)).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -17929,15 +17975,35 @@ mod cli_arg_tests {
 
     #[test]
     fn settings_open_uses_socket_path() {
+        assert!(run_local_command(&default_opts(args(&["settings"])))
+            .expect("settings default local check")
+            .is_none());
         assert!(
             run_local_command(&default_opts(args(&["settings", "open"])))
                 .expect("settings open local check")
+                .is_none()
+        );
+        assert!(
+            run_local_command(&default_opts(args(&["settings", "workspace-colors"])))
+                .expect("settings direct target local check")
                 .is_none()
         );
         let path_output = run_local_command(&default_opts(args(&["settings", "path"])))
             .expect("settings path local check")
             .expect("settings path stays local");
         assert!(matches!(path_output, CommandOutput::Text(_)));
+        let mut paths_opts = default_opts(args(&["settings", "paths"]));
+        paths_opts.json_output = true;
+        let paths_output = run_local_command(&paths_opts)
+            .expect("settings paths json local check")
+            .expect("settings paths stays local");
+        let CommandOutput::Json(payload) = paths_output else {
+            panic!("settings paths --json should render JSON");
+        };
+        assert!(payload["settings"]
+            .as_str()
+            .expect("settings path")
+            .ends_with("limux/settings.json"));
         assert_eq!(settings_target_raw_value("general"), Some("app"));
         assert_eq!(
             settings_target_raw_value("shortcuts"),
@@ -17948,6 +18014,14 @@ mod cli_arg_tests {
             Some("settingsJSON")
         );
         assert_eq!(settings_target_raw_value("missing"), None);
+
+        let params =
+            build_settings_open_params(&args(&["workspace-colors"])).expect("direct target params");
+        assert_eq!(params["target"], "workspaceColors");
+        let params =
+            build_settings_open_params(&args(&["open", "reset"])).expect("open target params");
+        assert_eq!(params["target"], "reset");
+        assert!(build_settings_open_params(&args(&["open", "missing"])).is_err());
     }
 
     #[test]
