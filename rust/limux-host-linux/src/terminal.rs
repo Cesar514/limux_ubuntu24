@@ -186,6 +186,8 @@ pub struct TerminalHealth {
     pub rows: u16,
     pub width_px: u32,
     pub height_px: u32,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
 }
 
 impl TerminalHandle {
@@ -273,6 +275,8 @@ impl TerminalHandle {
                 rows: 0,
                 width_px: 0,
                 height_px: 0,
+                cell_width_px: 0,
+                cell_height_px: 0,
             };
         };
 
@@ -284,6 +288,8 @@ impl TerminalHandle {
             rows: size.rows,
             width_px: size.width_px,
             height_px: size.height_px,
+            cell_width_px: size.cell_width_px,
+            cell_height_px: size.cell_height_px,
         }
     }
 

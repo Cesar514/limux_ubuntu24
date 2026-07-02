@@ -2914,6 +2914,22 @@ fn insert_tmux_pane_row(context: &mut BTreeMap<String, String>, pane: &Value) {
             if focused { "1" } else { "0" }.to_string(),
         );
     }
+    if let Some(columns) = pane.get("columns").and_then(Value::as_u64) {
+        context.insert("pane_width".to_string(), columns.to_string());
+    }
+    if let Some(rows) = pane.get("rows").and_then(Value::as_u64) {
+        context.insert("pane_height".to_string(), rows.to_string());
+    }
+    for (key, context_key) in [
+        ("width_px", "pane_width_px"),
+        ("height_px", "pane_height_px"),
+        ("cell_width_px", "pane_cell_width_px"),
+        ("cell_height_px", "pane_cell_height_px"),
+    ] {
+        if let Some(value) = pane.get(key).and_then(Value::as_u64) {
+            context.insert(context_key.to_string(), value.to_string());
+        }
+    }
 }
 
 // purpose: Add selected rows from a host list route to a tmux context.
@@ -13584,8 +13600,16 @@ mod cli_arg_tests {
     #[test]
     fn tmux_list_rows_render_format_strings() {
         let windows = vec![json!({"id": "workspace:alpha", "index": 2, "title": "Build"})];
-        let panes =
-            vec![json!({"id": "pane:one", "index": 1, "focused": true, "surface_count": 3})];
+        let panes = vec![json!({
+            "id": "pane:one",
+            "index": 1,
+            "focused": true,
+            "surface_count": 3,
+            "columns": 132,
+            "rows": 41,
+            "cell_width_px": 9,
+            "cell_height_px": 18,
+        })];
 
         assert_eq!(
             render_tmux_rows(
@@ -13602,6 +13626,14 @@ mod cli_arg_tests {
                 add_tmux_pane_row_context,
             ),
             "1:1:3"
+        );
+        assert_eq!(
+            render_tmux_rows(
+                &panes,
+                Some("#{pane_width}x#{pane_height}:#{pane_cell_width_px}x#{pane_cell_height_px}"),
+                add_tmux_pane_row_context,
+            ),
+            "132x41:9x18"
         );
     }
 

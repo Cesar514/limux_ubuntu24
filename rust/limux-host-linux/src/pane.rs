@@ -2172,6 +2172,7 @@ pub struct PaneSummary {
     pub pane_id: u32,
     pub surface_count: usize,
     pub active_surface_id: Option<String>,
+    pub active_terminal_health: Option<terminal::TerminalHealth>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2248,10 +2249,19 @@ pub fn pane_summaries_for_root(root: &gtk::Widget) -> Vec<PaneSummary> {
                         .first()
                         .map(|entry| composite_surface_id(pane_id, &entry.id))
                 });
+            let active_terminal_health = tab_state
+                .active_tab
+                .as_deref()
+                .and_then(|active_tab| tab_state.tabs.iter().find(|entry| entry.id == active_tab))
+                .and_then(|entry| match &entry.kind {
+                    TabKind::Terminal { state } => Some(state.handle.health()),
+                    TabKind::Browser { .. } | TabKind::Keybinds => None,
+                });
             PaneSummary {
                 pane_id,
                 surface_count: tab_state.tabs.len(),
                 active_surface_id,
+                active_terminal_health,
             }
         })
         .collect()

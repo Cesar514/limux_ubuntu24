@@ -2143,6 +2143,20 @@ fn pane_list_payload(state: &State, workspace: &Workspace) -> serde_json::Value 
             let focused = focused_pane_id == Some(pane.pane_id);
             row.insert("focused".to_string(), serde_json::Value::Bool(focused));
             row.insert("selected".to_string(), serde_json::Value::Bool(focused));
+            if let Some(health) = pane.active_terminal_health {
+                row.insert("columns".to_string(), serde_json::json!(health.columns));
+                row.insert("rows".to_string(), serde_json::json!(health.rows));
+                row.insert("width_px".to_string(), serde_json::json!(health.width_px));
+                row.insert("height_px".to_string(), serde_json::json!(health.height_px));
+                row.insert(
+                    "cell_width_px".to_string(),
+                    serde_json::json!(health.cell_width_px),
+                );
+                row.insert(
+                    "cell_height_px".to_string(),
+                    serde_json::json!(health.cell_height_px),
+                );
+            }
             if let Some(surface_id) = pane.active_surface_id {
                 row.insert(
                     "surface_id".to_string(),
@@ -2329,6 +2343,14 @@ fn surface_health_row(
             row.insert("rows".to_string(), serde_json::json!(health.rows));
             row.insert("width_px".to_string(), serde_json::json!(health.width_px));
             row.insert("height_px".to_string(), serde_json::json!(health.height_px));
+            row.insert(
+                "cell_width_px".to_string(),
+                serde_json::json!(health.cell_width_px),
+            );
+            row.insert(
+                "cell_height_px".to_string(),
+                serde_json::json!(health.cell_height_px),
+            );
         } else {
             row.insert("healthy".to_string(), serde_json::Value::Bool(false));
             row.insert("realized".to_string(), serde_json::Value::Bool(false));

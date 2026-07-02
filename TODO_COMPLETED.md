@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T11:40:29Z Implement and verify CMUX/tmux pane geometry exposure foundation: Ghostty terminal health now carries cell pixel dimensions, host `pane.list` and `surface-health` expose active terminal rows/columns/pixel/cell metrics, and CLI tmux format rendering consumes real `pane_width`, `pane_height`, and cell-size fields when present. \
 [x] 2026-07-02T11:35:44Z Implement and verify CMUX/tmux `split-window -P -F` print-format parity in `limux-cli`: formatted split output now renders pane, surface, and workspace fields from the created split payload, falls back to the new pane handle, and `--format` no longer leaks into command text. \
 [x] 2026-07-02T11:31:24Z Implement and verify CMUX/tmux split sizing request parity: `split-window -l <cells>` now serializes a bounded `initial_divider_position`, `surface.split` preserves that divider request, and the live host applies it as the initial split ratio while exact terminal-cell geometry remains tracked separately. \
 [x] 2026-07-02T11:24:17Z Implement and verify CMUX/tmux detached split focus parity: `split-window -d` serializes `focus:false`, `surface.split` preserves detached focus requests, and host terminal launch activation honors the requested focus setting. \
