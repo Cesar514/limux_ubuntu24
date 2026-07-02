@@ -641,6 +641,9 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         return Ok(None);
     };
     let args = &opts.command_args[1..];
+    if let Some(text) = command_help_probe_text(command, args) {
+        return Ok(Some(CommandOutput::Text(text.to_string())));
+    }
     let out = match command {
         "docs" => Some(CommandOutput::Text(docs_text(
             args.first().map(String::as_str),
@@ -663,6 +666,182 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     };
     Ok(out)
 }
+
+// purpose: Return CMUX-compatible no-socket help text for command probes.
+// inputs: Command name and its arguments.
+// returns/effects: Returns usage text only when the first command arg is --help or -h.
+fn command_help_probe_text(command: &str, args: &[String]) -> Option<&'static str> {
+    if !matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
+        return None;
+    }
+    cmux_command_usage(command)
+}
+
+// purpose: Map CMUX-compatible command names to stable usage text.
+// inputs: Top-level command name.
+// returns/effects: Returns no-socket help text for known CMUX probes.
+fn cmux_command_usage(command: &str) -> Option<&'static str> {
+    CMUX_HELP_USAGES
+        .iter()
+        .find_map(|(name, usage)| (*name == command).then_some(*usage))
+}
+
+const CMUX_HELP_USAGES: &[(&str, &str)] = &[
+    ("restore-session", "Usage: limux restore-session"),
+    ("open", "Usage: limux open <path-or-url>..."),
+    ("feedback", "Usage: limux feedback"),
+    ("feed", "Usage: limux feed tui [--opentui|--legacy]"),
+    (
+        "hooks",
+        "Usage: limux hooks setup [agent] [--agent <name>] [--yes|-y]",
+    ),
+    (
+        "codex",
+        "Usage: limux codex <install-hooks|uninstall-hooks>",
+    ),
+    ("themes", "Usage: limux themes"),
+    ("omo", "Usage: limux omo [opencode-args...]"),
+    ("omx", "Usage: limux omx [omx-args...]"),
+    ("omc", "Usage: limux omc [omc-args...]"),
+    ("identify", "Usage: limux identify"),
+    ("list-windows", "Usage: limux list-windows"),
+    ("current-window", "Usage: limux current-window"),
+    ("new-window", "Usage: limux new-window"),
+    (
+        "focus-window",
+        "Usage: limux focus-window --window <id|ref|index>",
+    ),
+    (
+        "close-window",
+        "Usage: limux close-window --window <id|ref|index>",
+    ),
+    (
+        "move-workspace-to-window",
+        "Usage: limux move-workspace-to-window",
+    ),
+    ("move-surface", "Usage: limux move-surface"),
+    ("split-off", "Usage: limux split-off"),
+    ("reorder-surface", "Usage: limux reorder-surface"),
+    ("reorder-workspace", "Usage: limux reorder-workspace"),
+    ("reorder-workspaces", "Usage: limux reorder-workspaces"),
+    (
+        "workspace-action",
+        "Usage: limux workspace-action --action <name>",
+    ),
+    (
+        "move-tab-to-new-workspace",
+        "Usage: limux move-tab-to-new-workspace",
+    ),
+    ("tab-action", "Usage: limux tab-action --action <name>"),
+    ("rename-tab", "Usage: limux rename-tab"),
+    ("new-workspace", "Usage: limux new-workspace"),
+    ("list-workspaces", "Usage: limux list-workspaces"),
+    ("ssh", "Usage: limux ssh <destination>\n--forward-agent"),
+    ("ssh-session-list", "Usage: limux ssh-session-list"),
+    (
+        "ssh-session-attach",
+        "Usage: limux ssh-session-attach --session-id <id>",
+    ),
+    ("ssh-session-cleanup", "Usage: limux ssh-session-cleanup"),
+    ("new-split", "Usage: limux new-split"),
+    ("list-panes", "Usage: limux list-panes"),
+    ("list-pane-surfaces", "Usage: limux list-pane-surfaces"),
+    ("tree", "Usage: limux tree"),
+    ("top", "Usage: limux top"),
+    ("focus-pane", "Usage: limux focus-pane"),
+    ("new-pane", "Usage: limux new-pane"),
+    ("new-surface", "Usage: limux new-surface"),
+    ("close-surface", "Usage: limux close-surface"),
+    (
+        "drag-surface-to-split",
+        "Usage: limux drag-surface-to-split",
+    ),
+    ("refresh-surfaces", "Usage: limux refresh-surfaces"),
+    ("reload-config", "Usage: limux reload-config"),
+    ("surface-health", "Usage: limux surface-health"),
+    ("debug-terminals", "Usage: limux debug-terminals"),
+    ("trigger-flash", "Usage: limux trigger-flash"),
+    ("list-panels", "Usage: limux list-panels"),
+    ("focus-panel", "Usage: limux focus-panel"),
+    ("close-workspace", "Usage: limux close-workspace"),
+    ("select-workspace", "Usage: limux select-workspace"),
+    ("rename-workspace", "Usage: limux rename-workspace"),
+    ("rename-window", "Usage: limux rename-workspace"),
+    ("current-workspace", "Usage: limux current-workspace"),
+    ("capture-pane", "Usage: limux capture-pane"),
+    ("resize-pane", "Usage: limux resize-pane"),
+    ("pipe-pane", "Usage: limux pipe-pane"),
+    ("wait-for", "Usage: limux wait-for"),
+    ("swap-pane", "Usage: limux swap-pane"),
+    ("break-pane", "Usage: limux break-pane"),
+    ("join-pane", "Usage: limux join-pane"),
+    ("next-window", "Usage: limux next-window"),
+    ("previous-window", "Usage: limux previous-window"),
+    ("last-window", "Usage: limux last-window"),
+    ("last-pane", "Usage: limux last-pane"),
+    ("find-window", "Usage: limux find-window"),
+    ("clear-history", "Usage: limux clear-history"),
+    ("set-hook", "Usage: limux set-hook"),
+    ("popup", "Usage: limux popup"),
+    ("bind-key", "Usage: limux bind-key"),
+    ("unbind-key", "Usage: limux unbind-key"),
+    ("copy-mode", "Usage: limux copy-mode"),
+    ("set-buffer", "Usage: limux set-buffer"),
+    ("paste-buffer", "Usage: limux paste-buffer"),
+    ("list-buffers", "Usage: limux list-buffers"),
+    ("respawn-pane", "Usage: limux respawn-pane"),
+    ("display-message", "Usage: limux display-message"),
+    ("read-screen", "Usage: limux read-screen"),
+    ("send", "Usage: limux send"),
+    ("send-key", "Usage: limux send-key"),
+    ("send-panel", "Usage: limux send-panel"),
+    ("send-key-panel", "Usage: limux send-key-panel"),
+    ("notify", "Usage: limux notify"),
+    ("list-notifications", "Usage: limux list-notifications"),
+    ("dismiss-notification", "Usage: limux dismiss-notification"),
+    (
+        "mark-notification-read",
+        "Usage: limux mark-notification-read",
+    ),
+    ("open-notification", "Usage: limux open-notification"),
+    ("jump-to-unread", "Usage: limux jump-to-unread"),
+    ("clear-notifications", "Usage: limux clear-notifications"),
+    (
+        "right-sidebar",
+        "Usage: limux right-sidebar <command> [flags]",
+    ),
+    ("set-status", "Usage: limux set-status"),
+    ("clear-status", "Usage: limux clear-status"),
+    ("list-status", "Usage: limux list-status"),
+    ("set-progress", "Usage: limux set-progress"),
+    ("clear-progress", "Usage: limux clear-progress"),
+    ("log", "Usage: limux log"),
+    ("clear-log", "Usage: limux clear-log"),
+    ("list-log", "Usage: limux list-log"),
+    ("sidebar-state", "Usage: limux sidebar-state"),
+    ("set-app-focus", "Usage: limux set-app-focus"),
+    ("simulate-app-active", "Usage: limux simulate-app-active"),
+    ("claude-hook", "Usage: limux claude-hook"),
+    ("browser", "Usage: limux browser"),
+    ("open-browser", "Legacy alias for 'limux browser open'"),
+    ("navigate", "Legacy alias for 'limux browser navigate'"),
+    ("browser-back", "Legacy alias for 'limux browser back'"),
+    (
+        "browser-forward",
+        "Legacy alias for 'limux browser forward'",
+    ),
+    ("browser-reload", "Legacy alias for 'limux browser reload'"),
+    ("get-url", "Legacy alias for 'limux browser get-url'"),
+    (
+        "focus-webview",
+        "Legacy alias for 'limux browser focus-webview'",
+    ),
+    (
+        "is-webview-focused",
+        "Legacy alias for 'limux browser is-webview-focused'",
+    ),
+    ("markdown", "Usage: limux markdown open <path>"),
+];
 
 // purpose: Adapt the no-socket CMUX sessions command module to CLI output.
 // inputs: Session command args plus global JSON preference.
@@ -7127,6 +7306,40 @@ mod cli_arg_tests {
             }
             CommandOutput::Json(_) => panic!("docs should render text"),
         }
+    }
+
+    // purpose: Verify CMUX command help probes do not require a running socket.
+    // inputs: Representative socket-backed and legacy alias commands with --help.
+    // returns/effects: Asserts local help output is returned before socket routing.
+    #[test]
+    fn cmux_command_help_probes_return_without_socket_client() {
+        for (command, expected) in [
+            ("list-panes", "Usage: limux list-panes"),
+            ("list-windows", "Usage: limux list-windows"),
+            ("resize-pane", "Usage: limux resize-pane"),
+            ("ssh", "--forward-agent"),
+            ("open-browser", "Legacy alias for 'limux browser open'"),
+        ] {
+            let opts = default_opts(args(&[command, "--help"]));
+            let output = run_local_command(&opts)
+                .expect("local help runs")
+                .expect("help is local");
+            let CommandOutput::Text(text) = output else {
+                panic!("help should render text");
+            };
+            assert!(text.contains(expected), "{command} output: {text}");
+        }
+    }
+
+    // purpose: Verify normal command arguments still use the socket-backed path.
+    // inputs: A supported socket-backed command without --help.
+    // returns/effects: Asserts local command handling declines the command.
+    #[test]
+    fn cmux_non_help_probe_still_requires_command_dispatch() {
+        let opts = default_opts(args(&["list-panes", "--workspace", "workspace-a"]));
+        assert!(run_local_command(&opts)
+            .expect("local command lookup")
+            .is_none());
     }
 
     #[test]
