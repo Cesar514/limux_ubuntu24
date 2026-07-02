@@ -25,8 +25,8 @@ use crate::app_config;
 use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
-    RightSidebarMode, RightSidebarTarget, SidebarAction, WorkspaceGroupAction, WorkspaceNavigation,
-    WorkspaceTarget,
+    RightSidebarMode, RightSidebarTarget, SidebarAction, SurfacePullRequestCommand,
+    WorkspaceGroupAction, WorkspaceNavigation, WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -166,6 +166,17 @@ struct SurfaceShellReport {
     shell_state: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SurfacePullRequestReport {
+    number: u64,
+    url: String,
+    label: String,
+    state: String,
+    branch: Option<String>,
+    last_action: Option<String>,
+    last_action_target: Option<String>,
+}
+
 pub(crate) struct AppState {
     app: adw::Application,
     window: adw::ApplicationWindow,
@@ -198,6 +209,7 @@ pub(crate) struct AppState {
     next_notification_id: u64,
     next_sidebar_log_id: u64,
     surface_shell_reports: HashMap<(String, String), SurfaceShellReport>,
+    surface_pull_requests: HashMap<(String, String), SurfacePullRequestReport>,
     notifications: Vec<HostNotification>,
     desktop_notification_routes: HashMap<u32, DesktopNotificationRoute>,
     _theme_portal_signal: Option<gio::SignalSubscription>,
@@ -2846,6 +2858,114 @@ fn shell_report_payload(
     })
 }
 
+/// purpose: Apply a CMUX PR/review metadata command to one terminal surface.
+/// inputs: Host state, workspace index, optional surface hint, and parsed PR command.
+/// returns/effects: Mutates in-memory PR metadata and returns CMUX-shaped JSON.
+fn surface_pull_request_payload(
+    app_state: &mut AppState,
+    workspace_index: usize,
+    surface_hint: Option<&str>,
+    command: SurfacePullRequestCommand,
+) -> Result<serde_json::Value, BridgeError> {
+    let surface = resolve_report_surface(&app_state.workspaces[workspace_index], surface_hint)?;
+    prune_surface_pull_requests(app_state, workspace_index);
+    let key = shell_report_key(
+        &app_state.workspaces[workspace_index].id,
+        &surface.surface_id,
+    );
+    match command {
+        SurfacePullRequestCommand::Report {
+            number,
+            url,
+            label,
+            state,
+            branch,
+        } => {
+            app_state.surface_pull_requests.insert(
+                key,
+                SurfacePullRequestReport {
+                    number,
+                    url,
+                    label,
+                    state,
+                    branch,
+                    last_action: None,
+                    last_action_target: None,
+                },
+            );
+        }
+        SurfacePullRequestCommand::Clear => {
+            app_state.surface_pull_requests.remove(&key);
+        }
+        SurfacePullRequestCommand::Action {
+            action,
+            action_target,
+        } => {
+            let report = app_state
+                .surface_pull_requests
+                .entry(key)
+                .or_insert_with(|| placeholder_pull_request_report(&action_target));
+            report.last_action = Some(action);
+            report.last_action_target = action_target;
+        }
+    }
+    Ok(surface_pull_request_response(
+        &app_state.workspaces[workspace_index],
+        &surface,
+        app_state.surface_pull_requests.get(&shell_report_key(
+            &app_state.workspaces[workspace_index].id,
+            &surface.surface_id,
+        )),
+    ))
+}
+
+/// purpose: Build placeholder metadata for standalone PR action hints.
+/// inputs: Optional action target such as a PR URL or branch.
+/// returns/effects: Returns in-memory-only metadata, no network or disk access.
+fn placeholder_pull_request_report(action_target: &Option<String>) -> SurfacePullRequestReport {
+    SurfacePullRequestReport {
+        number: 0,
+        url: action_target.clone().unwrap_or_default(),
+        label: "PR".to_string(),
+        state: "unknown".to_string(),
+        branch: None,
+        last_action: None,
+        last_action_target: None,
+    }
+}
+
+/// purpose: Drop PR metadata entries whose surfaces no longer exist.
+/// inputs: Host state and workspace index.
+/// returns/effects: Mutates only the in-memory PR report map.
+fn prune_surface_pull_requests(app_state: &mut AppState, workspace_index: usize) {
+    let workspace = &app_state.workspaces[workspace_index];
+    let live = pane::surface_summaries_for_root(&workspace.root)
+        .into_iter()
+        .map(|surface| surface.surface_id)
+        .collect::<HashSet<_>>();
+    let workspace_id = workspace.id.clone();
+    app_state
+        .surface_pull_requests
+        .retain(|(stored_workspace, surface_id), _| {
+            stored_workspace != &workspace_id || live.contains(surface_id)
+        });
+}
+
+/// purpose: Build the socket response for PR metadata mutations.
+/// inputs: Workspace, surface, and optional retained report.
+/// returns/effects: Returns JSON only.
+fn surface_pull_request_response(
+    workspace: &Workspace,
+    surface: &pane::SurfaceSummary,
+    report: Option<&SurfacePullRequestReport>,
+) -> serde_json::Value {
+    let mut payload = shell_report_payload(workspace, surface);
+    if let Some(report) = report {
+        payload["pull_request"] = pull_request_row(surface.surface_id.as_str(), report);
+    }
+    payload
+}
+
 #[derive(Clone)]
 struct WorkspaceSeedSource {
     workspace_cwd: Option<String>,
@@ -4349,6 +4469,68 @@ fn reported_port_row(surface_id: &str, port: u16, open_in_cmux_browser: bool) ->
     })
 }
 
+/// purpose: Render CMUX-reported pull requests for one workspace.
+/// inputs: In-memory PR metadata, workspace id, and sidebar visibility settings.
+/// returns/effects: Returns sorted PR rows without polling or disk writes.
+fn sidebar_pull_request_rows(
+    pull_requests: &HashMap<(String, String), SurfacePullRequestReport>,
+    workspace_id: &str,
+    sidebar: &app_config::SidebarConfig,
+) -> Vec<serde_json::Value> {
+    if sidebar.hide_all_details || !sidebar.show_pull_requests {
+        return Vec::new();
+    }
+    let mut rows = pull_requests
+        .iter()
+        .filter(|((stored_workspace, _), _)| stored_workspace == workspace_id)
+        .map(|((_, surface_id), report)| pull_request_row(surface_id, report))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let left_key = pull_request_sort_key(left);
+        let right_key = pull_request_sort_key(right);
+        left_key.cmp(&right_key)
+    });
+    rows
+}
+
+/// purpose: Build one CMUX-compatible pull-request sidebar row.
+/// inputs: Surface id plus retained PR report metadata.
+/// returns/effects: Returns JSON only.
+fn pull_request_row(surface_id: &str, report: &SurfacePullRequestReport) -> serde_json::Value {
+    serde_json::json!({
+        "number": report.number,
+        "url": report.url,
+        "label": report.label,
+        "state": report.state,
+        "status": report.state,
+        "branch": report.branch,
+        "last_action": report.last_action,
+        "last_action_target": report.last_action_target,
+        "source": "report_pr",
+        "surface_id": surface_id,
+        "surface_ref": surface_ref(surface_id),
+    })
+}
+
+/// purpose: Provide deterministic ordering for rendered PR rows.
+/// inputs: A PR row value.
+/// returns/effects: Returns number/url/surface sort tuple.
+fn pull_request_sort_key(row: &serde_json::Value) -> (u64, String, String) {
+    (
+        row.get("number")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        row.get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        row.get("surface_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
 /// purpose: Render all retained CMUX sidebar metadata for one workspace.
 /// inputs: Workspace with status/progress/log state plus current sidebar settings.
 /// returns/effects: Returns aggregate JSON without mutating state.
@@ -4373,6 +4555,7 @@ fn sidebar_state_payload(
         "workspace_ref": workspace_ref(&workspace.id),
         "cwd": cwd,
         "git_branch": git_branch,
+        "pull_requests": sidebar_pull_request_rows(&app_state.surface_pull_requests, &workspace.id, sidebar),
         "ports": sidebar_ports_rows(&app_state.surface_shell_reports, &workspace.id, sidebar)?,
         "status": sidebar_status_rows(workspace),
         "progress": sidebar_progress_row(workspace),
@@ -5149,6 +5332,7 @@ pub fn build_window(app: &adw::Application) {
         next_notification_id: 1,
         next_sidebar_log_id: 1,
         surface_shell_reports: HashMap::new(),
+        surface_pull_requests: HashMap::new(),
         notifications: Vec::new(),
         desktop_notification_routes: HashMap::new(),
         _theme_portal_signal: None,
@@ -11388,6 +11572,28 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             }
             let _ = reply.send(result);
         }
+        ControlCommand::SurfacePullRequest {
+            target,
+            surface_hint,
+            command,
+            reply,
+        } => {
+            let mut app_state = state.borrow_mut();
+            let result = workspace_index_for_target(&app_state, &target)
+                .ok_or_else(|| BridgeError::not_found("workspace not found"))
+                .and_then(|index| {
+                    surface_pull_request_payload(
+                        &mut app_state,
+                        index,
+                        surface_hint.as_deref(),
+                        command,
+                    )
+                });
+            if result.is_ok() {
+                sync_right_sidebar_panel(&mut app_state);
+            }
+            let _ = reply.send(result);
+        }
         ControlCommand::CreateWorkspace {
             name,
             description,
@@ -14522,18 +14728,19 @@ mod tests {
         sidebar_branch_directory_tooltip, sidebar_feed_preview_lines_from_value,
         sidebar_feed_visible_items, sidebar_file_preview_lines, sidebar_git_branch,
         sidebar_log_preview_lines_from_entries, sidebar_ports_rows, sidebar_progress_preview_line,
-        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
-        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
-        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
+        sidebar_pull_request_rows, sidebar_status_preview_lines_from_entries,
+        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
+        tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
         HostNotification, NeighborScore, NotificationPolicyContext, NotificationPolicyEffects,
         PaneBounds, PaneCreateDirection, PaneCreateTargetError, PortalColorSchemePreference,
         SessionSaveAccess, SessionSaveRequest, SidebarLogEntry, SidebarProgress,
-        SidebarStatusEntry, SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceSeedSource,
-        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport, WorkspaceEventSnapshot,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
@@ -14977,6 +15184,40 @@ mod tests {
         assert_eq!(rows[1]["port"], json!(5173));
         assert_eq!(rows[1]["source"], json!("report_ports"));
         assert_eq!(rows[1]["openInCmuxBrowser"], json!(true));
+    }
+
+    // purpose: Verify CMUX report_pr rows merge into sidebar metadata.
+    // inputs: In-memory PR metadata and sidebar visibility settings.
+    // returns/effects: Asserts rows are hidden by config and rendered with action hints.
+    #[test]
+    fn reported_pull_requests_render_sidebar_rows() {
+        let mut reports = HashMap::new();
+        reports.insert(
+            shell_report_key("workspace-test", "1:tab"),
+            SurfacePullRequestReport {
+                number: 42,
+                url: "https://github.com/org/repo/pull/42".to_string(),
+                label: "PR".to_string(),
+                state: "open".to_string(),
+                branch: Some("feature/pr".to_string()),
+                last_action: Some("checkout".to_string()),
+                last_action_target: Some("feature/pr".to_string()),
+            },
+        );
+        let sidebar = crate::app_config::SidebarConfig::default();
+        let rows = sidebar_pull_request_rows(&reports, "workspace-test", &sidebar);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["number"], json!(42));
+        assert_eq!(rows[0]["state"], json!("open"));
+        assert_eq!(rows[0]["branch"], json!("feature/pr"));
+        assert_eq!(rows[0]["last_action"], json!("checkout"));
+
+        let hidden_sidebar = crate::app_config::SidebarConfig {
+            show_pull_requests: false,
+            ..crate::app_config::SidebarConfig::default()
+        };
+        assert!(sidebar_pull_request_rows(&reports, "workspace-test", &hidden_sidebar).is_empty());
     }
 
     // purpose: Verify Limux clamps right-sidebar widths using CMUX policy values.

@@ -4815,6 +4815,112 @@ async fn run_surface_shell_report(
     client.call(method, Value::Object(params)).await
 }
 
+/// purpose: Run CMUX-compatible PR/review metadata commands through the live host.
+/// inputs: Method name and CLI args for report_pr/report_review/clear_pr/report_pr_action.
+/// returns/effects: Sends one surface PR metadata request or fails on malformed flags.
+async fn run_surface_pr_report(
+    client: &mut Client,
+    method: &str,
+    args: &[String],
+) -> Result<Value> {
+    let params = build_surface_pr_report_params(method, args)?;
+    client.call(method, Value::Object(params)).await
+}
+
+/// purpose: Build params for CMUX PR/review report command aliases.
+/// inputs: Method name plus raw CLI args.
+/// returns/effects: Returns normalized JSON params and rejects invalid states/actions/flags.
+fn build_surface_pr_report_params(method: &str, args: &[String]) -> Result<Map<String, Value>> {
+    let mut params = Map::new();
+    let mut positional = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let raw = args[index].as_str();
+        if raw.starts_with("--") {
+            insert_surface_pr_report_flag(&mut params, args, &mut index)?;
+            continue;
+        }
+        positional.push(raw.to_string());
+        index += 1;
+    }
+    insert_surface_pr_positionals(method, &mut params, positional)?;
+    insert_context_surface_shell_report_params(&mut params);
+    Ok(params)
+}
+
+/// purpose: Insert one supported PR report flag into a params map.
+/// inputs: Params map, raw args, and mutable parser index.
+/// returns/effects: Adds target/metadata params or fails on unknown flags.
+fn insert_surface_pr_report_flag(
+    params: &mut Map<String, Value>,
+    args: &[String],
+    index: &mut usize,
+) -> Result<()> {
+    let raw = args[*index].as_str();
+    let (name, inline) = raw
+        .trim_start_matches("--")
+        .split_once('=')
+        .map(|(name, value)| (format!("--{name}"), Some(value.to_string())))
+        .unwrap_or_else(|| (raw.to_string(), None));
+    let value = sidebar_option_value(args, index, &name, inline)?;
+    match name.as_str() {
+        "--workspace" => params.insert("workspace_id".to_string(), Value::String(value)),
+        "--surface" | "--tab" => params.insert("surface_id".to_string(), Value::String(value)),
+        "--panel" => params.insert("panel_id".to_string(), Value::String(value)),
+        "--label" => params.insert("label".to_string(), Value::String(value)),
+        "--state" | "--status" => params.insert(
+            "state".to_string(),
+            Value::String(parse_pr_state_arg(&value)?),
+        ),
+        "--branch" => params.insert("branch".to_string(), Value::String(value)),
+        "--target" => params.insert("target".to_string(), Value::String(value)),
+        "--url" => params.insert("url".to_string(), Value::String(value)),
+        _ => bail!("Unknown PR report option {name}"),
+    };
+    Ok(())
+}
+
+/// purpose: Apply positional args for CMUX PR report commands.
+/// inputs: Method name, params map, and collected positional args.
+/// returns/effects: Mutates params or fails on missing/extra args.
+fn insert_surface_pr_positionals(
+    method: &str,
+    params: &mut Map<String, Value>,
+    positional: Vec<String>,
+) -> Result<()> {
+    match method {
+        "surface.report_pr" | "surface.report_review" => {
+            if positional.len() != 2 {
+                bail!("report_pr/report_review require <number> <url>");
+            }
+            params.insert(
+                "number".to_string(),
+                json!(parse_pr_number_arg(&positional[0])?),
+            );
+            params
+                .entry("url".to_string())
+                .or_insert_with(|| Value::String(positional.get(1).cloned().unwrap_or_default()));
+            ensure_pr_url(params.get("url").and_then(Value::as_str))?;
+        }
+        "surface.clear_pr" => {
+            if !positional.is_empty() {
+                bail!("clear_pr accepts only --workspace, --surface, --tab, and --panel");
+            }
+        }
+        "surface.report_pr_action" => {
+            if positional.len() != 1 {
+                bail!("report_pr_action requires exactly one action");
+            }
+            params.insert(
+                "action".to_string(),
+                Value::String(parse_pr_action_arg(&positional[0])?),
+            );
+        }
+        _ => bail!("unsupported PR report method: {method}"),
+    }
+    Ok(())
+}
+
 /// purpose: Build params for CMUX shell report command aliases.
 /// inputs: Method name plus raw CLI args.
 /// returns/effects: Returns normalized JSON params and rejects invalid ports/flags.
@@ -4922,6 +5028,54 @@ fn parse_shell_state_arg(raw: &str) -> Result<String> {
         "prompt" | "running" => Ok(raw.to_string()),
         _ => bail!("report_shell_state requires prompt or running"),
     }
+}
+
+/// purpose: Parse one PR/MR number argument.
+/// inputs: Raw CLI positional string.
+/// returns/effects: Returns a positive number or fails loudly.
+fn parse_pr_number_arg(raw: &str) -> Result<u64> {
+    let number = raw
+        .parse::<u64>()
+        .with_context(|| format!("invalid PR number `{raw}`"))?;
+    if number == 0 {
+        bail!("PR number must be positive");
+    }
+    Ok(number)
+}
+
+/// purpose: Parse a CMUX PR state CLI value.
+/// inputs: Raw state string.
+/// returns/effects: Returns open/merged/closed or fails loudly.
+fn parse_pr_state_arg(raw: &str) -> Result<String> {
+    match raw {
+        "open" | "merged" | "closed" => Ok(raw.to_string()),
+        _ => bail!("PR state must be open, merged, or closed"),
+    }
+}
+
+/// purpose: Parse a CMUX report_pr_action CLI value.
+/// inputs: Raw action string.
+/// returns/effects: Returns a supported PR action or fails loudly.
+fn parse_pr_action_arg(raw: &str) -> Result<String> {
+    match raw {
+        "merge" | "close" | "reopen" | "create" | "checkout" | "ready" | "edit" | "view" => {
+            Ok(raw.to_string())
+        }
+        _ => bail!("report_pr_action requires merge, close, reopen, create, checkout, ready, edit, or view"),
+    }
+}
+
+/// purpose: Validate a PR/MR URL before sending it to the host.
+/// inputs: Optional URL from parsed params.
+/// returns/effects: Succeeds for http(s) URLs or fails loudly.
+fn ensure_pr_url(url: Option<&str>) -> Result<()> {
+    let Some(url) = url else {
+        bail!("report_pr/report_review require url");
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        bail!("PR url must start with http:// or https://");
+    }
+    Ok(())
 }
 
 /// purpose: Add Limux/CMUX workspace and surface context fallbacks.
@@ -11085,6 +11239,7 @@ fn render_sidebar_state_text(payload: &Value) -> String {
     let cwd = get_string(payload, &["cwd"]).unwrap_or_else(|| "none".to_string());
     let git_branch = get_string(payload, &["git_branch"]).unwrap_or_else(|| "none".to_string());
     let ports = render_sidebar_ports(payload);
+    let pull_requests = render_sidebar_pull_requests(payload);
     let status = render_sidebar_state_section(payload, "status", render_sidebar_status_row);
     let log = render_sidebar_state_section(payload, "log", render_sidebar_log_row);
     let progress = payload
@@ -11093,8 +11248,41 @@ fn render_sidebar_state_text(payload: &Value) -> String {
         .map(render_sidebar_progress_row)
         .unwrap_or_else(|| "none".to_string());
     format!(
-        "workspace={workspace}\ncwd={cwd}\ngit_branch={git_branch}\nports={ports}\nprogress={progress}\nstatus:\n{status}\nlog:\n{log}"
+        "workspace={workspace}\ncwd={cwd}\ngit_branch={git_branch}\n\
+         pull_requests={pull_requests}\nports={ports}\nprogress={progress}\n\
+         status:\n{status}\nlog:\n{log}"
     )
+}
+
+/// purpose: Render sidebar-state pull request rows in CMUX-compatible text form.
+/// inputs: Sidebar-state payload with optional `pull_requests` array.
+/// returns/effects: Returns comma-separated PR labels or "none".
+fn render_sidebar_pull_requests(payload: &Value) -> String {
+    let rows = payload
+        .get("pull_requests")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(render_sidebar_pull_request_row)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        "none".to_string()
+    } else {
+        rows.join(", ")
+    }
+}
+
+/// purpose: Render one sidebar pull-request row.
+/// inputs: PR row JSON from the host bridge.
+/// returns/effects: Returns a compact label string.
+fn render_sidebar_pull_request_row(row: &Value) -> String {
+    let label = get_string(row, &["label"]).unwrap_or_else(|| "PR".to_string());
+    let number = row.get("number").and_then(Value::as_u64).unwrap_or(0);
+    let state = get_string(row, &["state", "status"]).unwrap_or_else(|| "unknown".to_string());
+    let url = get_string(row, &["url"]).unwrap_or_default();
+    format!("{label}#{number}:{state}:{url}")
 }
 
 /// purpose: Render sidebar-state port rows in CMUX-compatible text form.
@@ -14870,6 +15058,38 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
+        "report_pr" | "report-pr" => {
+            let payload = run_surface_pr_report(client, "surface.report_pr", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "report_review" | "report-review" => {
+            let payload = run_surface_pr_report(client, "surface.report_review", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "clear_pr" | "clear-pr" => {
+            let payload = run_surface_pr_report(client, "surface.clear_pr", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "report_pr_action" | "report-pr-action" => {
+            let payload = run_surface_pr_report(client, "surface.report_pr_action", args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "list-panels"
         | "list-panes"
         | "list-workspaces"
@@ -15751,6 +15971,12 @@ mod cli_arg_tests {
             "workspace": "ws-1",
             "cwd": "/repo",
             "git_branch": "main",
+            "pull_requests": [{
+                "number": 42,
+                "url": "https://github.com/org/repo/pull/42",
+                "label": "PR",
+                "state": "open"
+            }],
             "ports": [
                 {"port": 3000, "url": "http://127.0.0.1:3000"},
                 {"port": 5173, "url": "http://127.0.0.1:5173"}
@@ -15765,6 +15991,7 @@ mod cli_arg_tests {
             }]
         }));
 
+        assert!(rendered.contains("pull_requests=PR#42:open:https://github.com/org/repo/pull/42"));
         assert!(rendered.contains("ports=3000, 5173"));
         assert!(rendered.contains("progress=0.5 label=Building"));
         assert!(rendered.contains("build=running priority=80"));
@@ -15840,6 +16067,70 @@ mod cli_arg_tests {
             &args(&["sleeping"])
         )
         .is_err());
+    }
+
+    #[test]
+    fn pr_report_params_accept_report_review_clear_and_actions() {
+        let report_params = build_surface_pr_report_params(
+            "surface.report_pr",
+            &args(&[
+                "42",
+                "https://github.com/org/repo/pull/42",
+                "--state=merged",
+                "--branch",
+                "feature/pr",
+                "--panel",
+                "panel-1",
+            ]),
+        )
+        .expect("report pr parses");
+        assert_eq!(report_params["number"], json!(42));
+        assert_eq!(
+            report_params["url"],
+            json!("https://github.com/org/repo/pull/42")
+        );
+        assert_eq!(report_params["state"], json!("merged"));
+        assert_eq!(report_params["branch"], json!("feature/pr"));
+        assert_eq!(report_params["panel_id"], json!("panel-1"));
+
+        let review_params = build_surface_pr_report_params(
+            "surface.report_review",
+            &args(&["7", "https://gitlab.com/org/repo/-/merge_requests/7"]),
+        )
+        .expect("report review parses");
+        assert_eq!(review_params["number"], json!(7));
+        assert_eq!(
+            review_params["url"],
+            json!("https://gitlab.com/org/repo/-/merge_requests/7")
+        );
+
+        let clear_params =
+            build_surface_pr_report_params("surface.clear_pr", &args(&["--surface=surface:1:tab"]))
+                .expect("clear pr parses");
+        assert_eq!(clear_params["surface_id"], json!("surface:1:tab"));
+
+        let action_params = build_surface_pr_report_params(
+            "surface.report_pr_action",
+            &args(&["checkout", "--target", "feature/pr"]),
+        )
+        .expect("report pr action parses");
+        assert_eq!(action_params["action"], json!("checkout"));
+        assert_eq!(action_params["target"], json!("feature/pr"));
+
+        assert!(build_surface_pr_report_params(
+            "surface.report_pr",
+            &args(&[
+                "42",
+                "https://github.com/org/repo/pull/42",
+                "--state",
+                "draft"
+            ])
+        )
+        .is_err());
+        assert!(
+            build_surface_pr_report_params("surface.report_pr_action", &args(&["approve"]))
+                .is_err()
+        );
     }
 
     #[test]

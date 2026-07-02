@@ -174,6 +174,10 @@ const METHODS: &[&str] = &[
     "surface.report_tty",
     "surface.report_pwd",
     "surface.report_shell_state",
+    "surface.report_pr",
+    "surface.report_review",
+    "surface.clear_pr",
+    "surface.report_pr_action",
     "surface.ports_kick",
     "surface.read_text",
     "surface.send_text",
@@ -610,6 +614,22 @@ pub enum SidebarAction {
 }
 
 #[derive(Debug)]
+pub enum SurfacePullRequestCommand {
+    Report {
+        number: u64,
+        url: String,
+        label: String,
+        state: String,
+        branch: Option<String>,
+    },
+    Clear,
+    Action {
+        action: String,
+        action_target: Option<String>,
+    },
+}
+
+#[derive(Debug)]
 pub enum ControlCommand {
     Identify {
         caller: Option<Value>,
@@ -839,6 +859,12 @@ pub enum ControlCommand {
         shell_state: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfacePullRequest {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        command: SurfacePullRequestCommand,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReadSurfaceText {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -999,6 +1025,7 @@ impl ControlCommand {
             | Self::SurfaceClearPorts { reply, .. }
             | Self::SurfaceReportPWD { reply, .. }
             | Self::SurfaceReportShellState { reply, .. }
+            | Self::SurfacePullRequest { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
             | Self::CreateWorkspace { reply, .. }
             | Self::WorkspaceEnv { reply, .. }
@@ -1137,6 +1164,86 @@ fn parse_report_port_value(value: &Value) -> Result<u16, BridgeError> {
         ));
     };
     Ok(port as u16)
+}
+
+/// purpose: Parse a CMUX pull-request number from JSON params.
+/// inputs: Request params and method label for diagnostics.
+/// returns/effects: Returns a positive PR/MR number or invalid_params.
+fn required_pr_number(params: &Map<String, Value>, method: &str) -> Result<u64, BridgeError> {
+    let value = params
+        .get("number")
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} requires number")))?;
+    let number = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+        .ok_or_else(|| BridgeError::invalid_params(format!("{method} number must be positive")))?;
+    if number == 0 {
+        return Err(BridgeError::invalid_params(format!(
+            "{method} number must be positive"
+        )));
+    }
+    Ok(number)
+}
+
+/// purpose: Validate one CMUX pull-request status token.
+/// inputs: Raw status from socket or CLI.
+/// returns/effects: Returns open/merged/closed or invalid_params.
+fn parse_pr_state(raw: &str, method: &str) -> Result<String, BridgeError> {
+    match raw {
+        "open" | "merged" | "closed" => Ok(raw.to_string()),
+        _ => Err(BridgeError::invalid_params(format!(
+            "{method} state must be open, merged, or closed"
+        ))),
+    }
+}
+
+/// purpose: Validate one CMUX PR-affecting action hint.
+/// inputs: Raw action token from socket or CLI.
+/// returns/effects: Returns a supported action or invalid_params.
+fn parse_pr_action(raw: &str) -> Result<String, BridgeError> {
+    match raw {
+        "merge" | "close" | "reopen" | "create" | "checkout" | "ready" | "edit" | "view" => {
+            Ok(raw.to_string())
+        }
+        _ => Err(BridgeError::invalid_params(
+            "surface.report_pr_action action must be merge, close, reopen, create, checkout, ready, edit, or view",
+        )),
+    }
+}
+
+/// purpose: Parse a CMUX pull-request metadata report command.
+/// inputs: Method name plus JSON params with number/url and optional label/state/branch.
+/// returns/effects: Returns a strict in-memory PR metadata command.
+fn parse_surface_pr_report(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Result<SurfacePullRequestCommand, BridgeError> {
+    let number = required_pr_number(params, method)?;
+    let url = required_sidebar_string(params, &["url"], method)?;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(BridgeError::invalid_params(format!(
+            "{method} url must start with http:// or https://"
+        )));
+    }
+    let default_label = if method == "surface.report_review" || method == "report_review" {
+        "MR"
+    } else {
+        "PR"
+    };
+    let label = optional_string(params, &["label"]).unwrap_or_else(|| default_label.to_string());
+    let state = parse_pr_state(
+        optional_string(params, &["state", "status"])
+            .unwrap_or_else(|| "open".to_string())
+            .as_str(),
+        method,
+    )?;
+    Ok(SurfacePullRequestCommand::Report {
+        number,
+        url,
+        label,
+        state,
+        branch: optional_string(params, &["branch"]),
+    })
 }
 
 fn required_browser_selector(
@@ -4201,6 +4308,95 @@ fn handle_method(
                     target,
                     surface_hint,
                     shell_state,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.report_pr" | "report_pr" | "surface.report_review" | "report_review" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let command = match parse_surface_pr_report(method, params) {
+                Ok(command) => command,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfacePullRequest {
+                    target,
+                    surface_hint,
+                    command,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.clear_pr" | "clear_pr" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfacePullRequest {
+                    target,
+                    surface_hint,
+                    command: SurfacePullRequestCommand::Clear,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.report_pr_action" | "report_pr_action" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let Some(raw_action) = optional_string(params, &["action", "value"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("surface.report_pr_action requires action"),
+                );
+            };
+            let action = match parse_pr_action(&raw_action) {
+                Ok(action) => action,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfacePullRequest {
+                    target,
+                    surface_hint,
+                    command: SurfacePullRequestCommand::Action {
+                        action,
+                        action_target: optional_string(params, &["target", "action_target"]),
+                    },
                     reply,
                 },
                 rx,
@@ -8564,6 +8760,116 @@ mod tests {
             },
         );
         assert_eq!(state_response.error, None);
+    }
+
+    #[test]
+    fn surface_pr_routes_accept_cmux_sidebar_metadata() {
+        let report_response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"report_pr","params":{"#,
+                r#""workspace_id":"codex","panel":"surface:4:tab","#,
+                r#""number":"42","url":"https://github.com/org/repo/pull/42","#,
+                r#""state":"open","branch":"feature/pr"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SurfacePullRequest {
+                    target,
+                    surface_hint,
+                    command:
+                        SurfacePullRequestCommand::Report {
+                            number,
+                            url,
+                            label,
+                            state,
+                            branch,
+                        },
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(number, 42);
+                    assert_eq!(url, "https://github.com/org/repo/pull/42");
+                    assert_eq!(label, "PR");
+                    assert_eq!(state, "open");
+                    assert_eq!(branch.as_deref(), Some("feature/pr"));
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(report_response.error, None);
+
+        let review_response = dispatch_request(
+            concat!(
+                r#"{"id":2,"method":"surface.report_review","params":{"#,
+                r#""number":7,"url":"https://gitlab.com/org/repo/-/merge_requests/7"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SurfacePullRequest {
+                    command:
+                        SurfacePullRequestCommand::Report {
+                            label,
+                            state,
+                            branch,
+                            ..
+                        },
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(label, "MR");
+                    assert_eq!(state, "open");
+                    assert_eq!(branch, None);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(review_response.error, None);
+
+        let action_response = dispatch_request(
+            concat!(
+                r#"{"id":3,"method":"report_pr_action","params":{"#,
+                r#""surface_id":"surface:4:tab","action":"merge","#,
+                r#""target":"https://github.com/org/repo/pull/42"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SurfacePullRequest {
+                    surface_hint,
+                    command:
+                        SurfacePullRequestCommand::Action {
+                            action,
+                            action_target,
+                        },
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(action, "merge");
+                    assert_eq!(
+                        action_target.as_deref(),
+                        Some("https://github.com/org/repo/pull/42")
+                    );
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(action_response.error, None);
+
+        let clear_response = dispatch_request(
+            r#"{"id":4,"method":"clear_pr","params":{"panel_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::SurfacePullRequest {
+                    command: SurfacePullRequestCommand::Clear,
+                    reply,
+                    ..
+                } => {
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(clear_response.error, None);
     }
 
     #[test]
