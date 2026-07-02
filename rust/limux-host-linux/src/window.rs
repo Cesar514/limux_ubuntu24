@@ -21,7 +21,7 @@ use crate::app_config;
 use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, WorkspaceGroupAction,
-    WorkspaceTarget,
+    WorkspaceNavigation, WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -96,6 +96,7 @@ pub(crate) struct AppState {
     workspaces: Vec<Workspace>,
     workspace_groups: Vec<WorkspaceGroupState>,
     active_idx: usize,
+    previous_workspace_id: Option<String>,
     shortcuts: Rc<ResolvedShortcutConfig>,
     stack: gtk::Stack,
     sidebar_list: gtk::ListBox,
@@ -1219,6 +1220,30 @@ fn workspace_payload(state: &AppState, index: usize) -> Option<serde_json::Value
         "title": workspace.name.as_str(),
         "name": workspace.name.as_str(),
     }))
+}
+
+// purpose: Select a live workspace through the same GTK stack/sidebar path as UI navigation.
+// inputs: Shared app state and target workspace index.
+// returns/effects: Changes active workspace when needed and returns the CMUX-shaped payload.
+fn select_workspace_for_control(
+    state: &State,
+    index: usize,
+) -> Result<serde_json::Value, BridgeError> {
+    let row = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .get(index)
+            .map(|workspace| workspace.sidebar_row.clone())
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?
+    };
+    let sidebar_list = state.borrow().sidebar_list.clone();
+    switch_workspace(state, index);
+    sidebar_list.select_row(Some(&row));
+
+    let app_state = state.borrow();
+    workspace_payload(&app_state, index)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))
 }
 
 fn focused_surface_payload(state: &State) -> Option<serde_json::Value> {
@@ -2551,6 +2576,7 @@ pub fn build_window(app: &adw::Application) {
         workspaces: Vec::new(),
         workspace_groups: Vec::new(),
         active_idx: 0,
+        previous_workspace_id: None,
         shortcuts,
         stack: stack.clone(),
         sidebar_list: sidebar_list.clone(),
@@ -6885,21 +6911,42 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let row = {
+            let _ = reply.send(select_workspace_for_control(state, index));
+        }
+        ControlCommand::NavigateWorkspace { action, reply } => {
+            let resolved = {
                 let app_state = state.borrow();
-                app_state.workspaces[index].sidebar_row.clone()
+                match action {
+                    WorkspaceNavigation::Next if !app_state.workspaces.is_empty() => {
+                        Some((app_state.active_idx + 1) % app_state.workspaces.len())
+                    }
+                    WorkspaceNavigation::Previous if !app_state.workspaces.is_empty() => Some(
+                        app_state
+                            .active_idx
+                            .checked_sub(1)
+                            .unwrap_or_else(|| app_state.workspaces.len() - 1),
+                    ),
+                    WorkspaceNavigation::Last => app_state
+                        .previous_workspace_id
+                        .as_deref()
+                        .and_then(|previous_id| {
+                            app_state
+                                .workspaces
+                                .iter()
+                                .position(|workspace| workspace.id == previous_id)
+                        }),
+                    _ => None,
+                }
             };
-            let sidebar_list = state.borrow().sidebar_list.clone();
-            switch_workspace(state, index);
-            sidebar_list.select_row(Some(&row));
 
-            let result = {
-                let app_state = state.borrow();
-                workspace_payload(&app_state, index)
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
             };
-            let _ = reply.send(result.ok_or_else(|| {
-                crate::control_bridge::BridgeError::not_found("workspace not found")
-            }));
+
+            let _ = reply.send(select_workspace_for_control(state, index));
         }
         ControlCommand::RenameWorkspace {
             target,
@@ -7555,6 +7602,10 @@ fn switch_workspace(state: &State, idx: usize) {
         if idx >= s.workspaces.len() || idx == s.active_idx {
             return;
         }
+        s.previous_workspace_id = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.id.clone());
         s.active_idx = idx;
         let stack = s.stack.clone();
         let stack_name = format!("ws-{}", s.workspaces[idx].id);

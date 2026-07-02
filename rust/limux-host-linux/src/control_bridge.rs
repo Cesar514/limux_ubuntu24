@@ -34,6 +34,9 @@ const METHODS: &[&str] = &[
     "workspace.create",
     "workspace.create_many",
     "workspace.select",
+    "workspace.next",
+    "workspace.previous",
+    "workspace.last",
     "workspace.rename",
     "workspace.close",
     "workspace.group.list",
@@ -456,6 +459,13 @@ pub enum WorkspaceGroupAction {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceNavigation {
+    Next,
+    Previous,
+    Last,
+}
+
 #[derive(Debug)]
 pub enum ControlCommand {
     Identify {
@@ -593,6 +603,10 @@ pub enum ControlCommand {
         target: WorkspaceTarget,
         reply: mpsc::Sender<BridgeResult>,
     },
+    NavigateWorkspace {
+        action: WorkspaceNavigation,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     RenameWorkspace {
         target: WorkspaceTarget,
         title: String,
@@ -682,6 +696,7 @@ impl ControlCommand {
             | Self::CreateWorkspace { reply, .. }
             | Self::CreateWorkspaces { reply, .. }
             | Self::SelectWorkspace { reply, .. }
+            | Self::NavigateWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
@@ -2519,6 +2534,36 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (ControlCommand::SelectWorkspace { target, reply }, rx)
         }
+        "workspace.next" | "next-window" => {
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::NavigateWorkspace {
+                    action: WorkspaceNavigation::Next,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "workspace.previous" | "previous-window" => {
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::NavigateWorkspace {
+                    action: WorkspaceNavigation::Previous,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "workspace.last" | "last-window" => {
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::NavigateWorkspace {
+                    action: WorkspaceNavigation::Last,
+                    reply,
+                },
+                rx,
+            )
+        }
         "workspace.rename" | "rename-workspace" => {
             let Some(title) = optional_string(params, &["title", "name"]) else {
                 return error_response(
@@ -3333,6 +3378,31 @@ mod tests {
         let error = parse_required_workspace_target(&params, true, "workspace.select")
             .expect_err("workspace.select should require a target");
         assert_eq!(error.code, INVALID_PARAMS_CODE);
+    }
+
+    #[test]
+    fn workspace_navigation_aliases_route_to_live_commands() {
+        for (method, expected) in [
+            ("next-window", WorkspaceNavigation::Next),
+            ("previous-window", WorkspaceNavigation::Previous),
+            ("last-window", WorkspaceNavigation::Last),
+        ] {
+            let response = dispatch_request(
+                format!(r#"{{"id":1,"method":"{}","params":{{}}}}"#, method).as_str(),
+                &|command| match command {
+                    ControlCommand::NavigateWorkspace { action, reply } => {
+                        assert_eq!(action, expected);
+                        let _ = reply.send(Ok(json!({ "ok": true })));
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                },
+            );
+            assert_eq!(response.error, None);
+            assert_eq!(
+                response.result.expect("workspace navigation result")["ok"],
+                true
+            );
+        }
     }
 
     #[test]
