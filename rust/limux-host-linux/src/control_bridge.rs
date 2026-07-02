@@ -706,6 +706,11 @@ pub enum ControlCommand {
         window_id: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    MoveWorkspaceToWindow {
+        target: WorkspaceTarget,
+        window_id: String,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -1059,6 +1064,7 @@ impl ControlCommand {
             | Self::SystemTree { reply, .. }
             | Self::ListWindows { reply }
             | Self::FocusWindow { reply, .. }
+            | Self::MoveWorkspaceToWindow { reply, .. }
             | Self::ReloadConfig { reply }
             | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
@@ -3110,6 +3116,28 @@ fn handle_method(
             let window_id = optional_string(params, &["window_id", "window", "id"]);
             let (reply, rx) = mpsc::channel();
             (ControlCommand::FocusWindow { window_id, reply }, rx)
+        }
+        "workspace.move_to_window" | "move-workspace-to-window" => {
+            let target =
+                match parse_required_workspace_target(params, true, "workspace.move_to_window") {
+                    Ok(target) => target,
+                    Err(error) => return error_response(id, error),
+                };
+            let Some(window_id) = optional_string(params, &["window_id", "window"]) else {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("workspace.move_to_window requires window_id"),
+                );
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::MoveWorkspaceToWindow {
+                    target,
+                    window_id,
+                    reply,
+                },
+                rx,
+            )
         }
         "workspace.list" | "list-workspaces" => {
             let (reply, rx) = mpsc::channel();
@@ -9148,6 +9176,38 @@ mod tests {
             },
         );
         assert_eq!(focused.error, None);
+    }
+
+    #[test]
+    fn workspace_move_to_window_route_queues_command() {
+        let moved = dispatch_request(
+            concat!(
+                r#"{"id":3,"method":"workspace.move_to_window","params":{"workspace_id":"workspace:abc","#,
+                r#""window_id":"window:1"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::MoveWorkspaceToWindow {
+                    target,
+                    window_id,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Handle("workspace:abc".to_string()));
+                    assert_eq!(window_id, "window:1");
+                    let _ = reply.send(Ok(json!({
+                        "workspace_id": "workspace:abc",
+                        "window_id": "window:1",
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(moved.error, None);
+
+        let missing = dispatch_request(
+            r#"{"id":4,"method":"workspace.move_to_window","params":{"workspace_id":"workspace:abc"}}"#,
+            &|_| panic!("invalid request should fail before dispatch"),
+        );
+        assert_eq!(missing.error.as_ref().map(|error| error.code), Some(-32602));
     }
 
     #[test]

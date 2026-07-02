@@ -13803,9 +13803,19 @@ fn build_window_alias_request(
         "list-windows" => "window.list",
         "focus-window" => "window.focus",
         "close-window" => "window.close",
+        "move-workspace-to-window" => "workspace.move_to_window",
         _ => return Ok(None),
     };
     let mut params = Map::new();
+    if command == "move-workspace-to-window" {
+        let workspace = parse_opt(args, "--workspace")
+            .ok_or_else(|| anyhow!("move-workspace-to-window requires --workspace"))?;
+        let window = parse_opt(args, "--window")
+            .ok_or_else(|| anyhow!("move-workspace-to-window requires --window"))?;
+        params.insert("workspace_id".to_string(), Value::String(workspace));
+        params.insert("window_id".to_string(), Value::String(window));
+        return Ok(Some((method, Value::Object(params))));
+    }
     if let Some(window) = parse_opt(args, "--window").or_else(|| first_positional(args)) {
         params.insert("window_id".to_string(), Value::String(window));
     }
@@ -17140,8 +17150,13 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
-        "new-window" | "neww" | "current-window" | "list-windows" | "focus-window"
-        | "close-window" => {
+        "new-window"
+        | "neww"
+        | "current-window"
+        | "list-windows"
+        | "focus-window"
+        | "close-window"
+        | "move-workspace-to-window" => {
             let merged_args = args_with_global_window(args, opts.window.as_deref());
             let Some((method, params)) = build_window_alias_request(command, &merged_args)? else {
                 bail!("unsupported window alias: {}", command);
@@ -20933,6 +20948,23 @@ mod cli_arg_tests {
             .expect("global window parses")
             .expect("global window maps");
         assert_eq!(global_window.1["window_id"], "window:5");
+
+        let move_workspace = build_window_alias_request(
+            "move-workspace-to-window",
+            &args(&["--workspace", "workspace:4", "--window", "window:2"]),
+        )
+        .expect("move workspace parses")
+        .expect("move workspace maps");
+        assert_eq!(move_workspace.0, "workspace.move_to_window");
+        assert_eq!(move_workspace.1["workspace_id"], "workspace:4");
+        assert_eq!(move_workspace.1["window_id"], "window:2");
+
+        let missing_window = build_window_alias_request(
+            "move-workspace-to-window",
+            &args(&["--workspace", "workspace:4"]),
+        )
+        .expect_err("missing move target window rejected");
+        assert!(missing_window.to_string().contains("requires --window"));
 
         let workspace = build_workspace_alias_request("select-workspace", &args(&["workspace:4"]))
             .expect("workspace parses")

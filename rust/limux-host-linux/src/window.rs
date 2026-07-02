@@ -2813,6 +2813,32 @@ fn focus_window_payload(
     }))
 }
 
+// purpose: Apply CMUX workspace.move_to_window for the current single GTK host window.
+// inputs: Shared host state, target workspace, and CMUX window id/ref/index.
+// returns/effects: Returns workspace/window metadata or rejects unsupported windows.
+fn move_workspace_to_window_payload(
+    state: &State,
+    target: &WorkspaceTarget,
+    window_id: &str,
+) -> Result<serde_json::Value, BridgeError> {
+    validate_host_window_id(Some(window_id))?;
+    let app_state = state.borrow();
+    let index = workspace_index_for_target(&app_state, target)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    let mut payload = workspace_payload(&app_state, index)
+        .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("ok".to_string(), serde_json::Value::Bool(true));
+        object.insert("window_id".to_string(), serde_json::json!("window:1"));
+        object.insert("window_ref".to_string(), serde_json::json!("window:1"));
+        object.insert(
+            "window".to_string(),
+            window_list_payload(&app_state)["windows"][0].clone(),
+        );
+    }
+    Ok(payload)
+}
+
 // purpose: Validate a CMUX window scope against the current single GTK host window.
 // inputs: Optional CMUX window id/ref/index string.
 // returns/effects: Returns not_found for unsupported live host windows.
@@ -13855,6 +13881,14 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::FocusWindow { window_id, reply } => {
             let result = focus_window_payload(state, window_id.as_deref());
+            let _ = reply.send(result);
+        }
+        ControlCommand::MoveWorkspaceToWindow {
+            target,
+            window_id,
+            reply,
+        } => {
+            let result = move_workspace_to_window_payload(state, &target, &window_id);
             let _ = reply.send(result);
         }
         ControlCommand::WorkspaceEnv {
