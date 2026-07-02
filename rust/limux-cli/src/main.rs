@@ -10442,10 +10442,10 @@ fn tmux_split_direction(args: &[String]) -> &'static str {
     }
 }
 
-// purpose: Convert CMUX/tmux split-window -l cells into an initial divider ratio.
-// inputs: Raw args and normalized split direction.
-// returns/effects: Returns a bounded ratio or fails loudly for invalid cell counts.
-fn tmux_split_initial_divider_position(args: &[String], direction: &str) -> Result<Option<f64>> {
+// purpose: Parse CMUX/tmux split-window -l cells.
+// inputs: Raw args with optional -l value.
+// returns/effects: Returns requested cells or fails loudly for invalid values.
+fn tmux_split_size_cells(args: &[String]) -> Result<Option<u64>> {
     let Some(raw) = parse_opt(args, "-l") else {
         return Ok(None);
     };
@@ -10459,13 +10459,37 @@ fn tmux_split_initial_divider_position(args: &[String], direction: &str) -> Resu
     if cells == 0 {
         bail!("split-window -l requires a positive integer cell count");
     }
-    let requested = cells.min(99) as f64 / 100.0;
+    Ok(Some(cells))
+}
+
+// purpose: Convert CMUX/tmux split-window -l cells into an exact divider ratio.
+// inputs: Requested cells, current pane cells, and normalized split direction.
+// returns/effects: Returns a bounded ratio matching CMUX's live geometry formula.
+fn tmux_initial_divider_from_cells(cells: u64, current_cells: u64, direction: &str) -> Option<f64> {
+    if cells == 0 || current_cells == 0 {
+        return None;
+    }
+    let requested = cells.min(current_cells.saturating_sub(1).max(1)) as f64;
+    let current = current_cells as f64;
     let ratio = match direction {
-        "left" | "up" => requested,
-        "right" | "down" => 1.0 - requested,
-        _ => 0.5,
+        "left" | "up" => requested / current,
+        "right" | "down" => (current - requested) / current,
+        _ => return None,
     };
-    Ok(Some(ratio.clamp(0.1, 0.9)))
+    Some(ratio.clamp(0.1, 0.9))
+}
+
+// purpose: Compare raw ids and Limux/CMUX refs for tmux target matching.
+// inputs: Candidate id or ref and the requested target.
+// returns/effects: Returns true when handles refer to the same object.
+fn tmux_handle_matches(candidate: &str, requested: &str) -> bool {
+    candidate == requested
+        || candidate.strip_prefix("surface:") == Some(requested)
+        || requested.strip_prefix("surface:") == Some(candidate)
+        || candidate.strip_prefix("pane:") == Some(requested)
+        || requested.strip_prefix("pane:") == Some(candidate)
+        || candidate.strip_prefix('%') == Some(requested)
+        || requested.strip_prefix('%') == Some(candidate)
 }
 
 // purpose: Insert optional split-window workspace and surface targets into params.
@@ -10505,9 +10529,7 @@ fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
         "focus".to_string(),
         Value::Bool(!tmux_has_short_flag(args, "-d")),
     );
-    if let Some(position) = tmux_split_initial_divider_position(args, direction)? {
-        params.insert("initial_divider_position".to_string(), json!(position));
-    }
+    let _ = tmux_split_size_cells(args)?;
     if let Some(cwd) = parse_opt(args, "-c").filter(|value| !value.trim().is_empty()) {
         params.insert("working_directory".to_string(), Value::String(cwd));
     }
@@ -10570,6 +10592,106 @@ fn render_tmux_split_print(payload: &Value, format: Option<&str>) -> String {
         .or_else(|| get_string(payload, &["surface_id", "surface_ref"]))
         .unwrap_or_default();
     tmux_render_format(format, &context, &fallback)
+}
+
+// purpose: Resolve the pane row used for exact tmux split sizing.
+// inputs: Live client, workspace id, optional pane id, and optional surface id.
+// returns/effects: Calls pane.list/surface.list and returns the target pane row.
+async fn tmux_split_target_pane_row(
+    client: &mut Client,
+    workspace_id: &str,
+    pane_id: Option<&str>,
+    surface_id: Option<&str>,
+) -> Result<Option<Value>> {
+    let panes = payload_array(
+        &client
+            .call("pane.list", json!({"workspace_id": workspace_id}))
+            .await?,
+        "panes",
+    );
+    if let Some(pane_id) = pane_id {
+        if let Some(row) = panes.iter().find(|row| {
+            get_string(row, &["pane_id", "pane_ref", "id"])
+                .is_some_and(|candidate| tmux_handle_matches(&candidate, pane_id))
+        }) {
+            return Ok(Some(row.clone()));
+        }
+    }
+    if let Some(surface_id) = surface_id {
+        let surfaces = payload_array(
+            &client
+                .call("surface.list", json!({"workspace_id": workspace_id}))
+                .await?,
+            "surfaces",
+        );
+        let target_pane = surfaces.iter().find_map(|row| {
+            let matches = get_string(row, &["surface_id", "surface_ref", "id"])
+                .is_some_and(|candidate| tmux_handle_matches(&candidate, surface_id));
+            if matches {
+                get_string(row, &["pane_id", "pane_ref"])
+            } else {
+                None
+            }
+        });
+        if let Some(target_pane) = target_pane {
+            return Ok(panes.into_iter().find(|row| {
+                get_string(row, &["pane_id", "pane_ref", "id"])
+                    .is_some_and(|candidate| tmux_handle_matches(&candidate, &target_pane))
+            }));
+        }
+    }
+    Ok(panes
+        .into_iter()
+        .find(|row| row.get("focused").and_then(Value::as_bool) == Some(true)))
+}
+
+// purpose: Add exact CMUX/tmux split-window -l divider sizing to surface.split params.
+// inputs: Live client, raw split args, direction, and mutable request params.
+// returns/effects: Inserts initial_divider_position or fails loudly for missing geometry.
+async fn insert_tmux_split_exact_size(
+    client: &mut Client,
+    args: &[String],
+    direction: &str,
+    params: &mut Value,
+) -> Result<()> {
+    let Some(cells) = tmux_split_size_cells(args)? else {
+        return Ok(());
+    };
+    let target = parse_opt(args, "-t")
+        .or_else(|| parse_opt(args, "--target"))
+        .or_else(|| parse_opt(args, "--surface"))
+        .or_else(|| parse_opt(args, "--panel"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"));
+    let context = tmux_target_context(client, target.as_deref()).await?;
+    let workspace_id = context
+        .workspace_id
+        .ok_or_else(|| anyhow!("split-window -l requires a workspace context"))?;
+    let row = tmux_split_target_pane_row(
+        client,
+        &workspace_id,
+        context.pane_id.as_deref(),
+        context.surface_id.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("split-window -l requires a target pane with geometry"))?;
+    let axis_key = match direction {
+        "left" | "right" => "columns",
+        "up" | "down" => "rows",
+        _ => bail!("split-window -l requires a valid split direction"),
+    };
+    let current_cells = row
+        .get(axis_key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("split-window -l requires {axis_key} in pane.list"))?;
+    let position = tmux_initial_divider_from_cells(cells, current_cells, direction)
+        .ok_or_else(|| anyhow!("split-window -l requires positive pane geometry"))?;
+    let Some(map) = params.as_object_mut() else {
+        bail!("surface.split params must be an object");
+    };
+    map.entry("workspace_id".to_string())
+        .or_insert(Value::String(workspace_id));
+    map.insert("initial_divider_position".to_string(), json!(position));
+    Ok(())
 }
 
 // purpose: Build CMUX/tmux select-layout params for the live equalize route.
@@ -10707,7 +10829,13 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             Ok(json!({"text": text}))
         }
         "split-window" => {
-            let (params, print_result) = build_tmux_split_window_request(args)?;
+            let (mut params, print_result) = build_tmux_split_window_request(args)?;
+            let direction = params
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("down")
+                .to_string();
+            insert_tmux_split_exact_size(client, args, &direction, &mut params).await?;
             let payload = client.call("surface.split", params).await?;
             if print_result {
                 let handle =
@@ -13723,14 +13851,24 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn tmux_split_window_serializes_size_cells_as_initial_divider() {
+    fn tmux_split_window_validates_size_cells_for_exact_live_geometry() {
         let (right, _) =
             build_tmux_split_window_request(&args(&["-h", "-l", "30"])).expect("right split");
-        assert_eq!(right["initial_divider_position"], 0.7);
+        assert!(right.get("initial_divider_position").is_none());
+        assert_eq!(
+            tmux_split_size_cells(&args(&["-l", "30"])).unwrap(),
+            Some(30)
+        );
+        assert_eq!(
+            tmux_initial_divider_from_cells(30, 120, "right"),
+            Some(0.75)
+        );
+        assert_eq!(tmux_initial_divider_from_cells(30, 120, "left"), Some(0.25));
+        assert_eq!(tmux_initial_divider_from_cells(999, 80, "down"), Some(0.1));
 
         let (left, _) =
             build_tmux_split_window_request(&args(&["-hb", "-l", "30"])).expect("left split");
-        assert_eq!(left["initial_divider_position"], 0.3);
+        assert!(left.get("initial_divider_position").is_none());
 
         let err = build_tmux_split_window_request(&args(&["-l", "0"]))
             .expect_err("zero cells should fail");
