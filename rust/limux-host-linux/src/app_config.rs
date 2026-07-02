@@ -52,6 +52,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub workspace_groups: WorkspaceGroupsConfig,
     #[serde(skip)]
+    pub new_workspace_placement: WorkspaceGroupNewPlacement,
+    #[serde(skip)]
     pub font_size: Option<f32>,
 }
 
@@ -310,6 +312,15 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(Value::as_str)
         .and_then(ColorScheme::from_str)
         .unwrap_or(color_scheme);
+    let app = root.get("app").map(|value| {
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("app must be an object"))
+    });
+    let new_workspace_placement = app
+        .and_then(|app| app.get("newWorkspacePlacement"))
+        .map(|value| parse_workspace_new_placement(value, "app.newWorkspacePlacement"))
+        .unwrap_or_default();
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -351,6 +362,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             hooks: notification_hooks,
         },
         workspace_groups,
+        new_workspace_placement,
         font_size,
     }
 }
@@ -364,9 +376,7 @@ fn parse_workspace_groups_config(value: &Value) -> WorkspaceGroupsConfig {
         .unwrap_or_else(|| panic!("workspaceGroups must be an object"));
     let new_workspace_placement = object
         .get("newWorkspacePlacement")
-        .map(|value| {
-            parse_workspace_group_placement(value, "workspaceGroups.newWorkspacePlacement")
-        })
+        .map(|value| parse_workspace_new_placement(value, "workspaceGroups.newWorkspacePlacement"))
         .unwrap_or_default();
     let by_cwd = object
         .get("byCwd")
@@ -396,7 +406,7 @@ fn parse_workspace_group_cwd_configs(value: &Value) -> Vec<WorkspaceGroupCwdConf
                 .as_object()
                 .unwrap_or_else(|| panic!("workspaceGroups.byCwd[{trimmed}] must be an object"));
             let placement = object.get("newWorkspacePlacement").map(|value| {
-                parse_workspace_group_placement(
+                parse_workspace_new_placement(
                     value,
                     &format!("workspaceGroups.byCwd[{trimmed}].newWorkspacePlacement"),
                 )
@@ -417,10 +427,10 @@ fn parse_workspace_group_cwd_configs(value: &Value) -> Vec<WorkspaceGroupCwdConf
         .collect()
 }
 
-// purpose: Parse one workspace group placement setting.
+// purpose: Parse one CMUX workspace placement setting.
 // inputs: JSON string value plus a diagnostic label.
 // returns/effects: Returns a valid placement or panics loudly.
-fn parse_workspace_group_placement(value: &Value, label: &str) -> WorkspaceGroupNewPlacement {
+fn parse_workspace_new_placement(value: &Value, label: &str) -> WorkspaceGroupNewPlacement {
     let raw = value
         .as_str()
         .unwrap_or_else(|| panic!("{label} must be a string"));
@@ -613,6 +623,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "focus".to_string(),
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+    let app = root.entry("app".to_string()).or_insert_with(|| json!({}));
+    if !app.is_object() {
+        *app = json!({});
+    }
+    app.as_object_mut().expect("app object").insert(
+        "newWorkspacePlacement".to_string(),
+        json!(config.new_workspace_placement.as_str()),
     );
     root.insert(
         "notifications".to_string(),
@@ -928,6 +946,50 @@ mod tests {
     }
 
     #[test]
+    fn load_from_path_reads_app_new_workspace_placement() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "newWorkspacePlacement": "top"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(
+            loaded.config.new_workspace_placement,
+            WorkspaceGroupNewPlacement::Top
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "app.newWorkspacePlacement must be afterCurrent, top, or end")]
+    fn load_from_path_rejects_invalid_app_new_workspace_placement() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "newWorkspacePlacement": "middle"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
     fn load_from_path_reads_workspace_group_placement_config() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
@@ -1072,6 +1134,38 @@ mod tests {
         assert_eq!(
             parsed["appearance"]["color_scheme"],
             Value::String("dark".to_string())
+        );
+    }
+
+    #[test]
+    fn save_to_path_writes_app_workspace_placement_and_preserves_app_keys() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "windowTitleTemplate": "{{workspace}}"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let mut config = load_from_path(&path).config;
+        config.new_workspace_placement = WorkspaceGroupNewPlacement::End;
+        save_to_path(&path, &config).expect("save app placement");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["app"]["newWorkspacePlacement"],
+            Value::String("end".to_string())
+        );
+        assert_eq!(
+            parsed["app"]["windowTitleTemplate"],
+            Value::String("{{workspace}}".to_string())
         );
     }
 

@@ -122,6 +122,12 @@ struct WorkspaceGroupFolderTarget {
     placement: app_config::WorkspaceGroupNewPlacement,
 }
 
+struct WorkspaceFolderTarget {
+    group: Option<WorkspaceGroupFolderTarget>,
+    reference_workspace_id: Option<String>,
+    placement: app_config::WorkspaceGroupNewPlacement,
+}
+
 #[derive(Clone)]
 struct HostNotification {
     id: u64,
@@ -6169,6 +6175,33 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
+// purpose: Resolve CMUX app.newWorkspacePlacement into a workspace insertion index.
+// inputs: Favorite flags including the source row, selected/reference index, source index, and placement.
+// returns/effects: Returns an insertion index before source removal without mutating state.
+fn workspace_insert_index_for_placement(
+    favorite_flags: &[bool],
+    selected_index: Option<usize>,
+    source_index: usize,
+    placement: app_config::WorkspaceGroupNewPlacement,
+) -> usize {
+    let total = favorite_flags.len();
+    let pinned_count = favorites_prefix_len(favorite_flags);
+    match placement {
+        app_config::WorkspaceGroupNewPlacement::Top => pinned_count,
+        app_config::WorkspaceGroupNewPlacement::End => total,
+        app_config::WorkspaceGroupNewPlacement::AfterCurrent => selected_index
+            .filter(|index| *index < total)
+            .map(|index| {
+                if favorite_flags[index] {
+                    pinned_count
+                } else {
+                    index.saturating_add(1)
+                }
+            })
+            .unwrap_or(source_index),
+    }
+}
+
 fn sync_sidebar_row_order(state: &mut AppState) {
     while let Some(child) = state.sidebar_list.first_child() {
         state.sidebar_list.remove(&child);
@@ -7163,10 +7196,72 @@ fn active_workspace_group_folder_target(state: &AppState) -> Option<WorkspaceGro
     })
 }
 
+// purpose: Snapshot CMUX placement context before a folder workspace is created.
+// inputs: Current host state and active workspace selection.
+// returns/effects: Returns group or app placement metadata without mutating state.
+fn active_workspace_folder_target(state: &AppState) -> WorkspaceFolderTarget {
+    WorkspaceFolderTarget {
+        group: active_workspace_group_folder_target(state),
+        reference_workspace_id: state
+            .active_workspace()
+            .map(|workspace| workspace.id.clone()),
+        placement: state.config.borrow().new_workspace_placement,
+    }
+}
+
+// purpose: Reorder a newly-created non-group workspace according to CMUX app placement.
+// inputs: Created workspace id, placement, and optional pre-creation reference workspace id.
+// returns/effects: Mutates workspace order/sidebar order or returns a placement error.
+fn place_created_workspace(
+    state: &State,
+    workspace_id: &str,
+    placement: app_config::WorkspaceGroupNewPlacement,
+    reference_workspace_id: Option<&str>,
+) -> Result<(), BridgeError> {
+    let mut s = state.borrow_mut();
+    let Some(source_index) = workspace_index_for_raw_id(&s, workspace_id) else {
+        return Err(BridgeError::not_found("workspace not found"));
+    };
+    let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+    let favorite_flags = s
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.favorite)
+        .collect::<Vec<_>>();
+    let reference_index =
+        reference_workspace_id.and_then(|raw| workspace_index_for_raw_id(&s, raw));
+    let target_index = workspace_insert_index_for_placement(
+        &favorite_flags,
+        reference_index,
+        source_index,
+        placement,
+    );
+    if source_index != target_index {
+        let workspace = s.workspaces.remove(source_index);
+        let adjusted = if target_index > source_index {
+            target_index - 1
+        } else {
+            target_index
+        };
+        s.workspaces.insert(adjusted, workspace);
+        if let Some(active_workspace_id) = active_workspace_id {
+            if let Some(active_index) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_workspace_id)
+            {
+                s.active_idx = active_index;
+            }
+        }
+    }
+    sync_sidebar_row_order(&mut s);
+    Ok(())
+}
+
 fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
-    let group_target = {
+    let target = {
         let s = state.borrow();
-        active_workspace_group_folder_target(&s)
+        active_workspace_folder_target(&s)
     };
     let workspace = WorkspaceState {
         id: None,
@@ -7175,27 +7270,35 @@ fn create_workspace_with_folder(state: &State, name: &str, folder_path: &str) {
         favorite: false,
         cwd: Some(folder_path.to_string()),
         folder_path: Some(folder_path.to_string()),
-        group_id: group_target.as_ref().map(|target| target.group_id.clone()),
+        group_id: target.group.as_ref().map(|group| group.group_id.clone()),
         environment: BTreeMap::new(),
         layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
     };
     add_workspace_from_state(state, &workspace);
-    if let Some(target) = group_target {
-        let created_workspace_id = {
-            let s = state.borrow();
-            s.workspaces
-                .last()
-                .map(|workspace| workspace.id.clone())
-                .expect("folder workspace creation must append a workspace")
-        };
+    let created_workspace_id = {
+        let s = state.borrow();
+        s.workspaces
+            .last()
+            .map(|workspace| workspace.id.clone())
+            .expect("folder workspace creation must append a workspace")
+    };
+    if let Some(group) = target.group {
         place_created_workspace_in_group(
             state,
             &created_workspace_id,
-            &target.group_id,
-            Some(target.placement.as_str()),
-            Some(&target.reference_workspace_id),
+            &group.group_id,
+            Some(group.placement.as_str()),
+            Some(&group.reference_workspace_id),
         )
         .expect("active workspace group target must remain valid after folder workspace creation");
+    } else {
+        place_created_workspace(
+            state,
+            &created_workspace_id,
+            target.placement,
+            target.reference_workspace_id.as_deref(),
+        )
+        .expect("created folder workspace must be orderable");
     }
     request_session_save(state);
 }
@@ -12890,14 +12993,16 @@ mod tests {
         tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
         workspace_folder_path_from_input, workspace_group_insert_index,
-        workspace_hidden_by_collapsed_group_id, workspace_lifecycle_payload,
-        workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
-        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
-        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
-        SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot, WorkspaceSeedSource, BASE_CSS,
-        HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
+        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
+        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
+        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
+        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
+        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, WorkspaceEventSnapshot,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
+    use crate::app_config::WorkspaceGroupNewPlacement;
     use crate::control_bridge::{BrowserAction, RightSidebarMode};
     use crate::layout_state::{
         LayoutNodeState, PaneState, SplitOrientation, SplitState, WorkspaceGroupState,
@@ -13861,6 +13966,47 @@ mod tests {
         assert_eq!(
             workspace_group_insert_index(&group_ids, 2, None, "group-a", 4, "afterCurrent"),
             3
+        );
+    }
+
+    #[test]
+    fn workspace_insert_index_matches_cmux_app_placements_with_pins() {
+        let favorite_flags = [true, true, false, false, false, false];
+        assert_eq!(
+            workspace_insert_index_for_placement(
+                &favorite_flags,
+                Some(3),
+                5,
+                WorkspaceGroupNewPlacement::Top,
+            ),
+            2
+        );
+        assert_eq!(
+            workspace_insert_index_for_placement(
+                &favorite_flags,
+                Some(3),
+                5,
+                WorkspaceGroupNewPlacement::End,
+            ),
+            6
+        );
+        assert_eq!(
+            workspace_insert_index_for_placement(
+                &favorite_flags,
+                Some(3),
+                5,
+                WorkspaceGroupNewPlacement::AfterCurrent,
+            ),
+            4
+        );
+        assert_eq!(
+            workspace_insert_index_for_placement(
+                &favorite_flags,
+                Some(1),
+                5,
+                WorkspaceGroupNewPlacement::AfterCurrent,
+            ),
+            2
         );
     }
 
