@@ -2156,6 +2156,172 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const BROWSER_SEARCH_ENGINES: &[&str] = &[
+    "google",
+    "duckduckgo",
+    "bing",
+    "kagi",
+    "startpage",
+    "brave",
+    "perplexity",
+    "exa",
+    "yahoo",
+    "ecosia",
+    "qwant",
+    "mojeek",
+    "wikipedia",
+    "github",
+    "baidu",
+    "yandex",
+    "custom",
+];
+
+const BROWSER_THEME_MODES: &[&str] = &["system", "light", "dark"];
+
+const BROWSER_DEFAULT_SEARCH_ENGINE_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.defaultSearchEngine",
+    section: "browser",
+    json_path: &["defaultSearchEngine"],
+    kind: ScalarSettingKind::Enum {
+        default: "google",
+        allowed: BROWSER_SEARCH_ENGINES,
+    },
+};
+
+const BROWSER_CUSTOM_SEARCH_ENGINE_NAME_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.customSearchEngineName",
+    section: "browser",
+    json_path: &["customSearchEngineName"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const BROWSER_CUSTOM_SEARCH_ENGINE_URL_TEMPLATE_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.customSearchEngineURLTemplate",
+    section: "browser",
+    json_path: &["customSearchEngineURLTemplate"],
+    kind: ScalarSettingKind::String {
+        default: "https://www.google.com/search?q={query}",
+    },
+};
+
+const BROWSER_SHOW_SEARCH_SUGGESTIONS_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.showSearchSuggestions",
+    section: "browser",
+    json_path: &["showSearchSuggestions"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const BROWSER_THEME_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.theme",
+    section: "browser",
+    json_path: &["theme"],
+    kind: ScalarSettingKind::Enum {
+        default: "system",
+        allowed: BROWSER_THEME_MODES,
+    },
+};
+
+const BROWSER_DISCARD_HIDDEN_WEB_VIEWS_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.discardHiddenWebViews",
+    section: "browser",
+    json_path: &["discardHiddenWebViews"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const BROWSER_HIDDEN_WEB_VIEW_DISCARD_DELAY_SECONDS_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.hiddenWebViewDiscardDelaySeconds",
+    section: "browser",
+    json_path: &["hiddenWebViewDiscardDelaySeconds"],
+    kind: ScalarSettingKind::Decimal {
+        default: 300.0,
+        min: 0.1,
+        max: 86400.0,
+    },
+};
+
+const BROWSER_ASK_WHERE_TO_SAVE_DOWNLOADS_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.askWhereToSaveDownloads",
+    section: "browser",
+    json_path: &["askWhereToSaveDownloads"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const BROWSER_OPEN_TERMINAL_LINKS_IN_CMUX_BROWSER_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.openTerminalLinksInCmuxBrowser",
+    section: "browser",
+    json_path: &["openTerminalLinksInCmuxBrowser"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const BROWSER_INTERCEPT_TERMINAL_OPEN_COMMAND_IN_CMUX_BROWSER_SETTING: ScalarSetting =
+    ScalarSetting {
+        key: "browser.interceptTerminalOpenCommandInCmuxBrowser",
+        section: "browser",
+        json_path: &["interceptTerminalOpenCommandInCmuxBrowser"],
+        kind: ScalarSettingKind::Boolean { default: true },
+    };
+
+const BROWSER_HOSTS_TO_OPEN_IN_EMBEDDED_BROWSER_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.hostsToOpenInEmbeddedBrowser",
+    section: "browser",
+    json_path: &["hostsToOpenInEmbeddedBrowser"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const BROWSER_URLS_TO_ALWAYS_OPEN_EXTERNALLY_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.urlsToAlwaysOpenExternally",
+    section: "browser",
+    json_path: &["urlsToAlwaysOpenExternally"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const BROWSER_INSECURE_HTTP_HOSTS_ALLOWED_IN_EMBEDDED_BROWSER_SETTING: ScalarSetting =
+    ScalarSetting {
+        key: "browser.insecureHttpHostsAllowedInEmbeddedBrowser",
+        section: "browser",
+        json_path: &["insecureHttpHostsAllowedInEmbeddedBrowser"],
+        kind: ScalarSettingKind::String {
+            default: "localhost\n*.localhost\n127.0.0.1\n::1\n0.0.0.0\n*.localtest.me",
+        },
+    };
+
+const BROWSER_SHOW_IMPORT_HINT_ON_BLANK_TABS_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.showImportHintOnBlankTabs",
+    section: "browser",
+    json_path: &["showImportHintOnBlankTabs"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const BROWSER_REACT_GRAB_VERSION_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.reactGrabVersion",
+    section: "browser",
+    json_path: &["reactGrabVersion"],
+    kind: ScalarSettingKind::String { default: "0.1.29" },
+};
+
+const BROWSER_DISABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.disabled",
+    section: "browser",
+    json_path: &["disabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const BROWSER_IMPORT_HINT_VARIANT_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.importHintVariant",
+    section: "browser",
+    json_path: &["importHintVariant"],
+    kind: ScalarSettingKind::String {
+        default: "toolbarChip",
+    },
+};
+
+const BROWSER_IMPORT_HINT_DISMISSED_SETTING: ScalarSetting = ScalarSetting {
+    key: "browser.importHintDismissed",
+    section: "browser",
+    json_path: &["importHintDismissed"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
 const SIDEBAR_HIDE_ALL_DETAILS_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.hideAllDetails",
     section: "sidebar",
@@ -2305,6 +2471,15 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "browser.defaultSearchEngine|browser.customSearchEngineName|",
+    "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
+    "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
+    "browser.askWhereToSaveDownloads|browser.openTerminalLinksInCmuxBrowser|",
+    "browser.interceptTerminalOpenCommandInCmuxBrowser|",
+    "browser.hostsToOpenInEmbeddedBrowser|browser.urlsToAlwaysOpenExternally|",
+    "browser.insecureHttpHostsAllowedInEmbeddedBrowser|",
+    "browser.showImportHintOnBlankTabs|browser.reactGrabVersion|browser.disabled|",
+    "browser.importHintVariant|browser.importHintDismissed|",
     "sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
@@ -2339,6 +2514,15 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "browser.defaultSearchEngine|browser.customSearchEngineName|",
+    "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
+    "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
+    "browser.askWhereToSaveDownloads|browser.openTerminalLinksInCmuxBrowser|",
+    "browser.interceptTerminalOpenCommandInCmuxBrowser|",
+    "browser.hostsToOpenInEmbeddedBrowser|browser.urlsToAlwaysOpenExternally|",
+    "browser.insecureHttpHostsAllowedInEmbeddedBrowser|",
+    "browser.showImportHintOnBlankTabs|browser.reactGrabVersion|browser.disabled|",
+    "browser.importHintVariant|browser.importHintDismissed|",
     "sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
@@ -2464,9 +2648,59 @@ fn numeric_setting(raw: &str) -> Option<NumericSetting> {
 // inputs: Raw config key from CLI arguments.
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    if raw.starts_with("terminal.") {
+        return terminal_scalar_setting(raw);
+    }
+    if raw.starts_with("browser.") {
+        return browser_scalar_setting(raw);
+    }
+    feature_scalar_setting(raw)
+}
+
+// purpose: Map CMUX terminal catalog keys to nested JSON descriptors.
+// inputs: Raw `terminal.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown terminal keys.
+fn terminal_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    if matches!(
+        raw,
+        "terminal.agentHibernation.enabled"
+            | "terminal.agentHibernation.idleSeconds"
+            | "terminal.agentHibernation.maxLiveTerminals"
+            | "terminal.rendererRealization.enabled"
+            | "terminal.rendererRealization.idleSeconds"
+            | "terminal.rendererRealization.maxWarmRenderers"
+            | "terminal.runawayMemoryGuardrail.enabled"
+            | "terminal.runawayMemoryGuardrail.thresholdGB"
+    ) {
+        return terminal_performance_scalar_setting(raw);
+    }
+    if matches!(
+        raw,
+        "terminal.titleUpdates.coalescing.enabled"
+            | "terminal.titleUpdates.coalescing.delayMilliseconds"
+            | "terminal.titleUpdates.diagnostics"
+            | "terminal.showTextBoxOnNewTerminals"
+            | "terminal.focusTextBoxOnNewTerminals"
+            | "terminal.textBoxMaxLines"
+            | "terminal.textBoxDefaultSubmitAction"
+            | "terminal.textBoxSubmitActions"
+    ) {
+        return terminal_text_scalar_setting(raw);
+    }
     match raw {
         "terminal.showScrollBar" => Some(TERMINAL_SHOW_SCROLL_BAR_SETTING),
         "terminal.copyOnSelect" => Some(TERMINAL_COPY_ON_SELECT_SETTING),
+        "terminal.resumeCommands" => Some(TERMINAL_RESUME_COMMANDS_SETTING),
+        "terminal.scrollSpeed" => Some(TERMINAL_SCROLL_SPEED_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX terminal performance and memory keys to JSON descriptors.
+// inputs: Raw terminal config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn terminal_performance_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
         "terminal.agentHibernation.enabled" => Some(TERMINAL_AGENT_HIBERNATION_ENABLED_SETTING),
         "terminal.agentHibernation.idleSeconds" => {
             Some(TERMINAL_AGENT_HIBERNATION_IDLE_SECONDS_SETTING)
@@ -2483,6 +2717,21 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "terminal.rendererRealization.maxWarmRenderers" => {
             Some(TERMINAL_RENDERER_REALIZATION_MAX_WARM_RENDERERS_SETTING)
         }
+        "terminal.runawayMemoryGuardrail.enabled" => {
+            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_ENABLED_SETTING)
+        }
+        "terminal.runawayMemoryGuardrail.thresholdGB" => {
+            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_THRESHOLD_GB_SETTING)
+        }
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX terminal title and text-box keys to JSON descriptors.
+// inputs: Raw terminal config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn terminal_text_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
         "terminal.titleUpdates.coalescing.enabled" => {
             Some(TERMINAL_TITLE_COALESCING_ENABLED_SETTING)
         }
@@ -2501,20 +2750,62 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
             Some(TERMINAL_TEXT_BOX_DEFAULT_SUBMIT_ACTION_SETTING)
         }
         "terminal.textBoxSubmitActions" => Some(TERMINAL_TEXT_BOX_SUBMIT_ACTIONS_SETTING),
-        "terminal.resumeCommands" => Some(TERMINAL_RESUME_COMMANDS_SETTING),
-        "terminal.scrollSpeed" => Some(TERMINAL_SCROLL_SPEED_SETTING),
-        "terminal.runawayMemoryGuardrail.enabled" => {
-            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_ENABLED_SETTING)
-        }
-        "terminal.runawayMemoryGuardrail.thresholdGB" => {
-            Some(TERMINAL_RUNAWAY_MEMORY_GUARDRAIL_THRESHOLD_GB_SETTING)
-        }
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX custom sidebar and beta-feature keys to JSON descriptors.
+// inputs: Raw non-terminal, non-browser scalar config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn feature_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
         "customSidebars.renderer" => Some(CUSTOM_SIDEBARS_RENDERER_SETTING),
         "customSidebars.beta.enabled" => Some(CUSTOM_SIDEBARS_BETA_ENABLED_SETTING),
         "rightSidebar.beta.feed.enabled" => Some(RIGHT_SIDEBAR_BETA_FEED_ENABLED_SETTING),
         "rightSidebar.beta.dock.enabled" => Some(RIGHT_SIDEBAR_BETA_DOCK_ENABLED_SETTING),
         "extensions.beta.enabled" => Some(EXTENSIONS_BETA_ENABLED_SETTING),
         "remoteTmux.beta.enabled" => Some(REMOTE_TMUX_BETA_ENABLED_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX Browser catalog keys to nested JSON descriptors.
+// inputs: Raw `browser.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown browser keys.
+fn browser_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "browser.defaultSearchEngine" => Some(BROWSER_DEFAULT_SEARCH_ENGINE_SETTING),
+        "browser.customSearchEngineName" => Some(BROWSER_CUSTOM_SEARCH_ENGINE_NAME_SETTING),
+        "browser.customSearchEngineURLTemplate" => {
+            Some(BROWSER_CUSTOM_SEARCH_ENGINE_URL_TEMPLATE_SETTING)
+        }
+        "browser.showSearchSuggestions" => Some(BROWSER_SHOW_SEARCH_SUGGESTIONS_SETTING),
+        "browser.theme" => Some(BROWSER_THEME_SETTING),
+        "browser.discardHiddenWebViews" => Some(BROWSER_DISCARD_HIDDEN_WEB_VIEWS_SETTING),
+        "browser.hiddenWebViewDiscardDelaySeconds" => {
+            Some(BROWSER_HIDDEN_WEB_VIEW_DISCARD_DELAY_SECONDS_SETTING)
+        }
+        "browser.askWhereToSaveDownloads" => Some(BROWSER_ASK_WHERE_TO_SAVE_DOWNLOADS_SETTING),
+        "browser.openTerminalLinksInCmuxBrowser" => {
+            Some(BROWSER_OPEN_TERMINAL_LINKS_IN_CMUX_BROWSER_SETTING)
+        }
+        "browser.interceptTerminalOpenCommandInCmuxBrowser" => {
+            Some(BROWSER_INTERCEPT_TERMINAL_OPEN_COMMAND_IN_CMUX_BROWSER_SETTING)
+        }
+        "browser.hostsToOpenInEmbeddedBrowser" => {
+            Some(BROWSER_HOSTS_TO_OPEN_IN_EMBEDDED_BROWSER_SETTING)
+        }
+        "browser.urlsToAlwaysOpenExternally" => {
+            Some(BROWSER_URLS_TO_ALWAYS_OPEN_EXTERNALLY_SETTING)
+        }
+        "browser.insecureHttpHostsAllowedInEmbeddedBrowser" => {
+            Some(BROWSER_INSECURE_HTTP_HOSTS_ALLOWED_IN_EMBEDDED_BROWSER_SETTING)
+        }
+        "browser.showImportHintOnBlankTabs" => Some(BROWSER_SHOW_IMPORT_HINT_ON_BLANK_TABS_SETTING),
+        "browser.reactGrabVersion" => Some(BROWSER_REACT_GRAB_VERSION_SETTING),
+        "browser.disabled" => Some(BROWSER_DISABLED_SETTING),
+        "browser.importHintVariant" => Some(BROWSER_IMPORT_HINT_VARIANT_SETTING),
+        "browser.importHintDismissed" => Some(BROWSER_IMPORT_HINT_DISMISSED_SETTING),
         _ => None,
     }
 }
@@ -19207,6 +19498,75 @@ mod cli_arg_tests {
             Value::Bool(true)
         );
         assert_eq!(parsed["extensions"]["beta"]["enabled"], Value::Bool(true));
+    }
+
+    // purpose: Verify CMUX browser config keys expose upstream defaults and nested writes.
+    // inputs: Temporary settings file plus browser scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and unrelated-key preservation.
+    #[test]
+    fn config_browser_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, BROWSER_DEFAULT_SEARCH_ENGINE_SETTING)
+            .expect("get search engine default");
+        assert!(text.contains("browser.defaultSearchEngine = google"));
+        let text = render_config_scalar_get(&path, BROWSER_THEME_SETTING).expect("get theme");
+        assert!(text.contains("browser.theme = system"));
+        let text = render_config_scalar_get(
+            &path,
+            BROWSER_INSECURE_HTTP_HOSTS_ALLOWED_IN_EMBEDDED_BROWSER_SETTING,
+        )
+        .expect("get insecure host default");
+        assert!(text.contains("*.localtest.me"));
+
+        fs::write(
+            &path,
+            br#"{"browser":{"existing":true},"terminal":{"scrollSpeed":1.25}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_scalar_set(&path, BROWSER_DEFAULT_SEARCH_ENGINE_SETTING, "kagi")
+            .expect("set search engine");
+        assert!(text.contains("browser.defaultSearchEngine = kagi"));
+        let text = render_config_scalar_set(&path, BROWSER_THEME_SETTING, "dark")
+            .expect("set browser theme");
+        assert!(text.contains("browser.theme = dark"));
+        let text = render_config_scalar_set(
+            &path,
+            BROWSER_HIDDEN_WEB_VIEW_DISCARD_DELAY_SECONDS_SETTING,
+            "120.5",
+        )
+        .expect("set discard delay");
+        assert!(text.contains("browser.hiddenWebViewDiscardDelaySeconds = 120.5"));
+        let text = render_config_scalar_set(&path, BROWSER_DISABLED_SETTING, "true")
+            .expect("set browser disabled");
+        assert!(text.contains("browser.disabled = true"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["browser"]["defaultSearchEngine"], "kagi");
+        assert_eq!(parsed["browser"]["theme"], "dark");
+        assert_eq!(parsed["browser"]["hiddenWebViewDiscardDelaySeconds"], 120.5);
+        assert_eq!(parsed["browser"]["disabled"], true);
+        assert_eq!(parsed["browser"]["existing"], true);
+        assert_eq!(parsed["terminal"]["scrollSpeed"], 1.25);
+    }
+
+    // purpose: Verify CMUX browser config enum settings fail loudly on unknown values.
+    // inputs: Invalid browser search engine and theme values.
+    // returns/effects: Asserts invalid values are rejected instead of persisted.
+    #[test]
+    fn config_browser_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err =
+            render_config_scalar_set(&path, BROWSER_DEFAULT_SEARCH_ENGINE_SETTING, "askjeeves")
+                .expect_err("invalid search engine");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, BROWSER_THEME_SETTING, "sepia")
+            .expect_err("invalid browser theme");
+        assert!(err.to_string().contains("must be one of"));
     }
 
     // purpose: Verify CMUX sidebar config booleans default true and preserve sibling keys.
