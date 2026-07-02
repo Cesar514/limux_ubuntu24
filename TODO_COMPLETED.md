@@ -116,3 +116,4 @@
 [x] 2026-04-15T20:34:21Z Reproduce the current Ubuntu 24.04 build and packaging path, document concrete blockers, and identify the minimum repo changes required for compatibility. \
 [x] 2026-07-02T02:56:15Z Implement and verify CMUX `events.stream` slow-consumer cutoff at 1,024 pending live events with an explicit `slow_consumer` error frame. \
 [x] 2026-07-02T03:02:31Z Implement and verify retained CMUX surface lifecycle events for successful create, focus, close, move, reorder, and drag-to-split mutations. \
+[x] 2026-07-02T03:11:16Z Implement and verify live CMUX `config reload`/`reload-config` parity with settings and shortcut reload, terminal appearance/font application, and retained `config.reloaded` event emission. \

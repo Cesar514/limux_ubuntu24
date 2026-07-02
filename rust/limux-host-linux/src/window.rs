@@ -4274,6 +4274,88 @@ fn apply_appearance(
     sync_ghostty_color_scheme_for_config(style_manager, system_prefers_dark, appearance);
 }
 
+// purpose: Convert a caught panic payload into a control-socket error detail.
+// inputs: Panic payload from config loading.
+// returns/effects: Returns a human-readable message without hiding the reload failure.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic while reloading config".to_string()
+}
+
+// purpose: Apply a newly-loaded app config to live GTK and terminal state.
+// inputs: App state, loaded config, and the previously active font size.
+// returns/effects: Updates in-memory config, appearance, and terminal font size bindings.
+fn apply_reloaded_app_config(
+    state: &State,
+    config: app_config::AppConfig,
+    previous_font_size: Option<f32>,
+) {
+    let system_prefers_dark = state.borrow().system_prefers_dark.get();
+    let style_manager = adw::StyleManager::default();
+    apply_appearance(&style_manager, system_prefers_dark, &config.appearance);
+    let next_font_size = config.font_size;
+    state.borrow().config.borrow_mut().clone_from(&config);
+    if next_font_size == previous_font_size {
+        return;
+    }
+    match next_font_size {
+        Some(size) => broadcast_font_size(size),
+        None => crate::terminal::broadcast_binding_action("reset_font_size"),
+    }
+}
+
+// purpose: Reload Limux settings and shortcuts for the running host.
+// inputs: Shared app state receiving a control-socket reload request.
+// returns/effects: Applies config, shortcuts, emits a retained CMUX config event, or returns an explicit error.
+fn reload_config_for_control(state: &State) -> Result<serde_json::Value, BridgeError> {
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(app_config::load))
+        .map_err(|payload| BridgeError::internal(panic_payload_message(payload)))?;
+    let (display, previous_font_size) = {
+        let app_state = state.borrow();
+        let display = app_state.stack.display();
+        let previous_font_size = app_state.config.borrow().font_size;
+        (display, previous_font_size)
+    };
+    let shortcuts = shortcut_config::load_shortcuts_for_display(&display);
+    apply_reloaded_app_config(state, loaded.config, previous_font_size);
+    apply_shortcut_config(state, shortcuts.clone());
+    let settings_path = app_config::settings_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    let shortcuts_path = shortcut_config::shortcuts_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    let payload = serde_json::json!({
+        "ok": true,
+        "reloaded": true,
+        "settings_path": settings_path,
+        "shortcuts_path": shortcuts_path,
+        "settings_warnings": loaded.warnings,
+        "shortcut_warnings": shortcuts.warnings,
+        "applied": {
+            "settings": true,
+            "shortcuts": true,
+            "appearance": true,
+            "terminal_font_size": true,
+        },
+    });
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name: "config.reloaded",
+        category: "config",
+        source: "config.reload",
+        workspace_id: None,
+        surface_id: None,
+        pane_id: None,
+        payload: payload.clone(),
+    });
+    Ok(payload)
+}
+
 fn open_keybind_editor_tab(state: &State, pane_widget: &gtk::Widget) {
     let shortcuts = {
         let s = state.borrow();
@@ -5982,6 +6064,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             let result = crate::memory_diagnostics::memory_diagnostic_payload(top_group_limit)
                 .map_err(BridgeError::internal);
+            let _ = reply.send(result);
+        }
+        ControlCommand::ReloadConfig { reply } => {
+            let result = reload_config_for_control(state);
             let _ = reply.send(result);
         }
         ControlCommand::ListWorkspaces { reply } => {

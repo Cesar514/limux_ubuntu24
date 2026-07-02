@@ -644,12 +644,13 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
             args.first().map(String::as_str),
         )?)),
         "settings" => Some(run_settings_command(args)?),
+        "config" if args.first().map(String::as_str) == Some("reload") => None,
         "config" => Some(run_config_command(args)?),
         "shortcuts" => Some(CommandOutput::Text(
             limux_shortcuts_path()?.display().to_string(),
         )),
         "themes" => Some(run_themes_command(args)?),
-        "reload-config" => Some(run_config_command(&["reload".to_string()])?),
+        "reload-config" => None,
         _ => None,
     };
     Ok(out)
@@ -6145,6 +6146,32 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_memory_text(&payload, opts.id_format))
             }
         }
+        "config" if args.first().map(String::as_str) == Some("reload") => {
+            if args.len() != 1 {
+                bail!("Usage: limux config reload");
+            }
+            let payload = client
+                .call("reload_config", Value::Object(Map::new()))
+                .await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK config reloaded".to_string())
+            }
+        }
+        "reload-config" => {
+            if !args.is_empty() {
+                bail!("Usage: limux reload-config");
+            }
+            let payload = client
+                .call("reload_config", Value::Object(Map::new()))
+                .await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK config reloaded".to_string())
+            }
+        }
         "list-pane-surfaces" => {
             let payload = client
                 .call("pane.surfaces", build_list_pane_surfaces_request(args)?)
@@ -6607,6 +6634,18 @@ mod cli_arg_tests {
             err.to_string().contains("is not valid JSON"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn config_reload_commands_use_socket_path() {
+        assert!(
+            run_local_command(&default_opts(args(&["config", "reload"])))
+                .expect("config reload local check")
+                .is_none()
+        );
+        assert!(run_local_command(&default_opts(args(&["reload-config"])))
+            .expect("reload-config local check")
+            .is_none());
     }
 
     #[test]

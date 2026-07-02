@@ -24,6 +24,8 @@ const METHODS: &[&str] = &[
     "system.identify",
     "system.capabilities",
     "system.memory",
+    "reload_config",
+    "config.reload",
     "events.stream",
     "feed.push",
     "feed.list",
@@ -500,6 +502,9 @@ pub enum ControlCommand {
         top_group_limit: usize,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ReloadConfig {
+        reply: mpsc::Sender<BridgeResult>,
+    },
     CurrentWorkspace {
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -744,6 +749,7 @@ impl ControlCommand {
         match self {
             Self::Identify { reply, .. }
             | Self::Memory { reply, .. }
+            | Self::ReloadConfig { reply }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
             | Self::ListWorkspaceGroups { reply }
@@ -1605,6 +1611,10 @@ fn handle_method(
                 },
                 rx,
             )
+        }
+        "reload_config" | "config.reload" => {
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::ReloadConfig { reply }, rx)
         }
         "workspace.current" => {
             let (reply, rx) = mpsc::channel();
@@ -3409,6 +3419,12 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_config_reload_methods() {
+        assert!(METHODS.contains(&"reload_config"));
+        assert!(METHODS.contains(&"config.reload"));
+    }
+
+    #[test]
     fn capabilities_include_feed_methods() {
         assert!(METHODS.contains(&"feed.push"));
         assert!(METHODS.contains(&"feed.permission.reply"));
@@ -3419,6 +3435,26 @@ mod tests {
     #[test]
     fn capabilities_include_workspace_group_list() {
         assert!(METHODS.contains(&"workspace.group.list"));
+    }
+
+    #[test]
+    fn config_reload_routes_queue_live_command() {
+        for method in ["reload_config", "config.reload"] {
+            let request = json!({
+                "id": 1,
+                "method": method,
+                "params": {},
+            })
+            .to_string();
+            let response = dispatch_request(&request, &|command| match command {
+                ControlCommand::ReloadConfig { reply } => {
+                    let _ = reply.send(Ok(json!({ "ok": true, "reloaded": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            });
+            assert_eq!(response.error, None);
+            assert_eq!(response.result.expect("reload result")["reloaded"], true);
+        }
     }
 
     #[test]
