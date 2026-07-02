@@ -754,6 +754,13 @@ pub enum ControlCommand {
         focus: bool,
         reply: mpsc::Sender<BridgeResult>,
     },
+    TabAction {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        action: String,
+        title: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     ReorderSurface {
         target: WorkspaceTarget,
         surface_hint: String,
@@ -937,6 +944,7 @@ impl ControlCommand {
             | Self::CloseSurface { reply, .. }
             | Self::MoveSurface { reply, .. }
             | Self::MoveTabToNewWorkspace { reply, .. }
+            | Self::TabAction { reply, .. }
             | Self::ReorderSurface { reply, .. }
             | Self::DragSurfaceToSplit { reply, .. }
             | Self::RefreshSurfaces { reply, .. }
@@ -3645,12 +3653,6 @@ fn handle_method(
                 }
             };
             let action_key = action.to_ascii_lowercase().replace('-', "_");
-            if action_key != "move_to_new_workspace" {
-                return error_response(
-                    id,
-                    BridgeError::invalid_params(format!("tab.action unsupported action: {action}")),
-                );
-            }
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
                 Err(error) => return error_response(id, error),
@@ -3667,22 +3669,50 @@ fn handle_method(
                 }),
                 Err(error) => return error_response(id, error),
             };
-            let focus = match optional_bool(params, "focus") {
-                Ok(focus) => focus.unwrap_or(false),
-                Err(error) => return error_response(id, error),
-            };
             let title = optional_string(params, &["title"]);
             let (reply, rx) = mpsc::channel();
-            (
-                ControlCommand::MoveTabToNewWorkspace {
-                    target,
-                    surface_hint,
-                    title,
-                    focus,
-                    reply,
-                },
-                rx,
-            )
+            if action_key == "move_to_new_workspace" {
+                let focus = match optional_bool(params, "focus") {
+                    Ok(focus) => focus.unwrap_or(false),
+                    Err(error) => return error_response(id, error),
+                };
+                (
+                    ControlCommand::MoveTabToNewWorkspace {
+                        target,
+                        surface_hint,
+                        title,
+                        focus,
+                        reply,
+                    },
+                    rx,
+                )
+            } else if !matches!(
+                action_key.as_str(),
+                "rename" | "clear_name" | "pin" | "unpin"
+            ) {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(format!("tab.action unsupported action: {action}")),
+                );
+            } else if action_key == "rename"
+                && title.as_deref().is_none_or(|value| value.trim().is_empty())
+            {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params("tab.action rename requires title"),
+                );
+            } else {
+                (
+                    ControlCommand::TabAction {
+                        target,
+                        surface_hint,
+                        action: action_key,
+                        title,
+                        reply,
+                    },
+                    rx,
+                )
+            }
         }
         "surface.reorder" | "reorder-surface" => {
             let target = match parse_optional_workspace_target(params, true) {
@@ -7284,9 +7314,43 @@ mod tests {
             response.result.expect("tab.action result")["created_workspace_ref"],
             "workspace:new"
         );
+    }
+
+    #[test]
+    fn tab_action_metadata_routes_and_validates_live_command() {
+        let pin = dispatch_request(
+            r#"{"id":2,"method":"tab.action","params":{"action":"pin","tab_id":"tab:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::TabAction {
+                    target,
+                    surface_hint,
+                    action,
+                    title,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Active);
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(action, "pin");
+                    assert_eq!(title, None);
+                    let _ = reply.send(Ok(json!({ "pinned": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(pin.error, None);
+        assert_eq!(pin.result.expect("tab.action pin result")["pinned"], true);
+
+        let rename_without_title = dispatch_request(
+            r#"{"id":3,"method":"tab.action","params":{"action":"rename","tab_id":"tab:4:tab"}}"#,
+            &|command| panic!("invalid tab.action rename should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            rename_without_title.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
 
         let unsupported = dispatch_request(
-            r#"{"id":2,"method":"tab.action","params":{"action":"pin","tab_id":"tab:4:tab"}}"#,
+            r#"{"id":4,"method":"tab.action","params":{"action":"duplicate","tab_id":"tab:4:tab"}}"#,
             &|command| panic!("unsupported tab.action should not dispatch: {command:?}"),
         );
         assert_eq!(

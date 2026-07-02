@@ -2195,6 +2195,12 @@ pub struct SurfaceSummary {
     pub uri: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TabActionSummary {
+    pub surface: SurfaceSummary,
+    pub pinned: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrowserTabCloseError {
     ContextNotFound,
@@ -2373,6 +2379,87 @@ pub fn active_surface_summary(pane_widget: &gtk::Widget) -> Option<SurfaceSummar
         cwd,
         uri,
     })
+}
+
+// purpose: Resolve the live pane internals and tab id for a CMUX tab action.
+// inputs: Workspace root and optional surface hint.
+// returns/effects: Returns the active or addressed tab without mutating state.
+fn tab_action_target_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<(Rc<PaneInternals>, String)> {
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+
+    for internals in pane_internals_for_root(root) {
+        let target_tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            let active_tab = tab_state.active_tab.as_deref();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                let matched = requested
+                    .map(|hint| surface_hint_matches(&surface_id, &entry.id, hint))
+                    .unwrap_or(active_tab == Some(entry.id.as_str()));
+                matched.then(|| entry.id.clone())
+            })
+        };
+        let Some(tab_id) = target_tab_id else {
+            continue;
+        };
+        return Some((internals, tab_id));
+    }
+    None
+}
+
+// purpose: Apply one supported CMUX metadata action to a resolved tab.
+// inputs: Pane internals, tab id, normalized action key, and optional title.
+// returns/effects: Mutates tab metadata and returns the new pinned state.
+fn apply_tab_metadata_action(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    action_key: &str,
+    title: Option<&str>,
+) -> Option<bool> {
+    let mut tab_state = internals.tab_state.borrow_mut();
+    let entry = tab_state.find_tab_mut(tab_id)?;
+    match action_key {
+        "rename" => {
+            let new_title = title?;
+            entry.custom_name = Some(new_title.to_string());
+            entry.title_label.set_label(new_title);
+        }
+        "clear_name" => {
+            entry.custom_name = None;
+            entry.title_label.set_label(&entry.id);
+        }
+        "pin" => {
+            entry.pinned = true;
+            apply_pin_visuals(&entry.tab_button, true);
+        }
+        "unpin" => {
+            entry.pinned = false;
+            apply_pin_visuals(&entry.tab_button, false);
+        }
+        _ => return None,
+    }
+    Some(entry.pinned)
+}
+
+// purpose: Apply supported CMUX tab metadata actions to a live tab.
+// inputs: Workspace root, optional surface hint, normalized action key, and optional title.
+// returns/effects: Mutates the tab label/pinned state and returns updated metadata.
+pub fn apply_tab_action_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+    action_key: &str,
+    title: Option<&str>,
+) -> Option<TabActionSummary> {
+    let (internals, tab_id) = tab_action_target_for_root(root, surface_hint)?;
+    let pinned = apply_tab_metadata_action(&internals, &tab_id, action_key, title)?;
+    (internals.callbacks.on_state_changed)();
+    let surface = surface_summary_for_tab(&internals, &tab_id)?;
+    Some(TabActionSummary { surface, pinned })
 }
 
 /// purpose: Focus the active tab in a pane identified by pane id.

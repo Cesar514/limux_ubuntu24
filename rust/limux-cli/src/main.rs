@@ -11328,7 +11328,9 @@ async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
         .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
         .unwrap_or_default();
     let tab = parse_opt(args, "--tab")
+        .or_else(|| parse_opt(args, "--surface"))
         .or_else(|| context_env_value("LIMUX_TAB_ID"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
         .unwrap_or_default();
     let title = trailing_title(args).ok_or_else(|| anyhow!("rename-tab requires a title"))?;
 
@@ -11345,20 +11347,30 @@ async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
     client.call("tab.action", Value::Object(params)).await
 }
 
-async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
-    if parse_flag(args, "--help") {
-        return Ok(json!({
-            "help": "Usage: limux tab-action --action <name> [--workspace <id|ref>] [--tab <id|ref>] [--title <text>] [--url <url>]\nTarget tab:\n  --tab tab:<n>       Stable tab reference alias\n  --tab surface:<n>   Surface alias (legacy-compatible)\nExamples:\n  limux tab-action --workspace workspace:2 --tab tab:1 --action pin\n  limux tab-action --tab tab:3 --action mark-unread"
-        }));
-    }
+struct TabActionRequest {
+    base_payload: Option<Value>,
+    method: String,
+    params: Value,
+}
 
+// purpose: Build CMUX tab-action RPC params from CLI flags.
+// inputs: `tab-action` arguments after the command name.
+// returns/effects: Returns action params, or pane-creation metadata for right-side new-tab actions.
+fn build_tab_action_request(args: &[String]) -> Result<TabActionRequest> {
     let action = parse_opt(args, "--action")
         .ok_or_else(|| anyhow!("tab-action requires --action <name>"))?;
     let workspace =
         parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"));
-    let tab = parse_opt(args, "--tab").or_else(|| context_env_value("LIMUX_TAB_ID"));
+    let window = parse_opt(args, "--window");
+    let tab = parse_opt(args, "--tab")
+        .or_else(|| parse_opt(args, "--surface"))
+        .or_else(|| context_env_value("LIMUX_TAB_ID"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"));
     let title = parse_opt(args, "--title").or_else(|| trailing_title(args));
     let url = parse_opt(args, "--url");
+    let focus = parse_opt(args, "--focus")
+        .map(|raw| parse_bool_string(&raw).ok_or_else(|| anyhow!("--focus must be true|false")))
+        .transpose()?;
 
     if action == "new-terminal-right" || action == "new-browser-right" {
         let pane_type = if action == "new-browser-right" {
@@ -11376,17 +11388,25 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
             params.push("--workspace".to_string());
             params.push(workspace);
         }
+        if let Some(window) = window.clone() {
+            params.push("--window".to_string());
+            params.push(window);
+        }
+        if let Some(focus) = focus {
+            params.push("--focus".to_string());
+            params.push(focus.to_string());
+        }
         if let Some(url) = url {
             params.push("--url".to_string());
             params.push(url);
         }
-        let created = run_new_pane(client, &params).await?;
         let tab_ref = tab.unwrap_or_else(|| "tab:1".to_string());
-        return Ok(json!({
-            "tab_ref": tab_ref,
-            "surface_id": created.get("surface_id").cloned().unwrap_or(Value::Null),
-            "surface_ref": created.get("surface_ref").cloned().unwrap_or(Value::Null),
-        }));
+        let (_, pane_params) = build_new_pane_request(&params, context_env_value);
+        return Ok(TabActionRequest {
+            base_payload: Some(json!({ "tab_ref": tab_ref })),
+            method: "pane.create".to_string(),
+            params: pane_params,
+        });
     }
 
     let mut params = Map::new();
@@ -11394,14 +11414,63 @@ async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
     if let Some(workspace) = workspace {
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
+    if let Some(window) = window {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
     if let Some(tab) = tab.clone() {
         params.insert("surface_id".to_string(), Value::String(tab));
     }
     if let Some(title) = title {
         params.insert("title".to_string(), Value::String(title));
     }
+    if let Some(focus) = focus {
+        params.insert("focus".to_string(), Value::Bool(focus));
+    }
 
-    let mut payload = client.call("tab.action", Value::Object(params)).await?;
+    Ok(TabActionRequest {
+        base_payload: None,
+        method: "tab.action".to_string(),
+        params: Value::Object(params),
+    })
+}
+
+async fn run_tab_action(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_flag(args, "--help") {
+        return Ok(json!({
+            "help": concat!(
+                "Usage: limux tab-action --action <name> [--workspace <id|ref>] ",
+                "[--tab <id|ref>] [--title <text>] [--url <url>]\n",
+                "Target tab:\n",
+                "  --tab tab:<n>       Stable tab reference alias\n",
+                "  --tab surface:<n>   Surface alias (legacy-compatible)\n",
+                "Examples:\n",
+                "  limux tab-action --workspace workspace:2 --tab tab:1 --action pin\n",
+                "  limux tab-action --tab tab:3 --action mark-unread",
+            )
+        }));
+    }
+
+    let action = parse_opt(args, "--action")
+        .ok_or_else(|| anyhow!("tab-action requires --action <name>"))?;
+    let tab = parse_opt(args, "--tab")
+        .or_else(|| parse_opt(args, "--surface"))
+        .or_else(|| context_env_value("LIMUX_TAB_ID"))
+        .or_else(|| context_env_value("LIMUX_SURFACE_ID"));
+    let request = build_tab_action_request(args)?;
+    let mut payload = client.call(&request.method, request.params).await?;
+    if let Some(mut base_payload) = request.base_payload {
+        if let Some(obj) = base_payload.as_object_mut() {
+            obj.insert(
+                "surface_id".to_string(),
+                payload.get("surface_id").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "surface_ref".to_string(),
+                payload.get("surface_ref").cloned().unwrap_or(Value::Null),
+            );
+        }
+        payload = base_payload;
+    }
     if let Some(obj) = payload.as_object_mut() {
         if !obj.contains_key("tab_ref") {
             obj.insert(
@@ -16619,6 +16688,46 @@ mod cli_arg_tests {
             .expect("killp maps");
         assert_eq!(killed.0, "surface.close");
         assert_eq!(killed.1["surface_id"], "surface:7:tab-a");
+    }
+
+    #[test]
+    fn cmux_tab_action_accepts_surface_window_and_focus_aliases() {
+        let request = build_tab_action_request(&args(&[
+            "--action",
+            "pin",
+            "--surface",
+            "surface:7:tab-a",
+            "--workspace",
+            "workspace:3",
+            "--window",
+            "window:2",
+            "--focus",
+            "false",
+        ]))
+        .expect("tab-action parses");
+        assert_eq!(request.method, "tab.action");
+        let params = request.params;
+        assert_eq!(params["action"], "pin");
+        assert_eq!(params["surface_id"], "surface:7:tab-a");
+        assert_eq!(params["workspace_id"], "workspace:3");
+        assert_eq!(params["window_id"], "window:2");
+        assert_eq!(params["focus"], false);
+
+        let rename_request = build_tab_action_request(&args(&[
+            "--action",
+            "rename",
+            "--surface",
+            "surface:7:tab-a",
+            "--title",
+            "build logs",
+        ]))
+        .expect("rename tab-action parses");
+        let rename_params = rename_request.params;
+        assert_eq!(rename_params["surface_id"], "surface:7:tab-a");
+        assert_eq!(rename_params["title"], "build logs");
+
+        let bad_focus = build_tab_action_request(&args(&["--action", "pin", "--focus", "later"]));
+        assert!(bad_focus.is_err());
     }
 
     #[test]

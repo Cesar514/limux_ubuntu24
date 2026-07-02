@@ -19,6 +19,7 @@ use gtk::glib;
 use gtk::glib::variant::ToVariant;
 use gtk4 as gtk;
 use libadwaita as adw;
+use serde_json::json;
 
 use crate::app_config;
 use crate::control_bridge::{
@@ -8816,6 +8817,56 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     return;
                 }
             };
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::TabAction {
+            target,
+            surface_hint,
+            action,
+            title,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(BridgeError::not_found("workspace not found")));
+                return;
+            };
+
+            let (workspace_id, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (workspace.id.clone(), workspace.root.clone())
+            };
+            let result = pane::apply_tab_action_for_root(
+                &workspace_root,
+                surface_hint.as_deref(),
+                &action,
+                title.as_deref(),
+            )
+            .map(|summary| {
+                json!({
+                    "ok": true,
+                    "action": action,
+                    "workspace_id": workspace_id.clone(),
+                    "workspace_ref": format!("workspace:{workspace_id}"),
+                    "surface_id": summary.surface.surface_id,
+                    "surface_ref": format!("surface:{}", summary.surface.surface_id),
+                    "tab_ref": format!("tab:{}", summary.surface.surface_id),
+                    "pane_id": summary.surface.pane_id,
+                    "pane_ref": format!("pane:{}", summary.surface.pane_id),
+                    "title": summary.surface.title,
+                    "pinned": summary.pinned,
+                })
+            });
+
+            let Some(payload) = result else {
+                let _ = reply.send(Err(BridgeError::not_found("tab not found")));
+                return;
+            };
+            request_session_save(state);
             let _ = reply.send(Ok(payload));
         }
         ControlCommand::BrowserTabAction {
