@@ -86,6 +86,10 @@ struct Workspace {
     /// Path label shown below workspace name in sidebar.
     #[allow(dead_code)]
     path_label: gtk::Label,
+    /// Clickable PR rows shown below workspace details in sidebar.
+    pull_request_links_box: gtk::Box,
+    /// Clickable port rows shown below workspace details in sidebar.
+    port_links_box: gtk::Box,
     /// CMUX-compatible sidebar status entries keyed by agent/tool id.
     sidebar_status: BTreeMap<String, SidebarStatusEntry>,
     /// CMUX-compatible workspace progress metadata.
@@ -6899,6 +6903,8 @@ fn build_sidebar_row(
     gtk::Label,
     gtk::Label,
     gtk::Label,
+    gtk::Box,
+    gtk::Box,
 ) {
     let notify_dot = gtk::Label::builder().label("\u{25CF}").build();
     notify_dot.add_css_class("limux-notify-dot-hidden");
@@ -6946,6 +6952,20 @@ fn build_sidebar_row(
         sidebar,
     );
 
+    let pull_request_links_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .margin_start(8)
+        .build();
+    pull_request_links_box.add_css_class("limux-ws-sidebar-links");
+
+    let port_links_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(8)
+        .build();
+    port_links_box.add_css_class("limux-ws-sidebar-links");
+
     let notify_label = gtk::Label::builder()
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -6962,6 +6982,8 @@ fn build_sidebar_row(
     vbox.append(&top_row);
     vbox.append(&description_label);
     vbox.append(&path_label);
+    vbox.append(&pull_request_links_box);
+    vbox.append(&port_links_box);
     vbox.append(&notify_label);
 
     let row = gtk::ListBoxRow::new();
@@ -6975,6 +6997,8 @@ fn build_sidebar_row(
         notify_label,
         path_label,
         description_label,
+        pull_request_links_box,
+        port_links_box,
     )
 }
 
@@ -7023,12 +7047,173 @@ fn apply_sidebar_detail_labels(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarLinkSpec {
+    label: String,
+    url: String,
+    tooltip: String,
+    open_in_cmux_browser: bool,
+    clickable: bool,
+}
+
+// purpose: Remove all existing clickable sidebar link rows before rerendering metadata.
+// inputs: GTK box that owns PR or port link widgets.
+// returns/effects: Mutates only children of the supplied box.
+fn clear_sidebar_link_box(box_widget: &gtk::Box) {
+    while let Some(child) = box_widget.first_child() {
+        box_widget.remove(&child);
+    }
+}
+
+// purpose: Build CMUX-compatible clickable PR specs for a workspace sidebar row.
+// inputs: PR metadata rows plus sidebar link settings.
+// returns/effects: Returns display specs without GTK or I/O side effects.
+fn sidebar_pull_request_link_specs(
+    rows: &[serde_json::Value],
+    sidebar: &app_config::SidebarConfig,
+) -> Vec<SidebarLinkSpec> {
+    rows.iter()
+        .filter_map(|row| {
+            let number = row.get("number").and_then(serde_json::Value::as_u64)?;
+            let url = row.get("url").and_then(serde_json::Value::as_str)?;
+            let label = row
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("PR");
+            let state = row
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("open");
+            let display = format!("{label} #{number} - {state}");
+            Some(SidebarLinkSpec {
+                label: display.clone(),
+                url: url.to_string(),
+                tooltip: format!("Open {display}"),
+                open_in_cmux_browser: sidebar.open_pull_request_links_in_cmux_browser,
+                clickable: sidebar.make_pull_requests_clickable,
+            })
+        })
+        .collect()
+}
+
+// purpose: Build CMUX-compatible clickable port specs for a workspace sidebar row.
+// inputs: Port metadata rows plus sidebar browser-open setting.
+// returns/effects: Returns display specs without GTK or network side effects.
+fn sidebar_port_link_specs(rows: &[serde_json::Value]) -> Vec<SidebarLinkSpec> {
+    rows.iter()
+        .filter_map(|row| {
+            let port = row.get("port").and_then(serde_json::Value::as_u64)?;
+            let url = row
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("http://localhost:{port}"));
+            let open_in_cmux_browser = row
+                .get("open_in_cmux_browser")
+                .or_else(|| row.get("openInCmuxBrowser"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Some(SidebarLinkSpec {
+                label: format!(":{port}"),
+                url,
+                tooltip: format!("Open port {port}"),
+                open_in_cmux_browser,
+                clickable: true,
+            })
+        })
+        .collect()
+}
+
+// purpose: Render one PR or port sidebar action as a label or clickable GTK button.
+// inputs: State for in-app browser opening, target workspace id, box widget, and link spec.
+// returns/effects: Appends one GTK child; button clicks may open a Limux browser split or URI.
+fn append_sidebar_link_button(
+    state: &State,
+    workspace_id: &str,
+    box_widget: &gtk::Box,
+    spec: SidebarLinkSpec,
+) {
+    if !spec.clickable {
+        let label = gtk::Label::builder()
+            .label(&spec.label)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        label.add_css_class("limux-ws-path");
+        label.set_tooltip_text(Some(&spec.tooltip));
+        box_widget.append(&label);
+        return;
+    }
+
+    let button = gtk::Button::with_label(&spec.label);
+    button.add_css_class("flat");
+    button.add_css_class("limux-sidebar-link-button");
+    button.set_halign(gtk::Align::Start);
+    button.set_tooltip_text(Some(&spec.tooltip));
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    button.connect_clicked(move |_| {
+        open_sidebar_link_url(&state, &workspace_id, &spec.url, spec.open_in_cmux_browser);
+    });
+    box_widget.append(&button);
+}
+
+// purpose: Open a sidebar PR or port URL using CMUX browser preference semantics.
+// inputs: App state, workspace id, URL string, and open-in-Limux-browser flag.
+// returns/effects: Creates a browser split when requested or launches the default URI handler.
+fn open_sidebar_link_url(state: &State, workspace_id: &str, url: &str, open_in_cmux_browser: bool) {
+    if open_in_cmux_browser && open_sidebar_url_in_browser_split(state, workspace_id, url) {
+        return;
+    }
+    if let Err(error) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
+        eprintln!("limux: failed to open sidebar URL {url}: {error}");
+    }
+}
+
+// purpose: Open a sidebar URL inside a new Limux browser split for a workspace.
+// inputs: App state, workspace id, and URL string.
+// returns/effects: Mutates the workspace split tree on success and returns whether it opened.
+fn open_sidebar_url_in_browser_split(state: &State, workspace_id: &str, url: &str) -> bool {
+    let root = {
+        let app_state = state.borrow();
+        app_state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.root.clone())
+    };
+    let Some(root) = root else {
+        eprintln!("limux: failed to open sidebar URL in Limux browser: workspace not found");
+        return false;
+    };
+    let pane_widget = first_leaf_pane(&root);
+    split_pane(
+        state,
+        workspace_id,
+        &pane_widget,
+        gtk::Orientation::Horizontal,
+        SplitPaneOptions {
+            initial_state: Some(PaneState::browser_only(Some(url))),
+            skip_default_tab: false,
+            new_pane_first: false,
+            initial_ratio: None,
+            persist: true,
+        },
+    )
+    .is_some()
+}
+
 // purpose: Apply CMUX sidebar detail visibility to an existing workspace row.
 // inputs: Workspace row model and sidebar settings.
 // returns/effects: Updates title wrapping, description, path, and notification detail rows.
 fn sync_workspace_sidebar_detail_row(
+    state: &State,
     workspace: &mut Workspace,
     sidebar: &app_config::SidebarConfig,
+    shell_reports: &HashMap<(String, String), SurfaceShellReport>,
+    pull_requests: &HashMap<(String, String), SurfacePullRequestReport>,
 ) {
     apply_sidebar_name_label_policy(&workspace.name_label, sidebar.wrap_workspace_titles);
     apply_sidebar_detail_labels(
@@ -7038,9 +7223,54 @@ fn sync_workspace_sidebar_detail_row(
         workspace.folder_path.as_deref(),
         sidebar,
     );
+    sync_workspace_sidebar_link_rows(state, workspace, sidebar, shell_reports, pull_requests);
     let show_notification =
         workspace.unread && should_show_sidebar_notification_message(true, sidebar);
     workspace.notify_label.set_visible(show_notification);
+}
+
+// purpose: Render CMUX PR and port detail rows in the left workspace sidebar.
+// inputs: Workspace widgets, sidebar config, and host-owned report metadata.
+// returns/effects: Rebuilds clickable PR/port widgets without polling or background work.
+fn sync_workspace_sidebar_link_rows(
+    state: &State,
+    workspace: &Workspace,
+    sidebar: &app_config::SidebarConfig,
+    shell_reports: &HashMap<(String, String), SurfaceShellReport>,
+    pull_requests: &HashMap<(String, String), SurfacePullRequestReport>,
+) {
+    clear_sidebar_link_box(&workspace.pull_request_links_box);
+    clear_sidebar_link_box(&workspace.port_links_box);
+
+    let pr_rows = sidebar_pull_request_rows(pull_requests, &workspace.id, sidebar);
+    let pr_specs = sidebar_pull_request_link_specs(&pr_rows, sidebar);
+    workspace
+        .pull_request_links_box
+        .set_visible(!pr_specs.is_empty());
+    for spec in pr_specs {
+        append_sidebar_link_button(
+            state,
+            &workspace.id,
+            &workspace.pull_request_links_box,
+            spec,
+        );
+    }
+
+    let port_rows = sidebar_ports_rows(shell_reports, &workspace.id, sidebar);
+    let port_specs = match port_rows {
+        Ok(rows) => sidebar_port_link_specs(&rows),
+        Err(error) => {
+            eprintln!(
+                "limux: failed to render sidebar ports for {}: {error}",
+                workspace.id
+            );
+            Vec::new()
+        }
+    };
+    workspace.port_links_box.set_visible(!port_specs.is_empty());
+    for spec in port_specs {
+        append_sidebar_link_button(state, &workspace.id, &workspace.port_links_box, spec);
+    }
 }
 
 // purpose: Resync all open workspace sidebar rows after config reload.
@@ -7048,8 +7278,27 @@ fn sync_workspace_sidebar_detail_row(
 // returns/effects: Mutates existing GTK labels without rebuilding workspaces.
 fn sync_sidebar_detail_rows(state: &State, sidebar: &app_config::SidebarConfig) {
     let mut app_state = state.borrow_mut();
+    sync_sidebar_detail_rows_in_state(state, &mut app_state, sidebar);
+}
+
+// purpose: Resync sidebar detail rows while the caller already owns mutable app state.
+// inputs: State for click handlers, mutable app state, and sidebar settings.
+// returns/effects: Updates existing GTK labels/buttons without nested RefCell borrowing.
+fn sync_sidebar_detail_rows_in_state(
+    state: &State,
+    app_state: &mut AppState,
+    sidebar: &app_config::SidebarConfig,
+) {
+    let shell_reports = app_state.surface_shell_reports.clone();
+    let pull_requests = app_state.surface_pull_requests.clone();
     for workspace in &mut app_state.workspaces {
-        sync_workspace_sidebar_detail_row(workspace, sidebar);
+        sync_workspace_sidebar_detail_row(
+            state,
+            workspace,
+            sidebar,
+            &shell_reports,
+            &pull_requests,
+        );
     }
 }
 
@@ -7720,13 +7969,22 @@ fn create_workspace_for_tab_payload(
         let sidebar = app_state.config.borrow().sidebar.clone();
         sidebar
     };
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, description_label) =
-        build_sidebar_row(
-            &seed.name,
-            None,
-            seed.folder_path.as_deref(),
-            &sidebar_config,
-        );
+    let (
+        row,
+        name_label,
+        favorite_button,
+        notify_dot,
+        notify_label,
+        path_label,
+        description_label,
+        pull_request_links_box,
+        port_links_box,
+    ) = build_sidebar_row(
+        &seed.name,
+        None,
+        seed.folder_path.as_deref(),
+        &sidebar_config,
+    );
     let row_clone = row.clone();
     {
         let mut app_state = state.borrow_mut();
@@ -7754,6 +8012,8 @@ fn create_workspace_for_tab_payload(
             cwd: Rc::new(RefCell::new(seed.cwd.clone())),
             folder_path: seed.folder_path.clone(),
             path_label,
+            pull_request_links_box,
+            port_links_box,
             sidebar_status: BTreeMap::new(),
             sidebar_progress: None,
             sidebar_log: Vec::new(),
@@ -11486,6 +11746,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     surface_report_tty_payload(&mut app_state, index, surface_hint.as_deref(), &tty)
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -11508,6 +11770,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     )
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -11524,6 +11788,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     surface_clear_ports_payload(&mut app_state, index, surface_hint.as_deref())
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -11546,6 +11812,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     )
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -11568,6 +11836,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     )
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -11590,6 +11860,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     )
                 });
             if result.is_ok() {
+                let sidebar = app_state.config.borrow().sidebar.clone();
+                sync_sidebar_detail_rows_in_state(state, &mut app_state, &sidebar);
                 sync_right_sidebar_panel(&mut app_state);
             }
             let _ = reply.send(result);
@@ -12364,13 +12636,22 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         let sidebar = app_state.config.borrow().sidebar.clone();
         sidebar
     };
-    let (row, name_label, favorite_button, notify_dot, notify_label, path_label, description_label) =
-        build_sidebar_row(
-            &workspace.name,
-            workspace.description.as_deref(),
-            workspace.folder_path.as_deref(),
-            &sidebar_config,
-        );
+    let (
+        row,
+        name_label,
+        favorite_button,
+        notify_dot,
+        notify_label,
+        path_label,
+        description_label,
+        pull_request_links_box,
+        port_links_box,
+    ) = build_sidebar_row(
+        &workspace.name,
+        workspace.description.as_deref(),
+        workspace.folder_path.as_deref(),
+        &sidebar_config,
+    );
     sidebar_list.append(&row);
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
@@ -12395,6 +12676,8 @@ fn add_workspace_from_state_internal(state: &State, workspace: &WorkspaceState, 
         cwd,
         folder_path: workspace.folder_path.clone(),
         path_label,
+        pull_request_links_box,
+        port_links_box,
         sidebar_status: BTreeMap::new(),
         sidebar_progress: None,
         sidebar_log: Vec::new(),
@@ -14727,12 +15010,12 @@ mod tests {
         should_show_unread_visual, sidebar_branch_directory_label,
         sidebar_branch_directory_tooltip, sidebar_feed_preview_lines_from_value,
         sidebar_feed_visible_items, sidebar_file_preview_lines, sidebar_git_branch,
-        sidebar_log_preview_lines_from_entries, sidebar_ports_rows, sidebar_progress_preview_line,
-        sidebar_pull_request_rows, sidebar_status_preview_lines_from_entries,
-        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
-        tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_group_insert_index,
+        sidebar_log_preview_lines_from_entries, sidebar_port_link_specs, sidebar_ports_rows,
+        sidebar_progress_preview_line, sidebar_pull_request_link_specs, sidebar_pull_request_rows,
+        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
+        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
@@ -15184,6 +15467,12 @@ mod tests {
         assert_eq!(rows[1]["port"], json!(5173));
         assert_eq!(rows[1]["source"], json!("report_ports"));
         assert_eq!(rows[1]["openInCmuxBrowser"], json!(true));
+
+        let specs = sidebar_port_link_specs(&rows);
+        assert_eq!(specs[1].label, ":5173");
+        assert_eq!(specs[1].url, "http://127.0.0.1:5173");
+        assert!(specs[1].open_in_cmux_browser);
+        assert!(specs[1].clickable);
     }
 
     // purpose: Verify CMUX report_pr rows merge into sidebar metadata.
@@ -15213,11 +15502,27 @@ mod tests {
         assert_eq!(rows[0]["branch"], json!("feature/pr"));
         assert_eq!(rows[0]["last_action"], json!("checkout"));
 
+        let specs = sidebar_pull_request_link_specs(&rows, &sidebar);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].label, "PR #42 - open");
+        assert_eq!(specs[0].url, "https://github.com/org/repo/pull/42");
+        assert!(specs[0].open_in_cmux_browser);
+        assert!(specs[0].clickable);
+
         let hidden_sidebar = crate::app_config::SidebarConfig {
             show_pull_requests: false,
             ..crate::app_config::SidebarConfig::default()
         };
         assert!(sidebar_pull_request_rows(&reports, "workspace-test", &hidden_sidebar).is_empty());
+
+        let plain_sidebar = crate::app_config::SidebarConfig {
+            make_pull_requests_clickable: false,
+            open_pull_request_links_in_cmux_browser: false,
+            ..crate::app_config::SidebarConfig::default()
+        };
+        let plain_specs = sidebar_pull_request_link_specs(&rows, &plain_sidebar);
+        assert!(!plain_specs[0].clickable);
+        assert!(!plain_specs[0].open_in_cmux_browser);
     }
 
     // purpose: Verify Limux clamps right-sidebar widths using CMUX policy values.
