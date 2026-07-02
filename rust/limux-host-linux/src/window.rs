@@ -213,6 +213,81 @@ fn browser_action_response_payload(
     })
 }
 
+#[derive(Clone, Debug)]
+struct BrowserEvent {
+    name: &'static str,
+    workspace_id: String,
+    surface_id: String,
+    pane_id: u32,
+    payload: serde_json::Value,
+}
+
+// purpose: Build a CMUX browser event payload from a live browser surface.
+// inputs: Workspace id, browser target, command name, and non-sensitive metadata.
+// returns/effects: Returns JSON without publishing or exposing typed values/scripts.
+fn browser_event_payload(
+    workspace_id: &str,
+    browser: &pane::BrowserSurfaceTarget,
+    command: &'static str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(workspace_id),
+        "surface_id": browser.surface.surface_id,
+        "surface_ref": surface_ref(&browser.surface.surface_id),
+        "pane_id": browser.surface.pane_id.to_string(),
+        "pane_ref": pane_ref(browser.surface.pane_id),
+        "surface_title": browser.surface.title,
+        "surface_type": browser.surface.kind,
+        "command": command,
+    });
+    if let Some(uri) = browser.surface.uri.as_ref().filter(|uri| !uri.is_empty()) {
+        payload["url"] = serde_json::Value::String(uri.clone());
+        payload["uri"] = serde_json::Value::String(uri.clone());
+    }
+    if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    payload
+}
+
+// purpose: Prepare a retained CMUX browser event for later publication.
+// inputs: Event name, workspace id, browser target, command, and safe metadata.
+// returns/effects: Returns an event object that can be emitted after success.
+fn browser_event(
+    name: &'static str,
+    workspace_id: &str,
+    browser: &pane::BrowserSurfaceTarget,
+    command: &'static str,
+    extra: serde_json::Value,
+) -> BrowserEvent {
+    BrowserEvent {
+        name,
+        workspace_id: workspace_id.to_string(),
+        surface_id: browser.surface.surface_id.clone(),
+        pane_id: browser.surface.pane_id,
+        payload: browser_event_payload(workspace_id, browser, command, extra),
+    }
+}
+
+// purpose: Publish a CMUX browser action event after a command succeeds.
+// inputs: Prepared browser event with redacted payload metadata.
+// returns/effects: Appends a retained browser event to the host event bus.
+fn publish_browser_event(event: BrowserEvent) -> u64 {
+    crate::event_bus::bus().publish(crate::event_bus::EventPublish {
+        name: event.name,
+        category: "browser",
+        source: "browser.action",
+        workspace_id: Some(serde_json::Value::String(event.workspace_id)),
+        surface_id: Some(serde_json::Value::String(event.surface_id)),
+        pane_id: Some(serde_json::Value::String(event.pane_id.to_string())),
+        payload: event.payload,
+    })
+}
+
 fn send_browser_eval_response(
     browser: pane::BrowserSurfaceTarget,
     script: String,
@@ -226,6 +301,34 @@ fn send_browser_eval_response(
             if output_key != "value" {
                 payload["value"] = value;
             }
+            let _ = reply.send(Ok(payload));
+        }
+        Err(error) => {
+            let _ = reply.send(Err(BridgeError::internal(format!(
+                "browser JavaScript evaluation failed: {error}"
+            ))));
+        }
+    });
+}
+
+// purpose: Evaluate JavaScript and publish a browser event only after success.
+// inputs: Browser target, script, response payload, output key, optional event, and reply channel.
+// returns/effects: Sends the socket response and emits no event when evaluation fails.
+fn send_browser_eval_response_with_event(
+    browser: pane::BrowserSurfaceTarget,
+    script: String,
+    mut payload: serde_json::Value,
+    output_key: &'static str,
+    event: BrowserEvent,
+    reply: std::sync::mpsc::Sender<Result<serde_json::Value, BridgeError>>,
+) {
+    browser.evaluate_javascript(&script, move |result| match result {
+        Ok(value) => {
+            payload[output_key] = value.clone();
+            if output_key != "value" {
+                payload["value"] = value;
+            }
+            publish_browser_event(event);
             let _ = reply.send(Ok(payload));
         }
         Err(error) => {
@@ -6923,101 +7026,235 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 BrowserAction::Click { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.click",
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script = browser_element_action_script(
                         selector,
                         "node.click(); return { action: 'click', selector, ok: true };",
                     );
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::DblClick { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.dblclick",
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script = browser_element_action_script(selector, browser_dblclick_body());
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Fill { selector, text } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.input",
+                        &workspace_id,
+                        &browser,
+                        "browser.fill",
+                        serde_json::json!({
+                            "selector": selector,
+                            "text_length": text.len(),
+                            "redacted_fields": ["text"],
+                        }),
+                    );
                     let script = browser_element_action_script(selector, &browser_fill_body(text));
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Type { selector, text } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.input",
+                        &workspace_id,
+                        &browser,
+                        "browser.type",
+                        serde_json::json!({
+                            "selector": selector,
+                            "text_length": text.len(),
+                            "redacted_fields": ["text"],
+                        }),
+                    );
                     let script = browser_element_action_script(selector, &browser_type_body(text));
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Select { selector, value } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.select",
+                        serde_json::json!({
+                            "selector": selector,
+                            "value_length": value.len(),
+                            "redacted_fields": ["value"],
+                        }),
+                    );
                     let script =
                         browser_element_action_script(selector, &browser_select_body(value));
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Hover { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.hover",
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script = browser_element_action_script(selector, browser_hover_body());
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::FocusElement { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.focus",
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script = browser_element_action_script(selector, browser_focus_body());
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Check { selector } | BrowserAction::Uncheck { selector } => {
                     let checked = matches!(action, BrowserAction::Check { .. });
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let command = if checked {
+                        "browser.check"
+                    } else {
+                        "browser.uncheck"
+                    };
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        command,
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script =
                         browser_element_action_script(selector, &browser_check_body(checked));
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Press { key } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.press",
+                        serde_json::json!({ "key": key }),
+                    );
                     let script = browser_key_action_script(key, "keydown");
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::KeyDown { key } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.keydown",
+                        serde_json::json!({ "key": key }),
+                    );
                     let script = browser_key_action_script(key, "keydown");
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::KeyUp { key } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.keyup",
+                        serde_json::json!({ "key": key }),
+                    );
                     let script = browser_key_action_script(key, "keyup");
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::Scroll { selector, dx, dy } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.scroll",
+                        serde_json::json!({ "selector": selector, "dx": dx, "dy": dy }),
+                    );
                     let script = browser_scroll_script(selector.as_deref(), *dx, *dy);
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::ScrollIntoView { selector } => {
                     let payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let event = browser_event(
+                        "browser.interaction",
+                        &workspace_id,
+                        &browser,
+                        "browser.scroll_into_view",
+                        serde_json::json!({ "selector": selector }),
+                    );
                     let script = browser_element_action_script(
                         selector,
                         "node.scrollIntoView({ block: 'center', inline: 'center' }); return { action: 'scroll_into_view', selector, ok: true };",
                     );
-                    send_browser_eval_response(browser, script, payload, "action", reply);
+                    send_browser_eval_response_with_event(
+                        browser, script, payload, "action", event, reply,
+                    );
                     return;
                 }
                 BrowserAction::AddScript { script } | BrowserAction::AddInitScript { script } => {
@@ -7240,6 +7477,48 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 browser_action_response_payload(&workspace_id, &workspace_name, &browser);
             if let Some(url) = url {
                 payload["url"] = serde_json::Value::String(url);
+            }
+            let event = match &action {
+                BrowserAction::Navigate { url } => Some(browser_event(
+                    "browser.navigation",
+                    &workspace_id,
+                    &browser,
+                    "browser.navigate",
+                    serde_json::json!({ "url": url }),
+                )),
+                BrowserAction::Back => Some(browser_event(
+                    "browser.navigation",
+                    &workspace_id,
+                    &browser,
+                    "browser.back",
+                    serde_json::json!({ "url": payload.get("url").cloned() }),
+                )),
+                BrowserAction::Forward => Some(browser_event(
+                    "browser.navigation",
+                    &workspace_id,
+                    &browser,
+                    "browser.forward",
+                    serde_json::json!({ "url": payload.get("url").cloned() }),
+                )),
+                BrowserAction::Reload => Some(browser_event(
+                    "browser.navigation",
+                    &workspace_id,
+                    &browser,
+                    "browser.reload",
+                    serde_json::json!({ "url": payload.get("url").cloned() }),
+                )),
+                BrowserAction::Focus => Some(browser_event(
+                    "browser.interaction",
+                    &workspace_id,
+                    &browser,
+                    "browser.focus_webview",
+                    serde_json::json!({}),
+                )),
+                BrowserAction::GetUrl => None,
+                _ => unreachable!("only synchronous browser actions reach event publication"),
+            };
+            if let Some(event) = event {
+                publish_browser_event(event);
             }
             let _ = reply.send(Ok(payload));
         }
@@ -10828,7 +11107,7 @@ mod tests {
         directional_neighbor_score, favorites_prefix_len, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
         next_active_workspace_index, notification_hook_policy_payload,
-        notification_policy_effects_from_value, pane_create_split_placement,
+        notification_policy_effects_from_value, pane_create_split_placement, publish_browser_event,
         publish_surface_input_sent_event, publish_surface_key_sent_event,
         publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
         queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
@@ -10839,7 +11118,7 @@ mod tests {
         surface_lifecycle_event_payload, tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
         workspace_folder_path_from_input, workspace_lifecycle_payload,
-        workspace_notification_message, workspace_reordered_payload, Direction,
+        workspace_notification_message, workspace_reordered_payload, BrowserEvent, Direction,
         EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
         NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
         PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceEventSnapshot,
@@ -11496,6 +11775,30 @@ mod tests {
             payload: serde_json::json!({}),
         });
         let _ = handle.join().expect("event stream thread");
+    }
+
+    #[test]
+    fn browser_input_publishes_redacted_cmux_event() {
+        let seq = publish_browser_event(BrowserEvent {
+            name: "browser.input",
+            workspace_id: "workspace-browser-test".to_string(),
+            surface_id: "13:tab-browser".to_string(),
+            pane_id: 13,
+            payload: serde_json::json!({
+                "workspace_id": "workspace-browser-test",
+                "workspace_ref": "workspace:workspace-browser-test",
+                "surface_id": "13:tab-browser",
+                "surface_ref": "surface:13:tab-browser",
+                "pane_id": "13",
+                "pane_ref": "pane:13",
+                "command": "browser.fill",
+                "selector": "#token",
+                "text_length": 9,
+                "redacted_fields": ["text"],
+            }),
+        });
+
+        assert!(seq > 0);
     }
 
     #[test]
