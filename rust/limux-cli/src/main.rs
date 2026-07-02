@@ -1854,17 +1854,118 @@ fn read_workspace_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(values)
 }
 
-// purpose: Collect workspace env-file and --env values using CMUX precedence.
-// inputs: CLI args where --env-file may repeat and --env overrides file keys.
-// returns/effects: Returns sorted workspace_env map for RPC params.
-fn parse_workspace_env_args(args: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut values = BTreeMap::new();
+// purpose: Merge workspace env sources using CMUX precedence.
+// inputs: Base project config env plus CLI args with repeated --env-file and --env.
+// returns/effects: Returns sorted workspace_env map where explicit CLI values win.
+fn parse_workspace_env_args_with_base(
+    args: &[String],
+    mut values: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
     for path in parse_opts(args, "--env-file") {
         values.extend(read_workspace_env_file(Path::new(&path))?);
     }
     for raw in parse_opts(args, "--env") {
         let (key, value) = parse_workspace_env_assignment(&raw)?;
         values.insert(key, value);
+    }
+    Ok(values)
+}
+
+// purpose: Locate CMUX project config from the current working directory.
+// inputs: Process cwd and optional HOME boundary from the environment.
+// returns/effects: Returns the nearest `.cmux/cmux.json` or `cmux.json`, if any.
+fn find_project_cmux_config_path() -> Result<Option<PathBuf>> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    Ok(find_project_cmux_config_path_from(&cwd, home.as_deref()))
+}
+
+// purpose: Implement CMUX's upward project config search order.
+// inputs: Starting directory and optional home boundary.
+// returns/effects: Stops before HOME, checking `.cmux/cmux.json` then `cmux.json`.
+fn find_project_cmux_config_path_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if home.is_some_and(|home| current == home) {
+            return None;
+        }
+        if let Some(candidate) = project_cmux_config_candidate(&current) {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+// purpose: Find the CMUX config candidate at one directory level.
+// inputs: Directory to inspect.
+// returns/effects: Prefers `.cmux/cmux.json` before sibling `cmux.json`.
+fn project_cmux_config_candidate(directory: &Path) -> Option<PathBuf> {
+    [
+        directory.join(".cmux").join("cmux.json"),
+        directory.join("cmux.json"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+// purpose: Load CMUX project workspace env for workspace creation parity.
+// inputs: Optional project cmux.json discovered from the current directory.
+// returns/effects: Fails loudly on malformed JSON or malformed workspace env keys.
+fn read_project_workspace_env() -> Result<BTreeMap<String, String>> {
+    let Some(path) = find_project_cmux_config_path()? else {
+        return Ok(BTreeMap::new());
+    };
+    read_project_workspace_env_at(&path)
+}
+
+// purpose: Decode workspace env from CMUX project config workspace definitions.
+// inputs: A project cmux.json path.
+// returns/effects: Reads top-level workspace.env or newWorkspaceCommand's workspace.env.
+fn read_project_workspace_env_at(path: &Path) -> Result<BTreeMap<String, String>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read project config {}", path.display()))?;
+    let root: Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse project config {}", path.display()))?;
+    if let Some(workspace) = root.get("workspace") {
+        return workspace_env_from_config_value(workspace, "workspace.env");
+    }
+    let Some(command_name) = root.get("newWorkspaceCommand").and_then(Value::as_str) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(commands) = root.get("commands").and_then(Value::as_array) else {
+        return Ok(BTreeMap::new());
+    };
+    for command in commands {
+        if command.get("name").and_then(Value::as_str) != Some(command_name) {
+            continue;
+        }
+        if let Some(workspace) = command.get("workspace") {
+            return workspace_env_from_config_value(workspace, "commands[].workspace.env");
+        }
+        return Ok(BTreeMap::new());
+    }
+    Ok(BTreeMap::new())
+}
+
+// purpose: Validate a CMUX workspace definition env object.
+// inputs: JSON object containing optional env.
+// returns/effects: Returns sorted env values or explicit schema/key errors.
+fn workspace_env_from_config_value(value: &Value, label: &str) -> Result<BTreeMap<String, String>> {
+    let Some(env_value) = value.get("env") else {
+        return Ok(BTreeMap::new());
+    };
+    let object = env_value
+        .as_object()
+        .ok_or_else(|| anyhow!("{label} must be an object of string values"))?;
+    let mut values = BTreeMap::new();
+    for (key, raw_value) in object {
+        validate_workspace_env_key(key).with_context(|| format!("invalid {label} key"))?;
+        let value = raw_value
+            .as_str()
+            .ok_or_else(|| anyhow!("{label}.{key} must be a string"))?;
+        values.insert(key.to_string(), value.to_string());
     }
     Ok(values)
 }
@@ -7165,7 +7266,7 @@ fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     if let Some(focus) = parse_optional_bool_arg(args, "--focus")? {
         params.insert("focus".to_string(), Value::Bool(focus));
     }
-    let environment = parse_workspace_env_args(args)?;
+    let environment = parse_workspace_env_args_with_base(args, read_project_workspace_env()?)?;
     if !environment.is_empty() {
         let environment = environment
             .into_iter()
@@ -11374,16 +11475,116 @@ mod cli_arg_tests {
         let path = dir.path().join("workspace.env");
         fs::write(&path, "FOO=file\n# ignored\nexport BAR=baz\n").expect("write env file");
 
-        let values = parse_workspace_env_args(&args(&[
-            "--env-file",
-            path.to_str().expect("utf8 path"),
-            "--env",
-            "FOO=cli",
-        ]))
+        let values = parse_workspace_env_args_with_base(
+            &args(&[
+                "--env-file",
+                path.to_str().expect("utf8 path"),
+                "--env",
+                "FOO=cli",
+            ]),
+            BTreeMap::new(),
+        )
         .expect("parse env args");
 
         assert_eq!(values.get("FOO").map(String::as_str), Some("cli"));
         assert_eq!(values.get("BAR").map(String::as_str), Some("baz"));
+    }
+
+    #[test]
+    fn project_cmux_config_search_prefers_dot_cmux_and_stops_before_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let project = home.join("project");
+        let nested = project.join("src");
+        fs::create_dir_all(project.join(".cmux")).expect("create dot cmux");
+        fs::create_dir_all(&nested).expect("create nested");
+        fs::write(project.join("cmux.json"), "{}").expect("write sibling config");
+        fs::write(project.join(".cmux/cmux.json"), "{}").expect("write dot config");
+
+        let found =
+            find_project_cmux_config_path_from(&nested, Some(home)).expect("project config");
+        assert_eq!(found, project.join(".cmux/cmux.json"));
+
+        fs::write(home.join(".cmux.json"), "{}").expect("write ignored home config");
+        assert!(find_project_cmux_config_path_from(home, Some(home)).is_none());
+    }
+
+    #[test]
+    fn project_workspace_env_reads_new_workspace_command_definition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux.json");
+        fs::write(
+            &path,
+            r#"{
+                "newWorkspaceCommand": "Build",
+                "commands": [
+                    {
+                        "name": "Build",
+                        "workspace": {
+                            "env": {
+                                "AWS_PROFILE": "project",
+                                "NODE_ENV": "test"
+                            }
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("write project config");
+
+        let values = read_project_workspace_env_at(&path).expect("project env");
+
+        assert_eq!(
+            values.get("AWS_PROFILE").map(String::as_str),
+            Some("project")
+        );
+        assert_eq!(values.get("NODE_ENV").map(String::as_str), Some("test"));
+    }
+
+    #[test]
+    fn project_workspace_env_merges_below_env_files_and_cli_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_file = dir.path().join("workspace.env");
+        fs::write(&env_file, "AWS_PROFILE=file\nFROM_FILE=yes\n").expect("write env file");
+        let mut project_env = BTreeMap::new();
+        project_env.insert("AWS_PROFILE".to_string(), "project".to_string());
+        project_env.insert("FROM_PROJECT".to_string(), "yes".to_string());
+
+        let values = parse_workspace_env_args_with_base(
+            &args(&[
+                "--env-file",
+                env_file.to_str().expect("utf8 path"),
+                "--env",
+                "AWS_PROFILE=cli",
+            ]),
+            project_env,
+        )
+        .expect("merged env");
+
+        assert_eq!(values.get("AWS_PROFILE").map(String::as_str), Some("cli"));
+        assert_eq!(values.get("FROM_FILE").map(String::as_str), Some("yes"));
+        assert_eq!(values.get("FROM_PROJECT").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn project_workspace_env_rejects_managed_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cmux.json");
+        fs::write(
+            &path,
+            r#"{
+                "workspace": {
+                    "env": {
+                        "CMUX_SOCKET": "/tmp/socket"
+                    }
+                }
+            }"#,
+        )
+        .expect("write project config");
+
+        let err = read_project_workspace_env_at(&path).expect_err("managed key error");
+
+        assert!(err.to_string().contains("invalid workspace.env key"));
     }
 
     #[test]
@@ -11482,8 +11683,11 @@ mod cli_arg_tests {
 
     #[test]
     fn workspace_env_rejects_managed_keys() {
-        let err = parse_workspace_env_args(&args(&["--env", "CMUX_SOCKET=/tmp/socket"]))
-            .expect_err("managed key rejected");
+        let err = parse_workspace_env_args_with_base(
+            &args(&["--env", "CMUX_SOCKET=/tmp/socket"]),
+            BTreeMap::new(),
+        )
+        .expect_err("managed key rejected");
         assert!(err.to_string().contains("cannot override managed key"));
     }
 
