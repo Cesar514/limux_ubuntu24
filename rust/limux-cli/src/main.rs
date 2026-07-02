@@ -924,10 +924,153 @@ struct ThemeSelection {
     source_path: Option<String>,
 }
 
+// purpose: Collect Ghostty theme names from candidate directories.
+// inputs: Existing or missing theme directories.
+// returns/effects: Returns case-insensitive deduplicated names in stable display order.
+fn available_theme_names_from_dirs(dirs: &[PathBuf]) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut themes = Vec::new();
+    for dir in dirs {
+        collect_theme_names_from_dir(dir, &mut seen, &mut themes)?;
+    }
+    themes.sort_by_key(|name| name.to_lowercase());
+    Ok(themes)
+}
+
+// purpose: Read theme names from one directory into the shared catalog state.
+// inputs: Candidate theme directory plus dedupe and output collections.
+// returns/effects: Appends new names, skips missing/non-directory candidates, errors on bad reads.
+fn collect_theme_names_from_dir(
+    dir: &Path,
+    seen: &mut BTreeSet<String>,
+    themes: &mut Vec<String>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(());
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", dir.display())),
+    };
+    for entry in entries {
+        let Some(name) = theme_name_from_entry(dir, entry?)? else {
+            continue;
+        };
+        if seen.insert(name.to_lowercase()) {
+            themes.push(name);
+        }
+    }
+    Ok(())
+}
+
+// purpose: Extract a valid Ghostty theme filename from one directory entry.
+// inputs: Parent directory and filesystem entry.
+// returns/effects: Returns a visible regular-file name or None for skipped entries.
+fn theme_name_from_entry(dir: &Path, entry: fs::DirEntry) -> Result<Option<String>> {
+    let file_type = entry
+        .file_type()
+        .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+    if file_type.is_dir() || !file_type.is_file() {
+        return Ok(None);
+    }
+    let name = entry.file_name().to_string_lossy().trim().to_string();
+    if name.is_empty() || name.starts_with('.') {
+        return Ok(None);
+    }
+    if entry.path().parent() != Some(dir) {
+        bail!("theme entry escaped directory {}", dir.display());
+    }
+    Ok(Some(name))
+}
+
+// purpose: Build Linux-friendly Ghostty theme catalog search paths.
+// inputs: Process environment and current executable location.
+// returns/effects: Returns existing and missing candidate directories without reading them.
+fn theme_directory_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push = |path: PathBuf| {
+        let key = path.display().to_string();
+        if seen.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    append_resource_theme_dir(&mut push);
+    append_exe_theme_dirs(&mut push);
+    append_xdg_theme_dirs(&mut push);
+    append_home_theme_dirs(&mut push);
+    dirs
+}
+
+// purpose: Add a GHOSTTY_RESOURCES_DIR theme candidate.
+// inputs: Mutable theme directory collector.
+// returns/effects: Appends the resources themes path when configured.
+fn append_resource_theme_dir(push: &mut impl FnMut(PathBuf)) {
+    if let Ok(resources) = env::var("GHOSTTY_RESOURCES_DIR") {
+        let trimmed = resources.trim();
+        if !trimmed.is_empty() {
+            push(PathBuf::from(trimmed).join("themes"));
+        }
+    }
+}
+
+// purpose: Add theme candidates relative to the running executable.
+// inputs: Mutable theme directory collector.
+// returns/effects: Appends repo, app-resource, and install-style ancestor paths.
+fn append_exe_theme_dirs(push: &mut impl FnMut(PathBuf)) {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    for ancestor in exe.ancestors() {
+        push(ancestor.join("ghostty/zig-out/share/ghostty/themes"));
+        push(ancestor.join("Resources/ghostty/themes"));
+        push(ancestor.join("share/limux/ghostty/themes"));
+        push(ancestor.join("share/ghostty/themes"));
+    }
+}
+
+// purpose: Add XDG data theme catalog candidates.
+// inputs: Mutable theme directory collector.
+// returns/effects: Appends Ghostty and Limux theme dirs from XDG_DATA_DIRS.
+fn append_xdg_theme_dirs(push: &mut impl FnMut(PathBuf)) {
+    let data_dirs =
+        env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for data_dir in data_dirs
+        .split(':')
+        .filter(|value| !value.trim().is_empty())
+    {
+        push(PathBuf::from(data_dir).join("ghostty/themes"));
+        push(PathBuf::from(data_dir).join("limux/ghostty/themes"));
+    }
+}
+
+// purpose: Add user theme catalog candidates.
+// inputs: Mutable theme directory collector.
+// returns/effects: Appends config and local-share theme directories under HOME.
+fn append_home_theme_dirs(push: &mut impl FnMut(PathBuf)) {
+    let Ok(home) = env::var("HOME") else {
+        return;
+    };
+    if home.trim().is_empty() {
+        return;
+    }
+    let home = PathBuf::from(home);
+    push(home.join(".config/ghostty/themes"));
+    push(home.join(".local/share/ghostty/themes"));
+}
+
+// purpose: Read available Ghostty theme names from known catalog directories.
+// inputs: Process environment and filesystem.
+// returns/effects: Returns discovered themes or an empty list when no catalogs exist.
+fn available_theme_names() -> Result<Vec<String>> {
+    available_theme_names_from_dirs(&theme_directory_paths())
+}
+
 // purpose: Reject malformed Ghostty theme names before writing a managed config block.
-// inputs: Raw CLI theme argument.
-// returns/effects: Returns a trimmed theme name or a fatal user-facing error.
-fn validated_theme_name(raw: &str) -> Result<String> {
+// inputs: Raw CLI theme argument plus discovered catalog names.
+// returns/effects: Returns a canonical theme name or a fatal user-facing error.
+fn validated_theme_name(raw: &str, available_themes: &[String]) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         bail!("themes set requires a non-empty theme name");
@@ -937,6 +1080,15 @@ fn validated_theme_name(raw: &str) -> Result<String> {
         .any(|ch| ch == ',' || ch == '\n' || ch == '\r' || ch == '\0')
     {
         bail!("theme name contains unsupported control or separator characters");
+    }
+    if let Some(matched) = available_themes
+        .iter()
+        .find(|theme| theme.eq_ignore_ascii_case(trimmed))
+    {
+        return Ok(matched.clone());
+    }
+    if !available_themes.is_empty() {
+        bail!("Unknown theme '{trimmed}'. Run 'limux themes' to list available themes.");
     }
     Ok(trimmed.to_string())
 }
@@ -1160,6 +1312,7 @@ fn consume_theme_set_arg(
     args: &[String],
     index: usize,
     parts: &mut ThemeSetParts,
+    available_themes: &[String],
 ) -> Result<usize> {
     match args[index].as_str() {
         "--light" | "--dark" => {
@@ -1168,9 +1321,9 @@ fn consume_theme_set_arg(
                 .get(index + 1)
                 .ok_or_else(|| anyhow!("themes set: {flag} requires a theme name"))?;
             if flag == "--light" {
-                parts.light = Some(validated_theme_name(value)?);
+                parts.light = Some(validated_theme_name(value, available_themes)?);
             } else {
-                parts.dark = Some(validated_theme_name(value)?);
+                parts.dark = Some(validated_theme_name(value, available_themes)?);
             }
             Ok(index + 2)
         }
@@ -1189,11 +1342,11 @@ fn consume_theme_set_arg(
 // purpose: Parse raw `themes set` arguments into explicit flags and positional tokens.
 // inputs: Theme set arguments after the subcommand.
 // returns/effects: Returns parsed parts or a fatal usage error.
-fn parse_theme_set_parts(args: &[String]) -> Result<ThemeSetParts> {
+fn parse_theme_set_parts(args: &[String], available_themes: &[String]) -> Result<ThemeSetParts> {
     let mut parts = ThemeSetParts::default();
     let mut index = 0;
     while index < args.len() {
-        index = consume_theme_set_arg(args, index, &mut parts)?;
+        index = consume_theme_set_arg(args, index, &mut parts, available_themes)?;
     }
     Ok(parts)
 }
@@ -1204,10 +1357,11 @@ fn parse_theme_set_parts(args: &[String]) -> Result<ThemeSetParts> {
 fn resolve_theme_set_parts(
     parts: ThemeSetParts,
     current: &ThemeSelection,
+    available_themes: &[String],
 ) -> Result<(Option<String>, Option<String>)> {
     if parts.light.is_none() && parts.dark.is_none() {
         let joined = parts.positional.join(" ");
-        let theme = validated_theme_name(&joined)?;
+        let theme = validated_theme_name(&joined, available_themes)?;
         return Ok((Some(theme.clone()), Some(theme)));
     }
     if !parts.positional.is_empty() {
@@ -1228,8 +1382,13 @@ fn resolve_theme_set_parts(
 fn parse_theme_set_args(
     args: &[String],
     current: &ThemeSelection,
+    available_themes: &[String],
 ) -> Result<(Option<String>, Option<String>)> {
-    resolve_theme_set_parts(parse_theme_set_parts(args)?, current)
+    resolve_theme_set_parts(
+        parse_theme_set_parts(args, available_themes)?,
+        current,
+        available_themes,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1910,9 +2069,9 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
     }
 }
 
-/// purpose: Implement CMUX-compatible theme list/set/clear commands for Ghostty themes.
-/// inputs: Theme subcommand arguments.
-/// returns/effects: Reads or writes CMUX's managed block in the Ghostty config.
+// purpose: Implement CMUX-compatible theme list/set/clear commands for Ghostty themes.
+// inputs: Theme subcommand arguments.
+// returns/effects: Reads or writes CMUX's managed block in the Ghostty config.
 fn run_themes_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
@@ -1937,45 +2096,119 @@ fn run_themes_command(args: &[String], json_output: bool) -> Result<CommandOutpu
     }
 }
 
-/// purpose: Render CMUX-style current theme state for the Ghostty config path.
-/// inputs: Ghostty config path plus JSON output preference.
-/// returns/effects: Reads config and returns text or JSON output.
+// purpose: Render CMUX-style current theme state for the Ghostty config path.
+// inputs: Ghostty config path plus JSON output preference.
+// returns/effects: Reads config and returns text or JSON output.
 fn render_themes_list(path: &Path, json_output: bool) -> Result<CommandOutput> {
     let current = current_theme_selection_at(path)?;
+    let themes = available_theme_names()?;
     if json_output {
-        return Ok(CommandOutput::Json(json!({
-            "themes": [],
-            "current": {
-                "raw_value": current.raw_value,
-                "light": current.light,
-                "dark": current.dark,
-                "source_path": current.source_path,
-            },
-            "config_path": path.display().to_string(),
-            "catalog": "external_ghostty",
-        })));
+        return Ok(CommandOutput::Json(theme_list_json(
+            path, &current, &themes,
+        )));
     }
-
-    Ok(CommandOutput::Text(format!(
-        concat!(
-            "Current light: {}\n",
-            "Current dark: {}\n",
-            "Config: {}\n\n",
-            "Theme catalog: external Ghostty theme names are accepted; ",
-            "run `limux config reload` to validate and apply."
-        ),
-        current.light.as_deref().unwrap_or("inherit"),
-        current.dark.as_deref().unwrap_or("inherit"),
-        path.display()
+    Ok(CommandOutput::Text(theme_list_text(
+        path, &current, &themes,
     )))
 }
 
-/// purpose: Apply a CMUX-compatible theme selection to Ghostty config.
-/// inputs: Ghostty config path, set arguments, and JSON output preference.
-/// returns/effects: Writes managed theme block and returns status payload.
+// purpose: Build CMUX-shaped JSON for `themes list`.
+// inputs: Config path, current theme selection, and catalog names.
+// returns/effects: Returns a JSON object with catalog rows and current state.
+fn theme_list_json(path: &Path, current: &ThemeSelection, themes: &[String]) -> Value {
+    json!({
+        "themes": themes.iter().map(|theme| theme_row_json(current, theme)).collect::<Vec<_>>(),
+        "current": {
+            "raw_value": current.raw_value.clone(),
+            "light": current.light.clone(),
+            "dark": current.dark.clone(),
+            "source_path": current.source_path.clone(),
+        },
+        "config_path": path.display().to_string(),
+        "catalog": "ghostty_theme_directories",
+    })
+}
+
+// purpose: Build one CMUX-shaped theme catalog JSON row.
+// inputs: Current theme selection and candidate name.
+// returns/effects: Marks whether the name is active for light or dark mode.
+fn theme_row_json(current: &ThemeSelection, theme: &str) -> Value {
+    json!({
+        "name": theme,
+        "current_light": theme_matches(current.light.as_deref(), theme),
+        "current_dark": theme_matches(current.dark.as_deref(), theme),
+    })
+}
+
+// purpose: Build CMUX-shaped text for `themes list`.
+// inputs: Config path, current theme selection, and catalog names.
+// returns/effects: Returns current state plus catalog rows or the no-themes message.
+fn theme_list_text(path: &Path, current: &ThemeSelection, themes: &[String]) -> String {
+    let mut text = format!(
+        "Current light: {}\nCurrent dark: {}\nConfig: {}\n",
+        current.light.as_deref().unwrap_or("inherit"),
+        current.dark.as_deref().unwrap_or("inherit"),
+        path.display()
+    );
+    if let Some(source_path) = current.source_path.as_deref() {
+        text.push_str(&format!("Source: {source_path}\n"));
+    }
+    text.push('\n');
+    if themes.is_empty() {
+        text.push_str("No themes found.");
+    } else {
+        for theme in themes {
+            text.push_str(&theme_text_row(current, theme));
+            text.push('\n');
+        }
+        text.truncate(text.trim_end().len());
+    }
+    text
+}
+
+// purpose: Build one CMUX-shaped text row for a theme name.
+// inputs: Current theme selection and candidate name.
+// returns/effects: Returns the name plus active light/dark badges when applicable.
+fn theme_text_row(current: &ThemeSelection, theme: &str) -> String {
+    let mut badges = Vec::new();
+    if theme_matches(current.light.as_deref(), theme) {
+        badges.push("light");
+    }
+    if theme_matches(current.dark.as_deref(), theme) {
+        badges.push("dark");
+    }
+    if badges.is_empty() {
+        theme.to_string()
+    } else {
+        format!("{theme}  [{}]", badges.join(", "))
+    }
+}
+
+// purpose: Compare configured and catalog theme names.
+// inputs: Optional configured name and catalog name.
+// returns/effects: Returns case-insensitive match state.
+fn theme_matches(configured: Option<&str>, theme: &str) -> bool {
+    configured.is_some_and(|value| value.eq_ignore_ascii_case(theme))
+}
+
+// purpose: Apply a CMUX-compatible theme selection to Ghostty config.
+// inputs: Ghostty config path, set arguments, and JSON output preference.
+// returns/effects: Writes managed theme block and returns status payload.
 fn run_themes_set_at(path: &Path, args: &[String], json_output: bool) -> Result<CommandOutput> {
+    run_themes_set_with_catalog_at(path, args, json_output, &available_theme_names()?)
+}
+
+// purpose: Apply a CMUX-compatible theme selection with an explicit theme catalog.
+// inputs: Ghostty config path, set arguments, JSON output preference, and theme names.
+// returns/effects: Writes managed theme block and returns status payload.
+fn run_themes_set_with_catalog_at(
+    path: &Path,
+    args: &[String],
+    json_output: bool,
+    available_themes: &[String],
+) -> Result<CommandOutput> {
     let current = current_theme_selection_at(path)?;
-    let (light, dark) = parse_theme_set_args(args, &current)?;
+    let (light, dark) = parse_theme_set_args(args, &current, available_themes)?;
     let raw_theme_value = encoded_theme_value(light.as_deref(), dark.as_deref())
         .ok_or_else(|| anyhow!("themes set requires at least one theme"))?;
     write_managed_theme_override_at(path, &raw_theme_value)?;
@@ -2000,9 +2233,9 @@ fn run_themes_set_at(path: &Path, args: &[String], json_output: bool) -> Result<
     )))
 }
 
-/// purpose: Clear CMUX's managed Ghostty theme selection.
-/// inputs: Ghostty config path plus JSON output preference.
-/// returns/effects: Removes the managed block and returns status payload.
+// purpose: Clear CMUX's managed Ghostty theme selection.
+// inputs: Ghostty config path plus JSON output preference.
+// returns/effects: Removes the managed block and returns status payload.
 fn run_themes_clear_at(path: &Path, json_output: bool) -> Result<CommandOutput> {
     clear_managed_theme_override_at(path)?;
     if json_output {
@@ -13301,7 +13534,8 @@ mod cli_arg_tests {
         write_managed_theme_override_at(&path, "light:Catppuccin Latte,dark:Catppuccin Mocha")
             .expect("seed themes");
 
-        run_themes_set_at(&path, &args(&["--dark", "Tokyo Night"]), false).expect("set dark theme");
+        run_themes_set_with_catalog_at(&path, &args(&["--dark", "Tokyo Night"]), false, &[])
+            .expect("set dark theme");
         let current = current_theme_selection_at(&path).expect("current theme");
         assert_eq!(current.light.as_deref(), Some("Catppuccin Latte"));
         assert_eq!(current.dark.as_deref(), Some("Tokyo Night"));
@@ -13324,6 +13558,38 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn theme_catalog_discovers_sorted_case_insensitive_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes = dir.path().join("themes");
+        fs::create_dir_all(&themes).expect("create themes");
+        fs::write(themes.join("Tokyo Night"), "").expect("theme");
+        fs::write(themes.join("tokyo night"), "").expect("duplicate");
+        fs::write(themes.join("Gruvbox Light"), "").expect("theme");
+        fs::create_dir(themes.join("Nested")).expect("nested dir");
+
+        let names = available_theme_names_from_dirs(&[themes]).expect("theme names");
+
+        assert_eq!(names, vec!["Gruvbox Light", "Tokyo Night"]);
+    }
+
+    #[test]
+    fn theme_set_uses_catalog_for_canonical_names_and_unknown_rejection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ghostty/config");
+        let catalog = vec!["Catppuccin Mocha".to_string(), "Tokyo Night".to_string()];
+
+        run_themes_set_with_catalog_at(&path, &args(&["catppuccin mocha"]), false, &catalog)
+            .expect("catalog theme set");
+        let current = current_theme_selection_at(&path).expect("current theme");
+        assert_eq!(current.light.as_deref(), Some("Catppuccin Mocha"));
+        assert_eq!(current.dark.as_deref(), Some("Catppuccin Mocha"));
+
+        let err = run_themes_set_with_catalog_at(&path, &args(&["Missing Theme"]), false, &catalog)
+            .expect_err("unknown catalog theme should fail");
+        assert!(err.to_string().contains("Unknown theme 'Missing Theme'"));
+    }
+
+    #[test]
     fn themes_json_outputs_cmux_shape() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ghostty/config");
@@ -13342,7 +13608,7 @@ mod cli_arg_tests {
             panic!("expected json list");
         };
         assert_eq!(payload["current"]["light"], "Gruvbox Light");
-        assert_eq!(payload["catalog"], "external_ghostty");
+        assert_eq!(payload["catalog"], "ghostty_theme_directories");
     }
 
     #[test]
