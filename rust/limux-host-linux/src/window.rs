@@ -3463,16 +3463,21 @@ fn apply_custom_sidebar_action(
 ) -> Result<serde_json::Value, BridgeError> {
     let mut app_state = state.borrow_mut();
     let workspace_id = validate_right_sidebar_target(&app_state, &target)?;
+    let beta_enabled = app_state.config.borrow().custom_sidebars.beta_enabled;
     match action {
-        CustomSidebarAction::Validate { name } => Ok(custom_sidebar_report_payload(name.as_deref())),
+        CustomSidebarAction::Validate { name } => Ok(custom_sidebar_report_payload_with_beta(
+            name.as_deref(),
+            beta_enabled,
+        )),
         CustomSidebarAction::Reload { name } => {
-            let mut payload = custom_sidebar_report_payload(name.as_deref());
+            let mut payload =
+                custom_sidebar_report_payload_with_beta(name.as_deref(), beta_enabled);
             let reloaded = payload["valid_count"].as_u64().unwrap_or(0);
             payload["reloaded_count"] = json!(reloaded);
             Ok(payload)
         }
         CustomSidebarAction::Select { name } => {
-            let selection = load_custom_sidebar_selection(&name)?;
+            let selection = load_custom_sidebar_selection_with_beta(&name, beta_enabled)?;
             app_state.right_sidebar_visible = true;
             app_state.right_sidebar_focused = true;
             app_state.custom_sidebar_selection = Some(selection);
@@ -3482,9 +3487,16 @@ fn apply_custom_sidebar_action(
             payload["selected_provider_id"] = json!(format!("custom:{name}"));
             Ok(payload)
         }
-        CustomSidebarAction::Open { name, .. } => Err(BridgeError::not_supported(format!(
-            "sidebar.custom.open requires custom-sidebar pane surfaces; JSON sidebar `{name}` can be selected with sidebar.custom.select"
-        ))),
+        CustomSidebarAction::Open { name, .. } => {
+            if !beta_enabled {
+                return Err(BridgeError::not_supported(
+                    "custom sidebars are disabled by customSidebars.beta.enabled",
+                ));
+            }
+            Err(BridgeError::not_supported(format!(
+                "sidebar.custom.open requires custom-sidebar pane surfaces; JSON sidebar `{name}` can be selected with sidebar.custom.select"
+            )))
+        }
     }
 }
 
@@ -3497,21 +3509,36 @@ fn runtime_custom_sidebars_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("XDG config directory is unavailable"))
 }
 
-/// purpose: Build a CMUX-shaped custom-sidebar validation payload.
-/// inputs: Optional sidebar name filter.
-/// returns/effects: Reads sidebar files and reports sorted validation rows.
-fn custom_sidebar_report_payload(filter: Option<&str>) -> serde_json::Value {
+/// purpose: Build a CMUX-shaped custom-sidebar validation payload with the beta gate.
+/// inputs: Optional sidebar name filter and loaded customSidebars.beta.enabled value.
+/// returns/effects: Hides sidebars while beta is disabled, matching CMUX visibility.
+fn custom_sidebar_report_payload_with_beta(
+    filter: Option<&str>,
+    beta_enabled: bool,
+) -> serde_json::Value {
     let dir = runtime_custom_sidebars_dir();
-    custom_sidebar_report_payload_at(&dir, filter)
+    custom_sidebar_report_payload_at_with_beta(&dir, filter, beta_enabled)
 }
 
-/// purpose: Build a CMUX-shaped custom-sidebar validation payload for one directory.
-/// inputs: Sidebar directory and optional sidebar name filter.
-/// returns/effects: Reads sidebar files and reports sorted validation rows.
-fn custom_sidebar_report_payload_at(
+/// purpose: Build a CMUX-shaped custom-sidebar validation payload for one directory and beta gate.
+/// inputs: Sidebar directory, optional sidebar name filter, and beta-enabled flag.
+/// returns/effects: Returns no visible sidebars while beta is disabled.
+fn custom_sidebar_report_payload_at_with_beta(
     dir: &std::path::Path,
     filter: Option<&str>,
+    beta_enabled: bool,
 ) -> serde_json::Value {
+    if !beta_enabled {
+        return json!({
+            "directory": dir.display().to_string(),
+            "sidebars": [],
+            "valid_count": 0,
+            "error_count": 0,
+            "beta_enabled": false,
+            "disabled": true,
+            "disabled_reason": "customSidebars.beta.enabled is false",
+        });
+    }
     let sidebars = discover_runtime_custom_sidebars(dir, filter);
     let valid_count = sidebars
         .iter()
@@ -3523,6 +3550,8 @@ fn custom_sidebar_report_payload_at(
         "sidebars": sidebars,
         "valid_count": valid_count,
         "error_count": error_count,
+        "beta_enabled": true,
+        "disabled": false,
     })
 }
 
@@ -3634,10 +3663,18 @@ fn read_runtime_custom_sidebar(path: &std::path::Path, kind: &str) -> Result<(),
     }
 }
 
-/// purpose: Load a named JSON custom sidebar for runtime rendering.
-/// inputs: Sidebar name.
-/// returns/effects: Returns a parsed selection or BridgeError for missing/Swift/invalid sources.
-fn load_custom_sidebar_selection(name: &str) -> Result<CustomSidebarSelection, BridgeError> {
+/// purpose: Load a named JSON custom sidebar for runtime rendering with beta gating.
+/// inputs: Sidebar name and loaded customSidebars.beta.enabled value.
+/// returns/effects: Rejects selection while custom sidebars are disabled.
+fn load_custom_sidebar_selection_with_beta(
+    name: &str,
+    beta_enabled: bool,
+) -> Result<CustomSidebarSelection, BridgeError> {
+    if !beta_enabled {
+        return Err(BridgeError::not_supported(
+            "custom sidebars are disabled by customSidebars.beta.enabled",
+        ));
+    }
     let dir = runtime_custom_sidebars_dir();
     load_custom_sidebar_selection_from_dir(&dir, name)
 }
@@ -16939,7 +16976,7 @@ mod tests {
         clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
         custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action, custom_sidebar_font_size,
         custom_sidebar_is_hex_color, custom_sidebar_markup_attrs, custom_sidebar_pango_color,
-        custom_sidebar_pango_weight, custom_sidebar_report_payload_at,
+        custom_sidebar_pango_weight, custom_sidebar_report_payload_at_with_beta,
         desktop_notification_action_entries, desktop_notification_action_from_signal,
         desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
@@ -16947,7 +16984,8 @@ mod tests {
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, host_notification_row,
         limit_text_to_last_lines, load_custom_sidebar_selection_from_dir,
-        next_active_workspace_index, notification_command_env, notification_hook_policy_payload,
+        load_custom_sidebar_selection_with_beta, next_active_workspace_index,
+        notification_command_env, notification_hook_policy_payload,
         notification_policy_effects_from_value, pane_create_split_placement,
         pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
         publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
@@ -17484,7 +17522,8 @@ mod tests {
         )
         .expect("write json sidebar");
 
-        let report = custom_sidebar_report_payload_at(dir.path(), Some("build-board"));
+        let report =
+            custom_sidebar_report_payload_at_with_beta(dir.path(), Some("build-board"), true);
         assert_eq!(report["valid_count"], json!(1));
         assert_eq!(report["error_count"], json!(0));
 
@@ -17578,6 +17617,29 @@ mod tests {
         let error = load_custom_sidebar_selection_from_dir(dir.path(), "bad-style")
             .expect_err("bad style rejected");
         assert!(format!("{error:?}").contains("node.padding must be a finite number"));
+    }
+
+    #[test]
+    fn custom_sidebar_beta_disabled_hides_and_rejects_runtime_sidebars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("hidden.json"),
+            r#"{"version":1,"root":{"type":"text","text":"Hidden"}}"#,
+        )
+        .expect("write hidden json sidebar");
+
+        let report = custom_sidebar_report_payload_at_with_beta(dir.path(), None, false);
+        assert_eq!(report["beta_enabled"], json!(false));
+        assert_eq!(report["disabled"], json!(true));
+        assert_eq!(report["valid_count"], json!(0));
+        assert_eq!(
+            report["sidebars"].as_array().expect("sidebars array").len(),
+            0
+        );
+
+        let error = load_custom_sidebar_selection_with_beta("hidden", false)
+            .expect_err("disabled custom sidebar rejected");
+        assert!(format!("{error:?}").contains("customSidebars.beta.enabled"));
     }
 
     #[test]
