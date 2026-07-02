@@ -4324,37 +4324,54 @@ fn run_settings_command(args: &[String], json_output: bool) -> Result<CommandOut
     let sub = args.first().map(String::as_str).unwrap_or("open");
     match sub {
         "--help" | "-h" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
-        "docs" | "documentation" if json_output => {
-            let reference = docs_reference("settings")
-                .ok_or_else(|| anyhow!("settings docs metadata is unavailable"))?;
-            Ok(CommandOutput::Json(docs_payload(reference)?))
-        }
-        "docs" | "documentation" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
-        "path" | "paths" => {
-            let config_dir = limux_config_dir()?;
-            let settings = limux_settings_path()?;
-            let shortcuts = limux_shortcuts_path()?;
-            if json_output {
-                return Ok(CommandOutput::Json(config_paths_json(
-                    &config_dir,
-                    &settings,
-                    &shortcuts,
-                )?));
-            }
-            if sub == "path" {
-                Ok(CommandOutput::Text(settings.display().to_string()))
-            } else {
-                Ok(CommandOutput::Text(format!(
-                    "config_dir: {}\nsettings: {}\nshortcuts: {}",
-                    config_dir.display(),
-                    settings.display(),
-                    shortcuts.display()
-                )))
-            }
-        }
+        "docs" | "documentation" => settings_docs_output(args, json_output),
+        "path" | "paths" => settings_paths_output(args, sub, json_output),
         "open" => bail!("settings open requires a running Limux host"),
         target => bail!("unsupported settings target `{target}`; expected path, docs, or open"),
     }
+}
+
+// purpose: Render the local CMUX settings docs probe.
+// inputs: Settings args and JSON-output preference.
+// returns/effects: Returns local docs metadata or a strict usage error for extra args.
+fn settings_docs_output(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    if args.len() != 1 {
+        bail!("Usage: limux settings docs");
+    }
+    if json_output {
+        let reference = docs_reference("settings")
+            .ok_or_else(|| anyhow!("settings docs metadata is unavailable"))?;
+        return Ok(CommandOutput::Json(docs_payload(reference)?));
+    }
+    Ok(CommandOutput::Text(docs_text(Some("settings"))?))
+}
+
+// purpose: Render local CMUX settings path probes.
+// inputs: Settings args, subcommand spelling, and JSON-output preference.
+// returns/effects: Returns path metadata or a strict usage error for extra args.
+fn settings_paths_output(args: &[String], sub: &str, json_output: bool) -> Result<CommandOutput> {
+    if args.len() != 1 {
+        bail!("Usage: limux settings path");
+    }
+    let config_dir = limux_config_dir()?;
+    let settings = limux_settings_path()?;
+    let shortcuts = limux_shortcuts_path()?;
+    if json_output {
+        return Ok(CommandOutput::Json(config_paths_json(
+            &config_dir,
+            &settings,
+            &shortcuts,
+        )?));
+    }
+    if sub == "path" {
+        return Ok(CommandOutput::Text(settings.display().to_string()));
+    }
+    Ok(CommandOutput::Text(format!(
+        "config_dir: {}\nsettings: {}\nshortcuts: {}",
+        config_dir.display(),
+        settings.display(),
+        shortcuts.display()
+    )))
 }
 
 // purpose: Normalize CMUX settings target aliases accepted by `settings open`.
@@ -4438,8 +4455,25 @@ fn config_paths_json(config_dir: &Path, settings: &Path, shortcuts: &Path) -> Re
 fn run_config_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
     let sub = args.first().map(String::as_str).unwrap_or("check");
     match sub {
-        "--help" | "-h" | "docs" | "documentation" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
+        "--help" | "-h" | "help" => Ok(CommandOutput::Text(docs_text(Some("settings"))?)),
+        "docs" | "documentation" if json_output => {
+            if args.len() != 1 {
+                bail!("Usage: limux config docs");
+            }
+            let reference = docs_reference("settings")
+                .ok_or_else(|| anyhow!("settings docs metadata is unavailable"))?;
+            Ok(CommandOutput::Json(docs_payload(reference)?))
+        }
+        "docs" | "documentation" => {
+            if args.len() != 1 {
+                bail!("Usage: limux config docs");
+            }
+            Ok(CommandOutput::Text(docs_text(Some("settings"))?))
+        }
         "path" | "paths" => {
+            if args.len() != 1 {
+                bail!("Usage: limux config path");
+            }
             let config_dir = limux_config_dir()?;
             let settings = limux_settings_path()?;
             let shortcuts = limux_shortcuts_path()?;
@@ -18287,6 +18321,30 @@ mod cli_arg_tests {
                 .expect("config paths is local"),
             CommandOutput::Json(_)
         ));
+
+        let help_output = run_local_command(&default_opts(args(&["config", "help"])))
+            .expect("config help succeeds")
+            .expect("config help is local");
+        assert!(matches!(help_output, CommandOutput::Text(_)));
+
+        let mut docs_opts = default_opts(args(&["config", "docs"]));
+        docs_opts.json_output = true;
+        let docs_output = run_local_command(&docs_opts)
+            .expect("config docs json succeeds")
+            .expect("config docs is local");
+        let CommandOutput::Json(payload) = docs_output else {
+            panic!("config docs --json should render JSON");
+        };
+        assert_eq!(payload["topic"], "settings");
+        assert_eq!(payload["reload_command"], "limux reload-config");
+
+        let err = run_local_command(&default_opts(args(&["config", "path", "extra"])))
+            .expect_err("config path extra arg should fail");
+        assert!(err.to_string().contains("Usage: limux config path"));
+
+        let err = run_local_command(&default_opts(args(&["config", "docs", "extra"])))
+            .expect_err("config docs extra arg should fail");
+        assert!(err.to_string().contains("Usage: limux config docs"));
     }
 
     #[test]
@@ -18330,6 +18388,12 @@ mod cli_arg_tests {
         };
         assert_eq!(payload["topic"], "settings");
         assert_eq!(payload["reload_command"], "limux reload-config");
+        let err = run_local_command(&default_opts(args(&["settings", "path", "extra"])))
+            .expect_err("settings path extra arg should fail");
+        assert!(err.to_string().contains("Usage: limux settings path"));
+        let err = run_local_command(&default_opts(args(&["settings", "docs", "extra"])))
+            .expect_err("settings docs extra arg should fail");
+        assert!(err.to_string().contains("Usage: limux settings docs"));
         assert_eq!(settings_target_raw_value("general"), Some("app"));
         assert_eq!(
             settings_target_raw_value("shortcuts"),
