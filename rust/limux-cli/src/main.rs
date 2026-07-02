@@ -4688,6 +4688,17 @@ fn persist_agent_hook_session(
         surface_id,
         cwd,
         pid,
+        is_restorable: existing.as_ref().and_then(|record| record.is_restorable),
+        transcript_path: hook_str(
+            payload,
+            &["transcript_path", "transcriptPath", "transcript"],
+        )
+        .map(str::to_string)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|record| record.transcript_path.clone())
+        }),
         launch_command,
         updated_at: agent_hooks::now_seconds(),
     };

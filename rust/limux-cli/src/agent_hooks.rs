@@ -143,26 +143,36 @@ impl AgentKind {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AgentLaunchCommandRecord {
+    #[serde(alias = "executablePath")]
     pub(crate) executable: String,
     pub(crate) arguments: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "workingDirectory")]
     pub(crate) cwd: Option<String>,
     #[serde(default)]
     pub(crate) environment: BTreeMap<String, String>,
+    #[serde(alias = "capturedAt")]
     pub(crate) captured_at: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AgentHookSessionRecord {
+    #[serde(alias = "sessionId")]
     pub(crate) session_id: String,
+    #[serde(alias = "workspaceId")]
     pub(crate) workspace_id: String,
+    #[serde(alias = "surfaceId")]
     pub(crate) surface_id: String,
     #[serde(default)]
     pub(crate) cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     pub(crate) pid: Option<u32>,
-    #[serde(default)]
+    #[serde(default, alias = "isRestorable")]
+    pub(crate) is_restorable: Option<bool>,
+    #[serde(default, alias = "transcriptPath")]
+    pub(crate) transcript_path: Option<String>,
+    #[serde(default, alias = "launchCommand")]
     pub(crate) launch_command: Option<AgentLaunchCommandRecord>,
+    #[serde(alias = "updatedAt")]
     pub(crate) updated_at: f64,
 }
 
@@ -728,6 +738,33 @@ fn normalized(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+// purpose: Parse optional PIDs from CMUX hook stores without rejecting out-of-range values.
+// inputs: JSON pid field that may be absent, null, signed, unsigned, string, or too large.
+// returns/effects: Returns Some(u32) only for valid positive Linux PID diagnostics.
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Number(number) => Ok(number
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)),
+        serde_json::Value::String(raw) => Ok(raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)),
+        serde_json::Value::Null => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -895,6 +932,8 @@ mod tests {
             surface_id: "7:tab-a".to_string(),
             cwd: Some("/tmp/project".to_string()),
             pid: Some(1234),
+            is_restorable: None,
+            transcript_path: None,
             launch_command: Some(AgentLaunchCommandRecord {
                 executable: "codex".to_string(),
                 arguments: vec![

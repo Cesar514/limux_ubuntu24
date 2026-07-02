@@ -70,6 +70,14 @@ struct CodexPidTranscript {
     path: String,
 }
 
+struct SessionForkDiagnostics {
+    transcript_path: Option<String>,
+    hook_record_restorable: bool,
+    fork_command: Option<String>,
+    fork_unavailable_reason: &'static str,
+    pid_exists: Option<bool>,
+}
+
 impl From<SessionCommandInput> for SessionCommandResult {
     fn from(input: SessionCommandInput) -> Self {
         session_command_result_from_input(input)
@@ -379,10 +387,8 @@ fn base_session_payload(
     snapshot: &AgentHookSessionSnapshot,
     record: &AgentHookSessionRecord,
 ) -> Value {
-    let pid_exists = record.pid.map(stored_pid_exists);
     let launch = record.launch_command.as_ref();
-    let fork_command =
-        agent_hooks::build_fork_command(snapshot.agent, &record.session_id, launch, None);
+    let fork = session_fork_diagnostics(snapshot.agent, record);
     json!({
         "agent": snapshot.agent.store_name(),
         "agent_display_name": snapshot.agent.label(),
@@ -394,24 +400,235 @@ fn base_session_payload(
         "updated_at": format!("{:.3}", record.updated_at),
         "updated_at_unix": record.updated_at,
         "cwd": record.cwd,
-        "transcript_path": Value::Null,
+        "transcript_path": fork.transcript_path,
         "pid": record.pid,
-        "stored_pid_exists": pid_exists,
+        "stored_pid_exists": fork.pid_exists,
         "runtime_status": Value::Null,
         "agent_lifecycle": Value::Null,
         "last_prompt_turn_id": Value::Null,
         "active_prompt_turn_id": Value::Null,
         "launch_working_directory": launch.and_then(|launch| launch.cwd.clone()),
         "launch_arguments": launch.map(|launch| launch.arguments.clone()).unwrap_or_default(),
-        "fork_command": fork_command,
-        "fork_command_available": fork_command.is_some(),
-        "fork_supported": fork_command.is_some(),
-        "fork_risk": pid_exists == Some(false),
+        "fork_command": fork.fork_command,
+        "fork_command_available": fork.fork_command.is_some(),
+        "fork_supported": fork.fork_command.is_some(),
+        "fork_unavailable_reason": fork.fork_unavailable_reason,
+        "fork_startup_input_available": false,
+        "hook_record_restorable": fork.hook_record_restorable,
+        "stale_pid_blocks_restore_in_0_64_17": fork.pid_exists == Some(false) && fork.hook_record_restorable,
+        "fork_risk": fork.pid_exists == Some(false),
         "active_for_workspace": false,
         "active_for_surface": false,
         "active_workspace_session_id": Value::Null,
         "active_surface_session_id": Value::Null,
     })
+}
+
+// purpose: Compute CMUX-compatible fork and restorable diagnostics for one session.
+// inputs: Agent kind and saved hook record.
+// returns/effects: Returns diagnostic values without mutating state.
+fn session_fork_diagnostics(
+    agent: AgentKind,
+    record: &AgentHookSessionRecord,
+) -> SessionForkDiagnostics {
+    let transcript_path = session_transcript_path(agent, record);
+    let hook_record_restorable = hook_record_restorable(agent, record, transcript_path.as_deref());
+    let launch = record.launch_command.as_ref();
+    let fork_command = hook_record_restorable
+        .then(|| agent_hooks::build_fork_command(agent, &record.session_id, launch, None))
+        .flatten();
+    SessionForkDiagnostics {
+        transcript_path,
+        hook_record_restorable,
+        fork_unavailable_reason: fork_unavailable_reason(hook_record_restorable, &fork_command),
+        fork_command,
+        pid_exists: record.pid.map(stored_pid_exists),
+    }
+}
+
+// purpose: Resolve the transcript path used by session diagnostics.
+// inputs: Agent kind and saved hook record.
+// returns/effects: Returns a known nonempty transcript path without creating files.
+fn session_transcript_path(agent: AgentKind, record: &AgentHookSessionRecord) -> Option<String> {
+    let recorded = record
+        .transcript_path
+        .as_deref()
+        .and_then(normalized)
+        .map(expand_tilde);
+    if let Some(path) = recorded.as_ref().filter(|path| regular_nonempty_file(path)) {
+        return Some(path.display().to_string());
+    }
+    if agent == AgentKind::Claude {
+        return claude_transcript_path(record);
+    }
+    recorded.map(|path| path.display().to_string())
+}
+
+// purpose: Apply CMUX's restorable-record trust rule for session list diagnostics.
+// inputs: Agent kind, record metadata, and resolved transcript evidence.
+// returns/effects: Returns false for untrusted Claude records without transcript evidence.
+fn hook_record_restorable(
+    agent: AgentKind,
+    record: &AgentHookSessionRecord,
+    transcript_path: Option<&str>,
+) -> bool {
+    if agent != AgentKind::Claude {
+        return record.is_restorable != Some(false);
+    }
+    if transcript_path.is_some() {
+        return true;
+    }
+    claude_transcript_path(record).is_some()
+}
+
+// purpose: Render CMUX-compatible fork unavailable reason metadata.
+// inputs: Trusted restorable flag and rendered fork command.
+// returns/effects: Returns the diagnostic reason string.
+fn fork_unavailable_reason(
+    hook_record_restorable: bool,
+    fork_command: &Option<String>,
+) -> &'static str {
+    if !hook_record_restorable {
+        "record_marked_non_restorable"
+    } else if fork_command.is_none() {
+        "agent_has_no_fork_command"
+    } else {
+        "available"
+    }
+}
+
+// purpose: Find a Claude transcript in known Claude config roots.
+// inputs: Session options and saved Claude hook record.
+// returns/effects: Searches config roots read-only and returns one direct transcript path.
+fn claude_transcript_path(record: &AgentHookSessionRecord) -> Option<String> {
+    if !safe_session_filename(&record.session_id) {
+        return None;
+    }
+    let cwd = record
+        .launch_command
+        .as_ref()
+        .and_then(|launch| launch.cwd.as_deref())
+        .or(record.cwd.as_deref())
+        .and_then(normalized);
+    claude_config_roots(record)
+        .into_iter()
+        .find_map(|root| claude_transcript_in_root(&root, record, cwd.as_deref()))
+}
+
+// purpose: Search one Claude config root for a session transcript.
+// inputs: Config root, saved hook record, and optional cwd.
+// returns/effects: Returns a nonempty transcript path when present.
+fn claude_transcript_in_root(
+    root: &Path,
+    record: &AgentHookSessionRecord,
+    cwd: Option<&str>,
+) -> Option<String> {
+    if let Some(cwd) = cwd {
+        let project = root.join("projects").join(encode_claude_project_dir(cwd));
+        if let Some(path) = claude_transcript_in_project(&project, &record.session_id) {
+            return Some(path.display().to_string());
+        }
+    }
+    read_dir_paths(&root.join("projects"))
+        .into_iter()
+        .find_map(|project| claude_transcript_in_project(&project, &record.session_id))
+        .map(|path| path.display().to_string())
+}
+
+// purpose: Resolve Claude config roots from launch metadata and standard locations.
+// inputs: Session-list options and one hook record.
+// returns/effects: Returns deduplicated candidate roots.
+fn claude_config_roots(record: &AgentHookSessionRecord) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    push_unique_path(
+        &mut roots,
+        record
+            .launch_command
+            .as_ref()
+            .and_then(|launch| launch.environment.get("CLAUDE_CONFIG_DIR"))
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| expand_tilde(value.clone())),
+    );
+    if roots.is_empty() {
+        if let Some(home) = dirs::home_dir() {
+            push_unique_path(&mut roots, Some(home.join(".claude")));
+            push_unique_path(&mut roots, Some(home.join(".subrouter/codex/claude")));
+        }
+    }
+    roots
+}
+
+// purpose: Add a path to a list once after lightweight normalization.
+// inputs: Mutable path list and optional candidate.
+// returns/effects: Mutates the list only when the path is new.
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: Option<PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+// purpose: Search one Claude project directory for a direct or nested session transcript.
+// inputs: Project directory and safe session id.
+// returns/effects: Returns a nonempty transcript path when present.
+fn claude_transcript_in_project(project: &Path, session_id: &str) -> Option<PathBuf> {
+    let direct = project.join(format!("{session_id}.jsonl"));
+    if regular_nonempty_file(&direct) {
+        return Some(direct);
+    }
+    let nested = project
+        .join(session_id)
+        .join("messages")
+        .join(format!("{session_id}.jsonl"));
+    regular_nonempty_file(&nested).then_some(nested)
+}
+
+// purpose: List direct child paths from a directory.
+// inputs: Directory path.
+// returns/effects: Missing or unreadable directories return an empty list.
+fn read_dir_paths(path: &Path) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .collect()
+}
+
+// purpose: Check whether a path is a nonempty regular file.
+// inputs: Candidate transcript path.
+// returns/effects: Reads metadata only and returns false on missing/unreadable paths.
+fn regular_nonempty_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+// purpose: Validate session ids before using them as local file names.
+// inputs: Raw session id.
+// returns/effects: Returns false for empty, dot, parent, or path-bearing ids.
+fn safe_session_filename(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+}
+
+// purpose: Encode Claude's project directory naming scheme.
+// inputs: Absolute project path.
+// returns/effects: Replaces path separators and dots with dashes.
+fn encode_claude_project_dir(path: &str) -> String {
+    path.replace(['/', '.'], "-")
+}
+
+// purpose: Normalize optional freeform stored text.
+// inputs: Raw string slice.
+// returns/effects: Returns trimmed nonempty text.
+fn normalized(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 // purpose: Render metadata for one inspected hook store.
@@ -842,6 +1059,12 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
+    struct ClaudeSeed {
+        is_restorable: Option<bool>,
+        transcript_path: Option<String>,
+        environment: BTreeMap<String, String>,
+    }
+
     // purpose: Seed one Codex hook-store record with a stale PID.
     // inputs: Hook state directory path.
     // returns/effects: Writes a test store record.
@@ -854,6 +1077,8 @@ mod tests {
                 surface_id: "surface-a".to_string(),
                 cwd: Some("/tmp/project".to_string()),
                 pid: Some(999_999),
+                is_restorable: None,
+                transcript_path: None,
                 launch_command: Some(AgentLaunchCommandRecord {
                     executable: "codex".to_string(),
                     arguments: vec![
@@ -951,26 +1176,227 @@ mod tests {
         assert_sessions_list_json_includes_fork_command();
     }
 
+    // purpose: Exercise CMUX Claude transcript trust behavior for session diagnostics.
+    // inputs: Temporary Claude hook store with an existing transcript path.
+    // returns/effects: Asserts transcript evidence overrides a false stored restorable flag.
+    fn assert_claude_transcript_backed_record_is_restorable() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let transcript = dir.path().join("claude-session.jsonl");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::write(&transcript, "{}\n").expect("transcript");
+        seed_claude_record(
+            dir.path(),
+            "claude-session",
+            &repo,
+            ClaudeSeed {
+                is_restorable: Some(false),
+                transcript_path: Some(transcript.display().to_string()),
+                environment: BTreeMap::new(),
+            },
+        );
+
+        let value = sessions_json_for(dir.path(), "claude", "claude-session");
+        let session = &value["sessions"][0];
+        assert_eq!(session["hook_record_restorable"], true);
+        assert_eq!(session["fork_command_available"], true);
+        assert_eq!(session["fork_supported"], true);
+        assert_eq!(session["fork_unavailable_reason"], "available");
+    }
+
+    #[test]
+    fn claude_transcript_backed_record_is_restorable() {
+        assert_claude_transcript_backed_record_is_restorable();
+    }
+
+    // purpose: Exercise CMUX Claude distrust behavior when no transcript evidence exists.
+    // inputs: Temporary Claude hook store with no transcript file.
+    // returns/effects: Asserts session diagnostics mark fork unavailable.
+    fn assert_claude_without_transcript_is_not_restorable() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        seed_claude_record(
+            dir.path(),
+            "claude-no-transcript",
+            &repo,
+            ClaudeSeed {
+                is_restorable: Some(true),
+                transcript_path: None,
+                environment: BTreeMap::new(),
+            },
+        );
+
+        let value = sessions_json_for(dir.path(), "claude", "claude-no-transcript");
+        let session = &value["sessions"][0];
+        assert_eq!(session["hook_record_restorable"], false);
+        assert_eq!(session["fork_command_available"], false);
+        assert_eq!(session["fork_supported"], false);
+        assert_eq!(
+            session["fork_unavailable_reason"],
+            "record_marked_non_restorable"
+        );
+    }
+
+    #[test]
+    fn claude_without_transcript_is_not_restorable() {
+        assert_claude_without_transcript_is_not_restorable();
+    }
+
+    // purpose: Exercise CMUX-compatible Claude transcript lookup in CLAUDE_CONFIG_DIR.
+    // inputs: Hook record without transcript path and a Claude projects transcript file.
+    // returns/effects: Asserts diagnostics trust the located transcript.
+    fn assert_claude_transcript_lookup_uses_launch_config_dir() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo.with.dot");
+        let config = dir.path().join("claude-config");
+        let session_id = "claude-config-lookup";
+        let project = config
+            .join("projects")
+            .join(encode_claude_project_dir(repo.to_str().expect("repo path")));
+        fs::create_dir_all(&project).expect("project");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+        let env = BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config.display().to_string(),
+        )]);
+        seed_claude_record(
+            dir.path(),
+            session_id,
+            &repo,
+            ClaudeSeed {
+                is_restorable: Some(false),
+                transcript_path: None,
+                environment: env,
+            },
+        );
+
+        let value = sessions_json_for(dir.path(), "claude", session_id);
+        let session = &value["sessions"][0];
+        assert_eq!(session["hook_record_restorable"], true);
+        assert_eq!(session["fork_unavailable_reason"], "available");
+        assert_eq!(session["fork_command_available"], true);
+    }
+
+    #[test]
+    fn claude_transcript_lookup_uses_launch_config_dir() {
+        assert_claude_transcript_lookup_uses_launch_config_dir();
+    }
+
+    // purpose: Seed one Claude session record for diagnostics tests.
+    // inputs: Hook state dir, session metadata, optional transcript, and launch environment.
+    // returns/effects: Writes one Claude hook store record.
+    fn seed_claude_record(dir: &Path, session_id: &str, repo: &Path, seed: ClaudeSeed) {
+        let store = AgentHookSessionStore::new_for_dir("claude", dir);
+        store
+            .upsert(AgentHookSessionRecord {
+                session_id: session_id.to_string(),
+                workspace_id: "workspace-a".to_string(),
+                surface_id: "surface-a".to_string(),
+                cwd: Some(repo.display().to_string()),
+                pid: None,
+                is_restorable: seed.is_restorable,
+                transcript_path: seed.transcript_path,
+                launch_command: Some(AgentLaunchCommandRecord {
+                    executable: "claude".to_string(),
+                    arguments: vec!["claude".to_string()],
+                    cwd: Some(repo.display().to_string()),
+                    environment: seed.environment,
+                    captured_at: 1.0,
+                }),
+                updated_at: 20.0,
+            })
+            .expect("store record");
+    }
+
+    // purpose: Exercise CMUX-compatible tolerance for out-of-range stored PID values.
+    // inputs: Manually-written hook store containing a PID larger than u32.
+    // returns/effects: Asserts listing succeeds and reports null PID existence.
+    fn assert_sessions_list_ignores_out_of_range_pid() {
+        let dir = tempdir().expect("tempdir");
+        let store = dir.path().join("codex-hook-sessions.json");
+        fs::write(
+            &store,
+            r#"{
+              "version": 1,
+              "sessions": {
+                "session-a": {
+                  "session_id": "session-a",
+                  "workspace_id": "workspace-a",
+                  "surface_id": "surface-a",
+                  "pid": 999999999999,
+                  "launch_command": {
+                    "executable": "codex",
+                    "arguments": ["codex"],
+                    "captured_at": 1.0
+                  },
+                  "updated_at": 20.0
+                }
+              }
+            }"#,
+        )
+        .expect("store");
+
+        let value = sessions_json_for(dir.path(), "codex", "session-a");
+        assert_eq!(value["sessions"][0]["stored_pid_exists"], Value::Null);
+    }
+
+    #[test]
+    fn sessions_list_ignores_out_of_range_pid() {
+        assert_sessions_list_ignores_out_of_range_pid();
+    }
+
+    // purpose: Run sessions list JSON for a single test record.
+    // inputs: Hook state directory, agent name, and session id.
+    // returns/effects: Returns parsed JSON output or panics in tests.
+    fn sessions_json_for(dir: &Path, agent: &str, session: &str) -> Value {
+        let output = sessions_json_command(vec![
+            "list".to_string(),
+            "--agent".to_string(),
+            agent.to_string(),
+            "--session".to_string(),
+            session.to_string(),
+            "--state-dir".to_string(),
+            dir.display().to_string(),
+            "--json".to_string(),
+        ]);
+        expect_sessions_json(output)
+    }
+
+    // purpose: Run a sessions JSON command for tests.
+    // inputs: Raw sessions command args.
+    // returns/effects: Returns the typed command result.
+    fn sessions_json_command(args: Vec<String>) -> SessionCommandResult {
+        SessionCommandResult::from(SessionCommandInput {
+            args,
+            global_json: false,
+        })
+    }
+
+    // purpose: Extract JSON from a sessions command result.
+    // inputs: Command result.
+    // returns/effects: Returns parsed JSON or panics in tests.
+    fn expect_sessions_json(output: SessionCommandResult) -> Value {
+        let SessionCommandResult::Output(SessionCommandOutput::Json(value)) = output else {
+            panic!("expected json output");
+        };
+        value
+    }
+
     // purpose: Exercise JSON output for empty session-list stores.
     // inputs: Empty temporary hook state directory.
     // returns/effects: Asserts JSON shape and missing-store metadata.
     fn assert_sessions_list_json_includes_store_metadata() {
         let dir = tempdir().expect("tempdir");
-        let output = SessionCommandResult::from(SessionCommandInput {
-            args: vec![
-                "debug".to_string(),
-                "--agent".to_string(),
-                "claude".to_string(),
-                "--state-dir".to_string(),
-                dir.path().display().to_string(),
-                "--json".to_string(),
-            ],
-            global_json: false,
-        });
-
-        let SessionCommandResult::Output(SessionCommandOutput::Json(value)) = output else {
-            panic!("expected json");
-        };
+        let value = expect_sessions_json(sessions_json_command(vec![
+            "debug".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+            "--state-dir".to_string(),
+            dir.path().display().to_string(),
+            "--json".to_string(),
+        ]));
         assert_eq!(value["total_matches"], 0);
         assert_eq!(value["stores"][0]["agent"], "claude");
         assert_eq!(value["stores"][0]["exists"], false);
