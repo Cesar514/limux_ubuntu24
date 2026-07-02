@@ -1640,6 +1640,27 @@ const SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_SHOW_CUSTOM_METADATA_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showCustomMetadata",
+    section: "sidebar",
+    json_key: "showCustomMetadata",
+    default: true,
+};
+
+const SIDEBAR_SHOW_PROGRESS_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showProgress",
+    section: "sidebar",
+    json_key: "showProgress",
+    default: true,
+};
+
+const SIDEBAR_SHOW_LOG_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showLog",
+    section: "sidebar",
+    json_key: "showLog",
+    default: true,
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -1660,7 +1681,8 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement>"
+    "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
+    "sidebar.showProgress|sidebar.showLog|workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
@@ -1676,7 +1698,8 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.autoResumeAgentSessions|sidebar.hideAllDetails|",
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
-    "sidebar.showBranchDirectory|workspaceGroups.newWorkspacePlacement> <value>"
+    "sidebar.showBranchDirectory|sidebar.showCustomMetadata|",
+    "sidebar.showProgress|sidebar.showLog|workspaceGroups.newWorkspacePlacement> <value>"
 );
 
 // purpose: Map CMUX config font-size keys to their supported ranges.
@@ -1750,6 +1773,9 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showWorkspaceDescription" => Some(SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING),
         "sidebar.showNotificationMessage" => Some(SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING),
         "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
+        "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
+        "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
+        "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
         _ => None,
     }
 }
@@ -16132,6 +16158,15 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING)
             .expect("get default sidebar branch directory");
         assert!(text.contains("sidebar.showBranchDirectory = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING)
+            .expect("get default sidebar custom metadata");
+        assert!(text.contains("sidebar.showCustomMetadata = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_PROGRESS_SETTING)
+            .expect("get default sidebar progress");
+        assert!(text.contains("sidebar.showProgress = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_LOG_SETTING)
+            .expect("get default sidebar log");
+        assert!(text.contains("sidebar.showLog = true"));
 
         fs::write(
             &path,
@@ -16155,6 +16190,15 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING, "false")
             .expect("set sidebar branch directory");
         assert!(text.contains("sidebar.showBranchDirectory = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING, "false")
+            .expect("set sidebar custom metadata");
+        assert!(text.contains("sidebar.showCustomMetadata = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_PROGRESS_SETTING, "false")
+            .expect("set sidebar progress");
+        assert!(text.contains("sidebar.showProgress = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_LOG_SETTING, "false")
+            .expect("set sidebar log");
+        assert!(text.contains("sidebar.showLog = false"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
@@ -16164,6 +16208,9 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showWorkspaceDescription"], false);
         assert_eq!(parsed["sidebar"]["showNotificationMessage"], false);
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
+        assert_eq!(parsed["sidebar"]["showCustomMetadata"], false);
+        assert_eq!(parsed["sidebar"]["showProgress"], false);
+        assert_eq!(parsed["sidebar"]["showLog"], false);
         assert_eq!(parsed["notifications"]["sound"], "Ping");
     }
 
@@ -16179,9 +16226,8 @@ mod cli_arg_tests {
             .expect_err("invalid bool");
         assert!(err.to_string().contains("requires true or false"));
 
-        fs::write(&path, br#"{"sidebar":{"showNotificationMessage":"false"}}"#)
-            .expect("write malformed bool");
-        let err = render_config_boolean_get(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING)
+        fs::write(&path, br#"{"sidebar":{"showLog":"false"}}"#).expect("write malformed bool");
+        let err = render_config_boolean_get(&path, SIDEBAR_SHOW_LOG_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
     }

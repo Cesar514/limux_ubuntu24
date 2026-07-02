@@ -130,6 +130,9 @@ pub struct SidebarConfig {
     pub show_workspace_description: bool,
     pub show_notification_message: bool,
     pub show_branch_directory: bool,
+    pub show_custom_metadata: bool,
+    pub show_progress: bool,
+    pub show_log: bool,
 }
 
 impl Default for SidebarConfig {
@@ -140,6 +143,9 @@ impl Default for SidebarConfig {
             show_workspace_description: true,
             show_notification_message: true,
             show_branch_directory: true,
+            show_custom_metadata: true,
+            show_progress: true,
+            show_log: true,
         }
     }
 }
@@ -652,6 +658,18 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showBranchDirectory"))
         .map(|value| parse_bool_setting(value, "sidebar.showBranchDirectory"))
         .unwrap_or(sidebar_defaults.show_branch_directory);
+    let show_custom_metadata = sidebar
+        .and_then(|sidebar| sidebar.get("showCustomMetadata"))
+        .map(|value| parse_bool_setting(value, "sidebar.showCustomMetadata"))
+        .unwrap_or(sidebar_defaults.show_custom_metadata);
+    let show_progress = sidebar
+        .and_then(|sidebar| sidebar.get("showProgress"))
+        .map(|value| parse_bool_setting(value, "sidebar.showProgress"))
+        .unwrap_or(sidebar_defaults.show_progress);
+    let show_log = sidebar
+        .and_then(|sidebar| sidebar.get("showLog"))
+        .map(|value| parse_bool_setting(value, "sidebar.showLog"))
+        .unwrap_or(sidebar_defaults.show_log);
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -744,6 +762,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_workspace_description,
             show_notification_message,
             show_branch_directory,
+            show_custom_metadata,
+            show_progress,
+            show_log,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -1152,6 +1173,9 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "showWorkspaceDescription": config.sidebar.show_workspace_description,
             "showNotificationMessage": config.sidebar.show_notification_message,
             "showBranchDirectory": config.sidebar.show_branch_directory,
+            "showCustomMetadata": config.sidebar.show_custom_metadata,
+            "showProgress": config.sidebar.show_progress,
+            "showLog": config.sidebar.show_log,
         }),
     );
     root.insert(
@@ -1286,7 +1310,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "wrapWorkspaceTitles": false,
             "showWorkspaceDescription": true,
             "showNotificationMessage": true,
-            "showBranchDirectory": true
+            "showBranchDirectory": true,
+            "showCustomMetadata": true,
+            "showProgress": true,
+            "showLog": true
         }
     });
     let serialized = serde_json::to_string_pretty(&default_root)
@@ -1810,7 +1837,10 @@ mod tests {
     "wrapWorkspaceTitles": true,
     "showWorkspaceDescription": false,
     "showNotificationMessage": false,
-    "showBranchDirectory": false
+    "showBranchDirectory": false,
+    "showCustomMetadata": false,
+    "showProgress": false,
+    "showLog": false
   }
 }
 "#,
@@ -1825,16 +1855,18 @@ mod tests {
         assert!(!loaded.config.sidebar.show_workspace_description);
         assert!(!loaded.config.sidebar.show_notification_message);
         assert!(!loaded.config.sidebar.show_branch_directory);
+        assert!(!loaded.config.sidebar.show_custom_metadata);
+        assert!(!loaded.config.sidebar.show_progress);
+        assert!(!loaded.config.sidebar.show_log);
     }
 
     #[test]
-    #[should_panic(expected = "sidebar.showNotificationMessage must be a boolean")]
-    fn load_from_path_rejects_invalid_sidebar_notification_message() {
+    #[should_panic(expected = "sidebar.showProgress must be a boolean")]
+    fn load_from_path_rejects_invalid_sidebar_progress() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
-        fs::write(&path, r#"{"sidebar":{"showNotificationMessage":"false"}}"#)
-            .expect("write config");
+        fs::write(&path, r#"{"sidebar":{"showProgress":"false"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2275,6 +2307,9 @@ mod tests {
         config.sidebar.show_workspace_description = false;
         config.sidebar.show_notification_message = false;
         config.sidebar.show_branch_directory = false;
+        config.sidebar.show_custom_metadata = false;
+        config.sidebar.show_progress = false;
+        config.sidebar.show_log = false;
         save_to_path(&path, &config).expect("save sidebar");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -2294,6 +2329,9 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
+        assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));
     }
 
     // purpose: Verify saving writes the CMUX terminal auto-resume setting without dropping siblings.

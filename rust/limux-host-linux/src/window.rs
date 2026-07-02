@@ -3015,6 +3015,10 @@ fn right_sidebar_mode_description(mode: &RightSidebarMode) -> &'static str {
 /// inputs: Mutable app state containing widgets and active workspace metadata.
 /// returns/effects: Rebuilds the right-sidebar body and toggles shell visibility.
 fn sync_right_sidebar_panel(state: &mut AppState) {
+    let (show_custom_metadata, show_progress, show_log) = {
+        let config = state.config.borrow();
+        right_sidebar_metadata_sections(&config.sidebar)
+    };
     state
         .right_sidebar_shell
         .set_visible(state.right_sidebar_visible);
@@ -3042,9 +3046,45 @@ fn sync_right_sidebar_panel(state: &mut AppState) {
         workspace,
         &state.right_sidebar_mode,
     );
-    sync_right_sidebar_status_rows(&state.right_sidebar_body, workspace);
-    sync_right_sidebar_progress_row(&state.right_sidebar_body, workspace);
-    sync_right_sidebar_log_rows(&state.right_sidebar_body, workspace);
+    sync_right_sidebar_metadata_rows(
+        &state.right_sidebar_body,
+        workspace,
+        show_custom_metadata,
+        show_progress,
+        show_log,
+    );
+}
+
+/// purpose: Resolve CMUX sidebar metadata visibility settings for the right sidebar.
+/// inputs: Loaded sidebar config.
+/// returns/effects: Returns status/custom-metadata, progress, and log visibility flags.
+fn right_sidebar_metadata_sections(sidebar: &app_config::SidebarConfig) -> (bool, bool, bool) {
+    (
+        sidebar.show_custom_metadata,
+        sidebar.show_progress,
+        sidebar.show_log,
+    )
+}
+
+/// purpose: Render visible metadata sections according to CMUX sidebar settings.
+/// inputs: Body widget, active workspace, and section visibility flags.
+/// returns/effects: Appends only the configured right-sidebar metadata sections.
+fn sync_right_sidebar_metadata_rows(
+    body: &gtk::Box,
+    workspace: &Workspace,
+    show_custom_metadata: bool,
+    show_progress: bool,
+    show_log: bool,
+) {
+    if show_custom_metadata {
+        sync_right_sidebar_status_rows(body, workspace);
+    }
+    if show_progress {
+        sync_right_sidebar_progress_row(body, workspace);
+    }
+    if show_log {
+        sync_right_sidebar_log_rows(body, workspace);
+    }
 }
 
 /// purpose: Render mode-specific right-sidebar content from live workspace state.
@@ -13857,19 +13897,19 @@ mod tests {
         publish_surface_key_sent_event, publish_surface_lifecycle_event,
         publish_workspace_lifecycle_event, queue_session_save_request,
         resolve_pane_create_source_id, resolve_workspace_creation_directory,
-        resolved_system_prefers_dark, right_sidebar_mode_description, right_sidebar_mode_title,
-        run_notification_hook_command, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, should_keep_workspace_open_after_empty_pane,
-        should_show_sidebar_notification_message, should_show_unread_visual,
-        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
-        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
-        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
-        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
-        tab_drag_workspace_seed, use_opaque_window_background,
-        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
-        workspace_folder_path_from_input, workspace_group_insert_index,
+        resolved_system_prefers_dark, right_sidebar_metadata_sections,
+        right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, should_emit_desktop_notification,
+        should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
+        should_show_unread_visual, sidebar_feed_preview_lines_from_value,
+        sidebar_feed_visible_items, sidebar_file_preview_lines,
+        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
+        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
+        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
+        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
+        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
@@ -14184,6 +14224,26 @@ mod tests {
                 label: Some("Building".to_string()),
             }),
             "63% - Building"
+        );
+    }
+
+    #[test]
+    fn right_sidebar_metadata_sections_follow_sidebar_config() {
+        let defaults = crate::app_config::SidebarConfig::default();
+        assert_eq!(
+            right_sidebar_metadata_sections(&defaults),
+            (true, true, true)
+        );
+
+        let custom = crate::app_config::SidebarConfig {
+            show_custom_metadata: false,
+            show_progress: true,
+            show_log: false,
+            ..crate::app_config::SidebarConfig::default()
+        };
+        assert_eq!(
+            right_sidebar_metadata_sections(&custom),
+            (false, true, false)
         );
     }
 
