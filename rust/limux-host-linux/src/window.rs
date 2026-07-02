@@ -146,6 +146,13 @@ struct WorkspaceSidebarRenderSource<'a> {
     group_id: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceOrderRow {
+    id: String,
+    group_id: Option<String>,
+    favorite: bool,
+}
+
 struct WorkspaceFolderTarget {
     group: Option<WorkspaceGroupFolderTarget>,
     reference_workspace_id: Option<String>,
@@ -7178,6 +7185,18 @@ fn dispatch_workspace_group_header_action(action: WorkspaceGroupAction) {
     });
 }
 
+// purpose: Dispatch a visible group-header workspace reorder drop through live state.
+// inputs: Dragged workspace id, target workspace id, and above/below drop half.
+// returns/effects: Reorders workspace rows or fails loudly when no host state exists.
+fn dispatch_workspace_reorder_drop(source_id: &str, target_id: &str, drop_below: bool) -> bool {
+    CONTROL_STATE.with(|slot| {
+        let Some(state) = slot.borrow().clone() else {
+            panic!("workspace reorder drop requires live control state");
+        };
+        reorder_workspace_by_id(&state, source_id, target_id, drop_below)
+    })
+}
+
 // purpose: Build one CMUX-style workspace-group header row.
 // inputs: Group metadata and number of member workspaces.
 // returns/effects: Returns a GTK ListBoxRow for the sidebar.
@@ -7273,7 +7292,109 @@ fn build_workspace_group_sidebar_row(
     let row = gtk::ListBoxRow::new();
     row.add_css_class("limux-ws-group-list-row");
     row.set_child(Some(&row_box));
+    install_workspace_group_header_drag_drop(&row, group);
     row
+}
+
+// purpose: Add CMUX-style drag/drop behavior to a visible workspace-group header.
+// inputs: Header row and group metadata.
+// returns/effects: Header drags carry the anchor workspace id and drops reorder top-level rows.
+fn install_workspace_group_header_drag_drop(row: &gtk::ListBoxRow, group: &WorkspaceGroupState) {
+    let Some(anchor_workspace_id) = group.anchor_workspace_id.clone() else {
+        return;
+    };
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+    {
+        let anchor_workspace_id = anchor_workspace_id.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            let payload = glib::Value::from(&anchor_workspace_id);
+            Some(gtk::gdk::ContentProvider::for_value(&payload))
+        });
+    }
+    {
+        let row = row.clone();
+        let anchor_workspace_id = anchor_workspace_id.clone();
+        drag_source.connect_drag_begin(move |source, _| {
+            CONTROL_STATE.with(|slot| {
+                let Some(state) = slot.borrow().clone() else {
+                    panic!("workspace group header drag requires live control state");
+                };
+                let mut s = state.borrow_mut();
+                s.workspace_dragging = Some(anchor_workspace_id.clone());
+                s.new_ws_btn.set_label("\u{1F5D1}\u{FE0E}");
+                s.new_ws_btn.add_css_class("limux-sidebar-btn-trash");
+            });
+            pane::set_workspace_dragging_all(true);
+            let icon = gtk::WidgetPaintable::new(Some(&row));
+            source.set_icon(Some(&icon), 0, 0);
+        });
+    }
+    drag_source.connect_drag_end(move |_, _, _| {
+        CONTROL_STATE.with(|slot| {
+            let Some(state) = slot.borrow().clone() else {
+                panic!("workspace group header drag end requires live control state");
+            };
+            let mut s = state.borrow_mut();
+            s.workspace_dragging = None;
+            s.new_ws_btn.set_label("New Workspace");
+            s.new_ws_btn.remove_css_class("limux-sidebar-btn-trash");
+            s.new_ws_btn
+                .remove_css_class("limux-sidebar-btn-trash-hover");
+        });
+        pane::set_workspace_dragging_all(false);
+    });
+    row.add_controller(drag_source);
+
+    let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+    drop_target.set_preload(true);
+    {
+        let row = row.clone();
+        let target_workspace_id = anchor_workspace_id.clone();
+        drop_target.connect_motion(move |_, _x, y| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
+            let dragged_workspace = CONTROL_STATE.with(|slot| {
+                let Some(state) = slot.borrow().clone() else {
+                    panic!("workspace group header drop motion requires live control state");
+                };
+                let dragging = state.borrow().workspace_dragging.clone();
+                dragging
+            });
+            if dragged_workspace.as_deref() != Some(target_workspace_id.as_str()) {
+                if y < row.height() as f64 / 2.0 {
+                    row.add_css_class("limux-drop-above");
+                } else {
+                    row.add_css_class("limux-drop-below");
+                }
+            }
+            gtk::gdk::DragAction::MOVE
+        });
+    }
+    {
+        let row = row.clone();
+        drop_target.connect_leave(move |_| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
+        });
+    }
+    {
+        let row = row.clone();
+        let target_workspace_id = anchor_workspace_id;
+        drop_target.connect_drop(move |_dt, value, _, y| {
+            row.remove_css_class("limux-drop-above");
+            row.remove_css_class("limux-drop-below");
+            let Ok(payload) = value.get::<String>() else {
+                return false;
+            };
+            if payload.contains(':') || payload == target_workspace_id {
+                return false;
+            }
+            let drop_below = y >= row.height() as f64 / 2.0;
+            dispatch_workspace_reorder_drop(&payload, &target_workspace_id, drop_below)
+        });
+    }
+    row.add_controller(drop_target);
 }
 
 // purpose: Apply CMUX title wrapping policy to a workspace sidebar row label.
@@ -7717,6 +7838,199 @@ fn clamp_workspace_insert_index_for_pinning(
     }
 }
 
+// purpose: Determine whether a workspace id is the visible header anchor for a CMUX group.
+// inputs: Workspace groups and a workspace id.
+// returns/effects: Returns true when the workspace is a group anchor.
+fn workspace_is_group_anchor(groups: &[WorkspaceGroupState], workspace_id: &str) -> bool {
+    groups
+        .iter()
+        .any(|group| group.anchor_workspace_id.as_deref() == Some(workspace_id))
+}
+
+// purpose: Snapshot workspace order data needed by CMUX reorder planning.
+// inputs: GTK-backed workspaces.
+// returns/effects: Returns cloneable row metadata without GTK widgets.
+fn workspace_order_rows(workspaces: &[Workspace]) -> Vec<WorkspaceOrderRow> {
+    workspaces
+        .iter()
+        .map(|workspace| WorkspaceOrderRow {
+            id: workspace.id.clone(),
+            group_id: workspace.group_id.clone(),
+            favorite: workspace.favorite,
+        })
+        .collect()
+}
+
+// purpose: Return the group id that owns a non-anchor grouped workspace.
+// inputs: Current workspaces, groups, and workspace id.
+// returns/effects: Returns None for ungrouped workspaces, anchors, or unknown ids.
+fn workspace_non_anchor_group_id<'a>(
+    workspaces: &'a [WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    workspace_id: &str,
+) -> Option<&'a str> {
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)?;
+    let group_id = workspace.group_id.as_deref()?;
+    let group = groups.iter().find(|group| group.id == group_id)?;
+    (group.anchor_workspace_id.as_deref() != Some(workspace_id)).then_some(group_id)
+}
+
+// purpose: Resolve a workspace row to its top-level sidebar representative.
+// inputs: Current workspaces, groups, and a workspace id.
+// returns/effects: Returns a group anchor for grouped rows or the workspace id itself.
+fn workspace_top_level_id(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    workspace_id: &str,
+) -> Option<String> {
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)?;
+    if let Some(group_id) = workspace.group_id.as_deref() {
+        if let Some(group) = groups.iter().find(|group| group.id == group_id) {
+            return group.anchor_workspace_id.clone();
+        }
+    }
+    Some(workspace.id.clone())
+}
+
+// purpose: Match CMUX sidebar planning for drops involving grouped rows.
+// inputs: Current workspaces/groups plus source and target workspace ids.
+// returns/effects: Returns true when the drop should be planned in group-header row space.
+fn workspace_reorder_uses_top_level_rows(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    source_id: &str,
+    target_id: &str,
+) -> bool {
+    if workspace_is_group_anchor(groups, source_id) || workspace_is_group_anchor(groups, target_id)
+    {
+        return true;
+    }
+    let target_group = workspace_non_anchor_group_id(workspaces, groups, target_id);
+    if target_group.is_some() {
+        return true;
+    }
+    workspace_non_anchor_group_id(workspaces, groups, source_id).is_some()
+}
+
+// purpose: Build CMUX top-level sidebar ids in current workspace order.
+// inputs: Current workspaces/groups and an optional grouped child promoted to top level.
+// returns/effects: Returns deduplicated top-level row ids.
+fn workspace_top_level_ids(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    promoted_workspace_id: Option<&str>,
+) -> Vec<String> {
+    let mut emitted_groups = HashSet::new();
+    let mut ids = Vec::with_capacity(workspaces.len());
+    for workspace in workspaces {
+        if let Some(group_id) = workspace.group_id.as_deref() {
+            if let Some(group) = groups.iter().find(|group| group.id == group_id) {
+                if emitted_groups.insert(group_id) {
+                    if let Some(anchor_id) = group.anchor_workspace_id.as_deref() {
+                        ids.push(anchor_id.to_string());
+                    }
+                }
+                continue;
+            }
+        }
+        ids.push(workspace.id.clone());
+    }
+    if let Some(promoted_workspace_id) = promoted_workspace_id {
+        if !ids.iter().any(|id| id == promoted_workspace_id) {
+            let insert_index =
+                promoted_workspace_insert_index(workspaces, groups, &ids, promoted_workspace_id);
+            ids.insert(insert_index, promoted_workspace_id.to_string());
+        }
+    }
+    ids
+}
+
+// purpose: Resolve a promoted grouped child insertion slot near its current group row.
+// inputs: Current rows, groups, top-level ids, and the promoted workspace id.
+// returns/effects: Returns a pin-tier-clamped top-level insertion index.
+fn promoted_workspace_insert_index(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    top_level_ids: &[String],
+    promoted_workspace_id: &str,
+) -> usize {
+    let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.id == promoted_workspace_id)
+    else {
+        return top_level_ids.len();
+    };
+    let Some(group_id) = workspace.group_id.as_deref() else {
+        return top_level_ids.len();
+    };
+    let Some(group) = groups.iter().find(|group| group.id == group_id) else {
+        return top_level_ids.len();
+    };
+    let Some(anchor_id) = group.anchor_workspace_id.as_deref() else {
+        return top_level_ids.len();
+    };
+    let desired_index = top_level_ids
+        .iter()
+        .position(|id| id == anchor_id)
+        .map(|index| index + 1)
+        .unwrap_or(top_level_ids.len());
+    let pinned_flags = top_level_ids
+        .iter()
+        .map(|id| top_level_workspace_is_pinned(workspaces, groups, id))
+        .collect::<Vec<_>>();
+    if workspace.favorite {
+        desired_index.min(favorites_prefix_len(&pinned_flags))
+    } else {
+        desired_index.max(favorites_prefix_len(&pinned_flags))
+    }
+}
+
+// purpose: Return top-level pin state using group pinning for group headers.
+// inputs: Current workspaces/groups and a top-level workspace id.
+// returns/effects: Returns true when the top-level row belongs in the pinned tier.
+fn top_level_workspace_is_pinned(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    top_level_id: &str,
+) -> bool {
+    if let Some(group) = groups
+        .iter()
+        .find(|group| group.anchor_workspace_id.as_deref() == Some(top_level_id))
+    {
+        return group.is_pinned;
+    }
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == top_level_id)
+        .map(|workspace| workspace.favorite)
+        .unwrap_or(false)
+}
+
+// purpose: Clamp top-level reorder slots into CMUX pinned/unpinned row tiers.
+// inputs: Current row state, moving id, and proposed top-level insertion index.
+// returns/effects: Returns a legal top-level insertion index.
+fn clamp_top_level_workspace_insert_index(
+    workspaces: &[WorkspaceOrderRow],
+    groups: &[WorkspaceGroupState],
+    top_level_ids_after_removal: &[String],
+    moving_id: &str,
+    proposed_index: usize,
+) -> usize {
+    let favorite_flags = top_level_ids_after_removal
+        .iter()
+        .map(|id| top_level_workspace_is_pinned(workspaces, groups, id))
+        .collect::<Vec<_>>();
+    clamp_workspace_insert_index_for_pinning(
+        &favorite_flags,
+        top_level_workspace_is_pinned(workspaces, groups, moving_id),
+        proposed_index.min(top_level_ids_after_removal.len()),
+    )
+}
+
 // purpose: Resolve CMUX app.newWorkspacePlacement into a workspace insertion index.
 // inputs: Favorite flags including the source row, selected/reference index, source index, and placement.
 // returns/effects: Returns an insertion index before source removal without mutating state.
@@ -8025,6 +8339,15 @@ fn reorder_workspace_by_id(
     target_id: &str,
     drop_below: bool,
 ) -> bool {
+    let uses_top_level_rows = {
+        let s = state.borrow();
+        let rows = workspace_order_rows(&s.workspaces);
+        workspace_reorder_uses_top_level_rows(&rows, &s.workspace_groups, source_id, target_id)
+    };
+    if uses_top_level_rows {
+        return reorder_top_level_workspace_by_id(state, source_id, target_id, drop_below);
+    }
+
     let (sidebar_list, row_to_select, ordered_ids, pinned_ids, selected_id, selected_index) = {
         let mut s = state.borrow_mut();
         let Some(source_idx) = s
@@ -8125,6 +8448,303 @@ fn reorder_workspace_by_id(
     request_session_save(state);
 
     true
+}
+
+// purpose: Reorder a CMUX top-level sidebar row without splitting grouped workspace runs.
+// inputs: Shared state, source workspace id, target workspace id, and above/below drop half.
+// returns/effects: Rebuilds workspace order, may promote a grouped child, and queues persistence.
+fn reorder_top_level_workspace_by_id(
+    state: &State,
+    source_id: &str,
+    target_id: &str,
+    drop_below: bool,
+) -> bool {
+    let (
+        sidebar_list,
+        row_to_select,
+        ordered_ids,
+        pinned_ids,
+        selected_id,
+        selected_index,
+        moved_ids,
+    ) = {
+        let mut s = state.borrow_mut();
+        let rows = workspace_order_rows(&s.workspaces);
+        let Some(source_top_id) = workspace_top_level_id(&rows, &s.workspace_groups, source_id)
+        else {
+            return false;
+        };
+        let Some(target_top_id) = workspace_top_level_id(&rows, &s.workspace_groups, target_id)
+        else {
+            return false;
+        };
+        let promoted_workspace_id =
+            workspace_non_anchor_group_id(&rows, &s.workspace_groups, source_id).map(|_| source_id);
+        let top_level_ids =
+            workspace_top_level_ids(&rows, &s.workspace_groups, promoted_workspace_id);
+        let moving_id = promoted_workspace_id.unwrap_or(source_top_id.as_str());
+        let Some(from_index) = top_level_ids.iter().position(|id| id == moving_id) else {
+            return false;
+        };
+        let Some(target_index) = top_level_ids.iter().position(|id| id == &target_top_id) else {
+            return false;
+        };
+        let mut desired_top_level_ids = top_level_ids.clone();
+        desired_top_level_ids.remove(from_index);
+        let Some(target_index_after_removal) = desired_top_level_ids
+            .iter()
+            .position(|id| id == &target_top_id)
+        else {
+            return false;
+        };
+        let proposed_index = if drop_below {
+            target_index_after_removal + 1
+        } else {
+            target_index_after_removal
+        };
+        let insert_index = clamp_top_level_workspace_insert_index(
+            &rows,
+            &s.workspace_groups,
+            &desired_top_level_ids,
+            moving_id,
+            proposed_index,
+        );
+        if from_index == target_index && promoted_workspace_id.is_none() {
+            return false;
+        }
+        desired_top_level_ids.insert(insert_index, moving_id.to_string());
+
+        if promoted_workspace_id.is_some() {
+            if let Some(index) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == source_id)
+            {
+                s.workspaces[index].group_id = None;
+            }
+        }
+
+        let active_workspace_id = s.active_workspace().map(|workspace| workspace.id.clone());
+        let moved_ids = top_level_moved_workspace_ids(&s, moving_id);
+        normalize_workspace_group_runs_preserving_order(&mut s, &desired_top_level_ids);
+        sync_workspace_groups_order_to_anchor_order(&mut s);
+        if let Some(active_workspace_id) = active_workspace_id {
+            if let Some(new_active_idx) = s
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_workspace_id)
+            {
+                s.active_idx = new_active_idx;
+            }
+        }
+
+        sync_sidebar_row_order(&mut s);
+        let row_to_select = sidebar_row_for_workspace_index(&s, s.active_idx);
+        let ordered_ids = s
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let pinned_ids = s
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.favorite)
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let selected_id = s
+            .workspaces
+            .get(s.active_idx)
+            .map(|workspace| workspace.id.clone());
+        (
+            s.sidebar_list.clone(),
+            row_to_select,
+            ordered_ids,
+            pinned_ids,
+            selected_id,
+            s.active_idx,
+            moved_ids,
+        )
+    };
+
+    if let Some(row) = row_to_select {
+        sidebar_list.select_row(Some(&row));
+    }
+    publish_workspace_reordered_event(
+        ordered_ids,
+        moved_ids,
+        pinned_ids,
+        selected_id,
+        selected_index,
+    );
+    request_session_save(state);
+
+    true
+}
+
+// purpose: Return the concrete workspace ids moved by a top-level reorder.
+// inputs: Current state and the moved top-level id.
+// returns/effects: Returns all group members for group headers or the single workspace id.
+fn top_level_moved_workspace_ids(state: &AppState, moving_id: &str) -> Vec<String> {
+    if let Some(group) = state
+        .workspace_groups
+        .iter()
+        .find(|group| group.anchor_workspace_id.as_deref() == Some(moving_id))
+    {
+        return state
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.group_id.as_deref() == Some(group.id.as_str()))
+            .map(|workspace| workspace.id.clone())
+            .collect();
+    }
+    vec![moving_id.to_string()]
+}
+
+// purpose: Rebuild workspaces from desired CMUX top-level row order.
+// inputs: Mutable state plus desired top-level workspace ids.
+// returns/effects: Keeps groups contiguous, anchor-first, and pin-tiered inside each group.
+fn normalize_workspace_group_runs_preserving_order(
+    state: &mut AppState,
+    desired_top_level_ids: &[String],
+) {
+    let final_ids = workspace_group_normalized_order_ids(state, desired_top_level_ids);
+    let mut reordered = Vec::with_capacity(state.workspaces.len());
+    for workspace_id in final_ids {
+        if let Some(index) = state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        {
+            reordered.push(state.workspaces.remove(index));
+        }
+    }
+    reordered.append(&mut state.workspaces);
+    state.workspaces = reordered;
+}
+
+// purpose: Compute normalized workspace ids from a CMUX top-level order.
+// inputs: Current state and desired top-level row ids.
+// returns/effects: Returns a complete workspace id order without mutating state.
+fn workspace_group_normalized_order_ids(
+    state: &AppState,
+    desired_top_level_ids: &[String],
+) -> Vec<String> {
+    let mut emitted_workspaces = HashSet::new();
+    let mut emitted_groups = HashSet::new();
+    let mut final_ids = Vec::with_capacity(state.workspaces.len());
+
+    for top_level_id in desired_top_level_ids {
+        append_workspace_or_group_order_ids(
+            state,
+            top_level_id,
+            &mut emitted_workspaces,
+            &mut emitted_groups,
+            &mut final_ids,
+        );
+    }
+    for workspace in &state.workspaces {
+        append_workspace_or_group_order_ids(
+            state,
+            &workspace.id,
+            &mut emitted_workspaces,
+            &mut emitted_groups,
+            &mut final_ids,
+        );
+    }
+    final_ids
+}
+
+// purpose: Append one workspace or group run to a normalized order accumulator.
+// inputs: Current state, requested workspace id, emitted sets, and output ids.
+// returns/effects: Appends ids once, expanding grouped rows to full group runs.
+fn append_workspace_or_group_order_ids(
+    state: &AppState,
+    workspace_id: &str,
+    emitted_workspaces: &mut HashSet<String>,
+    emitted_groups: &mut HashSet<String>,
+    final_ids: &mut Vec<String>,
+) {
+    let Some(workspace) = state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return;
+    };
+    if let Some(group_id) = workspace.group_id.as_deref() {
+        if emitted_groups.insert(group_id.to_string()) {
+            final_ids.extend(anchor_first_group_member_ids(state, group_id));
+        }
+        return;
+    }
+    if emitted_workspaces.insert(workspace.id.clone()) {
+        final_ids.push(workspace.id.clone());
+    }
+}
+
+// purpose: Return a group run with its anchor first and pinned members before unpinned members.
+// inputs: Current state and a group id.
+// returns/effects: Returns workspace ids for the group's contiguous sidebar run.
+fn anchor_first_group_member_ids(state: &AppState, group_id: &str) -> Vec<String> {
+    let Some(group) = state
+        .workspace_groups
+        .iter()
+        .find(|group| group.id == group_id)
+    else {
+        return Vec::new();
+    };
+    let anchor_id = group.anchor_workspace_id.as_deref();
+    let mut ids = Vec::new();
+    if let Some(anchor_id) = anchor_id {
+        if state.workspaces.iter().any(|workspace| {
+            workspace.id == anchor_id && workspace.group_id.as_deref() == Some(group_id)
+        }) {
+            ids.push(anchor_id.to_string());
+        }
+    }
+    ids.extend(
+        state
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                workspace.group_id.as_deref() == Some(group_id)
+                    && Some(workspace.id.as_str()) != anchor_id
+                    && workspace.favorite
+            })
+            .map(|workspace| workspace.id.clone()),
+    );
+    ids.extend(
+        state
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                workspace.group_id.as_deref() == Some(group_id)
+                    && Some(workspace.id.as_str()) != anchor_id
+                    && !workspace.favorite
+            })
+            .map(|workspace| workspace.id.clone()),
+    );
+    ids
+}
+
+// purpose: Keep group metadata order aligned with visible anchor order.
+// inputs: Mutable app state.
+// returns/effects: Sorts workspace groups by their anchor positions.
+fn sync_workspace_groups_order_to_anchor_order(state: &mut AppState) {
+    let anchor_indexes = state
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(index, workspace)| (workspace.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    state.workspace_groups.sort_by_key(|group| {
+        group
+            .anchor_workspace_id
+            .as_deref()
+            .and_then(|anchor_id| anchor_indexes.get(anchor_id))
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 }
 
 fn toggle_workspace_favorite(state: &State, workspace_id: &str) {
@@ -15360,14 +15980,15 @@ mod tests {
         workspace_drop_layout_path, workspace_folder_path_from_input,
         workspace_group_header_plus_action, workspace_group_header_toggle_action,
         workspace_group_insert_index, workspace_insert_index_for_placement,
-        workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
-        workspace_sidebar_render_items, workspace_title_from_directory, BrowserEvent, Direction,
-        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
-        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
-        SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport,
-        WorkspaceEventSnapshot, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
-        WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
+        workspace_lifecycle_payload, workspace_notification_message,
+        workspace_reorder_uses_top_level_rows, workspace_reordered_payload,
+        workspace_sidebar_render_items, workspace_title_from_directory, workspace_top_level_ids,
+        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
+        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
+        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
+        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport,
+        SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceOrderRow, WorkspaceSeedSource,
+        WorkspaceSidebarRenderItem, WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
@@ -15603,6 +16224,34 @@ mod tests {
         }
     }
 
+    // purpose: Build shared lightweight workspace rows for grouped reorder tests.
+    // inputs: None.
+    // returns/effects: Returns one free workspace and one group with anchor/member rows.
+    fn test_workspace_order_rows() -> Vec<WorkspaceOrderRow> {
+        vec![
+            WorkspaceOrderRow {
+                id: "ws-free".to_string(),
+                group_id: None,
+                favorite: false,
+            },
+            WorkspaceOrderRow {
+                id: "ws-anchor".to_string(),
+                group_id: Some("group-1".to_string()),
+                favorite: false,
+            },
+            WorkspaceOrderRow {
+                id: "ws-member".to_string(),
+                group_id: Some("group-1".to_string()),
+                favorite: false,
+            },
+            WorkspaceOrderRow {
+                id: "ws-tail".to_string(),
+                group_id: None,
+                favorite: false,
+            },
+        ]
+    }
+
     #[test]
     fn workspace_sidebar_render_items_use_group_header_for_anchor() {
         let groups = [test_workspace_group()];
@@ -15676,6 +16325,58 @@ mod tests {
                 WorkspaceSidebarRenderItem::Workspace {
                     workspace_id: "ws-free".to_string(),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_reorder_uses_top_level_rows_for_group_headers_and_members() {
+        let groups = [test_workspace_group()];
+        let rows = test_workspace_order_rows();
+
+        assert!(workspace_reorder_uses_top_level_rows(
+            &rows,
+            &groups,
+            "ws-anchor",
+            "ws-tail",
+        ));
+        assert!(workspace_reorder_uses_top_level_rows(
+            &rows,
+            &groups,
+            "ws-free",
+            "ws-member",
+        ));
+        assert!(workspace_reorder_uses_top_level_rows(
+            &rows,
+            &groups,
+            "ws-member",
+            "ws-tail",
+        ));
+        assert!(!workspace_reorder_uses_top_level_rows(
+            &rows, &groups, "ws-free", "ws-tail",
+        ));
+    }
+
+    #[test]
+    fn workspace_top_level_ids_promote_group_member_near_group_header() {
+        let groups = [test_workspace_group()];
+        let rows = test_workspace_order_rows();
+
+        assert_eq!(
+            workspace_top_level_ids(&rows, &groups, None),
+            vec![
+                "ws-free".to_string(),
+                "ws-anchor".to_string(),
+                "ws-tail".to_string(),
+            ]
+        );
+        assert_eq!(
+            workspace_top_level_ids(&rows, &groups, Some("ws-member")),
+            vec![
+                "ws-free".to_string(),
+                "ws-anchor".to_string(),
+                "ws-member".to_string(),
+                "ws-tail".to_string(),
             ]
         );
     }
