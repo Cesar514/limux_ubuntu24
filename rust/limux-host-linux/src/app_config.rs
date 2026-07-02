@@ -380,6 +380,10 @@ impl NotificationSound {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationConfig {
     pub enabled: bool,
+    pub dock_badge: bool,
+    pub show_in_menu_bar: bool,
+    pub unread_pane_ring: bool,
+    pub pane_flash: bool,
     pub sound: NotificationSound,
     pub custom_sound_file_path: String,
     pub hooks: Vec<NotificationHookConfig>,
@@ -448,6 +452,10 @@ impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            dock_badge: true,
+            show_in_menu_bar: true,
+            unread_pane_ring: true,
+            pane_flash: true,
             sound: NotificationSound::Default,
             custom_sound_file_path: String::new(),
             hooks: Vec::new(),
@@ -574,6 +582,22 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("enabled"))
         .and_then(Value::as_bool)
         .unwrap_or(notification_defaults.enabled);
+    let dock_badge = notifications
+        .and_then(|notifications| notifications.get("dockBadge"))
+        .map(|value| parse_bool_setting(value, "notifications.dockBadge"))
+        .unwrap_or(notification_defaults.dock_badge);
+    let show_in_menu_bar = notifications
+        .and_then(|notifications| notifications.get("showInMenuBar"))
+        .map(|value| parse_bool_setting(value, "notifications.showInMenuBar"))
+        .unwrap_or(notification_defaults.show_in_menu_bar);
+    let unread_pane_ring = notifications
+        .and_then(|notifications| notifications.get("unreadPaneRing"))
+        .map(|value| parse_bool_setting(value, "notifications.unreadPaneRing"))
+        .unwrap_or(notification_defaults.unread_pane_ring);
+    let pane_flash = notifications
+        .and_then(|notifications| notifications.get("paneFlash"))
+        .map(|value| parse_bool_setting(value, "notifications.paneFlash"))
+        .unwrap_or(notification_defaults.pane_flash);
     let notification_sound = notifications
         .and_then(|notifications| notifications.get("sound"))
         .map(|value| parse_notification_sound(value, "notifications.sound"))
@@ -631,6 +655,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
+            dock_badge,
+            show_in_menu_bar,
+            unread_pane_ring,
+            pane_flash,
             sound: notification_sound,
             custom_sound_file_path,
             hooks: notification_hooks,
@@ -1015,6 +1043,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "notifications".to_string(),
         json!({
             "enabled": config.notifications.enabled,
+            "dockBadge": config.notifications.dock_badge,
+            "showInMenuBar": config.notifications.show_in_menu_bar,
+            "unreadPaneRing": config.notifications.unread_pane_ring,
+            "paneFlash": config.notifications.pane_flash,
             "sound": config.notifications.sound.as_str(),
             "customSoundFilePath": config.notifications.custom_sound_file_path.clone(),
             "agentPermissionPrompt": config.notifications.agent_permission_prompt,
@@ -1123,6 +1155,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
         },
         "notifications": {
             "enabled": true,
+            "dockBadge": true,
+            "showInMenuBar": true,
+            "unreadPaneRing": true,
+            "paneFlash": true,
             "sound": "default",
             "suppressOnlyFocusedSurface": false
         }
@@ -1199,6 +1235,10 @@ mod tests {
             Value::String("dark".to_string())
         );
         assert_eq!(parsed["notifications"]["enabled"], Value::Bool(true));
+        assert_eq!(parsed["notifications"]["dockBadge"], Value::Bool(true));
+        assert_eq!(parsed["notifications"]["showInMenuBar"], Value::Bool(true));
+        assert_eq!(parsed["notifications"]["unreadPaneRing"], Value::Bool(true));
+        assert_eq!(parsed["notifications"]["paneFlash"], Value::Bool(true));
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("default".to_string())
@@ -1493,6 +1533,10 @@ mod tests {
             r#"{
   "notifications": {
     "enabled": false,
+    "dockBadge": false,
+    "showInMenuBar": false,
+    "unreadPaneRing": false,
+    "paneFlash": false,
     "sound": "bell",
     "customSoundFilePath": "/tmp/notify.wav",
     "agentPermissionPrompt": false,
@@ -1509,6 +1553,10 @@ mod tests {
 
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.config.notifications.enabled);
+        assert!(!loaded.config.notifications.dock_badge);
+        assert!(!loaded.config.notifications.show_in_menu_bar);
+        assert!(!loaded.config.notifications.unread_pane_ring);
+        assert!(!loaded.config.notifications.pane_flash);
         assert_eq!(loaded.config.notifications.sound, NotificationSound::Bell);
         assert_eq!(
             loaded.config.notifications.custom_sound_file_path,
@@ -1571,6 +1619,17 @@ mod tests {
             r#"{"notifications":{"suppressOnlyFocusedSurface":"true"}}"#,
         )
         .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "notifications.unreadPaneRing must be a boolean")]
+    fn load_from_path_rejects_invalid_unread_pane_ring() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"notifications":{"unreadPaneRing":"true"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -1940,6 +1999,10 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.notifications.enabled = false;
+        config.notifications.dock_badge = false;
+        config.notifications.show_in_menu_bar = false;
+        config.notifications.unread_pane_ring = false;
+        config.notifications.pane_flash = false;
         config.notifications.sound = NotificationSound::Alert;
         config.notifications.custom_sound_file_path = "/tmp/notify.wav".to_string();
         config.notifications.agent_permission_prompt = false;
@@ -1951,6 +2014,13 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
         assert_eq!(parsed["notifications"]["enabled"], Value::Bool(false));
+        assert_eq!(parsed["notifications"]["dockBadge"], Value::Bool(false));
+        assert_eq!(parsed["notifications"]["showInMenuBar"], Value::Bool(false));
+        assert_eq!(
+            parsed["notifications"]["unreadPaneRing"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["notifications"]["paneFlash"], Value::Bool(false));
         assert_eq!(
             parsed["notifications"]["sound"],
             Value::String("alert".to_string())

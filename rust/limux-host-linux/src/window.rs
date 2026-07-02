@@ -2633,6 +2633,7 @@ struct NotificationPolicyEffects {
     mark_unread: bool,
     desktop: bool,
     sound: bool,
+    pane_flash: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2654,6 +2655,7 @@ impl Default for NotificationPolicyEffects {
             mark_unread: true,
             desktop: true,
             sound: true,
+            pane_flash: true,
         }
     }
 }
@@ -12911,7 +12913,7 @@ fn notification_hook_policy_payload(
             "desktop": effects.desktop,
             "sound": effects.sound,
             "command": true,
-            "paneFlash": true,
+            "paneFlash": effects.pane_flash,
         }
     })
 }
@@ -12945,6 +12947,11 @@ fn notification_policy_effects_from_value(
             .get("sound")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(previous.sound),
+        pane_flash: effects
+            .get("paneFlash")
+            .or_else(|| effects.get("pane_flash"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(previous.pane_flash),
     })
 }
 
@@ -13034,7 +13041,10 @@ fn notification_policy_effects(
     config: &app_config::NotificationConfig,
     context: &NotificationPolicyContext,
 ) -> Result<NotificationPolicyEffects, BridgeError> {
-    let mut effects = NotificationPolicyEffects::default();
+    let mut effects = NotificationPolicyEffects {
+        pane_flash: config.pane_flash,
+        ..NotificationPolicyEffects::default()
+    };
     for hook in config.hooks.iter().filter(|hook| hook.enabled) {
         let payload = notification_hook_policy_payload(&hook.id, context, effects);
         let output = run_notification_hook_command(hook, &payload)?;
@@ -13448,6 +13458,13 @@ fn clear_host_notifications(
     Ok(serde_json::json!({ "notifications": rows }))
 }
 
+// purpose: Decide whether notification state should add an unread visual marker.
+// inputs: Whether the workspace is active and whether unread visual rings are enabled.
+// returns/effects: Returns true for inactive workspaces when the visual setting is enabled.
+fn should_show_unread_visual(workspace_is_active: bool, unread_pane_ring: bool) -> bool {
+    !workspace_is_active && unread_pane_ring
+}
+
 fn mark_workspace_unread_with_message(
     state: &State,
     ws_id: &str,
@@ -13483,7 +13500,7 @@ fn mark_workspace_unread_with_message(
             feed_actions,
         });
 
-        if idx != active_idx {
+        if should_show_unread_visual(workspace_is_active, notifications.unread_pane_ring) {
             ws.unread = true;
             ws.notify_dot.remove_css_class("limux-notify-dot-hidden");
             ws.notify_dot.add_css_class("limux-notify-dot");
@@ -13650,13 +13667,14 @@ mod tests {
         sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
         shortcut_blocked_by_editable, shortcut_command_from_key_event,
         shortcut_dispatch_propagation, should_emit_desktop_notification,
-        should_keep_workspace_open_after_empty_pane, sidebar_feed_preview_lines_from_value,
-        sidebar_feed_visible_items, sidebar_file_preview_lines,
-        sidebar_log_preview_lines_from_entries, sidebar_progress_preview_line,
-        sidebar_status_preview_lines_from_entries, surface_input_event_payload,
-        surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
-        use_opaque_window_background, validate_workspace_folder_input_with_dirs,
-        workspace_drop_layout_path, workspace_folder_path_from_input, workspace_group_insert_index,
+        should_keep_workspace_open_after_empty_pane, should_show_unread_visual,
+        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
+        sidebar_file_preview_lines, sidebar_log_preview_lines_from_entries,
+        sidebar_progress_preview_line, sidebar_status_preview_lines_from_entries,
+        surface_input_event_payload, surface_key_event_payload, surface_lifecycle_event_payload,
+        tab_drag_workspace_seed, use_opaque_window_background,
+        validate_workspace_folder_input_with_dirs, workspace_drop_layout_path,
+        workspace_folder_path_from_input, workspace_group_insert_index,
         workspace_hidden_by_collapsed_group_id, workspace_insert_index_for_placement,
         workspace_lifecycle_payload, workspace_notification_message, workspace_reordered_payload,
         workspace_title_from_directory, BrowserEvent, Direction, EditableCaptureContext,
@@ -15049,6 +15067,7 @@ mod tests {
                 mark_unread: true,
                 desktop: false,
                 sound: true,
+                pane_flash: false,
             },
         );
 
@@ -15063,6 +15082,7 @@ mod tests {
         assert_eq!(payload["effects"]["markUnread"], true);
         assert_eq!(payload["effects"]["desktop"], false);
         assert_eq!(payload["effects"]["sound"], true);
+        assert_eq!(payload["effects"]["paneFlash"], false);
     }
 
     #[test]
@@ -15072,6 +15092,7 @@ mod tests {
             mark_unread: true,
             desktop: true,
             sound: true,
+            pane_flash: true,
         };
 
         let updated = notification_policy_effects_from_value(
@@ -15080,7 +15101,8 @@ mod tests {
                 "effects": {
                     "record": false,
                     "markUnread": false,
-                    "sound": false
+                    "sound": false,
+                    "paneFlash": false
                 }
             }),
         )
@@ -15093,8 +15115,40 @@ mod tests {
                 mark_unread: false,
                 desktop: true,
                 sound: false,
+                pane_flash: false,
             }
         );
+    }
+
+    #[test]
+    fn notification_policy_effects_seed_pane_flash_from_config() {
+        let config = crate::app_config::NotificationConfig {
+            pane_flash: false,
+            ..crate::app_config::NotificationConfig::default()
+        };
+        let effects = super::notification_policy_effects(
+            &config,
+            &NotificationPolicyContext {
+                workspace_id: "workspace-a".to_string(),
+                surface_id: Some("3:tab-a".to_string()),
+                cwd: Some("/project".to_string()),
+                title: "Codex".to_string(),
+                subtitle: "Done".to_string(),
+                body: "Turn complete".to_string(),
+                app_focused: false,
+                focused_panel: false,
+            },
+        )
+        .expect("policy effects");
+
+        assert!(!effects.pane_flash);
+    }
+
+    #[test]
+    fn unread_visual_gate_respects_notification_setting() {
+        assert!(should_show_unread_visual(false, true));
+        assert!(!should_show_unread_visual(true, true));
+        assert!(!should_show_unread_visual(false, false));
     }
 
     #[test]

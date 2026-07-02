@@ -1498,6 +1498,30 @@ const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting
     kind: NotificationSettingKind::Bool { default: true },
 };
 
+const NOTIFICATION_DOCK_BADGE_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.dockBadge",
+    json_key: "dockBadge",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
+const NOTIFICATION_SHOW_IN_MENU_BAR_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.showInMenuBar",
+    json_key: "showInMenuBar",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
+const NOTIFICATION_UNREAD_PANE_RING_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.unreadPaneRing",
+    json_key: "unreadPaneRing",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
+const NOTIFICATION_PANE_FLASH_SETTING: NotificationSetting = NotificationSetting {
+    key: "notifications.paneFlash",
+    json_key: "paneFlash",
+    kind: NotificationSettingKind::Bool { default: true },
+};
+
 const NOTIFICATION_SOUND_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.sound",
     json_key: "sound",
@@ -1576,6 +1600,8 @@ const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = Placem
 
 const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.dockBadge|notifications.showInMenuBar|",
+    "notifications.unreadPaneRing|notifications.paneFlash|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
@@ -1586,6 +1612,8 @@ const CONFIG_GET_USAGE: &str = concat!(
 );
 const CONFIG_SET_USAGE: &str = concat!(
     "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size|",
+    "notifications.dockBadge|notifications.showInMenuBar|",
+    "notifications.unreadPaneRing|notifications.paneFlash|",
     "notifications.sound|notifications.customSoundFilePath|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
@@ -1611,6 +1639,10 @@ fn font_size_setting(raw: &str) -> Option<FontSizeSetting> {
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn notification_setting(raw: &str) -> Option<NotificationSetting> {
     match raw {
+        "notifications.dockBadge" => Some(NOTIFICATION_DOCK_BADGE_SETTING),
+        "notifications.showInMenuBar" => Some(NOTIFICATION_SHOW_IN_MENU_BAR_SETTING),
+        "notifications.unreadPaneRing" => Some(NOTIFICATION_UNREAD_PANE_RING_SETTING),
+        "notifications.paneFlash" => Some(NOTIFICATION_PANE_FLASH_SETTING),
         "notifications.sound" => Some(NOTIFICATION_SOUND_SETTING),
         "notifications.customSoundFilePath" => Some(NOTIFICATION_CUSTOM_SOUND_FILE_PATH_SETTING),
         "notifications.agentPermissionPrompt" => Some(AGENT_PERMISSION_PROMPT_SETTING),
@@ -15564,6 +15596,18 @@ mod cli_arg_tests {
         let text = render_config_notification_get(&path, AGENT_PERMISSION_PROMPT_SETTING)
             .expect("get default permission prompt");
         assert!(text.contains("notifications.agentPermissionPrompt = true"));
+        let text = render_config_notification_get(&path, NOTIFICATION_DOCK_BADGE_SETTING)
+            .expect("get default dock badge");
+        assert!(text.contains("notifications.dockBadge = true"));
+        let text = render_config_notification_get(&path, NOTIFICATION_SHOW_IN_MENU_BAR_SETTING)
+            .expect("get default menu bar");
+        assert!(text.contains("notifications.showInMenuBar = true"));
+        let text = render_config_notification_get(&path, NOTIFICATION_UNREAD_PANE_RING_SETTING)
+            .expect("get default unread pane ring");
+        assert!(text.contains("notifications.unreadPaneRing = true"));
+        let text = render_config_notification_get(&path, NOTIFICATION_PANE_FLASH_SETTING)
+            .expect("get default pane flash");
+        assert!(text.contains("notifications.paneFlash = true"));
         let text = render_config_notification_get(&path, NOTIFICATION_SOUND_SETTING)
             .expect("get default notification sound");
         assert!(text.contains("notifications.sound = default"));
@@ -15589,6 +15633,13 @@ mod cli_arg_tests {
             render_config_notification_set(&path, SUPPRESS_ONLY_FOCUSED_SURFACE_SETTING, "true")
                 .expect("set focused-surface suppression");
         assert!(text.contains("notifications.suppressOnlyFocusedSurface = true"));
+        let text =
+            render_config_notification_set(&path, NOTIFICATION_UNREAD_PANE_RING_SETTING, "false")
+                .expect("set unread pane ring");
+        assert!(text.contains("notifications.unreadPaneRing = false"));
+        let text = render_config_notification_set(&path, NOTIFICATION_PANE_FLASH_SETTING, "false")
+            .expect("set pane flash");
+        assert!(text.contains("notifications.paneFlash = false"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
@@ -15603,6 +15654,11 @@ mod cli_arg_tests {
             parsed["notifications"]["suppressOnlyFocusedSurface"],
             Value::Bool(true)
         );
+        assert_eq!(
+            parsed["notifications"]["unreadPaneRing"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["notifications"]["paneFlash"], Value::Bool(false));
     }
 
     #[test]
