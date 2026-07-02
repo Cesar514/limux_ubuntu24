@@ -28,6 +28,7 @@
 [x] 2026-07-01T23:41:59Z Implement and verify CLI and live bridge CMUX `surface.move` and `move-surface` parity for moving surfaces between panes. \
 [x] 2026-07-01T23:38:20Z Implement and verify live bridge CMUX `surface.close` and `close-surface` parity for GTK surfaces. \
 [x] 2026-07-01T23:33:49Z Implement and verify live bridge and CLI CMUX browser visible, enabled, and checked state checks. \
+[x] 2026-07-02T03:37:00Z Implement and verify retained CMUX browser console/error diagnostic buffers for live WebKit browser surfaces. \
 [x] 2026-07-02T03:21:00Z Implement and verify live bridge CMUX browser dialog accept/dismiss CLI/API parity for WebKit JavaScript dialogs. \
 [x] 2026-07-01T23:30:01Z Implement and verify live bridge CMUX browser state save and load parity for WebKit browser surfaces. \
 [x] 2026-07-01T23:25:27Z Implement and verify live bridge CMUX browser tab list, new, switch, and close parity for WebKit browser surfaces. \

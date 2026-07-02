@@ -6503,30 +6503,36 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 BrowserAction::ConsoleList => {
                     let mut payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
-                    payload["entries"] = serde_json::Value::Array(Vec::new());
-                    payload["count"] = serde_json::Value::Number(0.into());
+                    let snapshot = browser.console_entries();
+                    payload["entries"] = serde_json::Value::Array(snapshot.entries);
+                    payload["count"] = serde_json::Value::Number(snapshot.count.into());
                     let _ = reply.send(Ok(payload));
                     return;
                 }
                 BrowserAction::ConsoleClear => {
                     let mut payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let cleared = browser.clear_console_entries();
                     payload["cleared"] = serde_json::Value::Bool(true);
+                    payload["count"] = serde_json::Value::Number(cleared.into());
                     let _ = reply.send(Ok(payload));
                     return;
                 }
                 BrowserAction::ErrorsList => {
                     let mut payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
-                    payload["errors"] = serde_json::Value::Array(Vec::new());
-                    payload["count"] = serde_json::Value::Number(0.into());
+                    let snapshot = browser.error_entries();
+                    payload["errors"] = serde_json::Value::Array(snapshot.entries);
+                    payload["count"] = serde_json::Value::Number(snapshot.count.into());
                     let _ = reply.send(Ok(payload));
                     return;
                 }
                 BrowserAction::ErrorsClear => {
                     let mut payload =
                         browser_action_response_payload(&workspace_id, &workspace_name, &browser);
+                    let cleared = browser.clear_error_entries();
                     payload["cleared"] = serde_json::Value::Bool(true);
+                    payload["count"] = serde_json::Value::Number(cleared.into());
                     let _ = reply.send(Ok(payload));
                     return;
                 }

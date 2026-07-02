@@ -29,6 +29,8 @@ use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, Shortcu
 use crate::terminal::{self, TerminalCallbacks};
 
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(1);
+const BROWSER_DIAGNOSTIC_BUFFER_LIMIT: usize = 512;
+const LIMUX_BROWSER_DIAGNOSTICS_HANDLER: &str = "limuxBrowserDiagnostics";
 
 fn next_pane_id() -> u32 {
     NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
@@ -309,6 +311,49 @@ pub struct BrowserDialogResult {
     pub text: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct BrowserDiagnosticsBuffer {
+    console: VecDeque<Value>,
+    errors: VecDeque<Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BrowserDiagnosticsSnapshot {
+    pub entries: Vec<Value>,
+    pub count: usize,
+}
+
+// purpose: Append one diagnostic entry to a bounded ring without unbounded memory growth.
+// inputs: Mutable diagnostic ring and JSON entry captured from WebKit.
+// returns/effects: Drops the oldest entry when the ring reaches the configured cap.
+fn push_bounded_diagnostic(entries: &mut VecDeque<Value>, entry: Value) {
+    if entries.len() >= BROWSER_DIAGNOSTIC_BUFFER_LIMIT {
+        entries.pop_front();
+    }
+    entries.push_back(entry);
+}
+
+// purpose: Store a WebKit browser diagnostic event in its matching retained buffer.
+// inputs: Mutable per-browser buffers and a JSON event with a `kind` field.
+// returns/effects: Appends console or error entries and ignores unknown diagnostic kinds.
+fn push_browser_diagnostic(buffers: &mut BrowserDiagnosticsBuffer, event: Value) {
+    match event.get("kind").and_then(Value::as_str) {
+        Some("console") => push_bounded_diagnostic(&mut buffers.console, event),
+        Some("error") => push_bounded_diagnostic(&mut buffers.errors, event),
+        _ => {}
+    }
+}
+
+// purpose: Clone a retained diagnostic ring into a stable response snapshot.
+// inputs: Diagnostic ring for one browser surface.
+// returns/effects: Returns entries in capture order and the exact count.
+fn browser_diagnostics_snapshot(entries: &VecDeque<Value>) -> BrowserDiagnosticsSnapshot {
+    BrowserDiagnosticsSnapshot {
+        entries: entries.iter().cloned().collect(),
+        count: entries.len(),
+    }
+}
+
 impl BrowserSurfaceTarget {
     pub fn current_uri(&self) -> Option<String> {
         self.target.current_uri()
@@ -377,6 +422,34 @@ impl BrowserSurfaceTarget {
         F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
     {
         self.target.respond_to_dialog(accept, text, callback)
+    }
+
+    // purpose: Return retained browser console messages for CMUX diagnostics parity.
+    // inputs: Addressed browser surface.
+    // returns/effects: Clones the bounded console ring without mutating it.
+    pub fn console_entries(&self) -> BrowserDiagnosticsSnapshot {
+        self.target.console_entries()
+    }
+
+    // purpose: Clear retained browser console messages for CMUX diagnostics parity.
+    // inputs: Addressed browser surface.
+    // returns/effects: Empties the console ring and returns the number removed.
+    pub fn clear_console_entries(&self) -> usize {
+        self.target.clear_console_entries()
+    }
+
+    // purpose: Return retained page error messages for CMUX diagnostics parity.
+    // inputs: Addressed browser surface.
+    // returns/effects: Clones the bounded error ring without mutating it.
+    pub fn error_entries(&self) -> BrowserDiagnosticsSnapshot {
+        self.target.error_entries()
+    }
+
+    // purpose: Clear retained page error messages for CMUX diagnostics parity.
+    // inputs: Addressed browser surface.
+    // returns/effects: Empties the error ring and returns the number removed.
+    pub fn clear_error_entries(&self) -> usize {
+        self.target.clear_error_entries()
     }
 
     // purpose: Save the browser surface as a PNG screenshot.
@@ -3626,6 +3699,7 @@ struct BrowserHandles {
     dom_editable: Rc<Cell<bool>>,
     frame_selector: Rc<RefCell<Option<String>>>,
     pending_dialogs: Rc<RefCell<VecDeque<BrowserPendingDialog>>>,
+    diagnostics: Rc<RefCell<BrowserDiagnosticsBuffer>>,
 }
 
 #[cfg(feature = "webkit")]
@@ -3743,6 +3817,22 @@ impl BrowserShortcutTarget {
         F: FnOnce(Result<BrowserDialogResult, String>) + 'static,
     {
         self.handles.respond_to_dialog(accept, text, callback)
+    }
+
+    pub fn console_entries(&self) -> BrowserDiagnosticsSnapshot {
+        self.handles.console_entries()
+    }
+
+    pub fn clear_console_entries(&self) -> usize {
+        self.handles.clear_console_entries()
+    }
+
+    pub fn error_entries(&self) -> BrowserDiagnosticsSnapshot {
+        self.handles.error_entries()
+    }
+
+    pub fn clear_error_entries(&self) -> usize {
+        self.handles.clear_error_entries()
     }
 
     // purpose: Save the browser shortcut target as a PNG screenshot.
@@ -4012,6 +4102,40 @@ impl BrowserHandles {
         true
     }
 
+    // purpose: Return retained browser console entries for automation diagnostics.
+    // inputs: Browser handle for one surface.
+    // returns/effects: Clones the current bounded console ring in capture order.
+    fn console_entries(&self) -> BrowserDiagnosticsSnapshot {
+        browser_diagnostics_snapshot(&self.diagnostics.borrow().console)
+    }
+
+    // purpose: Clear retained browser console entries for automation diagnostics.
+    // inputs: Browser handle for one surface.
+    // returns/effects: Empties the console ring and returns the cleared count.
+    fn clear_console_entries(&self) -> usize {
+        let mut diagnostics = self.diagnostics.borrow_mut();
+        let count = diagnostics.console.len();
+        diagnostics.console.clear();
+        count
+    }
+
+    // purpose: Return retained browser page error entries for automation diagnostics.
+    // inputs: Browser handle for one surface.
+    // returns/effects: Clones the current bounded error ring in capture order.
+    fn error_entries(&self) -> BrowserDiagnosticsSnapshot {
+        browser_diagnostics_snapshot(&self.diagnostics.borrow().errors)
+    }
+
+    // purpose: Clear retained browser page error entries for automation diagnostics.
+    // inputs: Browser handle for one surface.
+    // returns/effects: Empties the error ring and returns the cleared count.
+    fn clear_error_entries(&self) -> usize {
+        let mut diagnostics = self.diagnostics.borrow_mut();
+        let count = diagnostics.errors.len();
+        diagnostics.errors.clear();
+        count
+    }
+
     fn save_screenshot<F>(&self, path: PathBuf, full_page: bool, callback: F) -> bool
     where
         F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
@@ -4236,6 +4360,22 @@ impl BrowserHandles {
         false
     }
 
+    fn console_entries(&self) -> BrowserDiagnosticsSnapshot {
+        BrowserDiagnosticsSnapshot::default()
+    }
+
+    fn clear_console_entries(&self) -> usize {
+        0
+    }
+
+    fn error_entries(&self) -> BrowserDiagnosticsSnapshot {
+        BrowserDiagnosticsSnapshot::default()
+    }
+
+    fn clear_error_entries(&self) -> usize {
+        0
+    }
+
     fn save_screenshot<F>(&self, _path: PathBuf, _full_page: bool, callback: F) -> bool
     where
         F: FnOnce(Result<BrowserScreenshotResult, String>) + 'static,
@@ -4410,6 +4550,82 @@ const LIMUX_BROWSER_EDITABLE_STATE_SCRIPT: &str = r#"
 "#;
 
 #[cfg(feature = "webkit")]
+const LIMUX_BROWSER_DIAGNOSTICS_SCRIPT: &str = r#"
+(() => {
+  const handler = globalThis.webkit?.messageHandlers?.limuxBrowserDiagnostics;
+  if (!handler || typeof handler.postMessage !== 'function') {
+    throw new Error('limuxBrowserDiagnostics message handler is unavailable');
+  }
+  if (globalThis.__limuxBrowserDiagnosticsInstalled) {
+    return;
+  }
+  Object.defineProperty(globalThis, '__limuxBrowserDiagnosticsInstalled', {
+    value: true,
+    configurable: false
+  });
+
+  const serialize = (value) => {
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        stack: value.stack || null
+      };
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (_error) {
+      return String(value);
+    }
+  };
+
+  const post = (kind, level, args, extra) => {
+    const serialized = Array.from(args || []).map(serialize);
+    handler.postMessage({
+      kind,
+      level,
+      message: serialized.map((item) => {
+        return typeof item === 'string' ? item : JSON.stringify(item);
+      }).join(' '),
+      args: serialized,
+      url: String(location.href || ''),
+      timestamp_ms: Date.now(),
+      extra: extra || null
+    });
+  };
+
+  for (const level of ['debug', 'log', 'info', 'warn', 'error']) {
+    const original = console[level];
+    if (typeof original !== 'function') {
+      continue;
+    }
+    console[level] = function (...args) {
+      post('console', level, args, null);
+      return original.apply(this, args);
+    };
+  }
+
+  window.addEventListener('error', (event) => {
+    post('error', 'error', [event.message || ''], {
+      source: event.filename || null,
+      line: event.lineno || null,
+      column: event.colno || null,
+      stack: event.error && event.error.stack ? String(event.error.stack) : null
+    });
+  }, true);
+
+  window.addEventListener('unhandledrejection', (event) => {
+    post('error', 'unhandledrejection', [event.reason], {
+      stack: event.reason && event.reason.stack ? String(event.reason.stack) : null
+    });
+  }, true);
+})();
+"#;
+
+#[cfg(feature = "webkit")]
 fn create_browser_widget(
     initial_uri: Option<&str>,
     saved_uri: Rc<RefCell<Option<String>>>,
@@ -4424,8 +4640,20 @@ fn create_browser_widget(
     let dom_editable = Rc::new(Cell::new(false));
     let _ = user_content_manager
         .register_script_message_handler(LIMUX_BROWSER_EDITABLE_STATE_HANDLER, None);
+    assert!(
+        user_content_manager
+            .register_script_message_handler(LIMUX_BROWSER_DIAGNOSTICS_HANDLER, None),
+        "webkit should register browser diagnostics handler"
+    );
     user_content_manager.add_script(&webkit6::UserScript::new(
         LIMUX_BROWSER_EDITABLE_STATE_SCRIPT,
+        webkit6::UserContentInjectedFrames::AllFrames,
+        webkit6::UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+    user_content_manager.add_script(&webkit6::UserScript::new(
+        LIMUX_BROWSER_DIAGNOSTICS_SCRIPT,
         webkit6::UserContentInjectedFrames::AllFrames,
         webkit6::UserScriptInjectionTime::Start,
         &[],
@@ -4441,6 +4669,19 @@ fn create_browser_widget(
                 } else {
                     value.to_str().as_str() == "true"
                 });
+            },
+        );
+    }
+    let diagnostics = Rc::new(RefCell::new(BrowserDiagnosticsBuffer::default()));
+    {
+        let diagnostics = diagnostics.clone();
+        user_content_manager.connect_script_message_received(
+            Some(LIMUX_BROWSER_DIAGNOSTICS_HANDLER),
+            move |_, value| {
+                push_browser_diagnostic(
+                    &mut diagnostics.borrow_mut(),
+                    javascript_value_to_json(value),
+                );
             },
         );
     }
@@ -4594,6 +4835,7 @@ fn create_browser_widget(
         dom_editable,
         frame_selector: Rc::new(RefCell::new(None)),
         pending_dialogs,
+        diagnostics,
     };
 
     {
@@ -4691,18 +4933,48 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_content_drop_zone, content_drop_preview_rect, effective_drop_target_dimensions,
-        is_localhost_input, next_active_after_tab_removal, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, surface_hint_matches, ContentDropZone,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
-        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS,
-        TAB_RENAME_ENTRY_CSS_CLASS, TAB_RENAME_ENTRY_CSS_CLASSES,
+        browser_diagnostics_snapshot, classify_content_drop_zone, content_drop_preview_rect,
+        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
+        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
+        push_browser_diagnostic, surface_hint_matches, BrowserDiagnosticsBuffer, ContentDropZone,
+        TabDragPayload, BROWSER_DIAGNOSTIC_BUFFER_LIMIT, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
+        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
+        TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
     use super::{
         env_value_contains_token, is_kde_wayland_session_from_env, BROWSER_WEB_VIEW_CSS_CLASS,
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
+    use serde_json::json;
+
+    #[test]
+    fn browser_diagnostics_buffer_routes_caps_and_snapshots_entries() {
+        let mut buffers = BrowserDiagnosticsBuffer::default();
+        push_browser_diagnostic(&mut buffers, json!({"kind": "console", "message": "ready"}));
+        push_browser_diagnostic(&mut buffers, json!({"kind": "error", "message": "boom"}));
+        push_browser_diagnostic(
+            &mut buffers,
+            json!({"kind": "network", "message": "ignored"}),
+        );
+
+        let console = browser_diagnostics_snapshot(&buffers.console);
+        assert_eq!(console.count, 1);
+        assert_eq!(console.entries[0]["message"], "ready");
+
+        let errors = browser_diagnostics_snapshot(&buffers.errors);
+        assert_eq!(errors.count, 1);
+        assert_eq!(errors.entries[0]["message"], "boom");
+
+        buffers.console.clear();
+        for idx in 0..=BROWSER_DIAGNOSTIC_BUFFER_LIMIT {
+            push_browser_diagnostic(&mut buffers, json!({"kind": "console", "message": idx}));
+        }
+        let capped = browser_diagnostics_snapshot(&buffers.console);
+        assert_eq!(capped.count, BROWSER_DIAGNOSTIC_BUFFER_LIMIT);
+        assert_eq!(capped.entries[0]["message"], 1);
+    }
 
     #[test]
     fn pane_action_tooltip_reflects_remaps_and_unbinds() {
