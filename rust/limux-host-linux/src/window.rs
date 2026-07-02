@@ -4421,7 +4421,7 @@ fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
     match action.action_type.as_str() {
         "log" => action.message.clone().unwrap_or_else(|| "log".to_string()),
         "noop" => "noop".to_string(),
-        "openURL" | "open" | "open.url" | "link.open" => {
+        "openURL" | "open" | "open.url" | "link.open" | "pr.open" => {
             custom_sidebar_action_url(action).unwrap_or_else(|_| "open URL".to_string())
         }
         "clipboard.write" => custom_sidebar_action_text(action)
@@ -4445,7 +4445,7 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
             action.message.as_deref().unwrap_or("")
         ),
         "noop" => button.set_tooltip_text(Some("noop")),
-        "openURL" | "open" | "open.url" | "link.open" => {
+        "openURL" | "open" | "open.url" | "link.open" | "pr.open" => {
             open_custom_sidebar_url(button, custom_sidebar_action_url(action).ok().as_deref())
         }
         "clipboard.write" => {
@@ -19393,6 +19393,13 @@ mod tests {
             message: None,
             params: url_param,
         };
+        let mut pr_url_param = serde_json::Map::new();
+        pr_url_param.insert("url".to_string(), json!("https://example.test/pr/3"));
+        let pr_open = CustomSidebarNodeAction {
+            action_type: "pr.open".to_string(),
+            message: None,
+            params: pr_url_param,
+        };
         let mut open_url_param_alias = serde_json::Map::new();
         open_url_param_alias.insert("param".to_string(), json!("https://example.test/pr/2"));
         let open_url_camel_param = CustomSidebarNodeAction {
@@ -19746,6 +19753,10 @@ mod tests {
         assert_eq!(
             custom_sidebar_action_tooltip(&link_open),
             "https://example.test/pr/1"
+        );
+        assert_eq!(
+            custom_sidebar_action_tooltip(&pr_open),
+            "https://example.test/pr/3"
         );
         assert_eq!(
             custom_sidebar_action_tooltip(&open_url_camel_param),
