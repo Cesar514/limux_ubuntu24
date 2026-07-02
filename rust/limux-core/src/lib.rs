@@ -25,6 +25,7 @@ const COMMANDS: &[&str] = &[
     "workspace.last",
     "workspace.rename",
     "workspace.reorder",
+    "workspace.reorder_many",
     "workspace.close",
     "workspace.move_to_window",
     "workspace.action",
@@ -917,6 +918,78 @@ impl ControlState {
             .iter()
             .find(|workspace| workspace.id == id)
             .map(WorkspaceState::info)
+    }
+
+    // purpose: Apply CMUX batch workspace ordering to the core state.
+    // inputs: Requested leading workspace ids.
+    // returns/effects: Reorders workspaces and returns public ordering metadata.
+    fn reorder_workspaces_many(&mut self, ids: &[u64]) -> Result<Value, CommandError> {
+        let seen = self.validate_reorder_many_workspace_ids(ids)?;
+        let previous: Vec<u64> = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect();
+        let mut desired = ids.to_vec();
+        desired.extend(previous.iter().copied().filter(|id| !seen.contains(id)));
+        let active_id = self.current_workspace_id;
+        let mut reordered = Vec::with_capacity(self.workspaces.len());
+        for id in &desired {
+            if let Some(index) = self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == *id)
+            {
+                reordered.push(self.workspaces.remove(index));
+            }
+        }
+        self.workspaces = reordered;
+        self.current_workspace_id = active_id;
+        Ok(json!({
+            "workspace_ids": desired.iter().map(|id| encode_handle_id(*id)).collect::<Vec<_>>(),
+            "workspace_refs": desired.iter().map(|id| workspace_ref(*id)).collect::<Vec<_>>(),
+            "moved_workspace_ids": moved_workspace_ids(&previous, &desired),
+        }))
+    }
+
+    // purpose: Validate a batch workspace reorder request before mutation.
+    // inputs: Requested workspace ids in caller-provided order.
+    // returns/effects: Returns the deduplicated id set or a validation error.
+    fn validate_reorder_many_workspace_ids(
+        &self,
+        ids: &[u64],
+    ) -> Result<HashSet<u64>, CommandError> {
+        if ids.is_empty() {
+            return Err(CommandError::invalid_params(
+                "workspace.reorder_many requires at least one workspace",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for id in ids {
+            self.validate_reorder_many_workspace_id(*id, &mut seen)?;
+        }
+        Ok(seen)
+    }
+
+    // purpose: Validate one workspace id in a batch reorder request.
+    // inputs: Workspace id and deduplication set for the current request.
+    // returns/effects: Mutates the seen set or returns a validation/not-found error.
+    fn validate_reorder_many_workspace_id(
+        &self,
+        id: u64,
+        seen: &mut HashSet<u64>,
+    ) -> Result<(), CommandError> {
+        if !seen.insert(id) {
+            return Err(CommandError::invalid_params(format!(
+                "workspace.reorder_many duplicate workspace: {id}"
+            )));
+        }
+        if !self.workspaces.iter().any(|workspace| workspace.id == id) {
+            return Err(CommandError::not_found(format!(
+                "workspace not found: {id}"
+            )));
+        }
+        Ok(())
     }
 
     fn close_workspace(&mut self, id: Option<u64>) -> Option<WorkspaceInfo> {
@@ -2889,6 +2962,19 @@ fn encode_handle_id(id: u64) -> String {
     format!("00000000-0000-0000-0000-{id:012x}")
 }
 
+// purpose: Encode ids whose position changed during workspace reorder.
+// inputs: Previous workspace order and desired workspace order.
+// returns/effects: Returns encoded public ids for moved workspaces.
+fn moved_workspace_ids(previous: &[u64], desired: &[u64]) -> Vec<String> {
+    desired
+        .iter()
+        .filter(|id| {
+            previous.iter().position(|old| old == *id) != desired.iter().position(|new| new == *id)
+        })
+        .map(|id| encode_handle_id(*id))
+        .collect()
+}
+
 fn decode_handle_id(raw: &str) -> Option<u64> {
     let s = raw.trim();
     if s.is_empty() {
@@ -3050,6 +3136,48 @@ fn optional_index_param(
             .map(Some)
             .map_err(|_| CommandError::invalid_params(format!("{key} is too large")))
     })
+}
+
+// purpose: Parse a CMUX reorder-many workspace id list.
+// inputs: JSON array of string ids/refs or a comma-separated string.
+// returns/effects: Returns decoded core ids or a validation error.
+fn parse_workspace_id_list(value: &Value) -> Result<Vec<u64>, CommandError> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .ok_or_else(|| {
+                        CommandError::invalid_params(
+                            "workspace.reorder_many workspace_ids must contain strings",
+                        )
+                    })
+                    .and_then(parse_workspace_id_token)
+            })
+            .collect(),
+        Value::String(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .map(parse_workspace_id_token)
+            .collect(),
+        _ => Err(CommandError::invalid_params(
+            "workspace.reorder_many workspace_ids/order must be a string or string array",
+        )),
+    }
+}
+
+// purpose: Parse one workspace id/ref token from a reorder-many request.
+// inputs: Raw workspace id or workspace:<id> reference.
+// returns/effects: Returns a decoded core id or validation error.
+fn parse_workspace_id_token(raw: &str) -> Result<u64, CommandError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::invalid_params(
+            "workspace.reorder_many order cannot contain empty workspace refs",
+        ));
+    }
+    decode_handle_id(trimmed)
+        .ok_or_else(|| CommandError::invalid_params(format!("invalid workspace id/ref: {trimmed}")))
 }
 
 fn focused_handles(state: &ControlState) -> Option<(u64, u64, u64, u64)> {
@@ -5096,6 +5224,19 @@ fn handle_command(
                 "workspace": workspace
             }))
         }
+        "workspace.reorder_many" => {
+            let params = params_object(params)?;
+            let ids_value = params
+                .get("workspace_ids")
+                .or_else(|| params.get("order"))
+                .ok_or_else(|| {
+                    CommandError::invalid_params(
+                        "workspace.reorder_many requires workspace_ids/order",
+                    )
+                })?;
+            let ids = parse_workspace_id_list(ids_value)?;
+            state.reorder_workspaces_many(&ids)
+        }
         "workspace.close" => {
             let params = params_object(params)?;
             let id = optional_u64_param_any(params, &["workspace_id", "id"])?;
@@ -6269,6 +6410,19 @@ mod tests {
         }
     }
 
+    // purpose: Create a named workspace and return its core id.
+    // inputs: Dispatcher under test and workspace name.
+    // returns/effects: Mutates dispatcher state and returns the created workspace id.
+    async fn create_workspace_id(dispatcher: &Dispatcher, name: &str) -> u64 {
+        dispatcher
+            .dispatch(request("workspace.create", json!({ "name": name })))
+            .await
+            .result
+            .expect("workspace create")["workspace"]["id"]
+            .as_u64()
+            .expect("workspace id")
+    }
+
     // purpose: Create a named workspace and return its active surface.
     // inputs: Dispatcher under test.
     // returns/effects: Mutates dispatcher state and returns workspace/surface ids.
@@ -6362,6 +6516,49 @@ mod tests {
                 .expect("window array")
                 .len()
                 >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_workspace_reorder_many_moves_leading_order() {
+        let dispatcher = Dispatcher::new();
+        let alpha = create_workspace_id(&dispatcher, "alpha").await;
+        let beta = create_workspace_id(&dispatcher, "beta").await;
+
+        let reordered = dispatcher
+            .dispatch(request(
+                "workspace.reorder_many",
+                json!({ "workspace_ids": [workspace_ref(beta), workspace_ref(alpha)] }),
+            ))
+            .await;
+        let payload = reordered.result.expect("reorder_many result");
+        assert_eq!(payload["workspace_refs"][0], workspace_ref(beta));
+        assert_eq!(payload["workspace_refs"][1], workspace_ref(alpha));
+
+        let listed = dispatcher
+            .dispatch(request("workspace.list", json!({})))
+            .await
+            .result
+            .expect("workspace list");
+        let rows = listed["workspaces"].as_array().expect("workspace rows");
+        assert_eq!(rows[0]["workspace_ref"], workspace_ref(beta));
+        assert_eq!(rows[1]["workspace_ref"], workspace_ref(alpha));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_workspace_reorder_many_rejects_duplicate_refs() {
+        let dispatcher = Dispatcher::new();
+        let beta = create_workspace_id(&dispatcher, "beta").await;
+
+        let duplicate = dispatcher
+            .dispatch(request(
+                "workspace.reorder_many",
+                json!({ "workspace_ids": [workspace_ref(beta), workspace_ref(beta)] }),
+            ))
+            .await;
+        assert_eq!(
+            duplicate.error.as_ref().map(|error| error.code),
+            Some(-32602)
         );
     }
 

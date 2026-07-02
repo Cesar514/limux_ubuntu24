@@ -26,7 +26,8 @@ use crate::control_bridge::{
     BridgeError, BrowserAction, BrowserTabAction, ControlCommand, CustomSidebarAction,
     PaneCreateDirection as BridgePaneCreateDirection, PaneCreateType, RightSidebarAction,
     RightSidebarMode, RightSidebarTarget, SidebarAction, SurfacePullRequestCommand,
-    WorkspaceAction, WorkspaceGroupAction, WorkspaceNavigation, WorkspaceTarget,
+    WorkspaceAction, WorkspaceGroupAction, WorkspaceNavigation, WorkspaceReorderTarget,
+    WorkspaceTarget,
 };
 use crate::keybind_editor;
 use crate::layout_state::{
@@ -6299,6 +6300,280 @@ fn reorder_workspace_for_custom_sidebar(
         request_session_save(state);
     }
     Ok(result.payload())
+}
+
+// purpose: Reorder one workspace from the live socket API.
+// inputs: Live host state, workspace target, placement target, and dry-run flag.
+// returns/effects: Mutates order unless dry-run, emits reorder events, and queues persistence.
+fn apply_workspace_reorder(
+    state: &State,
+    target: WorkspaceTarget,
+    reorder_target: WorkspaceReorderTarget,
+    dry_run: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    let (from_index, target_index) = {
+        let app_state = state.borrow();
+        let from_index = workspace_index_for_target(&app_state, &target)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        let target_index =
+            live_workspace_reorder_target_index(&app_state, from_index, &reorder_target)?;
+        (from_index, target_index)
+    };
+    if dry_run {
+        let app_state = state.borrow();
+        return Ok(live_workspace_reorder_dry_run_payload(
+            &app_state,
+            from_index,
+            target_index,
+        ));
+    }
+    let result = {
+        let mut app_state = state.borrow_mut();
+        reorder_workspace_to_index_in_state(&mut app_state, from_index, target_index)
+    };
+    publish_and_persist_workspace_reorder(state, &result);
+    Ok(result.payload())
+}
+
+// purpose: Resolve a live socket reorder placement target against current workspace order.
+// inputs: App state, source index, and parsed CMUX placement target.
+// returns/effects: Returns an absolute target index or a not-found error.
+fn live_workspace_reorder_target_index(
+    state: &AppState,
+    from_index: usize,
+    target: &WorkspaceReorderTarget,
+) -> Result<usize, BridgeError> {
+    match target {
+        WorkspaceReorderTarget::Index(index) => Ok(*index),
+        WorkspaceReorderTarget::Before(workspace_id) => {
+            let index = workspace_index_for_raw_id(state, workspace_id)
+                .ok_or_else(|| BridgeError::not_found("before workspace not found"))?;
+            Ok(custom_sidebar_workspace_reorder_before_index(
+                from_index, index,
+            ))
+        }
+        WorkspaceReorderTarget::After(workspace_id) => {
+            let index = workspace_index_for_raw_id(state, workspace_id)
+                .ok_or_else(|| BridgeError::not_found("after workspace not found"))?;
+            Ok(custom_sidebar_workspace_reorder_after_index(
+                from_index, index,
+            ))
+        }
+    }
+}
+
+// purpose: Build a CMUX dry-run payload for single-workspace reorder.
+// inputs: App state plus source and requested target indexes.
+// returns/effects: Reports the clamped target without mutating host state.
+fn live_workspace_reorder_dry_run_payload(
+    state: &AppState,
+    from_index: usize,
+    target_index: usize,
+) -> serde_json::Value {
+    let to_index =
+        custom_sidebar_workspace_reorder_to_index(from_index, target_index, state.workspaces.len());
+    let workspace_id = state.workspaces[from_index].id.clone();
+    serde_json::json!({
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref(&workspace_id),
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "from_index": from_index,
+        "to_index": to_index,
+        "index": to_index,
+        "dry_run": true,
+        "plan": [{
+            "workspace_id": workspace_id,
+            "workspace_ref": workspace_ref(&workspace_id),
+            "window_id": "window:1",
+            "window_ref": "window:1",
+            "from_index": from_index,
+            "to_index": to_index,
+        }],
+        "events": [],
+    })
+}
+
+// purpose: Publish and persist a successful CMUX workspace.reorder mutation.
+// inputs: Live host state and reorder result metadata.
+// returns/effects: Selects active row, emits event when changed, and saves session.
+fn publish_and_persist_workspace_reorder(
+    state: &State,
+    result: &CustomSidebarWorkspaceReorderResult,
+) {
+    if let Some(row) = result.row_to_select.clone() {
+        result.sidebar_list.select_row(Some(&row));
+    }
+    if result.changed {
+        publish_workspace_reordered_event(
+            result.ordered_workspace_ids.clone(),
+            vec![result.workspace_id.clone()],
+            result.pinned_workspace_ids.clone(),
+            result.selected_workspace_id.clone(),
+            result.selected_index,
+        );
+        request_session_save(state);
+    }
+}
+
+// purpose: Reorder several workspaces to the leading order requested by CMUX.
+// inputs: Live host state, raw workspace ids/refs, and dry-run flag.
+// returns/effects: Mutates the current workspace order unless dry-run.
+fn apply_workspace_reorder_many(
+    state: &State,
+    workspace_ids: Vec<String>,
+    dry_run: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    let previous_order = workspace_order_ids(&state.borrow());
+    let desired_order = {
+        let app_state = state.borrow();
+        workspace_reorder_many_desired_order(&app_state, &workspace_ids)?
+    };
+    let moved_ids = moved_workspace_ids(&previous_order, &desired_order);
+    if dry_run {
+        let app_state = state.borrow();
+        return Ok(workspace_reorder_many_payload(
+            true,
+            &previous_order,
+            &desired_order,
+            moved_ids,
+            &app_state,
+        ));
+    }
+    let result = {
+        let mut app_state = state.borrow_mut();
+        apply_workspace_order_ids(&mut app_state, &desired_order);
+        workspace_reorder_many_payload(
+            false,
+            &previous_order,
+            &desired_order,
+            moved_ids.clone(),
+            &app_state,
+        )
+    };
+    if previous_order != desired_order {
+        let app_state = state.borrow();
+        publish_workspace_reordered_event(
+            desired_order,
+            moved_ids,
+            pinned_workspace_ids(&app_state),
+            app_state
+                .workspaces
+                .get(app_state.active_idx)
+                .map(|workspace| workspace.id.clone()),
+            app_state.active_idx,
+        );
+        request_session_save(state);
+    }
+    Ok(result)
+}
+
+// purpose: Compute CMUX reorder_many final order from a leading workspace list.
+// inputs: Current state and requested raw workspace refs.
+// returns/effects: Returns leading requested ids plus untouched workspaces in original order.
+fn workspace_reorder_many_desired_order(
+    state: &AppState,
+    requested_ids: &[String],
+) -> Result<Vec<String>, BridgeError> {
+    let mut leading = Vec::with_capacity(requested_ids.len());
+    let mut seen = HashSet::new();
+    for raw in requested_ids {
+        let index = workspace_index_for_raw_id(state, raw)
+            .ok_or_else(|| BridgeError::not_found(format!("workspace not found: {raw}")))?;
+        let workspace_id = state.workspaces[index].id.clone();
+        if !seen.insert(workspace_id.clone()) {
+            return Err(BridgeError::invalid_params(format!(
+                "workspace.reorder_many duplicate workspace: {raw}"
+            )));
+        }
+        leading.push(workspace_id);
+    }
+    let mut desired = leading;
+    for workspace in &state.workspaces {
+        if !seen.contains(&workspace.id) {
+            desired.push(workspace.id.clone());
+        }
+    }
+    Ok(desired)
+}
+
+// purpose: Apply a complete workspace id order to AppState.
+// inputs: Mutable state and validated workspace ids.
+// returns/effects: Reorders live workspaces, preserves active workspace by id, and syncs sidebar rows.
+fn apply_workspace_order_ids(state: &mut AppState, desired_order: &[String]) {
+    let active_workspace_id = state
+        .active_workspace()
+        .map(|workspace| workspace.id.clone());
+    let mut reordered = Vec::with_capacity(state.workspaces.len());
+    for workspace_id in desired_order {
+        if let Some(index) = state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == *workspace_id)
+        {
+            reordered.push(state.workspaces.remove(index));
+        }
+    }
+    state.workspaces = reordered;
+    if let Some(active_workspace_id) = active_workspace_id {
+        if let Some(index) = state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == active_workspace_id)
+        {
+            state.active_idx = index;
+        }
+    }
+    sync_sidebar_row_order(state);
+}
+
+// purpose: Build a CMUX-shaped reorder_many response payload.
+// inputs: Dry-run flag, previous/final order, moved ids, and current state.
+// returns/effects: Returns plan/event metadata without mutating state.
+fn workspace_reorder_many_payload(
+    dry_run: bool,
+    previous_order: &[String],
+    desired_order: &[String],
+    moved_ids: Vec<String>,
+    state: &AppState,
+) -> serde_json::Value {
+    let plan = workspace_reorder_many_plan(previous_order, desired_order, &moved_ids);
+    serde_json::json!({
+        "window_id": "window:1",
+        "window_ref": "window:1",
+        "dry_run": dry_run,
+        "changed": previous_order != desired_order,
+        "ordered_workspace_ids": desired_order,
+        "moved_workspace_ids": moved_ids,
+        "pinned_workspace_ids": pinned_workspace_ids(state),
+        "selected_workspace_id": state.workspaces.get(state.active_idx).map(|workspace| workspace.id.clone()),
+        "selected_index": state.active_idx,
+        "plan": plan,
+        "events": if dry_run || previous_order == desired_order { Vec::<serde_json::Value>::new() } else { plan },
+    })
+}
+
+// purpose: Build per-workspace move plan rows for CMUX reorder_many output.
+// inputs: Previous/final order and moved workspace ids.
+// returns/effects: Reports old and new indexes for changed requested workspaces.
+fn workspace_reorder_many_plan(
+    previous_order: &[String],
+    desired_order: &[String],
+    moved_ids: &[String],
+) -> Vec<serde_json::Value> {
+    moved_ids
+        .iter()
+        .map(|workspace_id| {
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "workspace_ref": workspace_ref(workspace_id),
+                "window_id": "window:1",
+                "window_ref": "window:1",
+                "from_index": previous_order.iter().position(|id| id == workspace_id),
+                "to_index": desired_order.iter().position(|id| id == workspace_id),
+            })
+        })
+        .collect()
 }
 
 /// purpose: Resolve CMUX workspace.reorder target params against live state.
@@ -16238,6 +16513,26 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let _ = reply.send(result.ok_or_else(|| {
                 crate::control_bridge::BridgeError::not_found("workspace not found")
             }));
+        }
+        ControlCommand::ReorderWorkspace {
+            target,
+            reorder_target,
+            dry_run,
+            reply,
+        } => {
+            let _ = reply.send(apply_workspace_reorder(
+                state,
+                target,
+                reorder_target,
+                dry_run,
+            ));
+        }
+        ControlCommand::ReorderWorkspaces {
+            workspace_ids,
+            dry_run,
+            reply,
+        } => {
+            let _ = reply.send(apply_workspace_reorder_many(state, workspace_ids, dry_run));
         }
         ControlCommand::WorkspaceAction {
             target,

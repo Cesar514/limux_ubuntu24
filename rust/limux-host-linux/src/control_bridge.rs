@@ -54,6 +54,8 @@ const METHODS: &[&str] = &[
     "workspace.previous",
     "workspace.last",
     "workspace.rename",
+    "workspace.reorder",
+    "workspace.reorder_many",
     "workspace.action",
     "workspace.close",
     "workspace.remote.reconnect",
@@ -566,6 +568,13 @@ pub enum WorkspaceAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkspaceReorderTarget {
+    Index(usize),
+    Before(String),
+    After(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceNavigation {
     Next,
     Previous,
@@ -952,6 +961,17 @@ pub enum ControlCommand {
         title: String,
         reply: mpsc::Sender<BridgeResult>,
     },
+    ReorderWorkspace {
+        target: WorkspaceTarget,
+        reorder_target: WorkspaceReorderTarget,
+        dry_run: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    ReorderWorkspaces {
+        workspace_ids: Vec<String>,
+        dry_run: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     WorkspaceAction {
         target: WorkspaceTarget,
         action: WorkspaceAction,
@@ -1085,6 +1105,8 @@ impl ControlCommand {
             | Self::SelectWorkspace { reply, .. }
             | Self::NavigateWorkspace { reply, .. }
             | Self::RenameWorkspace { reply, .. }
+            | Self::ReorderWorkspace { reply, .. }
+            | Self::ReorderWorkspaces { reply, .. }
             | Self::WorkspaceAction { reply, .. }
             | Self::CloseWorkspace { reply, .. }
             | Self::SendText { reply, .. }
@@ -2726,6 +2748,124 @@ fn parse_workspace_action(params: &Map<String, Value>) -> Result<WorkspaceAction
             "workspace.action unsupported action: {raw_action}"
         ))),
     }
+}
+
+// purpose: Parse CMUX `workspace.reorder` placement target.
+// inputs: Socket params containing one of index, before_workspace_id, or after_workspace_id.
+// returns/effects: Returns a strict reorder target or a loud validation error.
+fn parse_workspace_reorder_target(
+    params: &Map<String, Value>,
+) -> Result<WorkspaceReorderTarget, BridgeError> {
+    let index = optional_index(params, "index")?;
+    let before = optional_handle(
+        params,
+        &["before_workspace_id", "before_workspace", "before"],
+    )?;
+    let after = optional_handle(params, &["after_workspace_id", "after_workspace", "after"])?;
+    let target_count =
+        usize::from(index.is_some()) + usize::from(before.is_some()) + usize::from(after.is_some());
+    if target_count != 1 {
+        return Err(BridgeError::invalid_params(
+            "workspace.reorder requires exactly one target: index|before_workspace_id|after_workspace_id",
+        ));
+    }
+    if let Some(index) = index {
+        return Ok(WorkspaceReorderTarget::Index(index));
+    }
+    if let Some(before) = before {
+        return Ok(WorkspaceReorderTarget::Before(before));
+    }
+    if let Some(after) = after {
+        return Ok(WorkspaceReorderTarget::After(after));
+    }
+    unreachable!("workspace.reorder target count was checked");
+}
+
+// purpose: Parse CMUX `workspace.reorder_many` order list.
+// inputs: Socket params containing workspace_ids/order as an array or comma-separated string.
+// returns/effects: Rejects empty entries and duplicate workspace refs before host mutation.
+fn required_workspace_reorder_many_ids(
+    params: &Map<String, Value>,
+) -> Result<Vec<String>, BridgeError> {
+    let Some(value) = ["workspace_ids", "order"]
+        .iter()
+        .find_map(|key| params.get(*key))
+    else {
+        return Err(BridgeError::invalid_params(
+            "workspace.reorder_many requires workspace_ids/order",
+        ));
+    };
+    let ids = workspace_reorder_many_ids_from_value(value)?;
+    validate_workspace_reorder_many_ids(&ids)?;
+    Ok(ids)
+}
+
+// purpose: Convert a workspace reorder-many JSON value into string refs.
+// inputs: A JSON array of strings or comma-separated string.
+// returns/effects: Returns trimmed refs or a loud validation error.
+fn workspace_reorder_many_ids_from_value(value: &Value) -> Result<Vec<String>, BridgeError> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(required_workspace_reorder_many_array_id)
+            .collect(),
+        Value::String(raw) => raw
+            .split(',')
+            .map(required_workspace_reorder_many_string_id)
+            .collect(),
+        _ => Err(BridgeError::invalid_params(
+            "workspace.reorder_many workspace_ids/order must be a string or string array",
+        )),
+    }
+}
+
+// purpose: Parse one array item in a CMUX reorder-many order list.
+// inputs: JSON value from workspace_ids/order.
+// returns/effects: Returns a trimmed workspace ref or a validation error.
+fn required_workspace_reorder_many_array_id(value: &Value) -> Result<String, BridgeError> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            BridgeError::invalid_params(
+                "workspace.reorder_many workspace_ids must contain non-empty strings",
+            )
+        })
+}
+
+// purpose: Parse one comma-delimited item in a CMUX reorder-many order list.
+// inputs: Raw workspace ref token.
+// returns/effects: Returns a trimmed workspace ref or rejects an empty token.
+fn required_workspace_reorder_many_string_id(value: &str) -> Result<String, BridgeError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "workspace.reorder_many order cannot contain empty workspace refs",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+// purpose: Validate parsed CMUX reorder-many refs before host mutation.
+// inputs: Parsed workspace refs.
+// returns/effects: Rejects empty lists and duplicates loudly.
+fn validate_workspace_reorder_many_ids(ids: &[String]) -> Result<(), BridgeError> {
+    if ids.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "workspace.reorder_many requires at least one workspace",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err(BridgeError::invalid_params(format!(
+                "workspace.reorder_many duplicate workspace: {id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn handle_method(
@@ -4782,6 +4922,49 @@ fn handle_method(
                 rx,
             )
         }
+        "workspace.reorder" | "reorder-workspace" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let reorder_target = match parse_workspace_reorder_target(params) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let dry_run = match optional_bool(params, "dry_run") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ReorderWorkspace {
+                    target,
+                    reorder_target,
+                    dry_run,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "workspace.reorder_many" | "reorder-workspaces" => {
+            let workspace_ids = match required_workspace_reorder_many_ids(params) {
+                Ok(ids) => ids,
+                Err(error) => return error_response(id, error),
+            };
+            let dry_run = match optional_bool(params, "dry_run") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::ReorderWorkspaces {
+                    workspace_ids,
+                    dry_run,
+                    reply,
+                },
+                rx,
+            )
+        }
         "workspace.action" | "workspace-action" => {
             let action = match parse_workspace_action(params) {
                 Ok(action) => action,
@@ -6201,7 +6384,10 @@ mod tests {
         assert_eq!(rename.error, None);
 
         let description = dispatch_request(
-            r#"{"id":2,"method":"workspace.action","params":{"workspace_id":"workspace:abc","action":"set-description","description":"Ship checklist"}}"#,
+            concat!(
+                r#"{"id":2,"method":"workspace.action","params":{"workspace_id":"workspace:abc","#,
+                r#""action":"set-description","description":"Ship checklist"}}"#
+            ),
             &|command| match command {
                 ControlCommand::WorkspaceAction { action, reply, .. } => {
                     assert_eq!(
@@ -6269,6 +6455,60 @@ mod tests {
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn workspace_reorder_routes_parse_cmux_params() {
+        let single = dispatch_request(
+            r#"{"id":1,"method":"workspace.reorder","params":{"workspace_id":"workspace:2","after_workspace_id":"workspace:1","dry_run":true}}"#,
+            &|command| match command {
+                ControlCommand::ReorderWorkspace {
+                    target,
+                    reorder_target,
+                    dry_run,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Handle("workspace:2".to_string()));
+                    assert_eq!(
+                        reorder_target,
+                        WorkspaceReorderTarget::After("workspace:1".to_string())
+                    );
+                    assert!(dry_run);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(single.error, None);
+
+        let many = dispatch_request(
+            r#"{"id":2,"method":"workspace.reorder_many","params":{"workspace_ids":["workspace:3","workspace:1"],"dry_run":true}}"#,
+            &|command| match command {
+                ControlCommand::ReorderWorkspaces {
+                    workspace_ids,
+                    dry_run,
+                    reply,
+                } => {
+                    assert_eq!(
+                        workspace_ids,
+                        vec!["workspace:3".to_string(), "workspace:1".to_string()]
+                    );
+                    assert!(dry_run);
+                    let _ = reply.send(Ok(json!({ "ok": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(many.error, None);
+
+        let duplicate = dispatch_request(
+            r#"{"id":3,"method":"workspace.reorder_many","params":{"order":"workspace:1,workspace:1"}}"#,
+            &|command| panic!("duplicate reorder_many dispatched: {command:?}"),
+        );
+        assert_eq!(
+            duplicate.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)
         );
     }

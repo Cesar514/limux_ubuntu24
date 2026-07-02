@@ -5555,6 +5555,18 @@ fn parse_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+// purpose: Parse a non-negative integer CLI option used by CMUX reorder commands.
+// inputs: Raw command args and option name.
+// returns/effects: Returns parsed index or a loud validation error.
+fn parse_optional_index_arg(args: &[String], name: &str) -> Result<Option<usize>> {
+    let Some(raw) = parse_opt(args, name) else {
+        return Ok(None);
+    };
+    raw.parse::<usize>()
+        .map(Some)
+        .map_err(|_| anyhow!("{name} must be a non-negative integer"))
+}
+
 // purpose: Parse CMUX boolean option values.
 // inputs: Raw value from an option such as --focus.
 // returns/effects: Returns a boolean for CMUX aliases or None for invalid text.
@@ -14293,6 +14305,108 @@ async fn run_workspace_action(client: &mut Client, args: &[String]) -> Result<Va
         .await
 }
 
+// purpose: Build CMUX reorder-workspace socket params.
+// inputs: `reorder-workspace` args including workspace target and one placement target.
+// returns/effects: Returns strict `workspace.reorder` params or a parser error.
+fn build_reorder_workspace_params(args: &[String]) -> Result<Value> {
+    let workspace = parse_opt(args, "--workspace")
+        .or_else(|| first_positional(args))
+        .ok_or_else(|| anyhow!("reorder-workspace requires --workspace <id|ref|index>"))?;
+    let index = parse_optional_index_arg(args, "--index")?;
+    let before = parse_opt(args, "--before").or_else(|| parse_opt(args, "--before-workspace"));
+    let after = parse_opt(args, "--after").or_else(|| parse_opt(args, "--after-workspace"));
+    let target_count =
+        usize::from(index.is_some()) + usize::from(before.is_some()) + usize::from(after.is_some());
+    if target_count != 1 {
+        bail!("reorder-workspace requires exactly one target: --index, --before, or --after");
+    }
+
+    let mut params = Map::new();
+    params.insert("workspace_id".to_string(), Value::String(workspace));
+    if let Some(index) = index {
+        params.insert("index".to_string(), json!(index));
+    }
+    if let Some(before) = before {
+        params.insert("before_workspace_id".to_string(), Value::String(before));
+    }
+    if let Some(after) = after {
+        params.insert("after_workspace_id".to_string(), Value::String(after));
+    }
+    if let Some(window) = parse_opt(args, "--window") {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    if parse_flag(args, "--dry-run") {
+        params.insert("dry_run".to_string(), Value::Bool(true));
+    }
+    Ok(Value::Object(params))
+}
+
+// purpose: Build CMUX reorder-workspaces batch socket params.
+// inputs: `reorder-workspaces --order a,b,c` args.
+// returns/effects: Rejects missing, empty, or malformed order lists loudly.
+fn build_reorder_workspaces_params(args: &[String]) -> Result<Value> {
+    let order = parse_opt(args, "--order").ok_or_else(|| {
+        anyhow!("reorder-workspaces requires --order <id|ref|index>,<id|ref|index>,...")
+    })?;
+    let workspace_ids = order
+        .split(',')
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                bail!("reorder-workspaces --order cannot contain empty workspace refs");
+            }
+            Ok(Value::String(value.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if workspace_ids.is_empty() {
+        bail!("reorder-workspaces requires at least one workspace in --order");
+    }
+
+    let mut params = Map::new();
+    params.insert("workspace_ids".to_string(), Value::Array(workspace_ids));
+    if let Some(window) = parse_opt(args, "--window") {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    if parse_flag(args, "--dry-run") {
+        params.insert("dry_run".to_string(), Value::Bool(true));
+    }
+    Ok(Value::Object(params))
+}
+
+async fn run_reorder_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_flag(args, "--help") {
+        return Ok(json!({
+            "help": concat!(
+                "Usage: limux reorder-workspace ",
+                "[--workspace <id|ref|index> | <id|ref|index>] ",
+                "(--index <n> | --before <id|ref|index> | --after <id|ref|index>) ",
+                "[--window <id|ref|index>] [--dry-run]"
+            )
+        }));
+    }
+    client
+        .call("workspace.reorder", build_reorder_workspace_params(args)?)
+        .await
+}
+
+async fn run_reorder_workspaces(client: &mut Client, args: &[String]) -> Result<Value> {
+    if parse_flag(args, "--help") {
+        return Ok(json!({
+            "help": concat!(
+                "Usage: limux reorder-workspaces ",
+                "--order <id|ref|index>,<id|ref|index>,... ",
+                "[--window <id|ref|index>] [--dry-run]"
+            )
+        }));
+    }
+    client
+        .call(
+            "workspace.reorder_many",
+            build_reorder_workspaces_params(args)?,
+        )
+        .await
+}
+
 async fn run_rename_tab(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
@@ -17479,6 +17593,26 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(help)
             } else {
                 CommandOutput::Text("OK".to_string())
+            }
+        }
+        "reorder-workspace" => {
+            let payload = run_reorder_workspace(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if let Some(help) = get_string(&payload, &["help"]) {
+                CommandOutput::Text(help)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "reorder-workspaces" => {
+            let payload = run_reorder_workspaces(client, args).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if let Some(help) = get_string(&payload, &["help"]) {
+                CommandOutput::Text(help)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
             }
         }
         "move-tab-to-new-workspace" | "detach-tab" => {
@@ -20688,6 +20822,67 @@ mod cli_arg_tests {
             .expect_err("missing title rejected")
             .to_string()
             .contains("rename requires"));
+    }
+
+    #[test]
+    fn cmux_reorder_workspace_commands_build_params() {
+        let single = build_reorder_workspace_params(&args(&[
+            "--workspace",
+            "workspace:2",
+            "--after",
+            "workspace:1",
+            "--window",
+            "window:1",
+            "--dry-run",
+        ]))
+        .expect("single reorder parses");
+        assert_eq!(
+            single,
+            json!({
+                "workspace_id": "workspace:2",
+                "after_workspace_id": "workspace:1",
+                "window_id": "window:1",
+                "dry_run": true,
+            })
+        );
+
+        let positional = build_reorder_workspace_params(&args(&["workspace:3", "--index", "0"]))
+            .expect("positional workspace parses");
+        assert_eq!(positional["workspace_id"], "workspace:3");
+        assert_eq!(positional["index"], 0);
+
+        let conflicting = build_reorder_workspace_params(&args(&[
+            "workspace:3",
+            "--index",
+            "0",
+            "--after",
+            "workspace:1",
+        ]));
+        assert!(conflicting
+            .expect_err("conflicting targets rejected")
+            .to_string()
+            .contains("exactly one target"));
+
+        let many = build_reorder_workspaces_params(&args(&[
+            "--order",
+            "workspace:3,workspace:1",
+            "--dry-run",
+        ]))
+        .expect("batch reorder parses");
+        assert_eq!(
+            many,
+            json!({
+                "workspace_ids": ["workspace:3", "workspace:1"],
+                "dry_run": true,
+            })
+        );
+
+        let empty =
+            build_reorder_workspaces_params(&args(&["--order", "workspace:1,,workspace:2"]));
+        assert!(empty
+            .expect_err("empty refs rejected")
+            .to_string()
+            .contains("empty workspace refs"));
     }
 
     #[test]
