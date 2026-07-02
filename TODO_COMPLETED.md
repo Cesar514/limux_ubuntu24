@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T08:55:16Z Implement and verify CMUX-compatible Codex wrapper-owned session-start emission for hand-typed `codex` in Limux terminals, including `LIMUX_CLI`/`CMUX_CLI` terminal env wiring, wrapper session/pid env metadata, and hook persistence support for wrapper-provided session id and pid values. \
 [x] 2026-07-02T08:42:24Z Implement and verify CMUX-compatible Codex per-surface wrapper shim injection for terminal tabs, including shim directory creation, `PATH` prepending, `CMUX_CODEX_WRAPPER_SHIM`/`LIMUX_CODEX_WRAPPER_SHIM` exports, and Codex launch metadata preservation for real Codex hook events. \
 [x] 2026-07-02T08:35:24Z Implement and verify CMUX-compatible JSONC preprocessing for `config doctor`, including line comments, block comments, trailing commas, top-level object validation after sanitization, and preservation of comment-like text inside strings. \
 [x] 2026-07-02T08:31:28Z Implement and verify CMUX-compatible `config doctor --path` and project config doctor target parity, including custom target parsing, default project `.cmux/cmux.json`/`cmux.json` inclusion, top-level object validation, key listing, and missing/error statuses. \

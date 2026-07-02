@@ -25,7 +25,8 @@ use webkit6::prelude::*;
 use crate::app_config::AppConfig;
 use crate::keybind_editor;
 use crate::layout_state::{
-    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+    limux_cli_executable, PaneState, RestorableAgentState, TabContentState,
+    TabState as SavedTabState,
 };
 use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -72,6 +73,23 @@ export LIMUX_AGENT_LAUNCH_ARGV="codex $*"
 export CMUX_AGENT_LAUNCH_ARGV="codex $*"
 export LIMUX_AGENT_LAUNCH_CWD="$(pwd -P)"
 export CMUX_AGENT_LAUNCH_CWD="$LIMUX_AGENT_LAUNCH_CWD"
+surface="${LIMUX_SURFACE_ID:-${CMUX_SURFACE_ID:-}}"
+workspace="${LIMUX_WORKSPACE_ID:-${CMUX_WORKSPACE_ID:-}}"
+socket="${LIMUX_SOCKET:-${CMUX_SOCKET_PATH:-${CMUX_SOCKET:-}}}"
+if [ -n "$socket" ] && [ -n "$surface" ]
+then
+  export LIMUX_AGENT_SESSION_ID="codex-wrapper-${surface}-$$"
+  export CMUX_AGENT_SESSION_ID="$LIMUX_AGENT_SESSION_ID"
+  export LIMUX_AGENT_PID="$$"
+  export CMUX_AGENT_PID="$LIMUX_AGENT_PID"
+  limux_cli="${LIMUX_CLI:-${CMUX_CLI:-limux}}"
+  if [ -n "$workspace" ]
+  then
+    printf '{}\n' | "$limux_cli" --json hooks codex session-start --workspace "$workspace" --surface "$surface" >/dev/null 2>&1 || true
+  else
+    printf '{}\n' | "$limux_cli" --json hooks codex session-start --surface "$surface" >/dev/null 2>&1 || true
+  fi
+fi
 exec "$real_codex" "$@"
 "#;
 
@@ -121,6 +139,9 @@ fn install_codex_wrapper_env(surface_id: &str, extra_env: &mut Vec<(String, Stri
     extra_env.push(("LIMUX_CODEX_WRAPPER_SHIM".to_string(), shim));
     extra_env.push(("CMUX_CODEX_WRAPPER_SHIM_ROOT".to_string(), root.clone()));
     extra_env.push(("LIMUX_CODEX_WRAPPER_SHIM_ROOT".to_string(), root));
+    let cli = limux_cli_executable();
+    extra_env.push(("CMUX_CLI".to_string(), cli.clone()));
+    extra_env.push(("LIMUX_CLI".to_string(), cli));
 }
 
 // purpose: Resolve the shim directory for one terminal surface.
@@ -5199,6 +5220,30 @@ printf 'arg1=%s\n' "$1"
 "#,
         )
         .expect("write fake codex");
+        let cli_dir = tempfile::tempdir().expect("fake limux cli dir");
+        let hook_log = cli_dir.path().join("hook.log");
+        let fake_limux = cli_dir.path().join("limux");
+        write_executable_file(
+            &fake_limux,
+            &format!(
+                r#"#!/bin/sh
+set -eu
+while IFS= read -r _line
+do
+  :
+done
+{{
+  printf 'args=%s\n' "$*"
+  printf 'session=%s\n' "${{LIMUX_AGENT_SESSION_ID:-}}"
+  printf 'pid=%s\n' "${{LIMUX_AGENT_PID:-}}"
+  printf 'surface=%s\n' "${{LIMUX_SURFACE_ID:-}}"
+  printf 'workspace=%s\n' "${{LIMUX_WORKSPACE_ID:-}}"
+}} >> {}
+"#,
+                hook_log.display()
+            ),
+        )
+        .expect("write fake limux cli");
 
         let shim = root.join("codex");
         let path = format!("{}:{}", root.display(), real_dir.path().display());
@@ -5206,15 +5251,32 @@ printf 'arg1=%s\n' "$1"
             .arg("run")
             .env("PATH", path)
             .env("CMUX_CODEX_WRAPPER_SHIM_ROOT", root.as_os_str())
+            .env("LIMUX_CLI", fake_limux.as_os_str())
+            .env("LIMUX_SOCKET", "/tmp/limux-test.sock")
+            .env("LIMUX_SURFACE_ID", "10:tab-a")
+            .env("LIMUX_WORKSPACE_ID", "workspace-a")
             .output()
             .expect("execute wrapper");
 
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8(output.stdout).expect("wrapper stdout utf8");
         assert!(stdout.contains("exe=codex"));
         assert!(stdout.contains("argv=codex run"));
         assert!(stdout.contains("arg1=run"));
         assert!(stdout.contains("cwd="));
+        let hook = fs::read_to_string(hook_log).expect("read hook log");
+        assert!(hook.contains(
+            "args=--json hooks codex session-start --workspace workspace-a --surface 10:tab-a"
+        ));
+        assert!(hook.contains("session=codex-wrapper-10:tab-a-"));
+        assert!(hook.contains("pid="));
+        assert!(hook.contains("surface=10:tab-a"));
+        assert!(hook.contains("workspace=workspace-a"));
     }
 
     fn env_value(env: &[(String, String)], key: &str) -> String {

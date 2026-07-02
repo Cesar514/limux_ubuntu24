@@ -893,7 +893,7 @@ fn wrap_restored_agent_command(
     format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
 }
 
-fn limux_cli_executable() -> String {
+pub(crate) fn limux_cli_executable() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|path| {

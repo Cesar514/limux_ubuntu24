@@ -4663,10 +4663,8 @@ fn persist_agent_hook_session(
     let cwd = hook_str(payload, &["cwd", "working_directory", "directory"])
         .map(str::to_string)
         .or_else(|| existing.as_ref().and_then(|record| record.cwd.clone()));
-    let pid = hook_str(payload, &["pid"])
-        .and_then(|value| value.parse::<u32>().ok())
-        .or_else(|| agent_ancestor_pid(agent))
-        .or_else(|| existing.as_ref().and_then(|record| record.pid));
+    let pid =
+        hook_agent_pid(payload, agent).or_else(|| existing.as_ref().and_then(|record| record.pid));
     let launch_command = agent_hooks::launch_record_from_env(agent, cwd.as_deref()).or_else(|| {
         existing
             .as_ref()
@@ -4702,7 +4700,17 @@ fn hook_session_id(payload: &Value) -> Option<String> {
         .or_else(|| limux_env_value("CLAUDE_CODE_SESSION_ID"))
         .or_else(|| limux_env_value("CLAUDE_SESSION_ID"))
         .or_else(|| hook_session_id_from_transcript(payload))
+        .or_else(|| limux_env_value("LIMUX_AGENT_SESSION_ID"))
+        .or_else(|| limux_env_value("CMUX_AGENT_SESSION_ID"))
         .filter(|value| !value.trim().is_empty())
+}
+
+fn hook_agent_pid(payload: &Value, agent: agent_hooks::AgentKind) -> Option<u32> {
+    hook_str(payload, &["pid"])
+        .and_then(|value| value.parse::<u32>().ok())
+        .or_else(|| limux_env_value("LIMUX_AGENT_PID").and_then(|value| value.parse().ok()))
+        .or_else(|| limux_env_value("CMUX_AGENT_PID").and_then(|value| value.parse().ok()))
+        .or_else(|| agent_ancestor_pid(agent))
 }
 
 fn hook_session_id_from_transcript(payload: &Value) -> Option<String> {
@@ -13771,6 +13779,26 @@ eventHooks:\n  events:\n    # cmux hooks rovodev begin\nsessions:\n  persistence
         assert_eq!(
             hook_session_id(&payload).as_deref(),
             Some("explicit-session")
+        );
+    }
+
+    #[test]
+    fn hook_session_id_accepts_wrapper_env_session_id() {
+        let _guard = EnvGuard::set("LIMUX_AGENT_SESSION_ID", "codex-wrapper-surface-123");
+
+        assert_eq!(
+            hook_session_id(&json!({})).as_deref(),
+            Some("codex-wrapper-surface-123")
+        );
+    }
+
+    #[test]
+    fn hook_agent_pid_accepts_wrapper_env_pid() {
+        let _guard = EnvGuard::set("LIMUX_AGENT_PID", "4242");
+
+        assert_eq!(
+            hook_agent_pid(&json!({}), agent_hooks::AgentKind::Codex),
+            Some(4242)
         );
     }
 }
