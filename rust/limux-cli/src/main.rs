@@ -356,7 +356,8 @@ fn full_help_text() -> &'static str {
         "  surface-health [--workspace <id|ref>]\n",
         "  send [--workspace <id|ref>] [--surface <id|ref>] <text>\n",
         "  send-key [--workspace <id|ref>] [--surface <id|ref>] <key>\n",
-        "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--focus <true|false>]\n",
+        "  new-workspace [--name <title>] [--cwd <path>] [--command <text>] [--layout <json>]\n",
+        "      [--focus <true|false>]\n",
         "      [--env KEY=VALUE] [--env-file <path>]\n",
         "  workspace env [<workspace>] [--workspace <id|ref|name>] [--mask]\n",
         "  select-workspace --workspace <id|ref>\n",
@@ -7127,8 +7128,24 @@ fn build_new_workspace_params(args: &[String]) -> Result<Map<String, Value>> {
     if let Some(cwd_value) = parse_opt(args, "--cwd") {
         params.insert("cwd".to_string(), Value::String(cwd_value.clone()));
     }
-    if let Some(command) = parse_opt(args, "--command") {
+    let layout = parse_opt(args, "--layout")
+        .map(|raw| {
+            serde_json::from_str::<Value>(&raw)
+                .with_context(|| "--layout value must be a valid JSON object".to_string())
+                .and_then(|value| {
+                    if value.is_object() {
+                        Ok(value)
+                    } else {
+                        bail!("--layout value must be a valid JSON object");
+                    }
+                })
+        })
+        .transpose()?;
+    if let Some(command) = parse_opt(args, "--command").filter(|_| layout.is_none()) {
         params.insert("command".to_string(), Value::String(command));
+    }
+    if let Some(layout) = layout {
+        params.insert("layout".to_string(), layout);
     }
     if let Some(focus) = parse_optional_bool_arg(args, "--focus")? {
         params.insert("focus".to_string(), Value::Bool(focus));
@@ -11399,6 +11416,33 @@ mod cli_arg_tests {
             build_new_workspace_params(&args(&["--focus", "maybe"])).expect_err("focus error");
 
         assert!(err.to_string().contains("--focus must be one of"));
+    }
+
+    #[test]
+    fn new_workspace_params_include_layout_and_skip_top_level_command() {
+        let params = build_new_workspace_params(&args(&[
+            "--layout",
+            r#"{"pane":{"surfaces":[{"type":"terminal","command":"echo hi"}]}}"#,
+            "--command",
+            "ignored",
+        ]))
+        .expect("workspace params");
+
+        assert!(params.get("command").is_none());
+        assert_eq!(
+            params["layout"]["pane"]["surfaces"][0]["command"],
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn new_workspace_params_reject_invalid_layout() {
+        let err =
+            build_new_workspace_params(&args(&["--layout", "[1,2]"])).expect_err("layout error");
+
+        assert!(err
+            .to_string()
+            .contains("--layout value must be a valid JSON object"));
     }
 
     #[test]

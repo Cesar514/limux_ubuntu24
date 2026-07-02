@@ -9768,6 +9768,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             cwd,
             command,
             focus,
+            layout,
             environment,
             reply,
         } => {
@@ -9783,6 +9784,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                     .unwrap_or_else(|| "workspace".to_string())
             });
 
+            let has_layout = layout.is_some();
             let workspace = WorkspaceState {
                 id: None,
                 name: title,
@@ -9791,7 +9793,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 folder_path: Some(folder_path.to_string()),
                 group_id: None,
                 environment,
-                layout: LayoutNodeState::Pane(PaneState::fallback(Some(folder_path))),
+                layout: layout.unwrap_or_else(|| {
+                    LayoutNodeState::Pane(PaneState::fallback(Some(folder_path)))
+                }),
             };
             add_workspace_from_state_internal(state, &workspace, focus);
             request_session_save(state);
@@ -9801,7 +9805,8 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 workspace_payload(&app_state, app_state.workspaces.len() - 1)
             };
 
-            if let (Some(command), Some(workspace_id)) = (
+            if let (false, Some(command), Some(workspace_id)) = (
+                has_layout,
                 command,
                 result
                     .as_ref()

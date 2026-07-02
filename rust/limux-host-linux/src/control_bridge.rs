@@ -19,6 +19,10 @@ use limux_control::socket_path::{bind_listener, resolve_socket_path, SocketMode}
 use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
+use crate::layout_state::{
+    LayoutNodeState, PaneState, SplitOrientation, SplitState, TabContentState, TabState,
+};
+
 const METHODS: &[&str] = &[
     "system.ping",
     "system.identify",
@@ -764,6 +768,7 @@ pub enum ControlCommand {
         cwd: Option<String>,
         command: Option<String>,
         focus: bool,
+        layout: Option<LayoutNodeState>,
         environment: BTreeMap<String, String>,
         reply: mpsc::Sender<BridgeResult>,
     },
@@ -1396,6 +1401,200 @@ fn optional_bool(params: &Map<String, Value>, key: &str) -> Result<Option<bool>,
         .as_bool()
         .map(Some)
         .ok_or_else(|| BridgeError::invalid_params(format!("{key} must be a boolean")))
+}
+
+// purpose: Parse optional CMUX workspace layout JSON into Limux layout state.
+// inputs: Request params and the workspace cwd used by terminal surface defaults.
+// returns/effects: Returns None when absent or rejects malformed layout objects.
+fn optional_workspace_layout(
+    params: &Map<String, Value>,
+    cwd: Option<&str>,
+) -> Result<Option<LayoutNodeState>, BridgeError> {
+    let Some(layout) = params.get("layout") else {
+        return Ok(None);
+    };
+    if !layout.is_object() {
+        return Err(BridgeError::invalid_params("layout must be a JSON object"));
+    }
+    cmux_layout_node(layout, cwd, &mut 0).map(Some)
+}
+
+// purpose: Translate one CMUX layout node or native Limux layout node.
+// inputs: Layout JSON, workspace cwd, and a counter for deterministic tab ids.
+// returns/effects: Returns Limux layout state or a precise invalid-params error.
+fn cmux_layout_node(
+    value: &Value,
+    cwd: Option<&str>,
+    next_tab: &mut usize,
+) -> Result<LayoutNodeState, BridgeError> {
+    if let Some(pane) = value.get("pane") {
+        return cmux_pane_layout(pane, cwd, next_tab);
+    }
+    if value.get("children").is_some() || value.get("direction").is_some() {
+        return cmux_split_layout(value, cwd, next_tab);
+    }
+    serde_json::from_value::<LayoutNodeState>(value.clone())
+        .map_err(|_| BridgeError::invalid_params("layout must be a CMUX or Limux layout object"))
+}
+
+// purpose: Translate a CMUX split layout node with exactly two children.
+// inputs: CMUX split object, workspace cwd, and tab id counter.
+// returns/effects: Preserves direction and split ratio in Limux layout state.
+fn cmux_split_layout(
+    value: &Value,
+    cwd: Option<&str>,
+    next_tab: &mut usize,
+) -> Result<LayoutNodeState, BridgeError> {
+    let direction = required_string(value, "direction", "layout.direction")?;
+    let orientation = match direction {
+        "horizontal" => SplitOrientation::Horizontal,
+        "vertical" => SplitOrientation::Vertical,
+        _ => {
+            return Err(BridgeError::invalid_params(
+                "layout.direction must be horizontal or vertical",
+            ));
+        }
+    };
+    let children = value
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BridgeError::invalid_params("layout.children must be an array"))?;
+    if children.len() != 2 {
+        return Err(BridgeError::invalid_params(
+            "layout.children must contain exactly two nodes",
+        ));
+    }
+    Ok(LayoutNodeState::Split(SplitState {
+        orientation,
+        ratio: value.get("split").and_then(Value::as_f64).unwrap_or(0.5),
+        start: Box::new(cmux_layout_node(&children[0], cwd, next_tab)?),
+        end: Box::new(cmux_layout_node(&children[1], cwd, next_tab)?),
+    }))
+}
+
+// purpose: Translate a CMUX pane layout node into terminal or browser tabs.
+// inputs: CMUX pane object, workspace cwd, and tab id counter.
+// returns/effects: Produces at least one tab and marks the first tab active.
+fn cmux_pane_layout(
+    value: &Value,
+    cwd: Option<&str>,
+    next_tab: &mut usize,
+) -> Result<LayoutNodeState, BridgeError> {
+    let surfaces = value
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BridgeError::invalid_params("layout pane.surfaces must be an array"))?;
+    let mut tabs = Vec::new();
+    for surface in surfaces {
+        tabs.push(cmux_surface_tab(surface, cwd, next_tab)?);
+    }
+    if tabs.is_empty() {
+        tabs.push(cmux_terminal_tab(cwd, None, None, next_tab));
+    }
+    Ok(LayoutNodeState::Pane(PaneState {
+        pane_id: None,
+        active_tab_id: tabs.first().map(|tab| tab.id.clone()),
+        tabs,
+    }))
+}
+
+// purpose: Translate one CMUX surface object into a Limux tab.
+// inputs: Surface object, workspace cwd, and tab id counter.
+// returns/effects: Supports terminal and browser surface types.
+fn cmux_surface_tab(
+    value: &Value,
+    cwd: Option<&str>,
+    next_tab: &mut usize,
+) -> Result<TabState, BridgeError> {
+    let surface_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("terminal");
+    match surface_type {
+        "terminal" => Ok(cmux_terminal_tab(
+            value.get("cwd").and_then(Value::as_str).or(cwd),
+            value.get("command").and_then(Value::as_str),
+            optional_tab_title(value),
+            next_tab,
+        )),
+        "browser" => Ok(cmux_browser_tab(
+            value
+                .get("url")
+                .or_else(|| value.get("uri"))
+                .and_then(Value::as_str),
+            optional_tab_title(value),
+            next_tab,
+        )),
+        _ => Err(BridgeError::invalid_params(
+            "layout surface type must be terminal or browser",
+        )),
+    }
+}
+
+// purpose: Build a terminal tab for translated CMUX layout surfaces.
+// inputs: Optional cwd, startup command, tab title, and tab id counter.
+// returns/effects: Stores startup_command for one-time terminal launch.
+fn cmux_terminal_tab(
+    cwd: Option<&str>,
+    startup_command: Option<&str>,
+    title: Option<&str>,
+    next_tab: &mut usize,
+) -> TabState {
+    let id = next_layout_tab_id("terminal", next_tab);
+    TabState {
+        id,
+        custom_name: title.map(ToOwned::to_owned),
+        pinned: false,
+        content: TabContentState::Terminal {
+            cwd: cwd.map(ToOwned::to_owned),
+            startup_command: startup_command.map(ToOwned::to_owned),
+            agent: None,
+        },
+    }
+}
+
+// purpose: Build a browser tab for translated CMUX layout surfaces.
+// inputs: Optional URI, tab title, and tab id counter.
+// returns/effects: Returns a browser tab state for workspace creation.
+fn cmux_browser_tab(uri: Option<&str>, title: Option<&str>, next_tab: &mut usize) -> TabState {
+    let id = next_layout_tab_id("browser", next_tab);
+    TabState {
+        id,
+        custom_name: title.map(ToOwned::to_owned),
+        pinned: false,
+        content: TabContentState::Browser {
+            uri: uri.map(ToOwned::to_owned),
+        },
+    }
+}
+
+// purpose: Read a required string field from a JSON object.
+// inputs: JSON object, field key, and display label.
+// returns/effects: Returns the string or an invalid-params error.
+fn required_string<'a>(value: &'a Value, key: &str, label: &str) -> Result<&'a str, BridgeError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::invalid_params(format!("{label} must be a string")))
+}
+
+// purpose: Read CMUX tab title aliases from a layout surface.
+// inputs: Surface JSON object.
+// returns/effects: Returns title/name when present without mutating input.
+fn optional_tab_title(value: &Value) -> Option<&str> {
+    value
+        .get("title")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+}
+
+// purpose: Allocate deterministic tab ids while translating a layout.
+// inputs: Tab kind prefix and mutable counter.
+// returns/effects: Increments the counter and returns a tab id.
+fn next_layout_tab_id(prefix: &str, next_tab: &mut usize) -> String {
+    let id = format!("{prefix}-layout-{next_tab}");
+    *next_tab += 1;
+    id
 }
 
 const SETTINGS_TARGETS: &[&str] = &[
@@ -3325,13 +3524,19 @@ fn handle_method(
                 Ok(focus) => focus.unwrap_or(false),
                 Err(error) => return error_response(id, error),
             };
+            let cwd = optional_string(params, &["cwd"]);
+            let layout = match optional_workspace_layout(params, cwd.as_deref()) {
+                Ok(layout) => layout,
+                Err(error) => return error_response(id, error),
+            };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreateWorkspace {
                     name: optional_string(params, &["name", "title"]),
-                    cwd: optional_string(params, &["cwd"]),
+                    cwd,
                     command: optional_string(params, &["command"]),
                     focus,
+                    layout,
                     environment,
                     reply,
                 },
@@ -4769,6 +4974,74 @@ mod tests {
             r#"{"id":2,"method":"workspace.create","params":{"focus":"yes"}}"#,
             &|command| panic!("invalid focus should not dispatch: {command:?}"),
         );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn workspace_create_route_translates_cmux_layout() {
+        let request = json!({
+            "id": 1,
+            "method": "workspace.create",
+            "params": {
+                "cwd": "/tmp/project",
+                "layout": {
+                    "direction": "horizontal",
+                    "split": 0.4,
+                    "children": [
+                        { "pane": { "surfaces": [
+                            { "type": "terminal", "command": "echo hi", "title": "Build" }
+                        ] } },
+                        { "pane": { "surfaces": [
+                            { "type": "browser", "url": "https://example.com" }
+                        ] } }
+                    ]
+                }
+            }
+        })
+        .to_string();
+        let created = dispatch_request(&request, &|command| match command {
+            ControlCommand::CreateWorkspace { layout, reply, .. } => {
+                let Some(LayoutNodeState::Split(split)) = layout else {
+                    panic!("expected split layout");
+                };
+                assert_eq!(split.orientation, SplitOrientation::Horizontal);
+                assert_eq!(split.ratio, 0.4);
+                let LayoutNodeState::Pane(left) = split.start.as_ref() else {
+                    panic!("expected left pane");
+                };
+                let LayoutNodeState::Pane(right) = split.end.as_ref() else {
+                    panic!("expected right pane");
+                };
+                match &left.tabs[0].content {
+                    TabContentState::Terminal {
+                        startup_command, ..
+                    } => {
+                        assert_eq!(startup_command.as_deref(), Some("echo hi"));
+                        assert_eq!(left.tabs[0].custom_name.as_deref(), Some("Build"));
+                    }
+                    other => panic!("expected terminal tab: {other:?}"),
+                }
+                assert!(matches!(
+                    &right.tabs[0].content,
+                    TabContentState::Browser { uri } if uri.as_deref() == Some("https://example.com")
+                ));
+                let _ = reply.send(Ok(json!({ "workspace_id": "workspace-a" })));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+        assert_eq!(created.error, None);
+    }
+
+    #[test]
+    fn workspace_create_route_rejects_invalid_layout() {
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"workspace.create","params":{"layout":[]}}"#,
+            &|command| panic!("invalid layout should not dispatch: {command:?}"),
+        );
+
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),
             Some(INVALID_PARAMS_CODE)

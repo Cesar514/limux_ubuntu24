@@ -217,6 +217,8 @@ pub enum TabContentState {
         #[serde(default)]
         cwd: Option<String>,
         #[serde(default)]
+        startup_command: Option<String>,
+        #[serde(default)]
         agent: Option<RestorableAgentState>,
     },
     Browser {
@@ -287,6 +289,7 @@ impl TabState {
             pinned: false,
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
+                startup_command: None,
                 agent: None,
             },
         }
@@ -1533,6 +1536,7 @@ mod tests {
                 pinned: false,
                 content: TabContentState::Terminal {
                     cwd: Some("/tmp/project".to_string()),
+                    startup_command: None,
                     agent: Some(RestorableAgentState {
                         kind: RestorableAgentKind::Codex,
                         session_id: "persisted-session".to_string(),
@@ -1618,6 +1622,7 @@ mod tests {
             pinned: false,
             content: TabContentState::Terminal {
                 cwd: Some("/tmp/project".to_string()),
+                startup_command: None,
                 agent: Some(RestorableAgentState {
                     kind: RestorableAgentKind::Codex,
                     session_id: "sess-123".to_string(),

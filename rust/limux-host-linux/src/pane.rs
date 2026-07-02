@@ -1180,7 +1180,11 @@ fn restore_tabs_from_state(
                     .is_some_and(|first| first.id == saved_tab.id)
             });
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => {
+            TabContentState::Terminal {
+                cwd,
+                startup_command,
+                agent,
+            } => {
                 add_terminal_tab_inner(
                     internals,
                     cwd.as_deref().or(working_directory),
@@ -1190,7 +1194,7 @@ fn restore_tabs_from_state(
                         pinned: saved_tab.pinned,
                         cwd: cwd.as_deref().or(working_directory),
                         agent: agent.clone(),
-                        startup_command: None,
+                        startup_command: startup_command.clone(),
                         activate: restore_active,
                     }),
                 );
@@ -1937,6 +1941,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
+                    startup_command: None,
                     agent: None,
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
