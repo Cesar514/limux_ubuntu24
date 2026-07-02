@@ -1671,6 +1671,34 @@ const SIDEBAR_SHOW_PORTS_SETTING: BooleanSetting = BooleanSetting {
     default: true,
 };
 
+const SIDEBAR_MAKE_PULL_REQUESTS_CLICKABLE_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.makePullRequestsClickable",
+    section: "sidebar",
+    json_key: "makePullRequestsClickable",
+    default: true,
+};
+
+const SIDEBAR_OPEN_PULL_REQUEST_LINKS_IN_CMUX_BROWSER_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.openPullRequestLinksInCmuxBrowser",
+    section: "sidebar",
+    json_key: "openPullRequestLinksInCmuxBrowser",
+    default: true,
+};
+
+const SIDEBAR_OPEN_PORT_LINKS_IN_CMUX_BROWSER_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.openPortLinksInCmuxBrowser",
+    section: "sidebar",
+    json_key: "openPortLinksInCmuxBrowser",
+    default: true,
+};
+
+const SIDEBAR_SHOW_SSH_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.showSSH",
+    section: "sidebar",
+    json_key: "showSSH",
+    default: true,
+};
+
 const SIDEBAR_SHOW_CUSTOM_METADATA_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showCustomMetadata",
     section: "sidebar",
@@ -1722,7 +1750,10 @@ const CONFIG_GET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showPullRequests|",
-    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showCustomMetadata|",
+    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showSSH|",
+    "sidebar.makePullRequestsClickable|",
+    "sidebar.openPullRequestLinksInCmuxBrowser|",
+    "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement>"
 );
@@ -1741,7 +1772,10 @@ const CONFIG_SET_USAGE: &str = concat!(
     "sidebar.wrapWorkspaceTitles|sidebar.showWorkspaceDescription|",
     "sidebar.showNotificationMessage|",
     "sidebar.showBranchDirectory|sidebar.showPullRequests|",
-    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showCustomMetadata|",
+    "sidebar.watchGitStatus|sidebar.showPorts|sidebar.showSSH|",
+    "sidebar.makePullRequestsClickable|",
+    "sidebar.openPullRequestLinksInCmuxBrowser|",
+    "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
@@ -1820,6 +1854,14 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showPullRequests" => Some(SIDEBAR_SHOW_PULL_REQUESTS_SETTING),
         "sidebar.watchGitStatus" => Some(SIDEBAR_WATCH_GIT_STATUS_SETTING),
         "sidebar.showPorts" => Some(SIDEBAR_SHOW_PORTS_SETTING),
+        "sidebar.makePullRequestsClickable" => Some(SIDEBAR_MAKE_PULL_REQUESTS_CLICKABLE_SETTING),
+        "sidebar.openPullRequestLinksInCmuxBrowser" => {
+            Some(SIDEBAR_OPEN_PULL_REQUEST_LINKS_IN_CMUX_BROWSER_SETTING)
+        }
+        "sidebar.openPortLinksInCmuxBrowser" => {
+            Some(SIDEBAR_OPEN_PORT_LINKS_IN_CMUX_BROWSER_SETTING)
+        }
+        "sidebar.showSSH" => Some(SIDEBAR_SHOW_SSH_SETTING),
         "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
         "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
         "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
@@ -16319,6 +16361,22 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_PORTS_SETTING)
             .expect("get default sidebar ports");
         assert!(text.contains("sidebar.showPorts = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_SHOW_SSH_SETTING)
+            .expect("get default sidebar ssh");
+        assert!(text.contains("sidebar.showSSH = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_MAKE_PULL_REQUESTS_CLICKABLE_SETTING)
+            .expect("get default sidebar clickable pull requests");
+        assert!(text.contains("sidebar.makePullRequestsClickable = true"));
+        let text = render_config_boolean_get(
+            &path,
+            SIDEBAR_OPEN_PULL_REQUEST_LINKS_IN_CMUX_BROWSER_SETTING,
+        )
+        .expect("get default sidebar pull request browser links");
+        assert!(text.contains("sidebar.openPullRequestLinksInCmuxBrowser = true"));
+        let text =
+            render_config_boolean_get(&path, SIDEBAR_OPEN_PORT_LINKS_IN_CMUX_BROWSER_SETTING)
+                .expect("get default sidebar port browser links");
+        assert!(text.contains("sidebar.openPortLinksInCmuxBrowser = true"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING)
             .expect("get default sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = true"));
@@ -16363,6 +16421,27 @@ mod cli_arg_tests {
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_PORTS_SETTING, "false")
             .expect("set sidebar ports");
         assert!(text.contains("sidebar.showPorts = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_SHOW_SSH_SETTING, "false")
+            .expect("set sidebar ssh");
+        assert!(text.contains("sidebar.showSSH = false"));
+        let text =
+            render_config_boolean_set(&path, SIDEBAR_MAKE_PULL_REQUESTS_CLICKABLE_SETTING, "false")
+                .expect("set sidebar clickable pull requests");
+        assert!(text.contains("sidebar.makePullRequestsClickable = false"));
+        let text = render_config_boolean_set(
+            &path,
+            SIDEBAR_OPEN_PULL_REQUEST_LINKS_IN_CMUX_BROWSER_SETTING,
+            "false",
+        )
+        .expect("set sidebar pull request browser links");
+        assert!(text.contains("sidebar.openPullRequestLinksInCmuxBrowser = false"));
+        let text = render_config_boolean_set(
+            &path,
+            SIDEBAR_OPEN_PORT_LINKS_IN_CMUX_BROWSER_SETTING,
+            "false",
+        )
+        .expect("set sidebar port browser links");
+        assert!(text.contains("sidebar.openPortLinksInCmuxBrowser = false"));
         let text = render_config_boolean_set(&path, SIDEBAR_SHOW_CUSTOM_METADATA_SETTING, "false")
             .expect("set sidebar custom metadata");
         assert!(text.contains("sidebar.showCustomMetadata = false"));
@@ -16387,6 +16466,13 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showPullRequests"], false);
         assert_eq!(parsed["sidebar"]["watchGitStatus"], false);
         assert_eq!(parsed["sidebar"]["showPorts"], false);
+        assert_eq!(parsed["sidebar"]["showSSH"], false);
+        assert_eq!(parsed["sidebar"]["makePullRequestsClickable"], false);
+        assert_eq!(
+            parsed["sidebar"]["openPullRequestLinksInCmuxBrowser"],
+            false
+        );
+        assert_eq!(parsed["sidebar"]["openPortLinksInCmuxBrowser"], false);
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], false);
         assert_eq!(parsed["sidebar"]["showProgress"], false);
         assert_eq!(parsed["sidebar"]["showLog"], false);

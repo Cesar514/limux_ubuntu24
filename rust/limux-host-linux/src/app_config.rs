@@ -133,6 +133,10 @@ pub struct SidebarConfig {
     pub show_pull_requests: bool,
     pub watch_git_status: bool,
     pub show_ports: bool,
+    pub make_pull_requests_clickable: bool,
+    pub open_pull_request_links_in_cmux_browser: bool,
+    pub open_port_links_in_cmux_browser: bool,
+    pub show_ssh: bool,
     pub show_custom_metadata: bool,
     pub show_progress: bool,
     pub show_log: bool,
@@ -150,6 +154,10 @@ impl Default for SidebarConfig {
             show_pull_requests: true,
             watch_git_status: true,
             show_ports: true,
+            make_pull_requests_clickable: true,
+            open_pull_request_links_in_cmux_browser: true,
+            open_port_links_in_cmux_browser: true,
+            show_ssh: true,
             show_custom_metadata: true,
             show_progress: true,
             show_log: true,
@@ -678,6 +686,22 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showPorts"))
         .map(|value| parse_bool_setting(value, "sidebar.showPorts"))
         .unwrap_or(sidebar_defaults.show_ports);
+    let make_pull_requests_clickable = sidebar
+        .and_then(|sidebar| sidebar.get("makePullRequestsClickable"))
+        .map(|value| parse_bool_setting(value, "sidebar.makePullRequestsClickable"))
+        .unwrap_or(sidebar_defaults.make_pull_requests_clickable);
+    let open_pull_request_links_in_cmux_browser = sidebar
+        .and_then(|sidebar| sidebar.get("openPullRequestLinksInCmuxBrowser"))
+        .map(|value| parse_bool_setting(value, "sidebar.openPullRequestLinksInCmuxBrowser"))
+        .unwrap_or(sidebar_defaults.open_pull_request_links_in_cmux_browser);
+    let open_port_links_in_cmux_browser = sidebar
+        .and_then(|sidebar| sidebar.get("openPortLinksInCmuxBrowser"))
+        .map(|value| parse_bool_setting(value, "sidebar.openPortLinksInCmuxBrowser"))
+        .unwrap_or(sidebar_defaults.open_port_links_in_cmux_browser);
+    let show_ssh = sidebar
+        .and_then(|sidebar| sidebar.get("showSSH"))
+        .map(|value| parse_bool_setting(value, "sidebar.showSSH"))
+        .unwrap_or(sidebar_defaults.show_ssh);
     let show_custom_metadata = sidebar
         .and_then(|sidebar| sidebar.get("showCustomMetadata"))
         .map(|value| parse_bool_setting(value, "sidebar.showCustomMetadata"))
@@ -788,6 +812,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_pull_requests,
             watch_git_status,
             show_ports,
+            make_pull_requests_clickable,
+            open_pull_request_links_in_cmux_browser,
+            open_port_links_in_cmux_browser,
+            show_ssh,
             show_custom_metadata,
             show_progress,
             show_log,
@@ -1239,6 +1267,19 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         ),
         ("showPorts".to_string(), json!(config.sidebar.show_ports)),
         (
+            "makePullRequestsClickable".to_string(),
+            json!(config.sidebar.make_pull_requests_clickable),
+        ),
+        (
+            "openPullRequestLinksInCmuxBrowser".to_string(),
+            json!(config.sidebar.open_pull_request_links_in_cmux_browser),
+        ),
+        (
+            "openPortLinksInCmuxBrowser".to_string(),
+            json!(config.sidebar.open_port_links_in_cmux_browser),
+        ),
+        ("showSSH".to_string(), json!(config.sidebar.show_ssh)),
+        (
             "showCustomMetadata".to_string(),
             json!(config.sidebar.show_custom_metadata),
         ),
@@ -1388,6 +1429,10 @@ fn ensure_default_config_file(path: &Path) -> std::io::Result<()> {
             "showPullRequests": true,
             "watchGitStatus": true,
             "showPorts": true,
+            "makePullRequestsClickable": true,
+            "openPullRequestLinksInCmuxBrowser": true,
+            "openPortLinksInCmuxBrowser": true,
+            "showSSH": true,
             "showCustomMetadata": true,
             "showProgress": true,
             "showLog": true
@@ -1918,6 +1963,10 @@ mod tests {
     "showPullRequests": false,
     "watchGitStatus": false,
     "showPorts": false,
+    "makePullRequestsClickable": false,
+    "openPullRequestLinksInCmuxBrowser": false,
+    "openPortLinksInCmuxBrowser": false,
+    "showSSH": false,
     "showCustomMetadata": false,
     "showProgress": false,
     "showLog": false,
@@ -1939,6 +1988,15 @@ mod tests {
         assert!(!loaded.config.sidebar.show_pull_requests);
         assert!(!loaded.config.sidebar.watch_git_status);
         assert!(!loaded.config.sidebar.show_ports);
+        assert!(!loaded.config.sidebar.make_pull_requests_clickable);
+        assert!(
+            !loaded
+                .config
+                .sidebar
+                .open_pull_request_links_in_cmux_browser
+        );
+        assert!(!loaded.config.sidebar.open_port_links_in_cmux_browser);
+        assert!(!loaded.config.sidebar.show_ssh);
         assert!(!loaded.config.sidebar.show_custom_metadata);
         assert!(!loaded.config.sidebar.show_progress);
         assert!(!loaded.config.sidebar.show_log);
@@ -1980,6 +2038,24 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"showPorts":"false"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX sidebar pull-request link settings fail loudly.
+    // inputs: Settings JSON with non-boolean sidebar.makePullRequestsClickable.
+    // returns/effects: Panics instead of accepting a silent fallback.
+    #[test]
+    #[should_panic(expected = "sidebar.makePullRequestsClickable must be a boolean")]
+    fn load_from_path_rejects_invalid_sidebar_pull_request_click_policy() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"sidebar":{"makePullRequestsClickable":"false"}}"#,
+        )
+        .expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -2437,6 +2513,10 @@ mod tests {
         config.sidebar.show_pull_requests = false;
         config.sidebar.watch_git_status = false;
         config.sidebar.show_ports = false;
+        config.sidebar.make_pull_requests_clickable = false;
+        config.sidebar.open_pull_request_links_in_cmux_browser = false;
+        config.sidebar.open_port_links_in_cmux_browser = false;
+        config.sidebar.show_ssh = false;
         config.sidebar.show_custom_metadata = false;
         config.sidebar.show_progress = false;
         config.sidebar.show_log = false;
@@ -2462,6 +2542,19 @@ mod tests {
         assert_eq!(parsed["sidebar"]["showPullRequests"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["watchGitStatus"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showPorts"], Value::Bool(false));
+        assert_eq!(
+            parsed["sidebar"]["makePullRequestsClickable"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["sidebar"]["openPullRequestLinksInCmuxBrowser"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["sidebar"]["openPortLinksInCmuxBrowser"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sidebar"]["showSSH"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));
