@@ -7197,6 +7197,143 @@ fn dispatch_workspace_reorder_drop(source_id: &str, target_id: &str, drop_below:
     })
 }
 
+// purpose: Build CMUX-compatible destructive group-delete confirmation copy.
+// inputs: Group display name and current member count including the anchor.
+// returns/effects: Returns the dialog detail string without mutating state.
+fn workspace_group_delete_confirmation_detail(group_name: &str, member_count: usize) -> String {
+    let other_member_count = member_count.saturating_sub(1);
+    if other_member_count == 0 {
+        format!("Delete the group \u{201C}{group_name}\u{201D} and close its workspace?")
+    } else if other_member_count == 1 {
+        format!("Delete the group \u{201C}{group_name}\u{201D} and close its 2 workspaces?")
+    } else {
+        format!(
+            "Delete the group \u{201C}{group_name}\u{201D} and close its {} workspaces?",
+            other_member_count + 1
+        )
+    }
+}
+
+// purpose: Show the CMUX-style destructive confirmation before deleting a group from the UI.
+// inputs: Shared app state and a group id/ref.
+// returns/effects: Presents an async GTK dialog and deletes only after the user confirms.
+fn confirm_delete_workspace_group_from_ui(state: &State, group_id: &str) {
+    let (window, group_id, detail) = {
+        let s = state.borrow();
+        let Some(group_index) = workspace_group_index(&s, group_id) else {
+            show_runtime_error(
+                state,
+                "Workspace group action failed",
+                "workspace group not found",
+            );
+            return;
+        };
+        let group = &s.workspace_groups[group_index];
+        let member_count = s
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.group_id.as_deref() == Some(group.id.as_str()))
+            .count();
+        (
+            s.window.clone(),
+            group.id.clone(),
+            workspace_group_delete_confirmation_detail(&group.name, member_count),
+        )
+    };
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Delete this group?")
+        .detail(detail)
+        .buttons(["Cancel", "Delete"])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match dialog.choose_future(Some(&window)).await {
+            Ok(1) => {
+                if let Err(error) =
+                    apply_workspace_group_action(&state, WorkspaceGroupAction::Delete { group_id })
+                {
+                    show_runtime_error(
+                        &state,
+                        "Workspace group action failed",
+                        &format!("{error:?}"),
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                show_runtime_error(
+                    &state,
+                    "Workspace group delete confirmation failed",
+                    &error.to_string(),
+                );
+            }
+        }
+    });
+}
+
+// purpose: Show a CMUX-style group header context menu with destructive confirmation.
+// inputs: Shared app state, group id/ref, and header row.
+// returns/effects: Presents a GTK popover and dispatches selected group actions.
+fn show_workspace_group_context_menu(state: &State, group_id: &str, row: &gtk::ListBoxRow) {
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(4);
+    menu_box.set_margin_end(4);
+
+    let new_btn = gtk::Button::with_label("New Workspace in Group");
+    new_btn.add_css_class("flat");
+    let ungroup_btn = gtk::Button::with_label("Ungroup (Keep Workspaces)");
+    ungroup_btn.add_css_class("flat");
+    let delete_btn = gtk::Button::with_label("Delete Group (Close Workspaces)");
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
+
+    menu_box.append(&new_btn);
+    menu_box.append(&ungroup_btn);
+    menu_box.append(&delete_btn);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&menu_box));
+    popover.set_parent(row);
+    popover.set_position(gtk::PositionType::Right);
+
+    {
+        let group_id = group_id.to_string();
+        let pop = popover.clone();
+        new_btn.connect_clicked(move |_| {
+            pop.popdown();
+            dispatch_workspace_group_header_action(workspace_group_header_plus_action(&group_id));
+        });
+    }
+    {
+        let group_id = group_id.to_string();
+        let pop = popover.clone();
+        ungroup_btn.connect_clicked(move |_| {
+            pop.popdown();
+            dispatch_workspace_group_header_action(WorkspaceGroupAction::Ungroup {
+                group_id: group_id.clone(),
+            });
+        });
+    }
+    {
+        let state = state.clone();
+        let group_id = group_id.to_string();
+        let pop = popover.clone();
+        delete_btn.connect_clicked(move |_| {
+            pop.popdown();
+            confirm_delete_workspace_group_from_ui(&state, &group_id);
+        });
+    }
+    popover.connect_closed(move |p| {
+        p.unparent();
+    });
+    popover.popup();
+}
+
 // purpose: Build one CMUX-style workspace-group header row.
 // inputs: Group metadata and number of member workspaces.
 // returns/effects: Returns a GTK ListBoxRow for the sidebar.
@@ -7303,6 +7440,22 @@ fn install_workspace_group_header_drag_drop(row: &gtk::ListBoxRow, group: &Works
     let Some(anchor_workspace_id) = group.anchor_workspace_id.clone() else {
         return;
     };
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    {
+        let group_id = group.id.clone();
+        let row = row.clone();
+        right_click.connect_pressed(move |_, _, _, _| {
+            CONTROL_STATE.with(|slot| {
+                let Some(state) = slot.borrow().clone() else {
+                    panic!("workspace group context menu requires live control state");
+                };
+                show_workspace_group_context_menu(&state, &group_id, &row);
+            });
+        });
+    }
+    row.add_controller(right_click);
+
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     {
@@ -15978,17 +16131,18 @@ mod tests {
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
         workspace_drop_layout_path, workspace_folder_path_from_input,
-        workspace_group_header_plus_action, workspace_group_header_toggle_action,
-        workspace_group_insert_index, workspace_insert_index_for_placement,
-        workspace_lifecycle_payload, workspace_notification_message,
-        workspace_reorder_uses_top_level_rows, workspace_reordered_payload,
-        workspace_sidebar_render_items, workspace_title_from_directory, workspace_top_level_ids,
-        BrowserEvent, Direction, EditableCaptureContext, HostNotification, NeighborScore,
-        NotificationPolicyContext, NotificationPolicyEffects, PaneBounds, PaneCreateDirection,
-        PaneCreateTargetError, PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest,
-        SidebarLogEntry, SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport,
-        SurfaceShellReport, WorkspaceEventSnapshot, WorkspaceOrderRow, WorkspaceSeedSource,
-        WorkspaceSidebarRenderItem, WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
+        workspace_group_delete_confirmation_detail, workspace_group_header_plus_action,
+        workspace_group_header_toggle_action, workspace_group_insert_index,
+        workspace_insert_index_for_placement, workspace_lifecycle_payload,
+        workspace_notification_message, workspace_reorder_uses_top_level_rows,
+        workspace_reordered_payload, workspace_sidebar_render_items,
+        workspace_title_from_directory, workspace_top_level_ids, BrowserEvent, Direction,
+        EditableCaptureContext, HostNotification, NeighborScore, NotificationPolicyContext,
+        NotificationPolicyEffects, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SidebarLogEntry,
+        SidebarProgress, SidebarStatusEntry, SurfacePullRequestReport, SurfaceShellReport,
+        WorkspaceEventSnapshot, WorkspaceOrderRow, WorkspaceSeedSource, WorkspaceSidebarRenderItem,
+        WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
@@ -16378,6 +16532,22 @@ mod tests {
                 "ws-member".to_string(),
                 "ws-tail".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn workspace_group_delete_confirmation_detail_matches_cmux_counts() {
+        assert_eq!(
+            workspace_group_delete_confirmation_detail("Agents", 1),
+            "Delete the group \u{201C}Agents\u{201D} and close its workspace?"
+        );
+        assert_eq!(
+            workspace_group_delete_confirmation_detail("Agents", 2),
+            "Delete the group \u{201C}Agents\u{201D} and close its 2 workspaces?"
+        );
+        assert_eq!(
+            workspace_group_delete_confirmation_detail("Agents", 5),
+            "Delete the group \u{201C}Agents\u{201D} and close its 5 workspaces?"
         );
     }
 
