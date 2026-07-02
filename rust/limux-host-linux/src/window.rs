@@ -222,9 +222,17 @@ struct CustomSidebarDocument {
 struct CustomSidebarNode {
     node_type: String,
     children: Vec<CustomSidebarNode>,
+    spacing: Option<i32>,
+    alignment: Option<String>,
+    padding: Option<i32>,
     text: Option<String>,
     title: Option<String>,
+    font: Option<String>,
+    weight: Option<String>,
+    color: Option<String>,
+    background: Option<String>,
     system_name: Option<String>,
+    size: Option<i32>,
     action: Option<CustomSidebarNodeAction>,
 }
 
@@ -3727,9 +3735,17 @@ fn parse_custom_sidebar_node(
     Ok(CustomSidebarNode {
         node_type: node_type.to_string(),
         children,
+        spacing: optional_json_nonnegative_i32(object, "spacing")?,
+        alignment: optional_json_string(object, "alignment"),
+        padding: optional_json_nonnegative_i32(object, "padding")?,
         text: optional_json_string(object, "text"),
         title: optional_json_string(object, "title"),
+        font: optional_json_string(object, "font"),
+        weight: optional_json_string(object, "weight"),
+        color: optional_json_string(object, "color"),
+        background: optional_json_string(object, "background"),
         system_name: optional_json_string(object, "systemName"),
+        size: optional_json_nonnegative_i32(object, "size")?,
         action: parse_custom_sidebar_action(object.get("action"))?,
     })
 }
@@ -3783,6 +3799,26 @@ fn optional_json_string(
         .get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// purpose: Read an optional non-negative numeric JSON style value.
+/// inputs: JSON object and key.
+/// returns/effects: Returns rounded i32 style units or rejects malformed values.
+fn optional_json_nonnegative_i32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<i32>, String> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("node.{key} must be a finite number"))?;
+    if number < 0.0 || number > f64::from(i32::MAX) {
+        return Err(format!("node.{key} must be between 0 and {}", i32::MAX));
+    }
+    Ok(Some(number.round() as i32))
 }
 
 /// purpose: Convert right-sidebar mode to the visible panel heading.
@@ -3929,10 +3965,14 @@ fn append_custom_sidebar_node(parent: &gtk::Box, node: &CustomSidebarNode) {
     match node.node_type.as_str() {
         "vstack" | "zstack" => append_custom_sidebar_box(parent, node, gtk::Orientation::Vertical),
         "hstack" => append_custom_sidebar_box(parent, node, gtk::Orientation::Horizontal),
-        "text" => append_right_sidebar_row(parent, node.text.as_deref().unwrap_or("")),
-        "image" => append_right_sidebar_row(parent, node.system_name.as_deref().unwrap_or("image")),
+        "text" => append_custom_sidebar_label(parent, node, node.text.as_deref().unwrap_or("")),
+        "image" => append_custom_sidebar_label(
+            parent,
+            node,
+            node.system_name.as_deref().unwrap_or("image"),
+        ),
         "button" => append_custom_sidebar_button(parent, node),
-        "spacer" => append_right_sidebar_muted(parent, ""),
+        "spacer" => append_custom_sidebar_spacer(parent, node),
         "divider" => append_right_sidebar_section(parent, ""),
         _ => append_right_sidebar_muted(parent, "Unsupported custom sidebar node"),
     }
@@ -3946,23 +3986,43 @@ fn append_custom_sidebar_box(
     node: &CustomSidebarNode,
     orientation: gtk::Orientation,
 ) {
+    let spacing = node.spacing.unwrap_or(4);
     let box_widget = gtk::Box::builder()
         .orientation(orientation)
-        .spacing(4)
+        .spacing(spacing)
         .build();
+    apply_custom_sidebar_layout(&box_widget, node);
     for child in &node.children {
         append_custom_sidebar_node(&box_widget, child);
     }
     parent.append(&box_widget);
 }
 
+/// purpose: Append one styled JSON-sidebar label node.
+/// inputs: Parent box, parsed node, and visible text.
+/// returns/effects: Adds a GTK label that honors CMUX JSON static style fields.
+fn append_custom_sidebar_label(parent: &gtk::Box, node: &CustomSidebarNode, text: &str) {
+    let label = gtk::Label::new(None);
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_markup(&custom_sidebar_markup(text, node));
+    apply_custom_sidebar_layout(&label, node);
+    parent.append(&label);
+}
+
 /// purpose: Append one JSON-sidebar button node.
 /// inputs: Parent box and parsed button node.
 /// returns/effects: Adds a button and wires safe local actions.
 fn append_custom_sidebar_button(parent: &gtk::Box, node: &CustomSidebarNode) {
-    let button = gtk::Button::with_label(node.title.as_deref().unwrap_or(""));
+    let label = gtk::Label::new(None);
+    label.set_xalign(0.0);
+    label.set_markup(&custom_sidebar_markup(
+        node.title.as_deref().unwrap_or(""),
+        node,
+    ));
+    let button = gtk::Button::builder().child(&label).build();
     button.add_css_class("flat");
-    button.set_halign(gtk::Align::Start);
+    apply_custom_sidebar_layout(&button, node);
     if let Some(action) = node.action.clone() {
         button.set_tooltip_text(Some(&custom_sidebar_action_tooltip(&action)));
         button.connect_clicked(move |clicked| {
@@ -3970,6 +4030,171 @@ fn append_custom_sidebar_button(parent: &gtk::Box, node: &CustomSidebarNode) {
         });
     }
     parent.append(&button);
+}
+
+/// purpose: Append one JSON-sidebar spacer node.
+/// inputs: Parent box and parsed node with optional size.
+/// returns/effects: Adds a fixed vertical spacer matching CMUX JSON size when provided.
+fn append_custom_sidebar_spacer(parent: &gtk::Box, node: &CustomSidebarNode) {
+    let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spacer.set_size_request(-1, node.size.unwrap_or(0));
+    apply_custom_sidebar_layout(&spacer, node);
+    parent.append(&spacer);
+}
+
+/// purpose: Apply CMUX JSON layout fields to one GTK widget.
+/// inputs: Widget and parsed custom-sidebar node.
+/// returns/effects: Applies alignment and padding as GTK alignment/margins.
+fn apply_custom_sidebar_layout<W: IsA<gtk::Widget>>(widget: &W, node: &CustomSidebarNode) {
+    widget.set_halign(custom_sidebar_halign(node.alignment.as_deref()));
+    widget.set_valign(custom_sidebar_valign(node.alignment.as_deref()));
+    if let Some(padding) = node.padding {
+        widget.set_margin_top(padding);
+        widget.set_margin_bottom(padding);
+        widget.set_margin_start(padding);
+        widget.set_margin_end(padding);
+    }
+}
+
+/// purpose: Resolve CMUX JSON horizontal alignment tokens for GTK.
+/// inputs: Optional alignment token.
+/// returns/effects: Returns GTK alignment, defaulting to center like CMUX.
+fn custom_sidebar_halign(alignment: Option<&str>) -> gtk::Align {
+    match alignment.map(str::to_ascii_lowercase).as_deref() {
+        Some("leading") | Some("left") => gtk::Align::Start,
+        Some("trailing") | Some("right") => gtk::Align::End,
+        _ => gtk::Align::Center,
+    }
+}
+
+/// purpose: Resolve CMUX JSON vertical alignment tokens for GTK.
+/// inputs: Optional alignment token.
+/// returns/effects: Returns GTK alignment, defaulting to center like CMUX.
+fn custom_sidebar_valign(alignment: Option<&str>) -> gtk::Align {
+    match alignment.map(str::to_ascii_lowercase).as_deref() {
+        Some("top") => gtk::Align::Start,
+        Some("bottom") => gtk::Align::End,
+        _ => gtk::Align::Center,
+    }
+}
+
+/// purpose: Build Pango markup for CMUX JSON text style fields.
+/// inputs: Visible text and parsed node style.
+/// returns/effects: Returns escaped markup that applies supported color/font/background fields.
+fn custom_sidebar_markup(text: &str, node: &CustomSidebarNode) -> String {
+    let escaped = glib::markup_escape_text(text);
+    let attrs = custom_sidebar_markup_attrs(node);
+    if attrs.is_empty() {
+        escaped.to_string()
+    } else {
+        format!("<span {}>{escaped}</span>", attrs.join(" "))
+    }
+}
+
+/// purpose: Convert supported CMUX JSON text style fields to Pango span attributes.
+/// inputs: Parsed custom-sidebar node.
+/// returns/effects: Returns safe markup attributes while ignoring CMUX theme-relative colors.
+fn custom_sidebar_markup_attrs(node: &CustomSidebarNode) -> Vec<String> {
+    let mut attrs = Vec::new();
+    if let Some(size) = custom_sidebar_font_size(node.font.as_deref(), node.size) {
+        attrs.push(format!("size=\"{}\"", size.saturating_mul(1024)));
+    }
+    if let Some(weight) = custom_sidebar_pango_weight(node.weight.as_deref(), node.font.as_deref())
+    {
+        attrs.push(format!("weight=\"{weight}\""));
+    }
+    if let Some(color) = custom_sidebar_pango_color(node.color.as_deref()) {
+        attrs.push(format!("foreground=\"{color}\""));
+    }
+    if let Some(background) = custom_sidebar_pango_color(node.background.as_deref()) {
+        attrs.push(format!("background=\"{background}\""));
+    }
+    attrs
+}
+
+/// purpose: Resolve CMUX JSON font tokens and explicit size to Pango point size.
+/// inputs: Optional font token and optional explicit size.
+/// returns/effects: Returns point size matching CMUX RenderStyle values where possible.
+fn custom_sidebar_font_size(font: Option<&str>, size: Option<i32>) -> Option<i32> {
+    if let Some(size) = size {
+        return Some(size);
+    }
+    match font.map(str::to_ascii_lowercase).as_deref() {
+        Some("largetitle") => Some(26),
+        Some("title") => Some(22),
+        Some("title2") => Some(17),
+        Some("title3") => Some(15),
+        Some("headline") | Some("body") => Some(13),
+        Some("subheadline") => Some(11),
+        Some("callout") => Some(12),
+        Some("footnote") | Some("caption") => Some(10),
+        Some("caption2") => Some(9),
+        _ => None,
+    }
+}
+
+/// purpose: Resolve CMUX JSON font-weight tokens to Pango weight values.
+/// inputs: Optional explicit weight and optional font token.
+/// returns/effects: Returns weight values, including CMUX headline semibold default.
+fn custom_sidebar_pango_weight(weight: Option<&str>, font: Option<&str>) -> Option<i32> {
+    let token = weight.or(font.filter(|value| value.eq_ignore_ascii_case("headline")))?;
+    match token.to_ascii_lowercase().as_str() {
+        "ultralight" => Some(200),
+        "thin" => Some(100),
+        "light" => Some(300),
+        "regular" | "normal" => Some(400),
+        "medium" => Some(500),
+        "semibold" | "headline" => Some(600),
+        "bold" => Some(700),
+        "heavy" => Some(800),
+        "black" => Some(900),
+        _ => None,
+    }
+}
+
+/// purpose: Resolve CMUX JSON color tokens to Pango-compatible colors.
+/// inputs: Optional CMUX color token.
+/// returns/effects: Returns named or hex colors; theme-relative tokens remain native GTK colors.
+fn custom_sidebar_pango_color(color: Option<&str>) -> Option<String> {
+    let color = color?.trim();
+    if color.is_empty() {
+        return None;
+    }
+    let lower = color.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "red" => "#ff3b30",
+        "orange" => "#ff9500",
+        "yellow" => "#ffcc00",
+        "green" => "#34c759",
+        "mint" => "#00c7be",
+        "teal" => "#30b0c7",
+        "cyan" => "#32ade6",
+        "blue" | "accent" | "accentcolor" => "#0a84ff",
+        "indigo" => "#5856d6",
+        "purple" => "#af52de",
+        "pink" => "#ff2d55",
+        "brown" => "#a2845e",
+        "gray" | "grey" => "#8e8e93",
+        "white" => "#ffffff",
+        "black" => "#000000",
+        "clear" | "primary" | "secondary" | "tertiary" | "quaternary" => return None,
+        _ => color,
+    };
+    if custom_sidebar_is_hex_color(mapped) {
+        Some(mapped.to_string())
+    } else {
+        None
+    }
+}
+
+/// purpose: Validate CMUX JSON hex color tokens for Pango markup.
+/// inputs: Candidate color token.
+/// returns/effects: Returns true for #RRGGBB or #RRGGBBAA only.
+fn custom_sidebar_is_hex_color(color: &str) -> bool {
+    let Some(hex) = color.strip_prefix('#') else {
+        return false;
+    };
+    matches!(hex.len(), 6 | 8) && hex.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 /// purpose: Describe a custom-sidebar button action for GTK tooltips.
@@ -16712,10 +16937,11 @@ mod tests {
         browser_find_script, browser_required_element_script, browser_scroll_script,
         browser_snapshot_script, browser_styles_script, build_window_css,
         clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
-        custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action,
-        custom_sidebar_report_payload_at, desktop_notification_action_entries,
-        desktop_notification_action_from_signal, desktop_notification_actions,
-        desktop_notification_activation_token_from_signal,
+        custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action, custom_sidebar_font_size,
+        custom_sidebar_is_hex_color, custom_sidebar_markup_attrs, custom_sidebar_pango_color,
+        custom_sidebar_pango_weight, custom_sidebar_report_payload_at,
+        desktop_notification_action_entries, desktop_notification_action_from_signal,
+        desktop_notification_actions, desktop_notification_activation_token_from_signal,
         desktop_notification_closed_id_from_signal, desktop_notification_hints,
         desktop_notification_id_from_response, directional_neighbor_score, favorites_prefix_len,
         feed_exit_plan_action_specs, feed_question_action_specs, font_size_after_delta,
@@ -17268,6 +17494,7 @@ mod tests {
         assert_eq!(selection.document.version, 1);
         assert_eq!(selection.document.root.node_type, "vstack");
         assert_eq!(selection.document.root.children.len(), 2);
+        assert_eq!(selection.document.root.spacing, None);
         let action = selection.document.root.children[1]
             .action
             .as_ref()
@@ -17277,6 +17504,80 @@ mod tests {
             custom_sidebar_action_tooltip(action),
             "cmux dispatcher: workspace.next"
         );
+    }
+
+    #[test]
+    fn custom_sidebar_json_loader_preserves_static_style_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("styled.json"),
+            r##"{
+                "version": 1,
+                "root": {
+                    "type": "vstack",
+                    "spacing": 9,
+                    "alignment": "leading",
+                    "padding": 3,
+                    "children": [
+                        {
+                            "type": "text",
+                            "text": "Styled",
+                            "font": "title3",
+                            "weight": "bold",
+                            "color": "#112233",
+                            "background": "yellow",
+                            "size": 18
+                        },
+                        { "type": "spacer", "size": 12 }
+                    ]
+                }
+            }"##,
+        )
+        .expect("write styled json sidebar");
+
+        let selection =
+            load_custom_sidebar_selection_from_dir(dir.path(), "styled").expect("load styled");
+        let root = &selection.document.root;
+        assert_eq!(root.spacing, Some(9));
+        assert_eq!(root.alignment.as_deref(), Some("leading"));
+        assert_eq!(root.padding, Some(3));
+        let styled = &root.children[0];
+        assert_eq!(styled.font.as_deref(), Some("title3"));
+        assert_eq!(styled.weight.as_deref(), Some("bold"));
+        assert_eq!(styled.color.as_deref(), Some("#112233"));
+        assert_eq!(styled.background.as_deref(), Some("yellow"));
+        assert_eq!(styled.size, Some(18));
+        assert_eq!(
+            custom_sidebar_font_size(styled.font.as_deref(), styled.size),
+            Some(18)
+        );
+        assert_eq!(
+            custom_sidebar_pango_weight(styled.weight.as_deref(), None),
+            Some(700)
+        );
+        assert_eq!(
+            custom_sidebar_pango_color(styled.color.as_deref()).as_deref(),
+            Some("#112233")
+        );
+        assert!(custom_sidebar_markup_attrs(styled).contains(&"size=\"18432\"".to_string()));
+        assert!(custom_sidebar_markup_attrs(styled).contains(&"weight=\"700\"".to_string()));
+        assert!(custom_sidebar_markup_attrs(styled).contains(&"background=\"#ffcc00\"".to_string()));
+        assert_eq!(root.children[1].size, Some(12));
+        assert!(custom_sidebar_is_hex_color("#112233"));
+    }
+
+    #[test]
+    fn custom_sidebar_json_loader_rejects_malformed_style_numbers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("bad-style.json"),
+            r#"{"version":1,"root":{"type":"text","text":"Bad","padding":"wide"}}"#,
+        )
+        .expect("write bad style json sidebar");
+
+        let error = load_custom_sidebar_selection_from_dir(dir.path(), "bad-style")
+            .expect_err("bad style rejected");
+        assert!(format!("{error:?}").contains("node.padding must be a finite number"));
     }
 
     #[test]
