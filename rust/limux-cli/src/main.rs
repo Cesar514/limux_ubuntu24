@@ -10858,6 +10858,7 @@ fn render_sidebar_state_text(payload: &Value) -> String {
         get_string(payload, &["workspace", "workspace_id"]).unwrap_or_else(|| "none".to_string());
     let cwd = get_string(payload, &["cwd"]).unwrap_or_else(|| "none".to_string());
     let git_branch = get_string(payload, &["git_branch"]).unwrap_or_else(|| "none".to_string());
+    let ports = render_sidebar_ports(payload);
     let status = render_sidebar_state_section(payload, "status", render_sidebar_status_row);
     let log = render_sidebar_state_section(payload, "log", render_sidebar_log_row);
     let progress = payload
@@ -10866,8 +10867,29 @@ fn render_sidebar_state_text(payload: &Value) -> String {
         .map(render_sidebar_progress_row)
         .unwrap_or_else(|| "none".to_string());
     format!(
-        "workspace={workspace}\ncwd={cwd}\ngit_branch={git_branch}\nprogress={progress}\nstatus:\n{status}\nlog:\n{log}"
+        "workspace={workspace}\ncwd={cwd}\ngit_branch={git_branch}\nports={ports}\nprogress={progress}\nstatus:\n{status}\nlog:\n{log}"
     )
+}
+
+/// purpose: Render sidebar-state port rows in CMUX-compatible text form.
+/// inputs: Sidebar-state payload with optional `ports` array.
+/// returns/effects: Returns comma-separated port numbers or "none".
+fn render_sidebar_ports(payload: &Value) -> String {
+    let ports = payload
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("port").and_then(Value::as_u64))
+                .map(|port| port.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if ports.is_empty() {
+        "none".to_string()
+    } else {
+        ports.join(", ")
+    }
 }
 
 /// purpose: Render one array section from sidebar-state.
@@ -15454,6 +15476,10 @@ mod cli_arg_tests {
             "workspace": "ws-1",
             "cwd": "/repo",
             "git_branch": "main",
+            "ports": [
+                {"port": 3000, "url": "http://127.0.0.1:3000"},
+                {"port": 5173, "url": "http://127.0.0.1:5173"}
+            ],
             "progress": {"value": 0.5, "label": "Building"},
             "status": [{"key": "build", "value": "running", "priority": 80}],
             "log": [{
@@ -15464,6 +15490,7 @@ mod cli_arg_tests {
             }]
         }));
 
+        assert!(rendered.contains("ports=3000, 5173"));
         assert!(rendered.contains("progress=0.5 label=Building"));
         assert!(rendered.contains("build=running priority=80"));
         assert!(rendered.contains("2026-07-02T04:37:18Z info build: Started"));

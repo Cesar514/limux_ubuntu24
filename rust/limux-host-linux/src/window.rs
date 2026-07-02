@@ -4008,7 +4008,11 @@ fn sidebar_ports_rows(
     if sidebar.hide_all_details || !sidebar.show_ports {
         return Ok(Vec::new());
     }
-    crate::port_discovery::workspace_port_rows(workspace_id, 20)
+    crate::port_discovery::workspace_port_rows(
+        workspace_id,
+        20,
+        sidebar.open_port_links_in_cmux_browser,
+    )
 }
 
 /// purpose: Render all retained CMUX sidebar metadata for one workspace.

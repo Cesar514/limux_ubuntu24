@@ -31,7 +31,11 @@ struct WorkspaceProcess {
 /// purpose: Discover CMUX-shaped local port rows for one Limux workspace.
 /// inputs: Raw workspace id/ref and maximum row count.
 /// returns/effects: Scans procfs once, sorted by port, without spawning helpers or writing files.
-pub fn workspace_port_rows(workspace_id: &str, max_rows: usize) -> Result<Vec<Value>, String> {
+pub fn workspace_port_rows(
+    workspace_id: &str,
+    max_rows: usize,
+    open_in_cmux_browser: bool,
+) -> Result<Vec<Value>, String> {
     let expected_workspace = normalize_workspace_id(workspace_id);
     let sockets = listening_sockets()?;
     if sockets.is_empty() {
@@ -45,7 +49,7 @@ pub fn workspace_port_rows(workspace_id: &str, max_rows: usize) -> Result<Vec<Va
         for inode in process_socket_inodes(process.pid)? {
             if let Some(socket) = sockets.get(&inode) {
                 if seen.insert((socket.protocol.clone(), socket.address.clone(), socket.port)) {
-                    rows.push(port_row(socket, &process));
+                    rows.push(port_row(socket, &process, open_in_cmux_browser));
                 }
             }
         }
@@ -135,9 +139,13 @@ fn process_child_map() -> Result<BTreeMap<u32, Vec<u32>>, String> {
 }
 
 /// purpose: Build one CMUX-compatible sidebar port row.
-/// inputs: Socket metadata and owning workspace process.
+/// inputs: Socket metadata, owning workspace process, and link open policy.
 /// returns/effects: Returns JSON without mutating state.
-fn port_row(socket: &ListeningSocket, process: &WorkspaceProcess) -> Value {
+fn port_row(
+    socket: &ListeningSocket,
+    process: &WorkspaceProcess,
+    open_in_cmux_browser: bool,
+) -> Value {
     let url_host = if socket.address == "0.0.0.0" || socket.address == "::" {
         "127.0.0.1"
     } else {
@@ -150,6 +158,8 @@ fn port_row(socket: &ListeningSocket, process: &WorkspaceProcess) -> Value {
         "url": format!("http://{url_host}:{}", socket.port),
         "pid": process.pid,
         "command": process.command,
+        "open_in_cmux_browser": open_in_cmux_browser,
+        "openInCmuxBrowser": open_in_cmux_browser,
     })
 }
 
@@ -199,11 +209,13 @@ mod tests {
             pid: 22,
             command: "python -m http.server".to_string(),
         };
-        let row = port_row(&socket, &process);
+        let row = port_row(&socket, &process, true);
         assert_eq!(row["port"], json!(3000));
         assert_eq!(row["url"], json!("http://127.0.0.1:3000"));
         assert_eq!(row["pid"], json!(22));
         assert_eq!(row["command"], json!("python -m http.server"));
+        assert_eq!(row["openInCmuxBrowser"], json!(true));
+        assert_eq!(row["open_in_cmux_browser"], json!(true));
     }
 
     // purpose: Verify real workspace-attributed child listeners are discovered from procfs.
@@ -236,7 +248,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut rows = Vec::new();
         while Instant::now() < deadline {
-            rows = workspace_port_rows(&workspace_id, 20).expect("discover ports");
+            rows = workspace_port_rows(&workspace_id, 20, true).expect("discover ports");
             if rows.iter().any(|row| row["port"] == json!(port)) {
                 break;
             }
