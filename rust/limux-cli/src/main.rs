@@ -4517,6 +4517,18 @@ fn install_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             claude_feed_hook_events(),
         ),
         agent_hooks::AgentKind::OpenCode => install_opencode_plugin(),
+        agent_hooks::AgentKind::Cursor => install_flat_json_hooks_with_feed(
+            &cursor_hooks_path(),
+            agent,
+            &[
+                ("beforeSubmitPrompt", "prompt-submit"),
+                ("stop", "stop"),
+                ("afterAgentResponse", "agent-response"),
+                ("beforeShellExecution", "shell-exec"),
+                ("afterShellExecution", "shell-done"),
+            ],
+            cursor_feed_hook_events(),
+        ),
         agent_hooks::AgentKind::Gemini => install_json_hooks_with_feed(
             &gemini_settings_path(),
             agent,
@@ -4587,6 +4599,7 @@ fn uninstall_hook_target(agent: agent_hooks::AgentKind) -> Result<()> {
             }
             opencode_config_unregister_plugin()
         }
+        agent_hooks::AgentKind::Cursor => uninstall_json_hooks(&cursor_hooks_path(), agent),
         agent_hooks::AgentKind::Gemini => uninstall_json_hooks(&gemini_settings_path(), agent),
         agent_hooks::AgentKind::Copilot => uninstall_json_hooks(&copilot_config_path(), agent),
         agent_hooks::AgentKind::CodeBuddy => {
@@ -4674,6 +4687,70 @@ fn install_json_hooks_with_feed(
     write_json_object(path, &root)
 }
 
+// purpose: Install flat JSON hooks and optional Feed hooks into an agent hook file.
+// inputs: Target JSON path, agent kind, lifecycle event mappings, and Feed hook event names.
+// returns/effects: Rewrites flat hook arrays after removing stale Limux entries for that agent.
+fn install_flat_json_hooks_with_feed(
+    path: &Path,
+    agent: agent_hooks::AgentKind,
+    events: &[(&str, &str)],
+    feed_events: &[&str],
+) -> Result<()> {
+    let mut root = read_json_object(path)?;
+    root.insert("version".to_string(), json!(1));
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} has non-object hooks field", path.display()))?;
+    let marker = hook_marker(agent);
+    for value in hooks.values_mut() {
+        if let Some(entries) = value.as_array_mut() {
+            entries.retain(|entry| !hook_entry_matches_agent(agent, entry, marker));
+        }
+    }
+    hooks.retain(|_, value| {
+        value
+            .as_array()
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(true)
+    });
+
+    for (agent_event, limux_event) in events {
+        append_flat_hook_entry(path, hooks, agent_event, hook_command(agent, limux_event)?)?;
+    }
+    for agent_event in feed_events {
+        append_flat_hook_entry(
+            path,
+            hooks,
+            agent_event,
+            feed_hook_command(agent, agent_event)?,
+        )?;
+    }
+
+    write_json_object(path, &root)
+}
+
+// purpose: Append one command entry to a flat JSON hook event array.
+// inputs: Config path for diagnostics, hooks map, agent event, and shell command.
+// returns/effects: Mutates the hooks map or fails if the existing hook is not an array.
+fn append_flat_hook_entry(
+    path: &Path,
+    hooks: &mut Map<String, Value>,
+    agent_event: &str,
+    command: String,
+) -> Result<()> {
+    let entries = hooks
+        .entry(agent_event.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let entries = entries
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("{} hook {agent_event} is not an array", path.display()))?;
+    entries.push(json!({ "command": command }));
+    Ok(())
+}
+
 // purpose: List the Claude hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Claude hook event names without side effects.
@@ -4703,6 +4780,13 @@ fn grok_feed_hook_events() -> &'static [&'static str] {
     &["PreToolUse"]
 }
 
+// purpose: List the Cursor hook events that CMUX forwards into Feed.
+// inputs: None.
+// returns/effects: Returns static Cursor hook event names without side effects.
+fn cursor_feed_hook_events() -> &'static [&'static str] {
+    &["beforeShellExecution"]
+}
+
 // purpose: List the Gemini hook events that CMUX forwards into Feed.
 // inputs: None.
 // returns/effects: Returns static Gemini hook event names without side effects.
@@ -4721,6 +4805,7 @@ fn hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Claude | agent_hooks::AgentKind::Grok => 5,
         agent_hooks::AgentKind::Codex
+        | agent_hooks::AgentKind::Cursor
         | agent_hooks::AgentKind::Gemini
         | agent_hooks::AgentKind::Copilot
         | agent_hooks::AgentKind::CodeBuddy
@@ -4737,6 +4822,7 @@ fn feed_hook_timeout(agent: agent_hooks::AgentKind) -> u64 {
     match agent {
         agent_hooks::AgentKind::Codex => 5,
         agent_hooks::AgentKind::Grok => 120,
+        agent_hooks::AgentKind::Cursor => 0,
         agent_hooks::AgentKind::Claude
         | agent_hooks::AgentKind::Gemini
         | agent_hooks::AgentKind::Copilot
@@ -4881,6 +4967,7 @@ fn hook_marker(agent: agent_hooks::AgentKind) -> &'static str {
         agent_hooks::AgentKind::Codex => "hooks codex",
         agent_hooks::AgentKind::Grok => "hooks grok",
         agent_hooks::AgentKind::OpenCode => "hooks opencode",
+        agent_hooks::AgentKind::Cursor => "hooks cursor",
         agent_hooks::AgentKind::Gemini => "hooks gemini",
         agent_hooks::AgentKind::Copilot => "hooks copilot",
         agent_hooks::AgentKind::CodeBuddy => "hooks codebuddy",
@@ -4957,6 +5044,12 @@ fn claude_settings_path() -> PathBuf {
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
         .unwrap_or_else(|| PathBuf::from(".claude"))
         .join("settings.json")
+}
+
+fn cursor_hooks_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cursor/hooks.json")
 }
 
 fn gemini_settings_path() -> PathBuf {
@@ -9968,6 +10061,10 @@ mod cli_arg_tests {
             Some(agent_hooks::AgentKind::Grok)
         );
         assert_eq!(
+            agent_hooks::AgentKind::from_hook_name("cursor-agent"),
+            Some(agent_hooks::AgentKind::Cursor)
+        );
+        assert_eq!(
             agent_hooks::AgentKind::from_hook_name("code-buddy"),
             Some(agent_hooks::AgentKind::CodeBuddy)
         );
@@ -9981,6 +10078,7 @@ mod cli_arg_tests {
         );
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::OpenCode));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Grok));
+        assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Cursor));
         assert!(!default_hook_targets().contains(&agent_hooks::AgentKind::Copilot));
     }
 
@@ -10164,6 +10262,51 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks grok notification"));
+    }
+
+    /// purpose: Verify Cursor setup writes CMUX flat lifecycle hooks and Feed shell hook.
+    /// inputs: Temporary hook JSON file and the Cursor flat hook installer.
+    /// returns/effects: Asserts flat hook shape, version, and command markers.
+    #[test]
+    fn cursor_hook_install_writes_feed_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hooks.json");
+
+        install_flat_json_hooks_with_feed(
+            &path,
+            agent_hooks::AgentKind::Cursor,
+            &[
+                ("beforeSubmitPrompt", "prompt-submit"),
+                ("beforeShellExecution", "shell-exec"),
+                ("afterShellExecution", "shell-done"),
+            ],
+            cursor_feed_hook_events(),
+        )
+        .expect("install hooks");
+
+        let root: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read hooks")).expect("json");
+        let feed = &root["hooks"]["beforeShellExecution"][1];
+
+        assert_eq!(root["version"], 1);
+        assert!(root["hooks"]["beforeSubmitPrompt"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks cursor prompt-submit"));
+        assert!(root["hooks"]["beforeShellExecution"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks cursor shell-exec"));
+        assert!(feed["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks feed --source cursor --event 'beforeShellExecution'"));
+        assert!(root["hooks"]["afterShellExecution"][0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("hooks cursor shell-done"));
+        assert!(feed.get("timeout").is_none());
+        assert!(feed.get("hooks").is_none());
     }
 
     /// purpose: Verify Claude setup writes blocking Feed hooks with Claude's matcher shape.

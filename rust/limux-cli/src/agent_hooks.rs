@@ -13,6 +13,7 @@ pub(crate) enum AgentKind {
     Codex,
     Grok,
     OpenCode,
+    Cursor,
     Gemini,
     Copilot,
     CodeBuddy,
@@ -21,12 +22,13 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 9] {
+    pub(crate) fn all() -> [Self; 10] {
         [
             Self::Claude,
             Self::Codex,
             Self::Grok,
             Self::OpenCode,
+            Self::Cursor,
             Self::Gemini,
             Self::Copilot,
             Self::CodeBuddy,
@@ -41,6 +43,7 @@ impl AgentKind {
             "codex" => Some(Self::Codex),
             "grok" => Some(Self::Grok),
             "opencode" | "open-code" => Some(Self::OpenCode),
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             "gemini" => Some(Self::Gemini),
             "copilot" => Some(Self::Copilot),
             "codebuddy" | "code-buddy" => Some(Self::CodeBuddy),
@@ -56,6 +59,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
+            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -70,6 +74,7 @@ impl AgentKind {
             Self::Codex => "Codex",
             Self::Grok => "Grok",
             Self::OpenCode => "OpenCode",
+            Self::Cursor => "Cursor",
             Self::Gemini => "Gemini",
             Self::Copilot => "Copilot",
             Self::CodeBuddy => "CodeBuddy",
@@ -84,6 +89,7 @@ impl AgentKind {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::OpenCode => "opencode",
+            Self::Cursor => "cursor-agent",
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::CodeBuddy => "codebuddy",
@@ -345,6 +351,7 @@ pub(crate) fn build_resume_command(
             parts.extend(preserved_tail);
         }
         AgentKind::Claude
+        | AgentKind::Cursor
         | AgentKind::Gemini
         | AgentKind::Copilot
         | AgentKind::CodeBuddy
@@ -450,6 +457,7 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Grok => arg == "-r" || arg == "--resume" || arg.starts_with("--resume="),
         AgentKind::Claude
+        | AgentKind::Cursor
         | AgentKind::Gemini
         | AgentKind::Copilot
         | AgentKind::CodeBuddy
@@ -672,6 +680,7 @@ mod tests {
     #[test]
     fn nested_json_agents_resume_with_native_resume_flag() {
         let cases = [
+            (AgentKind::Cursor, "cursor-agent"),
             (AgentKind::Copilot, "copilot"),
             (AgentKind::CodeBuddy, "codebuddy"),
             (AgentKind::Factory, "droid"),
