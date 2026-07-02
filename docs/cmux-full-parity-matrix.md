@@ -1,6 +1,6 @@
 # CMUX Full Parity Matrix
 
-Source CMUX commit: `3d309713f8140011565ed4c4b835b5e1dde0a159` in `/tmp/cmux-audit` `origin/main`.
+Source CMUX commit: `410429ca77135c3b88739db80e65bf8e8e0db9b6` in `/tmp/cmux-audit` `origin/main`.
 
 Status values:
 
@@ -45,6 +45,7 @@ Primary upstream references:
 
 Recent verified parity updates:
 
+- 2026-07-02: Added CMUX-compatible JSON custom-sidebar `noop` action parity for upstream Swift design-system corpus buttons: actions now accept ignored payload fields such as `value`, show a supported `noop` tooltip, and execute without mutating host state or requiring dispatcher state. Verified by `cargo test -p limux-host-linux custom_sidebar_dispatcher_actions_accept_documented_cmux_params -- --nocapture`, `cargo test -p limux-host-linux custom_sidebar -- --nocapture`, and host clippy.
 - 2026-07-02: Added CMUX-compatible JSON custom-sidebar `workspace.create` parity for upstream Swift sidebar buttons: actions support no-param background workspace creation, optional `name`/`title`/`template` title seeds, optional `cwd`/`working_directory`, optional `command` startup injection, strict boolean `focus`, real GTK workspace model creation, session persistence, CMUX workspace payloads, and loud validation for malformed focus params. Verified by `cargo test -p limux-host-linux custom_sidebar -- --nocapture` and host clippy.
 - 2026-07-02: Added CMUX-compatible JSON custom-sidebar `tab.create` parity for upstream Swift sidebar plus buttons: actions parse optional workspace targets from `workspace_id`, `workspace`, `param`, or `value`, default to the active workspace only when omitted, create a real terminal surface in the target workspace focused pane, optionally run `command`/`text` startup content, publish `surface.created` lifecycle events with `origin=tab.create`, persist session state, and fail loudly for explicit unknown workspaces or missing panes. Verified by `cargo test -p limux-host-linux custom_sidebar -- --nocapture` and host clippy.
 - 2026-07-02: Added live GTK bridge and JSON custom-sidebar `window.focus` parity for upstream CMUX window focus actions: the bridge advertises/routes `window.focus`, explicit `window_id`/`window`/`id` values are validated against Limux's current single GTK host window, no-id sidebar calls focus the current host window for upstream Swift corpus context menus, unsupported window refs fail loudly, and responses include CMUX-shaped `window_id`/`window_ref` data. Verified by `cargo test -p limux-host-linux window_focus_route_queues_command -- --nocapture`, `cargo test -p limux-host-linux custom_sidebar -- --nocapture`, and host clippy.

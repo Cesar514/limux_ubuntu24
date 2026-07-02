@@ -4420,6 +4420,7 @@ fn custom_sidebar_is_hex_color(color: &str) -> bool {
 fn custom_sidebar_action_tooltip(action: &CustomSidebarNodeAction) -> String {
     match action.action_type.as_str() {
         "log" => action.message.clone().unwrap_or_else(|| "log".to_string()),
+        "noop" => "noop".to_string(),
         "openURL" | "open" | "open.url" | "link.open" => {
             custom_sidebar_action_url(action).unwrap_or_else(|_| "open URL".to_string())
         }
@@ -4443,6 +4444,7 @@ fn run_custom_sidebar_node_action(button: &gtk::Button, action: &CustomSidebarNo
             "limux custom sidebar: {}",
             action.message.as_deref().unwrap_or("")
         ),
+        "noop" => button.set_tooltip_text(Some("noop")),
         "openURL" | "open" | "open.url" | "link.open" => {
             open_custom_sidebar_url(button, custom_sidebar_action_url(action).ok().as_deref())
         }
@@ -19082,6 +19084,13 @@ mod tests {
             message: None,
             params: clipboard_param_alias,
         };
+        let mut noop_value_param = serde_json::Map::new();
+        noop_value_param.insert("value".to_string(), json!("#AABBCC"));
+        let noop_value = CustomSidebarNodeAction {
+            action_type: "noop".to_string(),
+            message: None,
+            params: noop_value_param,
+        };
         let mut tab_param_alias = serde_json::Map::new();
         tab_param_alias.insert("param".to_string(), json!("tab-a"));
         let tab_toggle_pin = CustomSidebarNodeAction {
@@ -19389,6 +19398,7 @@ mod tests {
             custom_sidebar_action_tooltip(&no_param_action("clipboard.write")),
             "copy to clipboard"
         );
+        assert_eq!(custom_sidebar_action_tooltip(&noop_value), "noop");
         assert_eq!(
             custom_sidebar_dispatcher_action(&tab_toggle_pin),
             Ok(Some(CustomSidebarDispatcherAction::TabTogglePin(
