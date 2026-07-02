@@ -1550,6 +1550,7 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("list-windows", "Usage: limux list-windows"),
     ("current-window", "Usage: limux current-window"),
     ("new-window", "Usage: limux new-window"),
+    ("neww", "Usage: limux new-window"),
     (
         "focus-window",
         "Usage: limux focus-window --window <id|ref|index>",
@@ -1626,6 +1627,27 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("select-workspace", "Usage: limux select-workspace"),
     ("rename-workspace", "Usage: limux rename-workspace"),
     ("rename-window", "Usage: limux rename-workspace"),
+    (
+        "select-window",
+        "Usage: limux select-workspace -t <id|ref|index>",
+    ),
+    (
+        "select-pane",
+        "Usage: limux focus-pane -t <id|ref|index>",
+    ),
+    (
+        "kill-window",
+        "Usage: limux close-workspace -t <id|ref|index>",
+    ),
+    (
+        "kill-pane",
+        "Usage: limux close-surface -t <id|ref|index>",
+    ),
+    ("selectw", "Usage: limux select-workspace -t <id|ref|index>"),
+    ("selectp", "Usage: limux focus-pane -t <id|ref|index>"),
+    ("killw", "Usage: limux close-workspace -t <id|ref|index>"),
+    ("killp", "Usage: limux close-surface -t <id|ref|index>"),
+    ("renamew", "Usage: limux rename-window -t <id|ref|index> <title>"),
     ("current-workspace", "Usage: limux current-workspace"),
     ("capture-pane", "Usage: limux capture-pane"),
     ("resize-pane", "Usage: limux resize-pane"),
@@ -2401,6 +2423,8 @@ fn trailing_title(args: &[String]) -> Option<String> {
             || arg == "--value"
             || arg == "--amount"
             || arg == "--unset"
+            || arg == "--target"
+            || arg == "-t"
             || arg == "-b"
         {
             skip = true;
@@ -8098,9 +8122,8 @@ fn build_agents_md(
 }
 
 async fn run_close_workspace(client: &mut Client, args: &[String]) -> Result<Value> {
-    let workspace = parse_opt(args, "--workspace")
-        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
-        .ok_or_else(|| anyhow!("close-workspace requires --workspace <id|ref>"))?;
+    let workspace = tmux_target_arg(args, "--workspace", "LIMUX_WORKSPACE_ID")
+        .ok_or_else(|| anyhow!("close-workspace requires -t or --workspace <id|ref>"))?;
     client
         .call("workspace.close", json!({ "workspace_id": workspace }))
         .await
@@ -9027,9 +9050,10 @@ fn build_surface_alias_request(
     command: &str,
     args: &[String],
 ) -> Result<Option<(&'static str, Value)>> {
+    let command = canonical_tmux_command(command);
     let method = match command {
         "focus-panel" => "surface.focus",
-        "close-surface" => "surface.close",
+        "close-surface" | "kill-pane" => "surface.close",
         "move-surface" => "surface.move",
         "reorder-surface" => "surface.reorder",
         "split-off" | "drag-surface-to-split" => "surface.drag_to_split",
@@ -9119,6 +9143,7 @@ fn build_window_alias_request(
     command: &str,
     args: &[String],
 ) -> Result<Option<(&'static str, Value)>> {
+    let command = canonical_tmux_command(command);
     let method = match command {
         "new-window" => "window.create",
         "current-window" => "window.current",
@@ -9130,6 +9155,32 @@ fn build_window_alias_request(
     let mut params = Map::new();
     if let Some(window) = parse_opt(args, "--window").or_else(|| first_positional(args)) {
         params.insert("window_id".to_string(), Value::String(window));
+    }
+    Ok(Some((method, Value::Object(params))))
+}
+
+/// purpose: Build a CMUX/tmux-compatible pane lifecycle request.
+/// inputs: command is a pane alias and args may include -t, --target, --pane, or --workspace.
+/// returns/effects: Returns the target Limux method plus JSON params.
+fn build_pane_alias_request(
+    command: &str,
+    args: &[String],
+) -> Result<Option<(&'static str, Value)>> {
+    let command = canonical_tmux_command(command);
+    let method = match command {
+        "focus-pane" | "select-pane" => "pane.focus",
+        _ => return Ok(None),
+    };
+    let pane = tmux_target_arg(args, "--pane", "LIMUX_PANE_ID")
+        .ok_or_else(|| anyhow!("{command} requires -t, --pane, or a pane id"))?;
+    let mut params = Map::new();
+    params.insert("pane_id".to_string(), Value::String(pane));
+    if let Some(workspace) =
+        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        if !workspace.trim().is_empty() {
+            params.insert("workspace_id".to_string(), Value::String(workspace));
+        }
     }
     Ok(Some((method, Value::Object(params))))
 }
@@ -9155,17 +9206,17 @@ fn build_workspace_alias_request(
     command: &str,
     args: &[String],
 ) -> Result<Option<(&'static str, Value)>> {
+    let command = canonical_tmux_command(command);
     let method = match command {
         "capabilities" => "system.capabilities",
         "current-workspace" => "workspace.current",
-        "select-workspace" => "workspace.select",
+        "select-workspace" | "select-window" => "workspace.select",
         _ => return Ok(None),
     };
     let mut params = Map::new();
-    if command == "select-workspace" {
-        let workspace = parse_opt(args, "--workspace")
-            .or_else(|| first_positional(args))
-            .ok_or_else(|| anyhow!("select-workspace requires --workspace or a workspace id"))?;
+    if matches!(command, "select-workspace" | "select-window") {
+        let workspace = tmux_target_arg(args, "--workspace", "LIMUX_WORKSPACE_ID")
+            .ok_or_else(|| anyhow!("{command} requires -t, --workspace, or a workspace id"))?;
         params.insert("workspace_id".to_string(), Value::String(workspace));
     }
     Ok(Some((method, Value::Object(params))))
@@ -9314,6 +9365,8 @@ fn first_positional(args: &[String]) -> Option<String> {
         "--key",
         "--text",
         "--target-pane",
+        "--target",
+        "-t",
         "--index",
         "--before-surface",
         "--before",
@@ -9344,6 +9397,8 @@ fn first_positional(args: &[String]) -> Option<String> {
 fn surface_arg(args: &[String]) -> Option<String> {
     parse_opt(args, "--surface")
         .or_else(|| parse_opt(args, "--panel"))
+        .or_else(|| parse_opt(args, "-t"))
+        .or_else(|| parse_opt(args, "--target"))
         .or_else(|| first_positional(args))
         .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
         .filter(|value| !value.trim().is_empty())
@@ -9354,8 +9409,12 @@ async fn run_rename_workspace_like(
     command: &str,
     args: &[String],
 ) -> Result<Value> {
-    let workspace =
-        parse_opt(args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"));
+    let command = canonical_tmux_command(command);
+    let workspace = parse_opt(args, "-t")
+        .or_else(|| parse_opt(args, "--target"))
+        .or_else(|| parse_opt(args, "--workspace"))
+        .or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+        .filter(|value| !value.trim().is_empty());
     let title = trailing_title(args).ok_or_else(|| {
         if command == "rename-window" {
             anyhow!("rename-window requires a title")
@@ -10235,8 +10294,14 @@ fn canonical_tmux_command(command: &str) -> &str {
     match command {
         "capturep" => "capture-pane",
         "display" | "displayp" => "display-message",
+        "killp" => "kill-pane",
+        "killw" => "kill-window",
         "resizep" => "resize-pane",
         "respawnp" => "respawn-pane",
+        "neww" => "new-window",
+        "renamew" => "rename-window",
+        "selectp" => "select-pane",
+        "selectw" => "select-window",
         "setb" => "set-buffer",
         "pasteb" => "paste-buffer",
         "showb" => "show-buffer",
@@ -10244,6 +10309,18 @@ fn canonical_tmux_command(command: &str) -> &str {
         "lsp" => "list-panes",
         _ => command,
     }
+}
+
+// purpose: Resolve tmux target selectors used by short lifecycle aliases.
+// inputs: Raw args with optional -t, --target, or command-specific long option.
+// returns/effects: Returns the selected target, positional target, or matching Limux context id.
+fn tmux_target_arg(args: &[String], long_option: &str, env_name: &str) -> Option<String> {
+    parse_opt(args, "-t")
+        .or_else(|| parse_opt(args, "--target"))
+        .or_else(|| parse_opt(args, long_option))
+        .or_else(|| first_positional(args))
+        .or_else(|| context_env_value(env_name))
+        .filter(|value| !value.trim().is_empty())
 }
 
 // purpose: Resolve a tmux buffer name from CMUX and tmux spellings.
@@ -11470,7 +11547,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             return run_codex_teams(client, args, client.password.clone()).await;
         }
         "__codex-teams-watch" => return run_codex_teams_watcher(client, args).await,
-        "capabilities" | "current-workspace" | "select-workspace" => {
+        "capabilities" | "current-workspace" | "select-workspace" | "select-window" | "selectw" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
                 bail!("unsupported workspace alias: {}", command);
             };
@@ -11481,7 +11558,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
-        "new-window" | "current-window" | "list-windows" | "focus-window" | "close-window" => {
+        "new-window" | "neww" | "current-window" | "list-windows" | "focus-window"
+        | "close-window" => {
             let merged_args = args_with_global_window(args, opts.window.as_deref());
             let Some((method, params)) = build_window_alias_request(command, &merged_args)? else {
                 bail!("unsupported window alias: {}", command);
@@ -11612,9 +11690,22 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_list_text("list-panels", &payload))
             }
         }
+        "focus-pane" | "select-pane" | "selectp" => {
+            let Some((method, params)) = build_pane_alias_request(command, args)? else {
+                bail!("unsupported pane alias: {}", command);
+            };
+            let payload = client.call(method, params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "new-split"
         | "focus-panel"
         | "close-surface"
+        | "kill-pane"
+        | "killp"
         | "move-surface"
         | "split-off"
         | "drag-surface-to-split"
@@ -11704,7 +11795,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(format!("OK {}", handle))
             }
         }
-        "close-workspace" => {
+        "close-workspace" | "kill-window" | "killw" => {
             let payload = run_close_workspace(client, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -11803,7 +11894,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
-        "rename-workspace" | "rename-window" => {
+        "rename-workspace" | "rename-window" | "renamew" => {
             let payload = run_rename_workspace_like(client, command, args).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
@@ -13145,8 +13236,14 @@ mod cli_arg_tests {
         assert_eq!(canonical_tmux_command("capturep"), "capture-pane");
         assert_eq!(canonical_tmux_command("display"), "display-message");
         assert_eq!(canonical_tmux_command("displayp"), "display-message");
+        assert_eq!(canonical_tmux_command("killp"), "kill-pane");
+        assert_eq!(canonical_tmux_command("killw"), "kill-window");
+        assert_eq!(canonical_tmux_command("neww"), "new-window");
+        assert_eq!(canonical_tmux_command("renamew"), "rename-window");
         assert_eq!(canonical_tmux_command("resizep"), "resize-pane");
         assert_eq!(canonical_tmux_command("respawnp"), "respawn-pane");
+        assert_eq!(canonical_tmux_command("selectp"), "select-pane");
+        assert_eq!(canonical_tmux_command("selectw"), "select-window");
         assert_eq!(canonical_tmux_command("setb"), "set-buffer");
         assert_eq!(canonical_tmux_command("pasteb"), "paste-buffer");
         assert_eq!(canonical_tmux_command("showb"), "show-buffer");
@@ -13278,6 +13375,22 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn tmux_target_arg_accepts_dash_t_and_skips_title_values() {
+        assert_eq!(
+            tmux_target_arg(&args(&["-t", "workspace:7"]), "--workspace", "MISSING").as_deref(),
+            Some("workspace:7")
+        );
+        assert_eq!(
+            trailing_title(&args(&["-t", "workspace:7", "build logs"])).as_deref(),
+            Some("build logs")
+        );
+        assert_eq!(
+            first_positional(&args(&["-t", "workspace:7", "build logs"])).as_deref(),
+            Some("build logs")
+        );
+    }
+
+    #[test]
     fn notify_positional_title_skips_option_values() {
         let args = args(&[
             "--subtitle",
@@ -13384,10 +13497,21 @@ mod cli_arg_tests {
         assert_eq!(drag.0, "surface.drag_to_split");
         assert_eq!(drag.1["surface_id"], "surface:7:tab-a");
         assert_eq!(drag.1["direction"], "right");
+
+        let killed = build_surface_alias_request("killp", &args(&["-t", "surface:7:tab-a"]))
+            .expect("killp parses")
+            .expect("killp maps");
+        assert_eq!(killed.0, "surface.close");
+        assert_eq!(killed.1["surface_id"], "surface:7:tab-a");
     }
 
     #[test]
     fn cmux_window_and_workspace_aliases_map_to_limux_methods() {
+        let created = build_window_alias_request("neww", &args(&[]))
+            .expect("neww parses")
+            .expect("neww maps");
+        assert_eq!(created.0, "window.create");
+
         let window = build_window_alias_request("focus-window", &args(&["--window", "window:3"]))
             .expect("window parses")
             .expect("window maps");
@@ -13405,6 +13529,26 @@ mod cli_arg_tests {
             .expect("workspace maps");
         assert_eq!(workspace.0, "workspace.select");
         assert_eq!(workspace.1["workspace_id"], "workspace:4");
+
+        let selected = build_workspace_alias_request("selectw", &args(&["-t", "workspace:9"]))
+            .expect("selectw parses")
+            .expect("selectw maps");
+        assert_eq!(selected.0, "workspace.select");
+        assert_eq!(selected.1["workspace_id"], "workspace:9");
+    }
+
+    #[test]
+    fn cmux_pane_aliases_map_to_limux_methods() {
+        let pane = build_pane_alias_request(
+            "selectp",
+            &args(&["-t", "pane:12", "--workspace", "workspace:4"]),
+        )
+        .expect("selectp parses")
+        .expect("selectp maps");
+
+        assert_eq!(pane.0, "pane.focus");
+        assert_eq!(pane.1["pane_id"], "pane:12");
+        assert_eq!(pane.1["workspace_id"], "workspace:4");
     }
 
     #[test]
