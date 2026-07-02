@@ -304,7 +304,9 @@ fn full_help_text() -> &'static str {
         "CMUX compatibility aliases:\n",
         "  docs [settings|shortcuts|api|browser|agents]\n",
         "  settings [path|docs|open]\n",
-        "  config <doctor|check|validate|path|paths|docs|documentation|reload>\n",
+        "  config <doctor|check|validate|path|paths|docs|documentation|reload|get|set>\n",
+        "  config sidebar-font-size [points]\n",
+        "  config surface-tab-bar-font-size [points]\n",
         "  shortcuts\n",
         "  themes [list|set|clear]\n",
         "  new-window | current-window | list-windows | focus-window | close-window\n",
@@ -523,6 +525,111 @@ fn clear_theme_settings_at(path: &Path) -> Result<String> {
     Ok(format!("OK {}", path.display()))
 }
 
+#[derive(Clone, Copy)]
+struct FontSizeSetting {
+    key: &'static str,
+    default: f64,
+    min: f64,
+    max: f64,
+}
+
+const SIDEBAR_FONT_SIZE: FontSizeSetting = FontSizeSetting {
+    key: "sidebar-font-size",
+    default: 12.5,
+    min: 10.0,
+    max: 20.0,
+};
+
+const SURFACE_TAB_BAR_FONT_SIZE: FontSizeSetting = FontSizeSetting {
+    key: "surface-tab-bar-font-size",
+    default: 11.0,
+    min: 8.0,
+    max: 14.0,
+};
+
+/// purpose: Map CMUX config font-size keys to their supported ranges.
+/// inputs: Raw config key from CLI arguments.
+/// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn font_size_setting(raw: &str) -> Option<FontSizeSetting> {
+    match raw {
+        "sidebar-font-size" => Some(SIDEBAR_FONT_SIZE),
+        "surface-tab-bar-font-size" => Some(SURFACE_TAB_BAR_FONT_SIZE),
+        _ => None,
+    }
+}
+
+/// purpose: Format CMUX font-size values without unnecessary trailing zeros.
+/// inputs: Numeric point size.
+/// returns/effects: Returns strings like 12, 12.5, or 13.75.
+fn format_font_size(value: f64) -> String {
+    let scaled = (value * 100.0).round() as i64;
+    let whole = scaled / 100;
+    let fraction = (scaled % 100).abs();
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    if fraction % 10 == 0 {
+        return format!("{whole}.{}", fraction / 10);
+    }
+    format!("{whole}.{fraction:02}")
+}
+
+/// purpose: Read the effective CMUX font-size setting from Limux settings JSON.
+/// inputs: Settings path and supported font-size descriptor.
+/// returns/effects: Returns configured value when present, otherwise CMUX default.
+fn get_config_font_size_at(path: &Path, setting: FontSizeSetting) -> Result<(f64, bool)> {
+    let root = read_settings_root(path)?;
+    let configured = root
+        .get(setting.key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(setting.min, setting.max));
+    Ok((configured.unwrap_or(setting.default), configured.is_some()))
+}
+
+/// purpose: Write a CMUX font-size setting while preserving unrelated settings.
+/// inputs: Settings path, supported descriptor, and raw CLI value.
+/// returns/effects: Clamps numeric values and atomically writes settings JSON.
+fn set_config_font_size_at(path: &Path, setting: FontSizeSetting, raw: &str) -> Result<f64> {
+    let requested = raw
+        .parse::<f64>()
+        .with_context(|| format!("{} requires a numeric point size", setting.key))?;
+    if !requested.is_finite() {
+        bail!("{} requires a finite numeric point size", setting.key);
+    }
+    let value = requested.clamp(setting.min, setting.max);
+    let mut root = read_settings_root(path)?;
+    root.insert(setting.key.to_string(), json!(value));
+    write_settings_root(path, &root)?;
+    Ok(value)
+}
+
+/// purpose: Render CMUX-compatible config get output for one font-size setting.
+/// inputs: Settings path and setting descriptor.
+/// returns/effects: Returns text with effective value and backing path.
+fn render_config_font_size_get(path: &Path, setting: FontSizeSetting) -> Result<String> {
+    let (value, _) = get_config_font_size_at(path, setting)?;
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        format_font_size(value),
+        path.display()
+    ))
+}
+
+/// purpose: Apply a CMUX-compatible config set operation for one font-size setting.
+/// inputs: Settings path, setting descriptor, and raw point-size argument.
+/// returns/effects: Writes settings JSON and returns user-facing status text.
+fn render_config_font_size_set(path: &Path, setting: FontSizeSetting, raw: &str) -> Result<String> {
+    let value = set_config_font_size_at(path, setting, raw)?;
+    Ok(format!(
+        "OK {} = {} (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        format_font_size(value),
+        path.display()
+    ))
+}
+
 /// purpose: Handle CMUX-compatible local commands without requiring a socket.
 /// inputs: Parsed global CLI options.
 /// returns/effects: May read or write local config files, but never contacts the host socket.
@@ -580,6 +687,58 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
         ))),
         "check" | "validate" | "doctor" => Ok(CommandOutput::Text(config_validation_text()?)),
         "reload" => bail!("config reload requires running host reload support; restart Limux after editing settings"),
+        "get" => {
+            if args.len() != 2 {
+                bail!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>");
+            }
+            let key = args
+                .get(1)
+                .ok_or_else(|| anyhow!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>"))?;
+            let setting = font_size_setting(key).ok_or_else(|| {
+                anyhow!("Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size>")
+            })?;
+            Ok(CommandOutput::Text(render_config_font_size_get(
+                &limux_settings_path()?,
+                setting,
+            )?))
+        }
+        "set" => {
+            if args.len() != 3 {
+                bail!(
+                    "Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"
+                );
+            }
+            let key = args
+                .get(1)
+                .ok_or_else(|| anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"))?;
+            let value = args
+                .get(2)
+                .ok_or_else(|| anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>"))?;
+            let setting = font_size_setting(key).ok_or_else(|| {
+                anyhow!("Usage: limux config set <sidebar-font-size|surface-tab-bar-font-size> <points>")
+            })?;
+            Ok(CommandOutput::Text(render_config_font_size_set(
+                &limux_settings_path()?,
+                setting,
+                value,
+            )?))
+        }
+        "sidebar-font-size" | "surface-tab-bar-font-size" => {
+            if args.len() > 2 {
+                bail!("Usage: limux config {sub} [points]");
+            }
+            let setting = font_size_setting(sub).expect("matched supported setting");
+            let path = limux_settings_path()?;
+            if let Some(value) = args.get(1) {
+                Ok(CommandOutput::Text(render_config_font_size_set(
+                    &path, setting, value,
+                )?))
+            } else {
+                Ok(CommandOutput::Text(render_config_font_size_get(
+                    &path, setting,
+                )?))
+            }
+        }
         target => bail!("unsupported config command `{target}`"),
     }
 }
@@ -6276,6 +6435,45 @@ mod cli_arg_tests {
             fs::read_to_string(&path).expect("read settings"),
             r#"{"appearance":{"color_scheme":"dark"}}"#
         );
+    }
+
+    #[test]
+    fn config_font_size_get_uses_defaults_and_formats_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_font_size_get(&path, SIDEBAR_FONT_SIZE).expect("get default");
+        assert!(text.contains("sidebar-font-size = 12.5"));
+
+        fs::write(&path, br#"{"sidebar-font-size":13.75}"#).expect("write settings");
+        let text = render_config_font_size_get(&path, SIDEBAR_FONT_SIZE).expect("get configured");
+        assert!(text.contains("sidebar-font-size = 13.75"));
+    }
+
+    #[test]
+    fn config_font_size_set_clamps_and_preserves_unrelated_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, br#"{"focus":{"hover_terminal_focus":true}}"#).expect("write settings");
+
+        let text = render_config_font_size_set(&path, SURFACE_TAB_BAR_FONT_SIZE, "40")
+            .expect("set font size");
+        assert!(text.contains("surface-tab-bar-font-size = 14"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["focus"]["hover_terminal_focus"], true);
+        assert_eq!(parsed["surface-tab-bar-font-size"], 14.0);
+    }
+
+    #[test]
+    fn config_font_size_rejects_unknown_keys_and_non_numeric_values() {
+        assert!(font_size_setting("font-size").is_none());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let err = render_config_font_size_set(&path, SIDEBAR_FONT_SIZE, "large")
+            .expect_err("invalid value");
+        assert!(err.to_string().contains("requires a numeric point size"));
     }
 
     #[test]

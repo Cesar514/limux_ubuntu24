@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T01:27:16Z Implement and verify CMUX config `sidebar-font-size` and `surface-tab-bar-font-size` get/set parity while preserving unrelated Limux settings JSON. \
 [x] 2026-07-02T01:05:00Z Refresh the CMUX audit clone to current `manaflow-ai/cmux` main commit `871aa710b30d0775f5f18f0bf98f57cdb42047f4` and verify the Limux fork is ahead of `am-will/main` without pushing to `am-will`. \
 [x] 2026-07-02T01:05:00Z Implement and verify CMUX retained `events.stream` parity slice with replay ack metadata, category/name filters, heartbeat frames, and live socket takeover. \
 [x] 2026-07-02T01:05:00Z Implement and verify CMUX Feed and agent event publication for `feed.item.received`, `feed.item.completed`, `feed.item.resolved`, and `agent.hook.<HookEventName>`. \
