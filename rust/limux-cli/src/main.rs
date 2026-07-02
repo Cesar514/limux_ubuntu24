@@ -3,7 +3,7 @@
 // inputs: CLI arguments, environment variables, Unix control sockets, and JSON hook/config files.
 // returns/effects: Launches the host or sends bounded control requests, writes local state, and exits nonzero on errors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -10616,6 +10616,506 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
     }
 }
 
+struct CodexTeamsWatcherState {
+    workspace_id: String,
+    root_surface_id: String,
+    codex_path: String,
+    launch_path: Option<String>,
+    max_auto_depth: usize,
+    known_thread_ids: BTreeSet<String>,
+    parent_by_thread_id: BTreeMap<String, String>,
+    depth_by_thread_id: BTreeMap<String, usize>,
+    pending_by_parent_thread_id: BTreeMap<String, Vec<codex_teams::Thread>>,
+    opened_thread_ids: BTreeSet<String>,
+    subscribed_thread_ids: BTreeSet<String>,
+    approval_item_by_id: BTreeMap<String, Value>,
+    approval_item_order: Vec<String>,
+    last_agent_surface_id: Option<String>,
+}
+
+impl CodexTeamsWatcherState {
+    /// purpose: Create state for a single hidden Codex Teams watcher process.
+    /// inputs: Required workspace/surface ids, Codex executable metadata, and max auto depth.
+    /// returns/effects: Returns empty watcher state ready for app-server notifications.
+    fn new(
+        workspace_id: String,
+        root_surface_id: String,
+        codex_path: String,
+        launch_path: Option<String>,
+        max_auto_depth: usize,
+    ) -> Self {
+        Self {
+            workspace_id,
+            root_surface_id,
+            codex_path,
+            launch_path,
+            max_auto_depth,
+            known_thread_ids: BTreeSet::new(),
+            parent_by_thread_id: BTreeMap::new(),
+            depth_by_thread_id: BTreeMap::new(),
+            pending_by_parent_thread_id: BTreeMap::new(),
+            opened_thread_ids: BTreeSet::new(),
+            subscribed_thread_ids: BTreeSet::new(),
+            approval_item_by_id: BTreeMap::new(),
+            approval_item_order: Vec::new(),
+            last_agent_surface_id: None,
+        }
+    }
+
+    /// purpose: Cache bounded Codex item metadata for later approval Feed cards.
+    /// inputs: App-server notification method and params object.
+    /// returns/effects: Updates the bounded approval item cache.
+    fn cache_approval_item_if_present(&mut self, method: &str, params: &Map<String, Value>) {
+        if matches!(method, "item/started" | "item/completed") {
+            if let Some(item) = params.get("item").and_then(Value::as_object) {
+                if let Some(item_id) = codex_teams::string_value(item, &["id"]) {
+                    self.cache_approval_item(item_id, codex_teams::approval_item_snapshot(item));
+                }
+            }
+            return;
+        }
+        if method != "item/fileChange/patchUpdated" {
+            return;
+        }
+        let Some(item_id) = codex_teams::string_value(params, &["itemId", "item_id"]) else {
+            return;
+        };
+        let mut item = self
+            .approval_item_by_id
+            .get(&item_id)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut item = Map::new();
+                item.insert("type".to_string(), json!("fileChange"));
+                item.insert("id".to_string(), json!(item_id));
+                item
+            });
+        if let Some(changes) = params.get("changes") {
+            item.insert("changes".to_string(), changes.clone());
+        }
+        self.cache_approval_item(item_id, codex_teams::approval_item_snapshot(&item));
+    }
+
+    /// purpose: Observe a Codex app-server thread and create eligible subagent panes.
+    /// inputs: Limux socket client, app-server URL, and parsed Codex thread.
+    /// returns/effects: May call `surface.split`, `tab.action`, and layout equalization.
+    async fn observe_thread(
+        &mut self,
+        client: &mut Client,
+        app_server_url: &str,
+        thread: codex_teams::Thread,
+    ) -> Result<()> {
+        if self.known_thread_ids.contains(&thread.id) {
+            if let Some(spawn) = thread.spawn.clone() {
+                if !self.parent_by_thread_id.contains_key(&thread.id) {
+                    self.observe_spawn(client, app_server_url, thread, spawn)
+                        .await?;
+                } else if !self.opened_thread_ids.contains(&thread.id) {
+                    self.open_observed_subagent(client, app_server_url, &thread, &spawn)
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+        self.known_thread_ids.insert(thread.id.clone());
+        if let Some(spawn) = thread.spawn.clone() {
+            self.observe_spawn(client, app_server_url, thread.clone(), spawn)
+                .await?;
+        } else {
+            self.depth_by_thread_id.insert(thread.id.clone(), 0);
+        }
+        self.drain_pending_children(client, app_server_url, &thread.id)
+            .await
+    }
+
+    async fn observe_spawn(
+        &mut self,
+        client: &mut Client,
+        app_server_url: &str,
+        thread: codex_teams::Thread,
+        spawn: codex_teams::Spawn,
+    ) -> Result<()> {
+        self.parent_by_thread_id
+            .insert(thread.id.clone(), spawn.parent_thread_id.clone());
+        if !self.known_thread_ids.contains(&spawn.parent_thread_id)
+            || !self
+                .depth_by_thread_id
+                .contains_key(&spawn.parent_thread_id)
+        {
+            self.pending_by_parent_thread_id
+                .entry(spawn.parent_thread_id)
+                .or_default()
+                .push(thread);
+            return Ok(());
+        }
+        self.open_observed_subagent(client, app_server_url, &thread, &spawn)
+            .await
+    }
+
+    async fn drain_pending_children(
+        &mut self,
+        client: &mut Client,
+        app_server_url: &str,
+        parent_thread_id: &str,
+    ) -> Result<()> {
+        let mut stack = vec![parent_thread_id.to_string()];
+        while let Some(parent_thread_id) = stack.pop() {
+            let pending = self
+                .pending_by_parent_thread_id
+                .remove(&parent_thread_id)
+                .unwrap_or_default();
+            for child in pending {
+                let Some(spawn) = child.spawn.clone() else {
+                    continue;
+                };
+                self.open_observed_subagent(client, app_server_url, &child, &spawn)
+                    .await?;
+                stack.push(child.id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn open_observed_subagent(
+        &mut self,
+        client: &mut Client,
+        app_server_url: &str,
+        thread: &codex_teams::Thread,
+        spawn: &codex_teams::Spawn,
+    ) -> Result<()> {
+        let depth = self
+            .depth_by_thread_id
+            .get(&spawn.parent_thread_id)
+            .map(|depth| depth.saturating_add(1))
+            .unwrap_or_else(|| spawn.source_depth.unwrap_or(1).max(1));
+        self.depth_by_thread_id.insert(thread.id.clone(), depth);
+        if depth > self.max_auto_depth
+            || self.opened_thread_ids.contains(&thread.id)
+            || !codex_teams::thread_may_be_attachable(thread)
+        {
+            return Ok(());
+        }
+        let plan = codex_teams::subagent_split_plan(
+            &self.workspace_id,
+            &self.root_surface_id,
+            self.last_agent_surface_id.as_deref(),
+            thread,
+            spawn,
+            &codex_teams::SubagentLaunch {
+                codex_executable: &self.codex_path,
+                app_server_url,
+                launch_path: self.launch_path.as_deref(),
+                depth,
+            },
+        )?;
+        let created = client.call("surface.split", plan.params).await?;
+        if created.get("accepted").and_then(Value::as_bool) == Some(true) {
+            bail!(
+                "Codex subagent panes are not supported in remote tmux mirror workspaces (surface.split was routed to the remote tmux session)"
+            );
+        }
+        let surface_id = get_string(&created, &["surface_id"])
+            .ok_or_else(|| anyhow!("surface.split did not return surface_id"))?;
+        self.last_agent_surface_id = Some(surface_id.clone());
+        self.opened_thread_ids.insert(thread.id.clone());
+        let _ = client
+            .call(
+                "tab.action",
+                json!({
+                    "workspace_id": self.workspace_id,
+                    "surface_id": surface_id,
+                    "action": "rename",
+                    "title": plan.title,
+                }),
+            )
+            .await;
+        let _ = client
+            .call(
+                "workspace.equalize_splits",
+                json!({
+                    "workspace_id": self.workspace_id,
+                    "orientation": "vertical",
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
+    fn related_item_for_params(&self, params: &Map<String, Value>) -> Option<&Map<String, Value>> {
+        let item_id = codex_teams::string_value(params, &["itemId", "item_id"])?;
+        self.approval_item_by_id.get(&item_id)?.as_object()
+    }
+
+    fn cache_approval_item(&mut self, item_id: String, item: Value) {
+        if !self.approval_item_by_id.contains_key(&item_id) {
+            self.approval_item_order.push(item_id.clone());
+        }
+        self.approval_item_by_id.insert(item_id, item);
+        while self.approval_item_order.len() > 500 {
+            if let Some(evicted) = self.approval_item_order.first().cloned() {
+                self.approval_item_order.remove(0);
+                self.approval_item_by_id.remove(&evicted);
+            }
+        }
+    }
+}
+
+/// purpose: Run hidden CMUX-compatible Codex Teams app-server watcher.
+/// inputs: Parsed Limux client and hidden watcher args from the root launcher.
+/// returns/effects: Streams Codex app-server messages, bridges approvals, and opens subagent splits.
+async fn run_codex_teams_watcher(client: &mut Client, args: &[String]) -> Result<CommandOutput> {
+    let workspace_id = parse_opt(args, "--workspace-id")
+        .ok_or_else(|| anyhow!("__codex-teams-watch requires --workspace-id"))?;
+    let surface_id = parse_opt(args, "--surface-id")
+        .ok_or_else(|| anyhow!("__codex-teams-watch requires --surface-id"))?;
+    let app_server_url = parse_opt(args, "--app-server-url")
+        .ok_or_else(|| anyhow!("__codex-teams-watch requires --app-server-url"))?;
+    let codex_path = parse_opt(args, "--codex-path").unwrap_or_else(|| "codex".to_string());
+    let launch_path = parse_opt(args, "--launch-path");
+    let max_auto_depth = parse_opt(args, "--max-auto-depth")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .with_context(|| format!("invalid --max-auto-depth value `{value}`"))
+        })
+        .transpose()?
+        .unwrap_or(codex_teams::MAX_AUTO_DEPTH);
+    let mut state = CodexTeamsWatcherState::new(
+        workspace_id,
+        surface_id,
+        codex_path,
+        launch_path,
+        max_auto_depth,
+    );
+    let mut connection = codex_teams::AppServerConnection::connect(&app_server_url).await?;
+    connection
+        .initialize(
+            "limux-codex-teams",
+            env!("CARGO_PKG_VERSION"),
+            &[
+                "thread/tokenUsage/updated",
+                "turn/diff/updated",
+                "turn/plan/updated",
+                "item/agentMessage/delta",
+                "item/plan/delta",
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta",
+                "command/exec/outputDelta",
+                "process/outputDelta",
+                "item/fileChange/outputDelta",
+                "item/mcpToolCall/progress",
+                "thread/turn/delta",
+                "turn/delta",
+                "item/textDelta",
+                "item/thinkingDelta",
+                "item/reasoningDelta",
+                "item/commandExecution/outputDelta",
+                "item/commandExecution/stdoutDelta",
+                "item/commandExecution/stderrDelta",
+                "item/outputDelta",
+            ],
+            Duration::from_secs(10),
+        )
+        .await?;
+    backfill_codex_teams_threads(client, &mut connection, &mut state, &app_server_url).await?;
+    loop {
+        let message = connection.receive_object().await?;
+        handle_codex_teams_message(
+            client,
+            &mut connection,
+            &mut state,
+            &app_server_url,
+            message,
+        )
+        .await?;
+    }
+}
+
+async fn backfill_codex_teams_threads(
+    client: &mut Client,
+    connection: &mut codex_teams::AppServerConnection,
+    state: &mut CodexTeamsWatcherState,
+    app_server_url: &str,
+) -> Result<()> {
+    let mut notifications = Vec::new();
+    let loaded = connection
+        .request(
+            "thread/loaded/list",
+            Some(json!({"limit": 200})),
+            |message| {
+                notifications.push(message);
+                Ok(())
+            },
+            Duration::from_secs(10),
+        )
+        .await?;
+    for message in notifications {
+        handle_codex_teams_message_passive(client, connection, state, app_server_url, message)
+            .await?;
+    }
+    let thread_ids = loaded
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for thread_id in thread_ids.iter().filter_map(Value::as_str) {
+        subscribe_codex_teams_thread(client, connection, state, app_server_url, thread_id).await?;
+    }
+    Ok(())
+}
+
+async fn subscribe_codex_teams_thread(
+    client: &mut Client,
+    connection: &mut codex_teams::AppServerConnection,
+    state: &mut CodexTeamsWatcherState,
+    app_server_url: &str,
+    thread_id: &str,
+) -> Result<()> {
+    if !state.subscribed_thread_ids.insert(thread_id.to_string()) {
+        return Ok(());
+    }
+    let mut notifications = Vec::new();
+    let response = match connection
+        .request(
+            "thread/resume",
+            Some(json!({"threadId": thread_id, "excludeTurns": true})),
+            |message| {
+                notifications.push(message);
+                Ok(())
+            },
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            state.subscribed_thread_ids.remove(thread_id);
+            return Err(error);
+        }
+    };
+    for message in notifications {
+        handle_codex_teams_message_passive(client, connection, state, app_server_url, message)
+            .await?;
+    }
+    if let Some(thread) = response
+        .get("thread")
+        .and_then(Value::as_object)
+        .and_then(codex_teams::thread_from_object)
+    {
+        state.observe_thread(client, app_server_url, thread).await?;
+    }
+    Ok(())
+}
+
+async fn handle_codex_teams_message(
+    client: &mut Client,
+    connection: &mut codex_teams::AppServerConnection,
+    state: &mut CodexTeamsWatcherState,
+    app_server_url: &str,
+    message: Value,
+) -> Result<()> {
+    let thread_id = message
+        .get("params")
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("thread"))
+        .and_then(Value::as_object)
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    handle_codex_teams_message_passive(client, connection, state, app_server_url, message).await?;
+    if let Some(thread_id) = thread_id {
+        subscribe_codex_teams_thread(client, connection, state, app_server_url, &thread_id).await?;
+    }
+    Ok(())
+}
+
+async fn handle_codex_teams_message_passive(
+    client: &mut Client,
+    connection: &mut codex_teams::AppServerConnection,
+    state: &mut CodexTeamsWatcherState,
+    app_server_url: &str,
+    message: Value,
+) -> Result<()> {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if let Some(params) = message.get("params").and_then(Value::as_object) {
+        state.cache_approval_item_if_present(method, params);
+    }
+    if let Some(request_id) = message.get("id").cloned() {
+        if handle_codex_teams_approval_request(
+            client, connection, state, method, request_id, &message,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+    let Some(params) = message.get("params").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(thread) = params
+        .get("thread")
+        .and_then(Value::as_object)
+        .and_then(codex_teams::thread_from_object)
+    else {
+        return Ok(());
+    };
+    state
+        .observe_thread(client, app_server_url, thread.clone())
+        .await?;
+    Ok(())
+}
+
+async fn handle_codex_teams_approval_request(
+    client: &mut Client,
+    connection: &mut codex_teams::AppServerConnection,
+    state: &CodexTeamsWatcherState,
+    method: &str,
+    request_id: Value,
+    message: &Value,
+) -> Result<bool> {
+    if !matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+    ) {
+        return Ok(false);
+    }
+    let Some(params) = message.get("params").and_then(Value::as_object) else {
+        connection
+            .respond_error(request_id, -32602, "Codex approval request missing params")
+            .await?;
+        return Ok(true);
+    };
+    let related_item = state.related_item_for_params(params);
+    let event = codex_teams::feed_event(
+        method,
+        &request_id,
+        params,
+        &state.workspace_id,
+        related_item,
+    );
+    let feed_response = client
+        .call(
+            "feed.push",
+            json!({
+                "event": event,
+                "wait_timeout_seconds": 120.0,
+            }),
+        )
+        .await?;
+    let Some(mode) = codex_teams::permission_mode_from_feed_push_response(&feed_response) else {
+        return Ok(true);
+    };
+    if let Some(response) = codex_teams::app_server_approval_response(method, params, &mode) {
+        connection.respond(request_id, response).await?;
+    }
+    Ok(true)
+}
+
 async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<CommandOutput> {
     if let Some(raw_request) = &opts.request {
         let request: V2Request =
@@ -10666,6 +11166,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             }
         }
         "events" => return run_events(client, args).await,
+        "__codex-teams-watch" => return run_codex_teams_watcher(client, args).await,
         "capabilities" | "current-workspace" | "select-workspace" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
                 bail!("unsupported workspace alias: {}", command);
@@ -11555,6 +12056,22 @@ mod cli_arg_tests {
         let error = run_local_command(&opts).expect_err("codex-teams should fail locally");
         assert!(error.to_string().contains("not_supported"));
         assert!(error.to_string().contains("Codex app-server orchestration"));
+    }
+
+    #[tokio::test]
+    async fn cmux_codex_teams_hidden_watcher_routes_and_validates_required_args() {
+        let opts = default_opts(args(&["__codex-teams-watch"]));
+        assert!(run_local_command(&opts)
+            .expect("local command lookup")
+            .is_none());
+
+        let mut client = Client::new(PathBuf::from("/tmp/limux-missing.sock"), None);
+        let error = run_codex_teams_watcher(&mut client, &[])
+            .await
+            .expect_err("missing watcher args fail before socket use");
+        assert!(error
+            .to_string()
+            .contains("__codex-teams-watch requires --workspace-id"));
     }
 
     #[test]
