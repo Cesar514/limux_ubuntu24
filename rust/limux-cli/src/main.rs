@@ -3946,31 +3946,56 @@ enum TopTextFormat {
     Tsv,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TopOptions {
     sort_key: Option<TopSortKey>,
     text_format: TopTextFormat,
+    all: bool,
+    workspace: Option<String>,
+    window: Option<String>,
 }
 
 // purpose: Run CMUX `top` through Limux process diagnostics.
 // inputs: Socket client and parsed top options.
-// returns/effects: Returns system.memory payload tagged with top compatibility metadata.
-async fn run_top(client: &mut Client, options: TopOptions) -> Result<Value> {
-    let mut payload = run_memory(client, &[]).await?;
+// returns/effects: Returns system.top payload tagged with top compatibility metadata.
+async fn run_top(client: &mut Client, options: &TopOptions) -> Result<Value> {
+    let mut payload = client
+        .call("system.top", top_request_params(options))
+        .await?;
     sort_top_payload(&mut payload, options.sort_key);
     if let Some(map) = payload.as_object_mut() {
-        map.insert("source".to_string(), json!("limux_system_memory"));
         map.insert("cmux_command".to_string(), json!("top"));
     }
     Ok(payload)
 }
 
+// purpose: Build system.top params from parsed CLI options.
+// inputs: Parsed top options.
+// returns/effects: Returns a JSON object for the live bridge request.
+fn top_request_params(options: &TopOptions) -> Value {
+    let mut params = Map::new();
+    params.insert("top_group_limit".to_string(), json!(12));
+    if options.all {
+        params.insert("all".to_string(), json!(true));
+    }
+    if let Some(workspace) = &options.workspace {
+        params.insert("workspace_id".to_string(), json!(workspace));
+    }
+    if let Some(window) = &options.window {
+        params.insert("window_id".to_string(), json!(window));
+    }
+    Value::Object(params)
+}
+
 // purpose: Validate CMUX-compatible `top` flags Limux can safely accept.
 // inputs: Raw top command arguments.
-// returns/effects: Returns local render options or fails loudly for unsupported scoped flags.
+// returns/effects: Returns local render and scope options or fails loudly for unsupported metrics.
 fn parse_top_options(args: &[String]) -> Result<TopOptions> {
     let mut sort_key = None;
     let mut text_format = TopTextFormat::Tree;
+    let mut all = false;
+    let mut workspace = None;
+    let mut window = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -3989,11 +4014,17 @@ fn parse_top_options(args: &[String]) -> Result<TopOptions> {
                 text_format = TopTextFormat::Tsv;
                 index += 1;
             }
-            "--all" | "--workspace" | "--window" => {
-                let flag = args[index].as_str();
-                bail!(
-                    "top: {flag} requires CMUX system.top scoped diagnostics, which Limux does not implement yet"
-                );
+            "--all" => {
+                all = true;
+                index += 1;
+            }
+            "--workspace" => {
+                workspace = Some(parse_top_scope_value(args, index)?);
+                index += 2;
+            }
+            "--window" => {
+                window = Some(parse_top_scope_value(args, index)?);
+                index += 2;
             }
             unknown if unknown.starts_with("--") => {
                 let known = concat!(
@@ -4008,7 +4039,22 @@ fn parse_top_options(args: &[String]) -> Result<TopOptions> {
     Ok(TopOptions {
         sort_key,
         text_format,
+        all,
+        workspace,
+        window,
     })
+}
+
+// purpose: Parse a required top scope value.
+// inputs: Raw args and current flag index.
+// returns/effects: Returns a non-empty scope string or usage error.
+fn parse_top_scope_value(args: &[String], index: usize) -> Result<String> {
+    let flag = args[index].as_str();
+    let value = args
+        .get(index + 1)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("top requires {flag} <value>"))?;
+    Ok(value.to_string())
 }
 
 // purpose: Parse a CMUX-compatible top sort flag for local process groups.
@@ -12904,7 +12950,7 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         }
         "top" => {
             let top_options = parse_top_options(args)?;
-            let payload = run_top(client, top_options).await?;
+            let payload = run_top(client, &top_options).await?;
             if opts.json_output {
                 CommandOutput::Json(payload)
             } else if top_options.text_format == TopTextFormat::Tsv {
@@ -15087,7 +15133,7 @@ mod cli_arg_tests {
     }
 
     #[test]
-    fn cmux_top_options_accept_safe_flags_and_reject_unimplemented_scopes() {
+    fn cmux_top_options_accept_safe_flags_and_scopes() {
         let tree = parse_top_options(&args(&["--processes", "--format", "tree"]))
             .expect("safe top flags parse");
         assert_eq!(tree.text_format, TopTextFormat::Tree);
@@ -15104,9 +15150,19 @@ mod cli_arg_tests {
         let cpu = parse_top_options(&args(&["--sort", "cpu"])).expect_err("cpu needs real top");
         assert!(cpu.to_string().contains("CPU diagnostics"));
 
-        let scoped =
-            parse_top_options(&args(&["--workspace", "workspace:7"])).expect_err("scope fails");
-        assert!(scoped.to_string().contains("system.top scoped diagnostics"));
+        let scoped = parse_top_options(&args(&[
+            "--workspace",
+            "workspace:7",
+            "--window",
+            "window:1",
+        ]))
+        .expect("scope flags parse");
+        assert_eq!(scoped.workspace.as_deref(), Some("workspace:7"));
+        assert_eq!(scoped.window.as_deref(), Some("window:1"));
+
+        let params = top_request_params(&scoped);
+        assert_eq!(params["workspace_id"], "workspace:7");
+        assert_eq!(params["window_id"], "window:1");
     }
 
     #[test]

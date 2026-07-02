@@ -2308,6 +2308,35 @@ fn system_tree_payload(
     }))
 }
 
+// purpose: Build native CMUX system.top output from live process diagnostics.
+// inputs: Optional workspace and window scopes plus all-window flag.
+// returns/effects: Returns scoped process diagnostics or a loud scope error.
+fn system_top_payload(
+    state: &State,
+    top_group_limit: usize,
+    workspace_target: Option<&WorkspaceTarget>,
+    window_id: Option<&str>,
+    _include_all: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    validate_system_tree_window(window_id)?;
+    let workspace_id = if let Some(target) = workspace_target {
+        let app_state = state.borrow();
+        let index = workspace_index_for_target(&app_state, target)
+            .ok_or_else(|| BridgeError::not_found("workspace not found"))?;
+        Some(app_state.workspaces[index].id.clone())
+    } else {
+        None
+    };
+    let mut payload =
+        crate::memory_diagnostics::top_diagnostic_payload(top_group_limit, workspace_id.as_deref())
+            .map_err(BridgeError::internal)?;
+    if let Some(top) = payload.get("top_diagnostic").cloned() {
+        payload["memory_diagnostic"] = top;
+    }
+    payload["source"] = serde_json::Value::String("limux_system_top".to_string());
+    Ok(payload)
+}
+
 fn surface_list_payload(
     state: &State,
     workspace: &Workspace,
@@ -8139,6 +8168,22 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         } => {
             let result = crate::memory_diagnostics::memory_diagnostic_payload(top_group_limit)
                 .map_err(BridgeError::internal);
+            let _ = reply.send(result);
+        }
+        ControlCommand::SystemTop {
+            top_group_limit,
+            workspace_target,
+            window_id,
+            include_all,
+            reply,
+        } => {
+            let result = system_top_payload(
+                state,
+                top_group_limit,
+                workspace_target.as_ref(),
+                window_id.as_deref(),
+                include_all,
+            );
             let _ = reply.send(result);
         }
         ControlCommand::SystemTree {

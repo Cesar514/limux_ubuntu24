@@ -28,6 +28,7 @@ const METHODS: &[&str] = &[
     "system.identify",
     "system.capabilities",
     "system.memory",
+    "system.top",
     "system.tree",
     "auth.login",
     "auth.status",
@@ -611,6 +612,13 @@ pub enum ControlCommand {
         top_group_limit: usize,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SystemTop {
+        top_group_limit: usize,
+        workspace_target: Option<WorkspaceTarget>,
+        window_id: Option<String>,
+        include_all: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SystemTree {
         workspace_target: Option<WorkspaceTarget>,
         window_id: Option<String>,
@@ -891,6 +899,7 @@ impl ControlCommand {
         match self {
             Self::Identify { reply, .. }
             | Self::Memory { reply, .. }
+            | Self::SystemTop { reply, .. }
             | Self::SystemTree { reply, .. }
             | Self::ListWindows { reply }
             | Self::ReloadConfig { reply }
@@ -1868,6 +1877,37 @@ fn parse_system_tree_scope(
     Ok((workspace_target, window_id, include_all))
 }
 
+// purpose: Parse CMUX-compatible system.top scope fields.
+// inputs: JSON params for system.top.
+// returns/effects: Returns workspace/window/all scope or a loud invalid combination error.
+fn parse_system_top_scope(
+    params: &Map<String, Value>,
+) -> Result<(Option<WorkspaceTarget>, Option<String>, bool), BridgeError> {
+    let workspace_target = parse_optional_tree_workspace_target(params)?;
+    let window_id = optional_string(params, &["window_id", "window"]);
+    let include_all = optional_bool(params, "all")?.unwrap_or(false);
+    if include_all && (window_id.is_some() || workspace_target.is_some()) {
+        return Err(BridgeError::invalid_params(
+            "system.top all cannot be combined with window_id or workspace scope",
+        ));
+    }
+    Ok((workspace_target, window_id, include_all))
+}
+
+// purpose: Parse bounded top/memory diagnostic row limits.
+// inputs: JSON params and method name for diagnostics.
+// returns/effects: Returns 1..=100 limit or a method-specific invalid params error.
+fn parse_top_group_limit(params: &Map<String, Value>, method: &str) -> Result<usize, BridgeError> {
+    match optional_index(params, "top_group_limit") {
+        Ok(Some(limit)) if (1..=100).contains(&limit) => Ok(limit),
+        Ok(Some(_)) => Err(BridgeError::invalid_params(format!(
+            "{method} top_group_limit must be 1..=100"
+        ))),
+        Ok(None) => Ok(12),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_pane_create_direction(raw: &str) -> Result<PaneCreateDirection, BridgeError> {
     match raw {
@@ -2368,23 +2408,35 @@ fn handle_method(
             )
         }
         "system.memory" | "memory" => {
-            let top_group_limit = match optional_index(params, "top_group_limit") {
-                Ok(Some(limit)) if (1..=100).contains(&limit) => limit,
-                Ok(Some(_)) => {
-                    return error_response(
-                        id,
-                        BridgeError::invalid_params(
-                            "system.memory top_group_limit must be 1..=100",
-                        ),
-                    );
-                }
-                Ok(None) => 12,
+            let top_group_limit = match parse_top_group_limit(params, "system.memory") {
+                Ok(limit) => limit,
                 Err(error) => return error_response(id, error),
             };
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::Memory {
                     top_group_limit,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "system.top" | "top" => {
+            let top_group_limit = match parse_top_group_limit(params, "system.top") {
+                Ok(limit) => limit,
+                Err(error) => return error_response(id, error),
+            };
+            let (workspace_target, window_id, include_all) = match parse_system_top_scope(params) {
+                Ok(scope) => scope,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SystemTop {
+                    top_group_limit,
+                    workspace_target,
+                    window_id,
+                    include_all,
                     reply,
                 },
                 rx,
@@ -7556,6 +7608,51 @@ mod tests {
         let invalid = dispatch_request(
             r#"{"id":1,"method":"system.memory","params":{"top_group_limit":101}}"#,
             &|command| panic!("invalid system.memory should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn system_top_route_preserves_scope_and_limit() {
+        let request = concat!(
+            r#"{"id":1,"method":"system.top","params":{"#,
+            r#""top_group_limit":6,"workspace_id":"workspace:abc","window_id":"window:1"}}"#
+        );
+        let response = dispatch_request(request, &|command| match command {
+            ControlCommand::SystemTop {
+                top_group_limit,
+                workspace_target,
+                window_id,
+                include_all,
+                reply,
+            } => {
+                assert_eq!(top_group_limit, 6);
+                assert_eq!(window_id.as_deref(), Some("window:1"));
+                assert!(!include_all);
+                assert!(matches!(
+                    workspace_target,
+                    Some(WorkspaceTarget::Handle(ref id)) if id == "workspace:abc"
+                ));
+                let _ = reply.send(Ok(json!({ "top_diagnostic": { "ok": true } })));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("system.top result")["top_diagnostic"]["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn system_top_route_rejects_invalid_scope_combinations() {
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"system.top","params":{"all":true,"workspace_id":"abc"}}"#,
+            &|command| panic!("invalid system.top should not dispatch: {command:?}"),
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),

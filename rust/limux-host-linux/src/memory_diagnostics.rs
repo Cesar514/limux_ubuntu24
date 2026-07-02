@@ -37,10 +37,34 @@ struct ProcessGroup {
 /// inputs: top_group_limit controls the number of child groups returned.
 /// returns/effects: Returns JSON with app RSS and descendant group summaries.
 pub fn memory_diagnostic_payload(top_group_limit: usize) -> Result<Value, String> {
+    diagnostic_payload(top_group_limit, None, "memory_diagnostic")
+}
+
+/// purpose: Build the CMUX-style top diagnostic payload for the current host.
+/// inputs: top_group_limit controls rows and workspace_filter optionally scopes by workspace.
+/// returns/effects: Returns JSON with app RSS and descendant process groups.
+pub fn top_diagnostic_payload(
+    top_group_limit: usize,
+    workspace_filter: Option<&str>,
+) -> Result<Value, String> {
+    diagnostic_payload(top_group_limit, workspace_filter, "top_diagnostic")
+}
+
+/// purpose: Build a process diagnostic payload from one /proc scan.
+/// inputs: Row limit, optional workspace scope, and public payload key.
+/// returns/effects: Returns aggregate app/child process memory diagnostics.
+fn diagnostic_payload(
+    top_group_limit: usize,
+    workspace_filter: Option<&str>,
+    payload_key: &str,
+) -> Result<Value, String> {
     let root_pid = std::process::id();
     let root = read_process_stats(root_pid)?;
     let groups = collect_child_groups(root_pid)?;
-    let mut groups = group_processes_by_direct_child(groups);
+    let mut groups = group_processes_by_direct_child(groups)
+        .into_iter()
+        .filter(|group| group_matches_workspace(group, workspace_filter))
+        .collect::<Vec<_>>();
     groups.sort_by(|left, right| right.rss_bytes.cmp(&left.rss_bytes));
 
     let total_child_rss = groups.iter().map(|group| group.rss_bytes).sum::<u64>();
@@ -54,22 +78,50 @@ pub fn memory_diagnostic_payload(top_group_limit: usize) -> Result<Value, String
         .map(group_to_json)
         .collect::<Vec<_>>();
 
-    Ok(json!({
-        "memory_diagnostic": {
-            "summary": format!(
-                "Limux memory: app RSS {}, child RSS {} across {}",
-                format_bytes(root.resident_bytes),
-                format_bytes(total_child_rss),
-                process_count_text(total_child_count)
-            ),
-            "app": process_to_json(&root),
-            "children": {
-                "recursive_rss_bytes": total_child_rss,
-                "process_count": total_child_count,
-                "groups": group_values,
-            }
+    let mut diagnostic = json!({
+        "summary": format!(
+            "Limux memory: app RSS {}, child RSS {} across {}",
+            format_bytes(root.resident_bytes),
+            format_bytes(total_child_rss),
+            process_count_text(total_child_count)
+        ),
+        "app": process_to_json(&root),
+        "children": {
+            "recursive_rss_bytes": total_child_rss,
+            "process_count": total_child_count,
+            "groups": group_values,
         }
-    }))
+    });
+    if let Some(workspace_id) = workspace_filter {
+        diagnostic["scope"] = json!({
+            "workspace_id": normalize_workspace_filter(workspace_id),
+            "workspace_ref": format!("workspace:{}", normalize_workspace_filter(workspace_id)),
+        });
+    }
+    Ok(json!({ payload_key: diagnostic }))
+}
+
+/// purpose: Check whether a process group belongs to an optional workspace scope.
+/// inputs: Process group plus optional raw/ref workspace id.
+/// returns/effects: Returns true for unscoped diagnostics or matching attribution.
+fn group_matches_workspace(group: &ProcessGroup, workspace_filter: Option<&str>) -> bool {
+    let Some(workspace_filter) = workspace_filter else {
+        return true;
+    };
+    let expected = normalize_workspace_filter(workspace_filter);
+    group
+        .root
+        .attribution
+        .workspace_id
+        .as_deref()
+        .is_some_and(|workspace_id| workspace_id == expected)
+}
+
+/// purpose: Normalize CMUX workspace refs for process attribution matching.
+/// inputs: Raw workspace id or `workspace:<id>` ref.
+/// returns/effects: Returns the attribution id stored in child environments.
+fn normalize_workspace_filter(raw: &str) -> &str {
+    raw.strip_prefix("workspace:").unwrap_or(raw)
 }
 
 /// purpose: Read descendants grouped under each direct child of the host process.
@@ -375,5 +427,18 @@ mod tests {
     fn split_env_entry_preserves_values_with_equals() {
         let parsed = split_env_entry(b"LIMUX_SURFACE_ID=1:terminal=extra").expect("env parses");
         assert_eq!(parsed, ("LIMUX_SURFACE_ID", "1:terminal=extra".to_string()));
+    }
+
+    #[test]
+    fn group_workspace_filter_accepts_raw_and_ref_ids() {
+        let mut group = ProcessGroup::default();
+        group.root.attribution.workspace_id = Some("workspace-a".to_string());
+
+        assert!(group_matches_workspace(&group, Some("workspace-a")));
+        assert!(group_matches_workspace(
+            &group,
+            Some("workspace:workspace-a")
+        ));
+        assert!(!group_matches_workspace(&group, Some("workspace-b")));
     }
 }
