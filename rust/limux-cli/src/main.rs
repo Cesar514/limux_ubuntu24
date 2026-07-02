@@ -287,6 +287,8 @@ fn full_help_text() -> &'static str {
         "      [--direction <left|right|up|down>]\n",
         "  focus-panel --panel <id|ref> [--workspace <id|ref>]\n",
         "  close-surface --surface <id|ref>\n",
+        "  split-off --surface <id|ref> [--direction <left|right|up|down>]\n",
+        "  drag-surface-to-split --surface <id|ref> [--direction <left|right|up|down>]\n",
         "  reorder-surface --surface <id|ref>\n",
         "      (--index <n>|--before-surface <id|ref>|--after-surface <id|ref>)\n",
         "  refresh-surfaces [--surface <id|ref>]\n",
@@ -307,7 +309,7 @@ fn full_help_text() -> &'static str {
         "  themes [list|set|clear]\n",
         "  new-window | current-window | list-windows | focus-window | close-window\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
-        "  move-surface | reorder-surface\n",
+        "  move-surface | split-off | drag-surface-to-split | reorder-surface\n",
         "  refresh-surfaces\n",
         "  list-notifications | dismiss-notification | mark-notification-read\n",
         "  open-notification | jump-to-unread | clear-notifications\n\n",
@@ -4284,6 +4286,7 @@ fn build_surface_alias_request(
         "close-surface" => "surface.close",
         "move-surface" => "surface.move",
         "reorder-surface" => "surface.reorder",
+        "split-off" | "drag-surface-to-split" => "surface.drag_to_split",
         "new-split" => "surface.split",
         "refresh-surfaces" => "surface.refresh",
         _ => return Ok(None),
@@ -4301,6 +4304,13 @@ fn build_surface_alias_request(
         params.insert("surface_id".to_string(), Value::String(surface));
     }
     if command == "new-split" {
+        let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
+        params.insert("direction".to_string(), Value::String(direction));
+    }
+    if command == "split-off" || command == "drag-surface-to-split" {
+        if !params.contains_key("surface_id") {
+            bail!("{command} requires --surface, --panel, or a surface positional");
+        }
         let direction = parse_opt(args, "--direction").unwrap_or_else(|| "right".to_string());
         params.insert("direction".to_string(), Value::String(direction));
     }
@@ -5730,7 +5740,13 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(render_list_text("list-panels", &payload))
             }
         }
-        "new-split" | "focus-panel" | "close-surface" | "move-surface" | "reorder-surface"
+        "new-split"
+        | "focus-panel"
+        | "close-surface"
+        | "move-surface"
+        | "split-off"
+        | "drag-surface-to-split"
+        | "reorder-surface"
         | "refresh-surfaces" => {
             let Some((method, params)) = build_surface_alias_request(command, args)? else {
                 bail!("unsupported surface alias: {}", command);
@@ -6385,6 +6401,24 @@ mod cli_arg_tests {
                 .expect("refresh-surfaces maps");
         assert_eq!(refreshed.0, "surface.refresh");
         assert_eq!(refreshed.1["surface_id"], "surface:7:tab-a");
+
+        let split_off = build_surface_alias_request(
+            "split-off",
+            &args(&["--surface", "surface:7:tab-a", "--direction", "left"]),
+        )
+        .expect("split-off parses")
+        .expect("split-off maps");
+        assert_eq!(split_off.0, "surface.drag_to_split");
+        assert_eq!(split_off.1["surface_id"], "surface:7:tab-a");
+        assert_eq!(split_off.1["direction"], "left");
+
+        let drag =
+            build_surface_alias_request("drag-surface-to-split", &args(&["surface:7:tab-a"]))
+                .expect("drag-surface-to-split parses")
+                .expect("drag-surface-to-split maps");
+        assert_eq!(drag.0, "surface.drag_to_split");
+        assert_eq!(drag.1["surface_id"], "surface:7:tab-a");
+        assert_eq!(drag.1["direction"], "right");
     }
 
     #[test]

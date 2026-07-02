@@ -133,6 +133,7 @@ const METHODS: &[&str] = &[
     "surface.close",
     "surface.move",
     "surface.reorder",
+    "surface.drag_to_split",
     "surface.refresh",
     "surface.health",
     "surface.read_text",
@@ -553,6 +554,12 @@ pub enum ControlCommand {
         after_surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    DragSurfaceToSplit {
+        target: WorkspaceTarget,
+        surface_hint: String,
+        direction: PaneCreateDirection,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     RefreshSurfaces {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -668,6 +675,7 @@ impl ControlCommand {
             | Self::CloseSurface { reply, .. }
             | Self::MoveSurface { reply, .. }
             | Self::ReorderSurface { reply, .. }
+            | Self::DragSurfaceToSplit { reply, .. }
             | Self::RefreshSurfaces { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::ReadSurfaceText { reply, .. }
@@ -2338,6 +2346,43 @@ fn handle_method(
                     index,
                     before_surface_hint,
                     after_surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.drag_to_split" | "drag-surface-to-split" | "split-off" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint =
+                match optional_ref_handle(params, &["surface_id", "panel_id", "id"], "surface:") {
+                    Ok(Some(value)) if !value.trim().is_empty() => value,
+                    Ok(_) => {
+                        return error_response(
+                            id,
+                            BridgeError::invalid_params(
+                                "surface.drag_to_split requires surface_id",
+                            ),
+                        );
+                    }
+                    Err(error) => return error_response(id, error),
+                };
+            let direction = match parse_pane_create_direction(
+                optional_string(params, &["direction"])
+                    .unwrap_or_else(|| "right".to_string())
+                    .as_str(),
+            ) {
+                Ok(direction) => direction,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::DragSurfaceToSplit {
+                    target,
+                    surface_hint,
+                    direction,
                     reply,
                 },
                 rx,
@@ -4638,6 +4683,53 @@ mod tests {
         );
         assert_eq!(all.error, None);
         assert_eq!(all.result.expect("surface.refresh result")["refreshed"], 2);
+    }
+
+    #[test]
+    fn surface_drag_to_split_route_accepts_cmux_aliases() {
+        let explicit = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"drag-surface-to-split","params":{"workspace_id":"codex","#,
+                r#""surface_id":"surface:4:tab","direction":"left"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::DragSurfaceToSplit {
+                    target,
+                    surface_hint,
+                    direction,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, "4:tab");
+                    assert_eq!(direction, PaneCreateDirection::Left);
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:12:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(explicit.error, None);
+        assert_eq!(
+            explicit.result.expect("surface.drag_to_split result")["surface_ref"],
+            "surface:12:tab"
+        );
+
+        let split_off = dispatch_request(
+            r#"{"id":1,"method":"split-off","params":{"surface_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::DragSurfaceToSplit {
+                    surface_hint,
+                    direction,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(surface_hint, "4:tab");
+                    assert_eq!(direction, PaneCreateDirection::Right);
+                    let _ = reply.send(Ok(json!({ "surface_ref": "surface:12:tab" })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(split_off.error, None);
     }
 
     #[test]

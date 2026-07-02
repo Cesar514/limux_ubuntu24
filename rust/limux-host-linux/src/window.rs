@@ -6611,6 +6611,74 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             request_session_save(state);
             let _ = reply.send(Ok(result));
         }
+        ControlCommand::DragSurfaceToSplit {
+            target,
+            surface_hint,
+            direction,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(workspace_index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, source) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[workspace_index];
+                let source = pane::surface_source_for_root(&workspace.root, &surface_hint);
+                (workspace.id.clone(), workspace.name.clone(), source)
+            };
+            let Some((source_pane, tab_id)) = source else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            let placement = pane_create_split_placement(PaneCreateDirection::from(direction));
+            let new_pane = split_pane(
+                state,
+                &workspace_id,
+                &source_pane,
+                placement.orientation,
+                SplitPaneOptions {
+                    initial_state: None,
+                    skip_default_tab: true,
+                    new_pane_first: placement.new_pane_first,
+                    persist: false,
+                },
+            );
+            let Some(new_pane) = new_pane else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::invalid_params(
+                    "not enough room to split pane",
+                )));
+                return;
+            };
+
+            if !pane::move_tab_to_pane(&source_pane, &tab_id, &new_pane) {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            }
+            let Some(surface) = pane::active_surface_summary(&new_pane) else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::internal(
+                    "surface.drag_to_split did not produce a surface",
+                )));
+                return;
+            };
+
+            request_session_save(state);
+            let result = pane_create_response_payload(&workspace_id, &workspace_name, surface);
+            let _ = reply.send(Ok(result));
+        }
         ControlCommand::RefreshSurfaces {
             target,
             surface_hint,

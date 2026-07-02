@@ -2332,6 +2332,33 @@ pub fn move_surface_for_root(
     None
 }
 
+// purpose: Resolve a live surface to the pane widget and tab id that own it.
+// inputs: Workspace root and surface handle or tab id.
+// returns/effects: Returns source pane widget plus tab id without mutating state.
+pub fn surface_source_for_root(
+    root: &gtk::Widget,
+    surface_hint: &str,
+) -> Option<(gtk::Widget, String)> {
+    let requested = normalize_surface_hint(surface_hint);
+    if requested.is_empty() {
+        return None;
+    }
+
+    for internals in pane_internals_for_root(root) {
+        let tab_id = {
+            let tab_state = internals.tab_state.borrow();
+            tab_state.tabs.iter().find_map(|entry| {
+                let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+                surface_hint_matches(&surface_id, &entry.id, requested).then(|| entry.id.clone())
+            })
+        };
+        if let Some(tab_id) = tab_id {
+            return Some((internals.pane_outer.clone().upcast(), tab_id));
+        }
+    }
+    None
+}
+
 // purpose: Reorder a surface within its current pane.
 // inputs: Workspace root, source surface handle, and one target index/before/after hint.
 // returns/effects: Reorders the tab strip and returns the reordered surface summary.
