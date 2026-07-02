@@ -20,7 +20,7 @@ const MAX_WORKSTREAM_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
 static FEED: OnceLock<FeedCoordinator> = OnceLock::new();
 
-pub fn coordinator() -> &'static FeedCoordinator {
+pub(crate) fn coordinator() -> &'static FeedCoordinator {
     FEED.get_or_init(FeedCoordinator::new)
 }
 
@@ -49,7 +49,32 @@ struct FeedState {
     items: VecDeque<FeedItem>,
 }
 
-pub struct FeedCoordinator {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FeedNotificationRequest {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) surface_id: Option<String>,
+    pub(crate) title: String,
+    pub(crate) body: String,
+}
+
+struct FeedPushReceipt {
+    item_id: String,
+    request_id: Option<String>,
+    wait: Duration,
+    should_wait: bool,
+}
+
+struct FeedIncomingItem {
+    event: Value,
+    wait: Duration,
+    request_id: Option<String>,
+    kind: String,
+    source: String,
+    status: FeedStatus,
+    should_wait: bool,
+}
+
+pub(crate) struct FeedCoordinator {
     state: Mutex<FeedState>,
     changed: Condvar,
     audit_log_path: Option<PathBuf>,
@@ -74,35 +99,68 @@ impl FeedCoordinator {
         }
     }
 
-    // purpose: Ingest one CMUX workstream event and optionally wait for a decision.
-    // inputs: feed.push params with event or flattened event fields and wait_timeout_seconds.
-    // returns/effects: Stores a bounded feed item and returns acknowledged/resolved/timed_out.
-    pub fn push(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
-        let event = event_from_params(params)?;
-        let wait = wait_timeout(params)?;
-        let request_id = request_id_from_event(&event);
-        let kind = kind_from_event(&event);
-        let source = string_field(&event, &["_source", "source"])
-            .unwrap_or("unknown")
-            .to_string();
-        let actionable = matches!(kind.as_str(), "permissionRequest" | "exitPlan" | "question");
-        let should_wait = wait > Duration::ZERO && request_id.is_some();
-        let status = if actionable && request_id.is_some() {
-            FeedStatus::Pending
-        } else {
-            FeedStatus::Telemetry
-        };
+    // purpose: Ingest one Feed event and notify the host when it needs attention.
+    // inputs: Feed push params plus a synchronous callback for pending actionable rows.
+    // returns/effects: Stores the item, invokes callback before waiting, then resolves as normal.
+    pub(crate) fn push_with_received_hook<F>(
+        &self,
+        params: &Map<String, Value>,
+        mut on_received: F,
+    ) -> Result<Value, BridgeError>
+    where
+        F: FnMut(&FeedNotificationRequest),
+    {
+        let receipt = self.store_received_item(params, &mut on_received)?;
+        if !receipt.should_wait {
+            return self.complete_unblocked_push(&receipt);
+        }
+        self.wait_for_decision(receipt)
+    }
 
+    // purpose: Store one inbound item and emit received/audit/native-notification side effects.
+    // inputs: Ingestion params and callback for pending actionable native notifications.
+    // returns/effects: Mutates retained Feed state and returns wait metadata for the caller.
+    fn store_received_item<F>(
+        &self,
+        params: &Map<String, Value>,
+        on_received: &mut F,
+    ) -> Result<FeedPushReceipt, BridgeError>
+    where
+        F: FnMut(&FeedNotificationRequest),
+    {
+        let incoming = parse_incoming_item(params)?;
+        let (receipt, payload, notification) = self.insert_received_item(incoming)?;
+        publish_feed_bus_event(
+            "feed.item.received",
+            "feed",
+            "feed.coordinator",
+            payload.clone(),
+        );
+        self.write_audit_record("feed.item.received", &payload)?;
+        publish_agent_hook_event(&payload);
+        if let Some(notification) = notification {
+            on_received(&notification);
+        }
+        Ok(receipt)
+    }
+
+    // purpose: Insert one parsed Feed item into the retained ring.
+    // inputs: Parsed Feed item metadata.
+    // returns/effects: Mutates Feed state and returns received event/notification metadata.
+    fn insert_received_item(
+        &self,
+        incoming: FeedIncomingItem,
+    ) -> Result<(FeedPushReceipt, Value, Option<FeedNotificationRequest>), BridgeError> {
         let mut state = self.lock_state()?;
         let item_id = format!("feed-{}", state.next_id);
         state.next_id += 1;
         state.items.push_back(FeedItem {
             id: item_id.clone(),
-            request_id: request_id.clone(),
-            event,
-            source,
-            kind,
-            status,
+            request_id: incoming.request_id.clone(),
+            event: incoming.event,
+            source: incoming.source,
+            kind: incoming.kind,
+            status: incoming.status,
             created_at_ms: now_millis(),
             decision: None,
         });
@@ -111,95 +169,68 @@ impl FeedCoordinator {
         }
         let event_payload = feed_event_payload(
             &item_id,
-            request_id.as_deref(),
+            incoming.request_id.as_deref(),
             state.items.back().expect("just pushed feed item"),
             "received",
             None,
         );
+        let notification = state.items.back().and_then(feed_notification_request);
+        let receipt = FeedPushReceipt {
+            item_id,
+            request_id: incoming.request_id,
+            wait: incoming.wait,
+            should_wait: incoming.should_wait,
+        };
+        Ok((receipt, event_payload, notification))
+    }
+
+    // purpose: Finish ingestion that does not block for a user decision.
+    // inputs: Stored receipt for telemetry or zero timeout pending rows.
+    // returns/effects: Publishes completion and returns acknowledged status.
+    fn complete_unblocked_push(&self, receipt: &FeedPushReceipt) -> Result<Value, BridgeError> {
+        let state = self.lock_state()?;
+        let Some(item) = state
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.id == receipt.item_id)
+        else {
+            return Err(BridgeError::not_found("feed item not found"));
+        };
+        let completed_payload = feed_event_payload(
+            &receipt.item_id,
+            receipt.request_id.as_deref(),
+            item,
+            "acknowledged",
+            None,
+        );
         publish_feed_bus_event(
-            "feed.item.received",
+            "feed.item.completed",
             "feed",
             "feed.coordinator",
-            event_payload.clone(),
+            completed_payload.clone(),
         );
-        self.write_audit_record("feed.item.received", &event_payload)?;
-        publish_agent_hook_event(&event_payload);
+        self.write_audit_record("feed.item.completed", &completed_payload)?;
+        Ok(json!({ "status": "acknowledged", "item_id": receipt.item_id }))
+    }
 
-        if !should_wait {
-            let completed_payload = feed_event_payload(
-                &item_id,
-                request_id.as_deref(),
-                state.items.back().expect("just pushed feed item"),
-                "acknowledged",
-                None,
-            );
-            publish_feed_bus_event(
-                "feed.item.completed",
-                "feed",
-                "feed.coordinator",
-                completed_payload.clone(),
-            );
-            self.write_audit_record("feed.item.completed", &completed_payload)?;
-            return Ok(json!({ "status": "acknowledged", "item_id": item_id }));
-        }
-
-        let request_id = request_id.expect("checked should_wait");
-        let deadline = Instant::now() + wait;
+    // purpose: Wait for a Feed decision until the request resolves or times out.
+    // inputs: Stored Feed receipt with a required request id and timeout duration.
+    // returns/effects: Blocks current socket worker and publishes completion on resolve/timeout.
+    fn wait_for_decision(&self, receipt: FeedPushReceipt) -> Result<Value, BridgeError> {
+        let request_id = receipt.request_id.expect("checked should_wait");
+        let deadline = Instant::now() + receipt.wait;
+        let mut state = self.lock_state()?;
         loop {
-            if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
-                if item.status == FeedStatus::Resolved {
-                    let completed_payload = feed_event_payload(
-                        &item_id,
-                        Some(&request_id),
-                        item,
-                        "resolved",
-                        item.decision.as_ref(),
-                    );
-                    publish_feed_bus_event(
-                        "feed.item.completed",
-                        "feed",
-                        "feed.coordinator",
-                        completed_payload.clone(),
-                    );
-                    self.write_audit_record("feed.item.completed", &completed_payload)?;
-                    return Ok(json!({
-                        "status": "resolved",
-                        "item_id": item_id,
-                        "decision": item.decision.clone().unwrap_or_else(|| json!({})),
-                    }));
-                }
-                if item.status == FeedStatus::Expired {
-                    return Ok(json!({ "status": "timed_out", "item_id": item_id }));
-                }
+            if let Some(result) =
+                self.resolved_push_result(&state, &receipt.item_id, &request_id)?
+            {
+                return Ok(result);
             }
-
             let now = Instant::now();
             if now >= deadline {
-                if let Some(item) = state
-                    .items
-                    .iter_mut()
-                    .rev()
-                    .find(|item| item.request_id.as_deref() == Some(request_id.as_str()))
-                {
-                    if item.status == FeedStatus::Pending {
-                        item.status = FeedStatus::Expired;
-                    }
-                }
-                if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
-                    let completed_payload =
-                        feed_event_payload(&item_id, Some(&request_id), item, "timed_out", None);
-                    publish_feed_bus_event(
-                        "feed.item.completed",
-                        "feed",
-                        "feed.coordinator",
-                        completed_payload.clone(),
-                    );
-                    self.write_audit_record("feed.item.completed", &completed_payload)?;
-                }
-                self.changed.notify_all();
-                return Ok(json!({ "status": "timed_out", "item_id": item_id }));
+                return self.expire_pending_push(state, &receipt.item_id, &request_id);
             }
-
             let remaining = deadline.saturating_duration_since(now);
             let (next_state, _) = self
                 .changed
@@ -209,7 +240,82 @@ impl FeedCoordinator {
         }
     }
 
-    pub fn permission_reply(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
+    // purpose: Convert resolved/expired Feed state into a socket response when available.
+    // inputs: Locked Feed state, item id, and request id.
+    // returns/effects: Publishes resolved completion once; otherwise leaves state untouched.
+    fn resolved_push_result(
+        &self,
+        state: &FeedState,
+        item_id: &str,
+        request_id: &str,
+    ) -> Result<Option<Value>, BridgeError> {
+        let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) else {
+            return Ok(None);
+        };
+        if item.status == FeedStatus::Expired {
+            return Ok(Some(json!({ "status": "timed_out", "item_id": item_id })));
+        }
+        if item.status != FeedStatus::Resolved {
+            return Ok(None);
+        }
+        let payload = feed_event_payload(
+            item_id,
+            Some(request_id),
+            item,
+            "resolved",
+            item.decision.as_ref(),
+        );
+        publish_feed_bus_event(
+            "feed.item.completed",
+            "feed",
+            "feed.coordinator",
+            payload.clone(),
+        );
+        self.write_audit_record("feed.item.completed", &payload)?;
+        Ok(Some(json!({
+            "status": "resolved",
+            "item_id": item_id,
+            "decision": item.decision.clone().unwrap_or_else(|| json!({})),
+        })))
+    }
+
+    // purpose: Mark a pending Feed push expired and return timed-out socket status.
+    // inputs: Locked Feed state plus item/request identifiers.
+    // returns/effects: Mutates pending item status, publishes completion, and wakes waiters.
+    fn expire_pending_push(
+        &self,
+        mut state: std::sync::MutexGuard<'_, FeedState>,
+        item_id: &str,
+        request_id: &str,
+    ) -> Result<Value, BridgeError> {
+        if let Some(item) = state
+            .items
+            .iter_mut()
+            .rev()
+            .find(|item| item.request_id.as_deref() == Some(request_id))
+        {
+            if item.status == FeedStatus::Pending {
+                item.status = FeedStatus::Expired;
+            }
+        }
+        if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
+            let payload = feed_event_payload(item_id, Some(request_id), item, "timed_out", None);
+            publish_feed_bus_event(
+                "feed.item.completed",
+                "feed",
+                "feed.coordinator",
+                payload.clone(),
+            );
+            self.write_audit_record("feed.item.completed", &payload)?;
+        }
+        self.changed.notify_all();
+        Ok(json!({ "status": "timed_out", "item_id": item_id }))
+    }
+
+    pub(crate) fn permission_reply(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<Value, BridgeError> {
         let request_id = required_string(params, &["request_id", "requestId"])?;
         let mode = required_string(params, &["mode"])?;
         if !matches!(mode, "once" | "always" | "all" | "bypass" | "deny") {
@@ -220,7 +326,7 @@ impl FeedCoordinator {
         self.resolve(request_id, json!({ "kind": "permission", "mode": mode }))
     }
 
-    pub fn question_reply(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
+    pub(crate) fn question_reply(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
         let request_id = required_string(params, &["request_id", "requestId"])?;
         let selections = params
             .get("selections")
@@ -239,7 +345,10 @@ impl FeedCoordinator {
         )
     }
 
-    pub fn exit_plan_reply(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
+    pub(crate) fn exit_plan_reply(
+        &self,
+        params: &Map<String, Value>,
+    ) -> Result<Value, BridgeError> {
         let request_id = required_string(params, &["request_id", "requestId"])?;
         let raw_mode = required_string(params, &["mode"])?;
         let mode = match raw_mode {
@@ -259,7 +368,7 @@ impl FeedCoordinator {
         self.resolve(request_id, decision)
     }
 
-    pub fn list(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
+    pub(crate) fn list(&self, params: &Map<String, Value>) -> Result<Value, BridgeError> {
         let pending_only = params
             .get("pending_only")
             .or_else(|| params.get("pendingOnly"))
@@ -308,7 +417,7 @@ impl FeedCoordinator {
     // purpose: Clear retained Feed items and CMUX-compatible persisted workstream history.
     // inputs: No caller params; the coordinator-owned audit path selects persistent storage.
     // returns/effects: Empties memory, removes workstream JSONL files, and publishes clear metadata.
-    pub fn clear(&self) -> Result<Value, BridgeError> {
+    pub(crate) fn clear(&self) -> Result<Value, BridgeError> {
         let mut state = self.lock_state()?;
         let cleared_items = state.items.len();
         state.items.clear();
@@ -355,7 +464,7 @@ impl FeedCoordinator {
     }
 
     #[cfg(test)]
-    pub fn reset_for_tests(&self) {
+    pub(crate) fn reset_for_tests(&self) {
         let mut state = self.state.lock().expect("feed lock");
         state.next_id = 1;
         state.items.clear();
@@ -430,6 +539,35 @@ fn serialize_jsonl_line(record: &Value) -> io::Result<String> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     line.push('\n');
     Ok(line)
+}
+
+// purpose: Parse Feed push params into normalized retained item metadata.
+// inputs: Feed push params containing an event object or flattened event fields.
+// returns/effects: Returns parsed metadata and wait behavior without mutating state.
+fn parse_incoming_item(params: &Map<String, Value>) -> Result<FeedIncomingItem, BridgeError> {
+    let event = event_from_params(params)?;
+    let wait = wait_timeout(params)?;
+    let request_id = request_id_from_event(&event);
+    let kind = kind_from_event(&event);
+    let source = string_field(&event, &["_source", "source"])
+        .unwrap_or("unknown")
+        .to_string();
+    let actionable = matches!(kind.as_str(), "permissionRequest" | "exitPlan" | "question");
+    let should_wait = wait > Duration::ZERO && request_id.is_some();
+    let status = if actionable && request_id.is_some() {
+        FeedStatus::Pending
+    } else {
+        FeedStatus::Telemetry
+    };
+    Ok(FeedIncomingItem {
+        event,
+        wait,
+        request_id,
+        kind,
+        source,
+        status,
+        should_wait,
+    })
 }
 
 fn event_from_params(params: &Map<String, Value>) -> Result<Value, BridgeError> {
@@ -509,6 +647,102 @@ fn feed_item_row(item: &FeedItem) -> Value {
         row["tool_input"] = tool_input.clone();
     }
     row
+}
+
+// purpose: Build a host notification request for pending actionable Feed rows.
+// inputs: One retained Feed item.
+// returns/effects: Returns None for telemetry/resolved rows that do not need user attention.
+fn feed_notification_request(item: &FeedItem) -> Option<FeedNotificationRequest> {
+    if item.status != FeedStatus::Pending {
+        return None;
+    }
+    Some(FeedNotificationRequest {
+        workspace_id: string_field(&item.event, &["workspace_id", "workspaceId", "workspace"])
+            .map(str::to_string),
+        surface_id: string_field(&item.event, &["surface_id", "surfaceId", "surface"])
+            .map(str::to_string),
+        title: feed_notification_title(item),
+        body: feed_notification_body(item),
+    })
+}
+
+// purpose: Format the native notification title for one pending Feed row.
+// inputs: Pending Feed item with source and kind metadata.
+// returns/effects: Returns a short user-facing title.
+fn feed_notification_title(item: &FeedItem) -> String {
+    let source = title_case_source(&item.source);
+    match item.kind.as_str() {
+        "permissionRequest" | "PermissionRequest" => format!("{source} needs approval"),
+        "exitPlan" | "ExitPlanMode" => format!("{source} wants plan approval"),
+        "question" | "AskUserQuestion" => format!("{source} has a question"),
+        _ => format!("{source} needs attention"),
+    }
+}
+
+// purpose: Format native notification body text for one pending Feed row.
+// inputs: Pending Feed item with optional tool name and question prompt.
+// returns/effects: Returns compact non-empty body text.
+fn feed_notification_body(item: &FeedItem) -> String {
+    if matches!(item.kind.as_str(), "question" | "AskUserQuestion") {
+        if let Some(question) = first_question_prompt(&item.event) {
+            return question;
+        }
+    }
+    let tool = string_field(&item.event, &["tool_name", "toolName", "name"]);
+    match tool {
+        Some(tool) => format!("{}: {tool}", feed_notification_kind_label(&item.kind)),
+        None => feed_notification_kind_label(&item.kind).to_string(),
+    }
+}
+
+// purpose: Convert normalized Feed kinds into stable notification labels.
+// inputs: Feed item kind.
+// returns/effects: Returns a display label without mutating state.
+fn feed_notification_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "permissionRequest" | "PermissionRequest" => "PermissionRequest",
+        "exitPlan" | "ExitPlanMode" => "ExitPlanMode",
+        "question" | "AskUserQuestion" => "AskUserQuestion",
+        _ => "Feed",
+    }
+}
+
+// purpose: Extract the first question prompt from CMUX/Claude question payloads.
+// inputs: Feed event with possible tool_input.questions array.
+// returns/effects: Returns a trimmed question string when present.
+fn first_question_prompt(event: &Value) -> Option<String> {
+    let input = event.get("tool_input").or_else(|| event.get("toolInput"))?;
+    let question = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .and_then(|questions| questions.first())
+        .and_then(|question| string_field(question, &["question", "prompt", "text"]))?;
+    let question = question.trim();
+    (!question.is_empty()).then(|| question.to_string())
+}
+
+// purpose: Convert an agent source token into concise title-case display text.
+// inputs: Lowercase or kebab-case Feed source.
+// returns/effects: Returns stable labels for known sources and generic title case otherwise.
+fn title_case_source(source: &str) -> String {
+    match source {
+        "codex" => "Codex".to_string(),
+        "claude" => "Claude".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "hermes-agent" => "Hermes Agent".to_string(),
+        _ => source
+            .split(['-', '_'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
 }
 
 fn feed_event_payload(
@@ -638,12 +872,65 @@ mod tests {
         let path = dir.path().join("workstream.jsonl");
         let feed = FeedCoordinator::with_audit_log_path(Some(path.clone()));
 
-        let result = feed.push(&feed_push_params()).expect("push feed item");
+        let result = feed
+            .push_with_received_hook(&feed_push_params(), |_| {})
+            .expect("push feed item");
 
         assert_eq!(result["status"], "acknowledged");
         let text = fs::read_to_string(path).expect("read workstream log");
         assert!(text.contains("\"name\":\"feed.item.received\""));
         assert!(text.contains("\"name\":\"feed.item.completed\""));
+    }
+
+    #[test]
+    fn push_notifies_for_pending_actionable_feed_items() {
+        let feed = FeedCoordinator::with_audit_log_path(None);
+        let mut params = Map::new();
+        params.insert(
+            "event".to_string(),
+            json!({
+                "session_id": "session-a",
+                "hook_event_name": "PermissionRequest",
+                "_source": "codex",
+                "_opencode_request_id": "request-a",
+                "workspace_id": "workspace-a",
+                "surface_id": "7:tab-a",
+                "tool_name": "shell"
+            }),
+        );
+
+        let mut notifications = Vec::new();
+        let result = feed
+            .push_with_received_hook(&params, |notification| {
+                notifications.push(notification.clone());
+            })
+            .expect("push pending feed item");
+
+        assert_eq!(result["status"], "acknowledged");
+        assert_eq!(
+            notifications,
+            vec![FeedNotificationRequest {
+                workspace_id: Some("workspace-a".to_string()),
+                surface_id: Some("7:tab-a".to_string()),
+                title: "Codex needs approval".to_string(),
+                body: "PermissionRequest: shell".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn push_does_not_notify_for_telemetry_feed_items() {
+        let feed = FeedCoordinator::with_audit_log_path(None);
+        let mut notifications = Vec::new();
+
+        let result = feed
+            .push_with_received_hook(&feed_push_params(), |notification| {
+                notifications.push(notification.clone());
+            })
+            .expect("push telemetry feed item");
+
+        assert_eq!(result["status"], "acknowledged");
+        assert!(notifications.is_empty());
     }
 
     #[test]
@@ -669,7 +956,8 @@ mod tests {
         fs::write(&rotated, "{}\n").expect("seed rotated log");
 
         let feed = FeedCoordinator::with_audit_log_path(Some(path.clone()));
-        feed.push(&feed_push_params()).expect("push feed item");
+        feed.push_with_received_hook(&feed_push_params(), |_| {})
+            .expect("push feed item");
         let result = feed.clear().expect("clear feed");
 
         assert_eq!(result["cleared_items"], 1);

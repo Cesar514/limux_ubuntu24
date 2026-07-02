@@ -2136,7 +2136,12 @@ fn handle_method(
             return V2Response::success(id, json!({ "commands": METHODS, "methods": METHODS }));
         }
         "feed.push" => {
-            return match crate::feed::coordinator().push(params) {
+            return match crate::feed::coordinator().push_with_received_hook(
+                params,
+                |notification| {
+                    dispatch(feed_notification_command(notification));
+                },
+            ) {
                 Ok(result) => V2Response::success(id, result),
                 Err(error) => error_response(id, error),
             };
@@ -3924,6 +3929,27 @@ fn handle_method(
     }
 }
 
+// purpose: Convert a pending Feed item notification into the host notification command.
+// inputs: Feed notification request with optional workspace and surface identifiers.
+// returns/effects: Returns a fire-and-forget CreateNotification command.
+fn feed_notification_command(
+    notification: &crate::feed::FeedNotificationRequest,
+) -> ControlCommand {
+    let (reply, _rx) = mpsc::channel();
+    ControlCommand::CreateNotification {
+        target: notification
+            .workspace_id
+            .as_ref()
+            .map(|workspace_id| WorkspaceTarget::Handle(workspace_id.clone()))
+            .unwrap_or(WorkspaceTarget::Active),
+        surface_hint: notification.surface_id.clone(),
+        title: notification.title.clone(),
+        subtitle: "Feed".to_string(),
+        body: notification.body.clone(),
+        reply,
+    }
+}
+
 fn error_response(id: Option<Value>, error: BridgeError) -> V2Response {
     V2Response::error(id, error.code, error.message, error.data)
 }
@@ -4623,8 +4649,25 @@ mod tests {
         let _guard = feed_test_guard();
         crate::feed::coordinator().reset_for_tests();
         let push = dispatch_request(
-            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"PermissionRequest","_source":"codex","_opencode_request_id":"req-sidebar","tool_name":"Bash"},"wait_timeout_seconds":0}}"#,
-            &|command| panic!("feed.push should not queue command: {command:?}"),
+            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"PermissionRequest","_source":"codex","_opencode_request_id":"req-sidebar","workspace_id":"workspace-a","surface_id":"7:tab-a","tool_name":"Bash"},"wait_timeout_seconds":0}}"#,
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    target,
+                    surface_hint,
+                    title,
+                    subtitle,
+                    body,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Handle("workspace-a".to_string()));
+                    assert_eq!(surface_hint.as_deref(), Some("7:tab-a"));
+                    assert_eq!(title, "Codex needs approval");
+                    assert_eq!(subtitle, "Feed");
+                    assert_eq!(body, "PermissionRequest: Bash");
+                    let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
         );
         assert_eq!(push.error, None);
 
@@ -4649,7 +4692,21 @@ mod tests {
         crate::feed::coordinator().reset_for_tests();
         let push = dispatch_request(
             r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"ExitPlanMode","_source":"claude","_opencode_request_id":"req-plan","tool_name":"ExitPlanMode"},"wait_timeout_seconds":0}}"#,
-            &|command| panic!("feed.push should not queue command: {command:?}"),
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    target,
+                    title,
+                    body,
+                    reply,
+                    ..
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Active);
+                    assert_eq!(title, "Claude wants plan approval");
+                    assert_eq!(body, "ExitPlanMode: ExitPlanMode");
+                    let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
         );
         assert_eq!(push.error, None);
 
@@ -4674,7 +4731,16 @@ mod tests {
         crate::feed::coordinator().reset_for_tests();
         let push = dispatch_request(
             r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"AskUserQuestion","_source":"claude","_opencode_request_id":"req-question","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Deploy?","options":["Yes","No"]}]}},"wait_timeout_seconds":0}}"#,
-            &|command| panic!("feed.push should not queue command: {command:?}"),
+            &|command| match command {
+                ControlCommand::CreateNotification {
+                    title, body, reply, ..
+                } => {
+                    assert_eq!(title, "Claude has a question");
+                    assert_eq!(body, "Deploy?");
+                    let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
         );
         assert_eq!(push.error, None);
 
@@ -4713,8 +4779,12 @@ mod tests {
         })
         .to_string();
         let handle = std::thread::spawn(move || {
-            dispatch_request(&request, &|command| {
-                panic!("feed.push should not queue command: {command:?}")
+            dispatch_request(&request, &|command| match command {
+                ControlCommand::CreateNotification { title, reply, .. } => {
+                    assert_eq!(title, "Claude needs approval");
+                    let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+                }
+                other => panic!("unexpected command: {other:?}"),
             })
         });
         std::thread::sleep(Duration::from_millis(25));
@@ -4756,8 +4826,12 @@ mod tests {
             },
         })
         .to_string();
-        let timed_out = dispatch_request(&request, &|command| {
-            panic!("feed.push should not queue command: {command:?}")
+        let timed_out = dispatch_request(&request, &|command| match command {
+            ControlCommand::CreateNotification { title, reply, .. } => {
+                assert_eq!(title, "Claude needs approval");
+                let _ = reply.send(Ok(json!({ "notification_id": 1 })));
+            }
+            other => panic!("unexpected command: {other:?}"),
         });
         assert_eq!(timed_out.error, None);
         assert_eq!(
