@@ -305,6 +305,30 @@ impl FeedCoordinator {
         Ok(json!({ "delivered": true }))
     }
 
+    // purpose: Clear retained Feed items and CMUX-compatible persisted workstream history.
+    // inputs: No caller params; the coordinator-owned audit path selects persistent storage.
+    // returns/effects: Empties memory, removes workstream JSONL files, and publishes clear metadata.
+    pub fn clear(&self) -> Result<Value, BridgeError> {
+        let mut state = self.lock_state()?;
+        let cleared_items = state.items.len();
+        state.items.clear();
+        self.changed.notify_all();
+        drop(state);
+
+        let removed_paths = match &self.audit_log_path {
+            Some(path) => remove_workstream_logs(path).map_err(|error| {
+                BridgeError::internal(format!("feed workstream clear failed: {error}"))
+            })?,
+            None => Vec::new(),
+        };
+        let payload = json!({
+            "cleared_items": cleared_items,
+            "removed_paths": removed_paths,
+        });
+        publish_feed_bus_event("feed.cleared", "feed", "feed.coordinator", payload.clone());
+        Ok(payload)
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, FeedState>, BridgeError> {
         self.state
             .lock()
@@ -378,6 +402,24 @@ fn rotate_workstream_log_if_needed(path: &Path, next_len: u64) -> io::Result<()>
         Err(error) => return Err(error),
     }
     fs::rename(path, rotated)
+}
+
+// purpose: Remove CMUX Feed persistent history files for a clear operation.
+// inputs: Primary workstream JSONL path.
+// returns/effects: Deletes the primary log and one bounded rotation, ignoring only missing files.
+fn remove_workstream_logs(path: &Path) -> io::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for candidate in [
+        path.to_path_buf(),
+        path.with_file_name("workstream.jsonl.1"),
+    ] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => removed.push(candidate.display().to_string()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
 }
 
 // purpose: Serialize a JSON value as one newline-terminated JSONL record.
@@ -616,5 +658,24 @@ mod tests {
         assert!(dir.path().join("workstream.jsonl.1").exists());
         let text = fs::read_to_string(path).expect("read new log");
         assert!(text.contains("\"name\":\"feed.item.received\""));
+    }
+
+    #[test]
+    fn clear_removes_retained_items_and_workstream_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workstream.jsonl");
+        let rotated = dir.path().join("workstream.jsonl.1");
+        fs::write(&path, "{}\n").expect("seed log");
+        fs::write(&rotated, "{}\n").expect("seed rotated log");
+
+        let feed = FeedCoordinator::with_audit_log_path(Some(path.clone()));
+        feed.push(&feed_push_params()).expect("push feed item");
+        let result = feed.clear().expect("clear feed");
+
+        assert_eq!(result["cleared_items"], 1);
+        assert!(!path.exists());
+        assert!(!rotated.exists());
+        let listed = feed.list(&Map::new()).expect("list cleared feed");
+        assert_eq!(listed["items"].as_array().expect("items").len(), 0);
     }
 }

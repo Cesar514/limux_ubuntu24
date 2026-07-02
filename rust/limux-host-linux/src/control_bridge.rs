@@ -32,6 +32,7 @@ const METHODS: &[&str] = &[
     "events.stream",
     "feed.push",
     "feed.list",
+    "feed.clear",
     "feed.permission.reply",
     "feed.question.reply",
     "feed.exit_plan.reply",
@@ -1899,6 +1900,12 @@ fn handle_method(
         }
         "feed.list" => {
             return match crate::feed::coordinator().list(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
+        }
+        "feed.clear" => {
+            return match crate::feed::coordinator().clear() {
                 Ok(result) => V2Response::success(id, result),
                 Err(error) => error_response(id, error),
             };
@@ -4053,6 +4060,7 @@ mod tests {
     #[test]
     fn capabilities_include_feed_methods() {
         assert!(METHODS.contains(&"feed.push"));
+        assert!(METHODS.contains(&"feed.clear"));
         assert!(METHODS.contains(&"feed.permission.reply"));
         assert!(METHODS.contains(&"feed.question.reply"));
         assert!(METHODS.contains(&"feed.exit_plan.reply"));
@@ -4314,6 +4322,35 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["kind"], "PreToolUse");
         assert_eq!(items[0]["status"], "telemetry");
+    }
+
+    #[test]
+    fn feed_clear_removes_live_items() {
+        let _guard = feed_test_guard();
+        crate::feed::coordinator().reset_for_tests();
+        let push = dispatch_request(
+            r#"{"id":1,"method":"feed.push","params":{"event":{"session_id":"s1","hook_event_name":"PostToolUse","_source":"codex"},"wait_timeout_seconds":0}}"#,
+            &|command| panic!("feed.push should not queue command: {command:?}"),
+        );
+        assert_eq!(push.error, None);
+
+        let clear = dispatch_request(
+            r#"{"id":2,"method":"feed.clear","params":{}}"#,
+            &|command| panic!("feed.clear should not queue command: {command:?}"),
+        );
+        assert_eq!(clear.error, None);
+        assert_eq!(clear.result.expect("feed.clear result")["cleared_items"], 1);
+
+        let listed = dispatch_request(r#"{"id":3,"method":"feed.list","params":{}}"#, &|command| {
+            panic!("feed.list should not queue command: {command:?}")
+        });
+        assert_eq!(
+            listed.result.expect("feed.list result")["items"]
+                .as_array()
+                .expect("items")
+                .len(),
+            0
+        );
     }
 
     #[test]

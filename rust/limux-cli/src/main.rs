@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1004,6 +1004,9 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "shortcuts" => Some(CommandOutput::Text(
             limux_shortcuts_path()?.display().to_string(),
         )),
+        "feed" if args.first().map(String::as_str) == Some("clear") => {
+            Some(run_feed_clear_command(args, opts.json_output)?)
+        }
         "themes" => Some(run_themes_command(args, opts.json_output)?),
         "sessions" => Some(run_sessions_local_command(args, opts.json_output)?),
         "session-debug" => {
@@ -1021,7 +1024,110 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
 // inputs: Top-level command and remaining CLI args.
 // returns/effects: Returns true only for interactive Feed UI forms, not hook forwarding.
 fn is_unsupported_feed_cli_command(command: &str, args: &[String]) -> bool {
-    command == "feed" && matches!(args.first().map(String::as_str), Some("tui" | "clear"))
+    command == "feed" && matches!(args.first().map(String::as_str), Some("tui"))
+}
+
+// purpose: Clear CMUX-compatible Feed persistent history from the local state file.
+// inputs: `feed clear` arguments plus global JSON preference.
+// returns/effects: Prompts unless --yes/-y is present, then removes workstream JSONL files.
+fn run_feed_clear_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    let path = feed_workstream_log_path()?;
+    run_feed_clear_at(args, json_output, &path)
+}
+
+// purpose: Clear Feed history at a caller-selected path for CLI and isolated tests.
+// inputs: `feed clear` args, JSON preference, and primary workstream JSONL path.
+// returns/effects: Removes primary and rotated history files after optional confirmation.
+fn run_feed_clear_at(args: &[String], json_output: bool, path: &Path) -> Result<CommandOutput> {
+    if args.is_empty() || args[0] != "clear" {
+        bail!("Usage: limux feed clear [--yes|-y]");
+    }
+    let assume_yes = parse_feed_clear_args(&args[1..])?;
+    if !assume_yes && !confirm_feed_clear(path)? {
+        if json_output {
+            return Ok(CommandOutput::Json(
+                json!({ "cleared": false, "aborted": true }),
+            ));
+        }
+        return Ok(CommandOutput::Text("Aborted.".to_string()));
+    }
+    let removed_paths = remove_feed_history_files(path)?;
+    if json_output {
+        return Ok(CommandOutput::Json(json!({
+            "cleared": true,
+            "path": path,
+            "removed_paths": removed_paths,
+        })));
+    }
+    if removed_paths.is_empty() {
+        return Ok(CommandOutput::Text(format!(
+            "No Feed history to clear ({} does not exist).",
+            path.display()
+        )));
+    }
+    Ok(CommandOutput::Text(format!("Cleared {}", path.display())))
+}
+
+// purpose: Parse CMUX Feed clear confirmation flags.
+// inputs: Arguments after `feed clear`.
+// returns/effects: Returns whether confirmation is bypassed, failing on unknown flags.
+fn parse_feed_clear_args(args: &[String]) -> Result<bool> {
+    let mut assume_yes = false;
+    for arg in args {
+        match arg.as_str() {
+            "--yes" | "-y" => assume_yes = true,
+            "--help" | "-h" => bail!("Usage: limux feed clear [--yes|-y]"),
+            other => bail!("unknown feed clear argument: {other}"),
+        }
+    }
+    Ok(assume_yes)
+}
+
+// purpose: Resolve the CMUX-compatible Feed persistent history path.
+// inputs: Current user home directory.
+// returns/effects: Fails loudly if the operating system does not expose a home directory.
+fn feed_workstream_log_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("home directory is required for Feed history")?;
+    Ok(home.join(".cmuxterm/workstream.jsonl"))
+}
+
+// purpose: Ask for destructive Feed history deletion confirmation.
+// inputs: Workstream log path shown to the user.
+// returns/effects: Writes a prompt, reads one line from stdin, and returns true only for y/yes.
+fn confirm_feed_clear(path: &Path) -> Result<bool> {
+    print!(
+        "This will permanently delete {}. Proceed? [y/N] ",
+        path.display()
+    );
+    io::stdout()
+        .flush()
+        .context("failed to flush Feed clear prompt")?;
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .context("failed to read Feed clear confirmation")?;
+    Ok(response.trim().to_ascii_lowercase().starts_with('y'))
+}
+
+// purpose: Delete the Feed persistent history files used by CMUX-compatible audit storage.
+// inputs: Primary workstream JSONL path.
+// returns/effects: Removes the primary file and one rotation, ignoring only missing files.
+fn remove_feed_history_files(path: &Path) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for candidate in [
+        path.to_path_buf(),
+        path.with_file_name("workstream.jsonl.1"),
+    ] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => removed.push(candidate.display().to_string()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove {}", candidate.display()));
+            }
+        }
+    }
+    Ok(removed)
 }
 
 // purpose: Return CMUX-compatible no-socket help text for command probes.
@@ -8666,11 +8772,10 @@ mod cli_arg_tests {
 
     #[test]
     fn cmux_feed_tui_commands_fail_locally_with_not_supported() {
-        for subcommand in ["tui", "clear"] {
-            let opts = default_opts(args(&["feed", subcommand]));
-            let error = run_local_command(&opts).expect_err("feed UI command should fail locally");
-            assert!(error.to_string().contains("not_supported"), "{subcommand}");
-        }
+        let opts = default_opts(args(&["feed", "tui"]));
+        let error = run_local_command(&opts).expect_err("feed UI command should fail locally");
+        assert!(error.to_string().contains("not_supported"));
+        assert!(!is_unsupported_feed_cli_command("feed", &args(&["clear"])));
 
         let help = run_local_command(&default_opts(args(&["feed", "--help"])))
             .expect("help probe")
@@ -8679,6 +8784,32 @@ mod cli_arg_tests {
             panic!("help should render text");
         };
         assert!(text.contains("Usage: limux feed tui"));
+    }
+
+    #[test]
+    fn cmux_feed_clear_removes_local_workstream_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workstream.jsonl");
+        let rotated = dir.path().join("workstream.jsonl.1");
+        fs::write(&path, "{}\n").expect("seed history");
+        fs::write(&rotated, "{}\n").expect("seed rotated history");
+
+        let output = run_feed_clear_at(&args(&["clear", "--yes"]), true, &path)
+            .expect("feed clear succeeds");
+        let CommandOutput::Json(payload) = output else {
+            panic!("feed clear should render JSON");
+        };
+
+        assert_eq!(payload["cleared"], true);
+        assert!(!path.exists());
+        assert!(!rotated.exists());
+        assert_eq!(
+            payload["removed_paths"]
+                .as_array()
+                .expect("removed paths")
+                .len(),
+            2
+        );
     }
 
     #[test]
