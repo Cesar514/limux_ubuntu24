@@ -445,13 +445,14 @@ fn ghostty_config_path() -> Result<PathBuf> {
 /// inputs: Optional docs topic from the CLI.
 /// returns/effects: Returns text only; never contacts the Limux socket.
 fn docs_text(topic: Option<&str>) -> Result<String> {
-    let topics = "settings, shortcuts, api, browser, agents";
+    let topics = "settings, shortcuts, api, browser, agents, dock";
     let Some(topic) = topic else {
         return Ok(format!(
             "Limux docs topics: {topics}\nUse `limux docs <topic>`."
         ));
     };
-    match topic {
+    let normalized = topic.replace('_', "-");
+    match normalized.as_str() {
         "settings" => Ok(format!(
             "Settings docs\nsettings path: {}\nvalidate: limux config validate\nreload: restart Limux or use host reload support when available",
             limux_settings_path()?.display()
@@ -471,6 +472,15 @@ fn docs_text(topic: Option<&str>) -> Result<String> {
             "Agent docs\n",
             "Use `limux hooks setup`, `limux agent-team`, and agent hook commands ",
             "for Codex, Claude, Gemini, and OpenCode."
+        )
+        .to_string()),
+        "dock" | "doc" | "controls" | "right-sidebar" | "dock-json" => Ok(concat!(
+            "Dock docs\n",
+            "Custom right-sidebar terminal controls are loaded from .cmux/dock.json ",
+            "or ~/.config/cmux/dock.json in CMUX.\n",
+            "Limux currently maps dock mode to the right sidebar; custom dock.json ",
+            "interactive controls remain tracked in the CMUX parity matrix.\n",
+            "Validate JSON with: python3 -m json.tool .cmux/dock.json"
         )
         .to_string()),
         _ => bail!("unknown docs topic `{topic}`; expected one of {topics}"),
@@ -13268,6 +13278,19 @@ mod cli_arg_tests {
         assert_eq!(opts.window.as_deref(), Some("window:3"));
         assert_eq!(opts.password.as_deref(), Some("secret"));
         assert_eq!(opts.command_args, args(&["focus-window"]));
+    }
+
+    #[test]
+    fn cmux_docs_includes_dock_topic_and_aliases() {
+        let index = docs_text(None).expect("docs index");
+        assert!(index.contains("dock"));
+
+        let dock = docs_text(Some("dock")).expect("dock docs");
+        assert!(dock.contains(".cmux/dock.json"));
+        assert!(dock.contains("right sidebar"));
+
+        let alias = docs_text(Some("right_sidebar")).expect("dock alias docs");
+        assert!(alias.contains("dock.json"));
     }
 
     #[tokio::test]
