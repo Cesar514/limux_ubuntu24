@@ -4,6 +4,9 @@
 // returns/effects: Maintains a bounded in-memory feed ring and blocks feed.push until reply or timeout.
 
 use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +16,7 @@ use crate::control_bridge::BridgeError;
 
 const MAX_FEED_ITEMS: usize = 2_000;
 const MAX_WAIT_SECONDS: f64 = 120.0;
+const MAX_WORKSTREAM_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
 static FEED: OnceLock<FeedCoordinator> = OnceLock::new();
 
@@ -48,16 +52,25 @@ struct FeedState {
 pub struct FeedCoordinator {
     state: Mutex<FeedState>,
     changed: Condvar,
+    audit_log_path: Option<PathBuf>,
 }
 
 impl FeedCoordinator {
     fn new() -> Self {
+        Self::with_audit_log_path(Some(workstream_log_path()))
+    }
+
+    // purpose: Build a Feed coordinator with caller-selected audit persistence.
+    // inputs: Optional JSONL path for production or isolated tests.
+    // returns/effects: Initializes an empty feed ring and decision wakeup condition.
+    fn with_audit_log_path(audit_log_path: Option<PathBuf>) -> Self {
         Self {
             state: Mutex::new(FeedState {
                 next_id: 1,
                 items: VecDeque::new(),
             }),
             changed: Condvar::new(),
+            audit_log_path,
         }
     }
 
@@ -109,21 +122,24 @@ impl FeedCoordinator {
             "feed.coordinator",
             event_payload.clone(),
         );
+        self.write_audit_record("feed.item.received", &event_payload)?;
         publish_agent_hook_event(&event_payload);
 
         if !should_wait {
+            let completed_payload = feed_event_payload(
+                &item_id,
+                request_id.as_deref(),
+                state.items.back().expect("just pushed feed item"),
+                "acknowledged",
+                None,
+            );
             publish_feed_bus_event(
                 "feed.item.completed",
                 "feed",
                 "feed.coordinator",
-                feed_event_payload(
-                    &item_id,
-                    request_id.as_deref(),
-                    state.items.back().expect("just pushed feed item"),
-                    "acknowledged",
-                    None,
-                ),
+                completed_payload.clone(),
             );
+            self.write_audit_record("feed.item.completed", &completed_payload)?;
             return Ok(json!({ "status": "acknowledged", "item_id": item_id }));
         }
 
@@ -132,18 +148,20 @@ impl FeedCoordinator {
         loop {
             if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
                 if item.status == FeedStatus::Resolved {
+                    let completed_payload = feed_event_payload(
+                        &item_id,
+                        Some(&request_id),
+                        item,
+                        "resolved",
+                        item.decision.as_ref(),
+                    );
                     publish_feed_bus_event(
                         "feed.item.completed",
                         "feed",
                         "feed.coordinator",
-                        feed_event_payload(
-                            &item_id,
-                            Some(&request_id),
-                            item,
-                            "resolved",
-                            item.decision.as_ref(),
-                        ),
+                        completed_payload.clone(),
                     );
+                    self.write_audit_record("feed.item.completed", &completed_payload)?;
                     return Ok(json!({
                         "status": "resolved",
                         "item_id": item_id,
@@ -168,12 +186,15 @@ impl FeedCoordinator {
                     }
                 }
                 if let Some(item) = state.items.iter().rev().find(|item| item.id == item_id) {
+                    let completed_payload =
+                        feed_event_payload(&item_id, Some(&request_id), item, "timed_out", None);
                     publish_feed_bus_event(
                         "feed.item.completed",
                         "feed",
                         "feed.coordinator",
-                        feed_event_payload(&item_id, Some(&request_id), item, "timed_out", None),
+                        completed_payload.clone(),
                     );
+                    self.write_audit_record("feed.item.completed", &completed_payload)?;
                 }
                 self.changed.notify_all();
                 return Ok(json!({ "status": "timed_out", "item_id": item_id }));
@@ -266,18 +287,20 @@ impl FeedCoordinator {
         };
         item.status = FeedStatus::Resolved;
         item.decision = Some(decision);
+        let resolved_payload = feed_event_payload(
+            &item.id,
+            item.request_id.as_deref(),
+            item,
+            "resolved",
+            item.decision.as_ref(),
+        );
         publish_feed_bus_event(
             "feed.item.resolved",
             "feed",
             "feed.coordinator",
-            feed_event_payload(
-                &item.id,
-                item.request_id.as_deref(),
-                item,
-                "resolved",
-                item.decision.as_ref(),
-            ),
+            resolved_payload.clone(),
         );
+        self.write_audit_record("feed.item.resolved", &resolved_payload)?;
         self.changed.notify_all();
         Ok(json!({ "delivered": true }))
     }
@@ -288,6 +311,25 @@ impl FeedCoordinator {
             .map_err(|_| BridgeError::internal("feed coordinator lock poisoned"))
     }
 
+    // purpose: Persist one Feed audit record to the CMUX-compatible JSONL log.
+    // inputs: Event name and redacted event-stream payload.
+    // returns/effects: Appends to workstream.jsonl when audit persistence is enabled.
+    fn write_audit_record(&self, name: &str, payload: &Value) -> Result<(), BridgeError> {
+        let Some(path) = &self.audit_log_path else {
+            return Ok(());
+        };
+        let record = json!({
+            "name": name,
+            "category": "feed",
+            "source": "feed.coordinator",
+            "occurred_at": now_millis(),
+            "payload": payload,
+        });
+        write_workstream_record(path, &record).map_err(|error| {
+            BridgeError::internal(format!("feed workstream audit write failed: {error}"))
+        })
+    }
+
     #[cfg(test)]
     pub fn reset_for_tests(&self) {
         let mut state = self.state.lock().expect("feed lock");
@@ -295,6 +337,57 @@ impl FeedCoordinator {
         state.items.clear();
         self.changed.notify_all();
     }
+}
+
+// purpose: Resolve CMUX-compatible Feed audit log location.
+// inputs: Current user home directory from the OS.
+// returns/effects: Panics loudly if no home directory is available.
+fn workstream_log_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".cmuxterm/workstream.jsonl"))
+        .expect("home directory is required for CMUX Feed workstream log")
+}
+
+// purpose: Append one Feed audit record to a bounded JSONL log.
+// inputs: Destination path and JSON record.
+// returns/effects: Creates parent directories, rotates at 16 MiB, and writes one line.
+fn write_workstream_record(path: &Path, record: &Value) -> io::Result<()> {
+    let line = serialize_jsonl_line(record)?;
+    rotate_workstream_log_if_needed(path, line.len() as u64)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
+// purpose: Rotate the Feed workstream log before it exceeds the size cap.
+// inputs: Log path and next append length in bytes.
+// returns/effects: Renames current log to workstream.jsonl.1, replacing prior rotation.
+fn rotate_workstream_log_if_needed(path: &Path, next_len: u64) -> io::Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len().saturating_add(next_len) <= MAX_WORKSTREAM_LOG_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_file_name("workstream.jsonl.1");
+    match fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(path, rotated)
+}
+
+// purpose: Serialize a JSON value as one newline-terminated JSONL record.
+// inputs: Record value.
+// returns/effects: Returns an io error if JSON serialization fails.
+fn serialize_jsonl_line(record: &Value) -> io::Result<String> {
+    let mut line = serde_json::to_string(record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    line.push('\n');
+    Ok(line)
 }
 
 fn event_from_params(params: &Map<String, Value>) -> Result<Value, BridgeError> {
@@ -477,4 +570,51 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_push_params() -> Map<String, Value> {
+        let mut params = Map::new();
+        params.insert(
+            "event".to_string(),
+            json!({
+                "session_id": "session-a",
+                "hook_event_name": "PostToolUse",
+                "_source": "codex",
+                "tool_name": "shell"
+            }),
+        );
+        params
+    }
+
+    #[test]
+    fn push_writes_workstream_jsonl_audit_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workstream.jsonl");
+        let feed = FeedCoordinator::with_audit_log_path(Some(path.clone()));
+
+        let result = feed.push(&feed_push_params()).expect("push feed item");
+
+        assert_eq!(result["status"], "acknowledged");
+        let text = fs::read_to_string(path).expect("read workstream log");
+        assert!(text.contains("\"name\":\"feed.item.received\""));
+        assert!(text.contains("\"name\":\"feed.item.completed\""));
+    }
+
+    #[test]
+    fn workstream_jsonl_rotates_at_size_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workstream.jsonl");
+        fs::write(&path, "x".repeat(MAX_WORKSTREAM_LOG_BYTES as usize)).expect("write log");
+
+        write_workstream_record(&path, &json!({ "name": "feed.item.received" }))
+            .expect("append record");
+
+        assert!(dir.path().join("workstream.jsonl.1").exists());
+        let text = fs::read_to_string(path).expect("read new log");
+        assert!(text.contains("\"name\":\"feed.item.received\""));
+    }
 }

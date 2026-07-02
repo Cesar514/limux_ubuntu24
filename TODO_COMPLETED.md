@@ -2,6 +2,7 @@
 // Format: [x] <timestamp> <task> \
 // Example: [x] 2026-04-05T20:39:27Z Verify the completed-task log is sorted newest-first using 24-hour HH:MM:SS UTC timestamps. \
 
+[x] 2026-07-02T01:39:20Z Implement and verify CMUX Feed `~/.cmuxterm/workstream.jsonl` audit persistence with bounded rotation. \
 [x] 2026-07-02T01:35:42Z Implement and verify CMUX surface-targeted notification metadata parity for `created_at`, surface/pane refs, and `tab_title` rows/events. \
 [x] 2026-07-02T01:30:11Z Implement and verify CMUX durable bounded `~/.cmuxterm/events.jsonl` event logging with 16 MiB rotation and oversized event-frame truncation. \
 [x] 2026-07-02T01:27:16Z Implement and verify CMUX config `sidebar-font-size` and `surface-tab-bar-font-size` get/set parity while preserving unrelated Limux settings JSON. \
