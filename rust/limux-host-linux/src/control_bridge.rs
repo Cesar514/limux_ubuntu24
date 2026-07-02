@@ -43,6 +43,8 @@ const METHODS: &[&str] = &[
     "workspace.last",
     "workspace.rename",
     "workspace.close",
+    "workspace.remote.reconnect",
+    "workspace.remote.disconnect",
     "workspace.group.list",
     "workspace.group.create",
     "workspace.group.ungroup",
@@ -1031,6 +1033,16 @@ fn is_unsupported_browser_method(method: &str) -> bool {
     )
 }
 
+// purpose: Identify CMUX remote workspace APIs not yet backed by a Limux remote daemon.
+// inputs: Requested control method name.
+// returns/effects: Returns true for explicit not_supported responses, without dispatching.
+fn is_unsupported_remote_workspace_method(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace.remote.reconnect" | "workspace.remote.disconnect"
+    )
+}
+
 fn optional_handle(
     params: &Map<String, Value>,
     keys: &[&str],
@@ -1543,6 +1555,9 @@ fn handle_method(
         Err(error) => return error_response(id, error),
     };
     if is_unsupported_browser_method(method) {
+        return error_response(id, BridgeError::not_supported(method));
+    }
+    if is_unsupported_remote_workspace_method(method) {
         return error_response(id, BridgeError::not_supported(method));
     }
 
@@ -3453,6 +3468,31 @@ mod tests {
     #[test]
     fn capabilities_include_workspace_group_list() {
         assert!(METHODS.contains(&"workspace.group.list"));
+    }
+
+    #[test]
+    fn capabilities_include_remote_workspace_methods() {
+        assert!(METHODS.contains(&"workspace.remote.reconnect"));
+        assert!(METHODS.contains(&"workspace.remote.disconnect"));
+    }
+
+    #[test]
+    fn remote_workspace_methods_fail_before_dispatch() {
+        for method in ["workspace.remote.reconnect", "workspace.remote.disconnect"] {
+            let request = json!({
+                "id": 1,
+                "method": method,
+                "params": {},
+            })
+            .to_string();
+            let response = dispatch_request(&request, &|command| {
+                panic!("unsupported remote method should not dispatch: {command:?}")
+            });
+            let error = response.error.expect("unsupported error");
+            assert_eq!(error.code, NOT_SUPPORTED_CODE);
+            assert!(error.message.contains("not_supported"));
+            assert!(error.message.contains(method));
+        }
     }
 
     #[test]

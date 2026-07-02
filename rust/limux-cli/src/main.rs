@@ -4743,7 +4743,7 @@ fn build_workspace_alias_request(
 
 // purpose: Build CMUX workspace namespace requests.
 // inputs: Arguments after `limux workspace`.
-// returns/effects: Supports workspace env and workspace create parity routes.
+// returns/effects: Supports workspace env plus explicit remote reconnect/disconnect parity routes.
 fn build_workspace_namespace_request(args: &[String]) -> Result<Option<(&'static str, Value)>> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         return Ok(None);
@@ -4760,6 +4760,20 @@ fn build_workspace_namespace_request(args: &[String]) -> Result<Option<(&'static
                 params.insert("mask".to_string(), Value::Bool(true));
             }
             Ok(Some(("workspace.env", Value::Object(params))))
+        }
+        "reconnect" | "disconnect" => {
+            let rest = &args[1..];
+            let mut params = Map::new();
+            let workspace = parse_opt(rest, "--workspace").or_else(|| first_positional(rest));
+            if let Some(workspace) = workspace {
+                params.insert("workspace_id".to_string(), Value::String(workspace));
+            }
+            let method = if subcommand == "reconnect" {
+                "workspace.remote.reconnect"
+            } else {
+                "workspace.remote.disconnect"
+            };
+            Ok(Some((method, Value::Object(params))))
         }
         _ => Ok(None),
     }
@@ -6809,6 +6823,26 @@ mod cli_arg_tests {
         assert_eq!(method, "workspace.env");
         assert_eq!(params["workspace_id"], "workspace:abc");
         assert_eq!(params["mask"], true);
+    }
+
+    #[test]
+    fn workspace_remote_namespace_requests_map_to_cmux_methods() {
+        let (method, params) =
+            build_workspace_namespace_request(&args(&["reconnect", "workspace:abc"]))
+                .expect("workspace reconnect request")
+                .expect("request");
+        assert_eq!(method, "workspace.remote.reconnect");
+        assert_eq!(params["workspace_id"], "workspace:abc");
+
+        let (method, params) = build_workspace_namespace_request(&args(&[
+            "disconnect",
+            "--workspace",
+            "workspace:def",
+        ]))
+        .expect("workspace disconnect request")
+        .expect("request");
+        assert_eq!(method, "workspace.remote.disconnect");
+        assert_eq!(params["workspace_id"], "workspace:def");
     }
 
     #[test]

@@ -119,3 +119,4 @@
 [x] 2026-07-02T03:11:16Z Implement and verify live CMUX `config reload`/`reload-config` parity with settings and shortcut reload, terminal appearance/font application, and retained `config.reloaded` event emission. \
 [x] 2026-07-02T03:24:41Z Implement and verify retained CMUX browser navigation, interaction, and redacted input event emission for successful live browser actions. \
 [x] 2026-07-02T03:38:12Z Implement and verify CMUX `read-screen`/`capture-pane` `--lines` and `--scrollback` request plumbing, last-N visible text limiting, and explicit scrollback capability metadata. \
+[x] 2026-07-02T03:48:03Z Implement and verify CMUX `workspace reconnect`/`workspace disconnect` CLI/API routing with explicit `not_supported` errors until remote daemon support exists. \
