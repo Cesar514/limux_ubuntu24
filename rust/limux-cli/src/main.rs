@@ -10353,6 +10353,13 @@ fn tmux_list_format_arg(args: &[String]) -> Option<String> {
     parse_opt(args, "-F").or_else(|| parse_opt(args, "--format"))
 }
 
+// purpose: Resolve tmux split-window print format flags.
+// inputs: Raw split-window args with optional -F or --format value.
+// returns/effects: Returns the requested format string.
+fn tmux_split_format_arg(args: &[String]) -> Option<String> {
+    parse_opt(args, "-F").or_else(|| parse_opt(args, "--format"))
+}
+
 // purpose: Collect command positionals after tmux-style value and boolean flags.
 // inputs: Raw tmux args plus recognized value and boolean flag names.
 // returns/effects: Returns non-flag command tokens without option values.
@@ -10494,6 +10501,7 @@ fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
         &[
             "-c",
             "-F",
+            "--format",
             "-l",
             "-t",
             "--target",
@@ -10508,6 +10516,44 @@ fn build_tmux_split_window_request(args: &[String]) -> Result<(Value, bool)> {
         params.insert("command".to_string(), Value::String(command));
     }
     Ok((Value::Object(params), tmux_has_short_flag(args, "-P")))
+}
+
+// purpose: Render CMUX/tmux split-window -P output from the created split payload.
+// inputs: surface.split payload and optional -F/--format string.
+// returns/effects: Returns tmux-compatible text, falling back to the new pane handle.
+fn render_tmux_split_print(payload: &Value, format: Option<&str>) -> String {
+    let mut context = base_tmux_format_context();
+    if let Some(workspace_id) = get_string(payload, &["workspace_id", "workspace_ref"]) {
+        context.insert(
+            "session_id".to_string(),
+            format!("${}", tmux_stable_numeric_id(&workspace_id)),
+        );
+        context.insert(
+            "window_id".to_string(),
+            format!("@{}", tmux_stable_numeric_id(&workspace_id)),
+        );
+        context.insert("window_uuid".to_string(), workspace_id);
+    }
+    if let Some(pane_id) = get_string(payload, &["pane_id", "pane_ref"]) {
+        context.insert(
+            "pane_id".to_string(),
+            format!("%{}", tmux_stable_numeric_id(&pane_id)),
+        );
+        context.insert("pane_uuid".to_string(), pane_id);
+    }
+    if let Some(surface_id) = get_string(payload, &["surface_id", "surface_ref"]) {
+        context.insert("surface_id".to_string(), surface_id);
+    }
+    if let Some(title) = nonempty_row_title(payload) {
+        context.insert("pane_title".to_string(), title);
+    }
+    let fallback = context
+        .get("pane_id")
+        .cloned()
+        .or_else(|| get_string(payload, &["pane_id", "pane_ref"]))
+        .or_else(|| get_string(payload, &["surface_id", "surface_ref"]))
+        .unwrap_or_default();
+    tmux_render_format(format, &context, &fallback)
 }
 
 // purpose: Build CMUX/tmux select-layout params for the live equalize route.
@@ -10648,7 +10694,8 @@ async fn run_tmux_compat(client: &mut Client, command: &str, args: &[String]) ->
             let (params, print_result) = build_tmux_split_window_request(args)?;
             let payload = client.call("surface.split", params).await?;
             if print_result {
-                let handle = handle_from_payload(&payload, "surface_id", "surface_ref");
+                let handle =
+                    render_tmux_split_print(&payload, tmux_split_format_arg(args).as_deref());
                 Ok(json!({"text": handle, "result": payload}))
             } else {
                 Ok(payload)
@@ -13656,6 +13703,41 @@ mod cli_arg_tests {
         let err = build_tmux_split_window_request(&args(&["-l", "0"]))
             .expect_err("zero cells should fail");
         assert!(err.to_string().contains("positive integer cell count"));
+    }
+
+    #[test]
+    fn tmux_split_window_format_flag_is_not_command_text() {
+        let (params, print_result) = build_tmux_split_window_request(&args(&[
+            "-P",
+            "--format",
+            "#{pane_id}:#{surface_id}",
+            "echo",
+            "ready",
+        ]))
+        .expect("split-window parses");
+
+        assert!(print_result);
+        assert_eq!(params["command"], "echo ready");
+    }
+
+    #[test]
+    fn tmux_split_window_print_renders_format_from_created_payload() {
+        let payload = json!({
+            "workspace_id": "workspace:alpha",
+            "pane_id": "pane:new",
+            "surface_id": "pane:new:tab",
+            "title": "worker",
+        });
+        let pane_ref = format!("%{}", tmux_stable_numeric_id("pane:new"));
+
+        assert_eq!(render_tmux_split_print(&payload, None), pane_ref);
+        assert_eq!(
+            render_tmux_split_print(
+                &payload,
+                Some("#{pane_id}|#{pane_uuid}|#{surface_id}|#{pane_title}|#{missing}"),
+            ),
+            format!("{pane_ref}|pane:new|pane:new:tab|worker|")
+        );
     }
 
     #[test]
