@@ -441,11 +441,20 @@ fn ghostty_config_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("XDG config directory is unavailable"))
 }
 
-/// purpose: Produce CMUX-compatible docs pointers for local command families.
-/// inputs: Optional docs topic from the CLI.
-/// returns/effects: Returns text only; never contacts the Limux socket.
+// purpose: Resolve CMUX custom sidebar directory for local sidebar commands.
+// inputs: The process XDG config directory environment.
+// returns/effects: Returns ~/.config/cmux/sidebars or a fatal config-dir error.
+fn cmux_sidebars_dir() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|base| base.join("cmux/sidebars"))
+        .ok_or_else(|| anyhow!("XDG config directory is unavailable"))
+}
+
+// purpose: Produce CMUX-compatible docs pointers for local command families.
+// inputs: Optional docs topic from the CLI.
+// returns/effects: Returns text only; never contacts the Limux socket.
 fn docs_text(topic: Option<&str>) -> Result<String> {
-    let topics = "settings, shortcuts, api, browser, agents, dock";
+    let topics = "settings, shortcuts, api, browser, agents, dock, sidebars";
     let Some(topic) = topic else {
         return Ok(format!(
             "Limux docs topics: {topics}\nUse `limux docs <topic>`."
@@ -474,22 +483,45 @@ fn docs_text(topic: Option<&str>) -> Result<String> {
             "for Codex, Claude, Gemini, and OpenCode."
         )
         .to_string()),
-        "dock" | "doc" | "controls" | "right-sidebar" | "dock-json" => Ok(concat!(
-            "Dock docs\n",
-            "Custom right-sidebar terminal controls are loaded from .cmux/dock.json ",
-            "or ~/.config/cmux/dock.json in CMUX.\n",
-            "Limux currently maps dock mode to the right sidebar; custom dock.json ",
-            "interactive controls remain tracked in the CMUX parity matrix.\n",
-            "Validate JSON with: python3 -m json.tool .cmux/dock.json"
-        )
-        .to_string()),
+        "dock" | "doc" | "controls" | "right-sidebar" | "dock-json" => Ok(dock_docs_text()),
+        "sidebars" | "custom-sidebars" | "custom-sidebar" => custom_sidebar_docs_text(),
         _ => bail!("unknown docs topic `{topic}`; expected one of {topics}"),
     }
 }
 
-/// purpose: Parse a JSON config file if it exists and fail loudly if it is corrupt.
-/// inputs: A settings or shortcuts path.
-/// returns/effects: Returns true when the file existed and parsed; false when absent.
+// purpose: Produce CMUX-compatible dock docs text.
+// inputs: None.
+// returns/effects: Returns static text for local docs output.
+fn dock_docs_text() -> String {
+    concat!(
+        "Dock docs\n",
+        "Custom right-sidebar terminal controls are loaded from .cmux/dock.json ",
+        "or ~/.config/cmux/dock.json in CMUX.\n",
+        "Limux currently maps dock mode to the right sidebar; custom dock.json ",
+        "interactive controls remain tracked in the CMUX parity matrix.\n",
+        "Validate JSON with: python3 -m json.tool .cmux/dock.json"
+    )
+    .to_string()
+}
+
+// purpose: Produce CMUX-compatible custom sidebar docs text.
+// inputs: The process XDG config directory environment.
+// returns/effects: Returns local docs text or fails if the config directory is unavailable.
+fn custom_sidebar_docs_text() -> Result<String> {
+    Ok(format!(
+        concat!(
+            "Custom sidebar docs\n",
+            "CMUX custom sidebars live in: {}\n",
+            "Supported source files: <name>.swift or <name>.json. ",
+            "When both exist, .swift wins.\n",
+            "Validate locally with: limux sidebar validate [name|--all]\n",
+            "Limux validates files and reports CMUX-shaped results; ",
+            "runtime custom-sidebar rendering remains tracked in the CMUX parity matrix."
+        ),
+        cmux_sidebars_dir()?.display()
+    ))
+}
+
 struct ConfigDoctorTarget {
     label: String,
     path: PathBuf,
@@ -1530,6 +1562,7 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
         "settings" => Some(run_settings_command(args)?),
         "config" if args.first().map(String::as_str) == Some("reload") => None,
         "config" => Some(run_config_command(args)?),
+        "sidebar" => Some(run_custom_sidebar_command(args, opts.json_output)?),
         "shortcuts" => Some(CommandOutput::Text(
             limux_shortcuts_path()?.display().to_string(),
         )),
@@ -2077,6 +2110,256 @@ fn run_config_command(args: &[String]) -> Result<CommandOutput> {
         }
         target => bail!("unsupported config command `{target}`"),
     }
+}
+
+// purpose: Implement CMUX-compatible local custom-sidebar CLI probes.
+// inputs: Sidebar command args plus JSON output preference.
+// returns/effects: Validates local sidebar files or fails loudly for missing renderer actions.
+fn run_custom_sidebar_command(args: &[String], json_output: bool) -> Result<CommandOutput> {
+    let sub = args.first().map(String::as_str).unwrap_or("--help");
+    match sub {
+        "--help" | "-h" => Ok(CommandOutput::Text(custom_sidebar_help_text())),
+        "validate" | "reload" => run_custom_sidebar_validate_like(sub, &args[1..], json_output),
+        "select" | "open" => {
+            let name = args
+                .get(1)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("sidebar {sub} requires a sidebar name"))?;
+            ensure_custom_sidebar_valid_for_runtime_action(sub, name)?;
+            bail!(
+                "not_supported: sidebar {sub} requires CMUX custom-sidebar runtime rendering, which Limux does not implement yet"
+            );
+        }
+        _ => bail!("Unknown sidebar command '{sub}'"),
+    }
+}
+
+// purpose: Validate one sidebar before a runtime action that Limux cannot render yet.
+// inputs: Sidebar action and requested sidebar name.
+// returns/effects: Fails loudly for missing/invalid files before reporting missing renderer support.
+fn ensure_custom_sidebar_valid_for_runtime_action(action: &str, name: &str) -> Result<()> {
+    let payload = custom_sidebar_report(&cmux_sidebars_dir()?, Some(name))?;
+    let row = payload["sidebars"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| anyhow!("sidebar {action}: custom sidebar '{name}' not found"))?;
+    if row["ok"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        let error = get_string(row, &["error"]).unwrap_or_else(|| "validation failed".to_string());
+        bail!("sidebar {action}: {error}");
+    }
+}
+
+// purpose: Validate or reload local CMUX custom sidebar definitions.
+// inputs: Action, remaining args, and JSON output preference.
+// returns/effects: Returns text/JSON report without contacting the host socket.
+fn run_custom_sidebar_validate_like(
+    action: &str,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let filter = parse_custom_sidebar_filter(args)?;
+    let mut payload = custom_sidebar_report(&cmux_sidebars_dir()?, filter.as_deref())?;
+    if action == "reload" {
+        let reloaded = payload
+            .get("valid_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        payload["reloaded_count"] = json!(reloaded);
+    }
+    if json_output {
+        Ok(CommandOutput::Json(payload))
+    } else {
+        Ok(CommandOutput::Text(render_custom_sidebar_report(
+            &payload, action,
+        )))
+    }
+}
+
+// purpose: Return CMUX-compatible custom sidebar command help.
+// inputs: None.
+// returns/effects: Returns static help text.
+fn custom_sidebar_help_text() -> String {
+    concat!(
+        "Usage: limux sidebar <validate|reload|select|open> [name|--all] [--json]\n",
+        "Validate, reload, select, or open custom sidebars from ~/.config/cmux/sidebars.\n",
+        "Commands:\n",
+        "  validate [name]   Validate all custom sidebars, or one named sidebar\n",
+        "  reload [name]     Validate all sidebars, then reload every valid one\n",
+        "  select <name>     Activate one custom sidebar when runtime support exists\n",
+        "  open <name>       Open one custom sidebar when runtime support exists"
+    )
+    .to_string()
+}
+
+// purpose: Parse optional custom sidebar name filters.
+// inputs: Raw args after validate/reload.
+// returns/effects: Returns None for all sidebars or a single requested name.
+fn parse_custom_sidebar_filter(args: &[String]) -> Result<Option<String>> {
+    if args.is_empty() || args == ["--all"] {
+        return Ok(None);
+    }
+    if args.len() == 1 && !args[0].starts_with("--") {
+        return Ok(Some(args[0].clone()));
+    }
+    bail!("sidebar validate/reload accepts at most one name or --all")
+}
+
+// purpose: Build a CMUX-shaped validation report for custom sidebar files.
+// inputs: Sidebar directory and optional sidebar name.
+// returns/effects: Reads files and validates supported source shapes.
+fn custom_sidebar_report(dir: &Path, filter: Option<&str>) -> Result<Value> {
+    let sidebars = discover_custom_sidebars(dir, filter)?;
+    let valid_count = sidebars
+        .iter()
+        .filter(|sidebar| sidebar["ok"].as_bool().unwrap_or(false))
+        .count();
+    let error_count = sidebars.len().saturating_sub(valid_count);
+    Ok(json!({
+        "sidebars": sidebars,
+        "valid_count": valid_count,
+        "error_count": error_count,
+    }))
+}
+
+// purpose: Discover CMUX custom sidebar files with .swift preference over .json.
+// inputs: Sidebar directory and optional name filter.
+// returns/effects: Returns sorted validation rows; missing directories are empty.
+fn discover_custom_sidebars(dir: &Path, filter: Option<&str>) -> Result<Vec<Value>> {
+    if let Some(name) = filter {
+        return Ok(vec![custom_sidebar_row_for_name(dir, name)]);
+    }
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("failed to read {}", dir.display()))?
+            .path();
+        let extension = path.extension().and_then(|value| value.to_str());
+        if !matches!(extension, Some("swift" | "json")) {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+            names.insert(stem.to_string());
+        }
+    }
+    Ok(names
+        .into_iter()
+        .map(|name| custom_sidebar_row_for_name(dir, &name))
+        .collect())
+}
+
+// purpose: Validate one named sidebar using CMUX source precedence.
+// inputs: Sidebar directory and bare sidebar name.
+// returns/effects: Returns a validation row; missing names are explicit errors.
+fn custom_sidebar_row_for_name(dir: &Path, name: &str) -> Value {
+    let swift = dir.join(format!("{name}.swift"));
+    let json_path = dir.join(format!("{name}.json"));
+    if swift.exists() {
+        return validate_custom_sidebar_source(name, &swift, "swift");
+    }
+    if json_path.exists() {
+        return validate_custom_sidebar_source(name, &json_path, "json");
+    }
+    json!({
+        "name": name,
+        "kind": "missing",
+        "path": dir.join(format!("{name}.swift")).display().to_string(),
+        "ok": false,
+        "error": "custom sidebar file not found",
+    })
+}
+
+// purpose: Validate one custom sidebar source file.
+// inputs: Sidebar name, path, and kind.
+// returns/effects: Returns a CMUX-shaped OK/error row.
+fn validate_custom_sidebar_source(name: &str, path: &Path, kind: &str) -> Value {
+    match read_and_validate_custom_sidebar(path, kind) {
+        Ok(()) => json!({
+            "name": name,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "ok": true,
+        }),
+        Err(error) => json!({
+            "name": name,
+            "kind": kind,
+            "path": path.display().to_string(),
+            "ok": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+// purpose: Read and validate one custom sidebar source.
+// inputs: Sidebar source path and kind.
+// returns/effects: Fails loudly for unreadable, empty, or malformed supported files.
+fn read_and_validate_custom_sidebar(path: &Path, kind: &str) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read custom sidebar {}", path.display()))?;
+    match kind {
+        "swift" => {
+            if raw.trim().is_empty() {
+                bail!("custom sidebar Swift source is empty");
+            }
+            Ok(())
+        }
+        "json" => {
+            let value: Value = serde_json::from_str(&raw)
+                .with_context(|| format!("custom sidebar JSON is invalid: {}", path.display()))?;
+            if !value.is_object() {
+                bail!("custom sidebar JSON must be an object");
+            }
+            Ok(())
+        }
+        _ => bail!("unsupported custom sidebar kind {kind}"),
+    }
+}
+
+// purpose: Render CMUX-style custom sidebar validation output.
+// inputs: Validation payload and action.
+// returns/effects: Returns a human-readable report.
+fn render_custom_sidebar_report(payload: &Value, action: &str) -> String {
+    let sidebars = payload["sidebars"].as_array().cloned().unwrap_or_default();
+    let mut lines = custom_sidebar_report_rows(sidebars);
+    let valid = payload["valid_count"].as_u64().unwrap_or(0);
+    let errors = payload["error_count"].as_u64().unwrap_or(0);
+    if action == "reload" {
+        let reloaded = payload["reloaded_count"].as_u64().unwrap_or(0);
+        lines.push(format!(
+            "Reloaded {reloaded} valid sidebars. {valid} valid, {errors} invalid."
+        ));
+    } else {
+        lines.push(format!("{valid} valid, {errors} invalid."));
+    }
+    lines.join("\n")
+}
+
+// purpose: Render custom sidebar per-file report rows.
+// inputs: Sidebar validation rows.
+// returns/effects: Returns OK/ERROR lines or an empty-directory message.
+fn custom_sidebar_report_rows(sidebars: Vec<Value>) -> Vec<String> {
+    if sidebars.is_empty() {
+        return vec!["No custom sidebars found.".to_string()];
+    }
+    sidebars
+        .into_iter()
+        .map(|sidebar| {
+            let name = get_string(&sidebar, &["name"]).unwrap_or_else(|| "(unknown)".to_string());
+            let kind = get_string(&sidebar, &["kind"]).unwrap_or_default();
+            let path = get_string(&sidebar, &["path"]).unwrap_or_default();
+            if sidebar["ok"].as_bool().unwrap_or(false) {
+                format!("OK {name} [{kind}] {path}")
+            } else {
+                let error =
+                    get_string(&sidebar, &["error"]).unwrap_or_else(|| "Unknown error".to_string());
+                format!("ERROR {name} [{kind}] {path}: {error}")
+            }
+        })
+        .collect()
 }
 
 // purpose: Implement CMUX-compatible theme list/set/clear commands for Ghostty themes.
@@ -13490,6 +13773,7 @@ mod cli_arg_tests {
     fn cmux_docs_includes_dock_topic_and_aliases() {
         let index = docs_text(None).expect("docs index");
         assert!(index.contains("dock"));
+        assert!(index.contains("sidebars"));
 
         let dock = docs_text(Some("dock")).expect("dock docs");
         assert!(dock.contains(".cmux/dock.json"));
@@ -13497,6 +13781,72 @@ mod cli_arg_tests {
 
         let alias = docs_text(Some("right_sidebar")).expect("dock alias docs");
         assert!(alias.contains("dock.json"));
+
+        let sidebars = docs_text(Some("sidebars")).expect("sidebars docs");
+        assert!(sidebars.contains("cmux/sidebars"));
+        assert!(sidebars.contains("sidebar validate"));
+    }
+
+    #[test]
+    fn custom_sidebar_report_validates_missing_swift_json_and_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = custom_sidebar_report(dir.path(), None).expect("empty report");
+        assert_eq!(empty["valid_count"], json!(0));
+        assert_eq!(empty["error_count"], json!(0));
+        assert!(
+            render_custom_sidebar_report(&empty, "validate").contains("No custom sidebars found.")
+        );
+
+        fs::write(dir.path().join("alpha.swift"), "struct AlphaView {}").expect("write swift");
+        fs::write(dir.path().join("beta.json"), br#"{"title":"Beta"}"#).expect("write json");
+        fs::write(dir.path().join("bad.json"), br#"["not-object"]"#).expect("write bad json");
+        fs::write(dir.path().join("dupe.json"), br#"{"title":"JSON"}"#).expect("write dupe json");
+        fs::write(dir.path().join("dupe.swift"), "struct DupeView {}").expect("write dupe swift");
+
+        let report = custom_sidebar_report(dir.path(), None).expect("report");
+        assert_eq!(report["valid_count"], json!(3));
+        assert_eq!(report["error_count"], json!(1));
+        let rows = report["sidebars"].as_array().expect("rows");
+        assert!(rows
+            .iter()
+            .any(|row| { row["name"] == "alpha" && row["kind"] == "swift" && row["ok"] == true }));
+        assert!(rows
+            .iter()
+            .any(|row| { row["name"] == "beta" && row["kind"] == "json" && row["ok"] == true }));
+        assert!(rows
+            .iter()
+            .any(|row| { row["name"] == "bad" && row["kind"] == "json" && row["ok"] == false }));
+        assert!(rows
+            .iter()
+            .any(|row| { row["name"] == "dupe" && row["kind"] == "swift" && row["ok"] == true }));
+    }
+
+    #[test]
+    fn custom_sidebar_filter_and_runtime_actions_are_loud() {
+        assert_eq!(
+            parse_custom_sidebar_filter(&args(&[])).expect("empty"),
+            None
+        );
+        assert_eq!(
+            parse_custom_sidebar_filter(&args(&["--all"])).expect("all"),
+            None
+        );
+        assert_eq!(
+            parse_custom_sidebar_filter(&args(&["alpha"])).expect("name"),
+            Some("alpha".to_string())
+        );
+        assert!(parse_custom_sidebar_filter(&args(&["--bad"])).is_err());
+        assert!(parse_custom_sidebar_filter(&args(&["one", "two"])).is_err());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = custom_sidebar_report(dir.path(), Some("missing")).expect("missing report");
+        let row = &missing["sidebars"][0];
+        assert_eq!(row["kind"], "missing");
+        assert_eq!(row["ok"], false);
+
+        let error =
+            run_custom_sidebar_command(&args(&["open"]), false).expect_err("open requires name");
+        assert!(error.to_string().contains("requires a sidebar name"));
     }
 
     #[tokio::test]
