@@ -428,8 +428,10 @@ pub enum BrowserTabAction {
 /// - `direction` is one of `left|right|up|down`, defaulting to `right`.
 /// - `type` is one of `terminal|browser`, defaulting to `terminal`.
 /// - `command` is a terminal-only host extension: the host injects it into the
-///   newly-created surface after creation. The standalone core dispatcher may
-///   accept the field for compatibility but does not launch a process.
+///   newly-created surface after creation. `initial_command` launches as the
+///   terminal startup command and is used by CMUX watcher-created panes.
+/// - `working_directory` and `startup_environment` are terminal-only CMUX
+///   watcher fields used when `initial_command` starts a managed terminal.
 ///
 /// Browser pane support uses the existing WebKit pane state path. Responses
 /// must keep the existing core/CLI field names: `pane_id`, `pane_ref`,
@@ -442,6 +444,9 @@ pub struct CreatePaneRequest {
     pub direction: PaneCreateDirection,
     pub pane_type: PaneCreateType,
     pub command: Option<String>,
+    pub initial_command: Option<String>,
+    pub working_directory: Option<String>,
+    pub startup_environment: BTreeMap<String, String>,
     pub url: Option<String>,
 }
 
@@ -1841,6 +1846,14 @@ fn parse_create_pane_request(
 
     let url = optional_string(params, &["url"]);
     let command = optional_string(params, &["command"]);
+    let initial_command = optional_string(params, &["initial_command", "initialCommand"]);
+    let working_directory = optional_string(params, &["working_directory", "workingDirectory"]);
+    let startup_environment = parse_startup_environment(params)?;
+    if command.is_some() && initial_command.is_some() {
+        return Err(BridgeError::invalid_params(
+            "pane.create accepts command or initial_command, not both",
+        ));
+    }
     if matches!(pane_type, PaneCreateType::Terminal) && url.is_some() {
         return Err(BridgeError::invalid_params(
             "pane.create url is only supported for browser panes",
@@ -1851,6 +1864,15 @@ fn parse_create_pane_request(
             "pane.create command is only supported for terminal panes",
         ));
     }
+    if matches!(pane_type, PaneCreateType::Browser)
+        && (initial_command.is_some()
+            || working_directory.is_some()
+            || !startup_environment.is_empty())
+    {
+        return Err(BridgeError::invalid_params(
+            "pane.create startup fields are only supported for terminal panes",
+        ));
+    }
 
     Ok(CreatePaneRequest {
         target: parse_optional_workspace_target(params, true)?,
@@ -1859,6 +1881,9 @@ fn parse_create_pane_request(
         direction,
         pane_type,
         command,
+        initial_command,
+        working_directory,
+        startup_environment,
         url,
     })
 }
@@ -1945,22 +1970,7 @@ fn required_group_id(params: &Map<String, Value>, method: &str) -> Result<String
 // inputs: Candidate environment key from CLI or RPC.
 // returns/effects: Rejects empty, malformed, and managed CMUX/LIMUX keys.
 fn validate_workspace_env_key(key: &str) -> Result<(), BridgeError> {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return Err(BridgeError::invalid_params(
-            "workspace_env keys must not be empty",
-        ));
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return Err(BridgeError::invalid_params(format!(
-            "invalid workspace_env key `{key}`"
-        )));
-    }
-    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
-        return Err(BridgeError::invalid_params(format!(
-            "invalid workspace_env key `{key}`"
-        )));
-    }
+    validate_env_key_shape(key, "workspace_env")?;
     if key.starts_with("CMUX_") || key.starts_with("LIMUX_") {
         return Err(BridgeError::invalid_params(format!(
             "workspace_env cannot override managed key `{key}`"
@@ -1996,6 +2006,100 @@ fn parse_workspace_environment(
         environment.insert(key.clone(), value.to_string());
     }
     Ok(environment)
+}
+
+// purpose: Parse CMUX terminal startup environment fields.
+// inputs: Request params that may contain startup_environment or startupEnvironment.
+// returns/effects: Returns sorted key/value pairs or a loud validation error.
+fn parse_startup_environment(
+    params: &Map<String, Value>,
+) -> Result<BTreeMap<String, String>, BridgeError> {
+    let Some(value) = params
+        .get("startup_environment")
+        .or_else(|| params.get("startupEnvironment"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| BridgeError::invalid_params("startup_environment must be an object"))?;
+    let mut environment = BTreeMap::new();
+    for (key, value) in object {
+        validate_startup_env_key(key)?;
+        let Some(value) = value.as_str() else {
+            return Err(BridgeError::invalid_params(format!(
+                "startup_environment value for `{key}` must be a string"
+            )));
+        };
+        if value.contains('\0') {
+            return Err(BridgeError::invalid_params(format!(
+                "startup_environment value for `{key}` must not contain NUL"
+            )));
+        }
+        environment.insert(key.clone(), value.to_string());
+    }
+    Ok(environment)
+}
+
+// purpose: Validate terminal startup environment names without blocking CMUX teams metadata.
+// inputs: Candidate environment key from a CMUX watcher request.
+// returns/effects: Rejects malformed keys and identity/socket/wrapper overrides.
+fn validate_startup_env_key(key: &str) -> Result<(), BridgeError> {
+    validate_env_key_shape(key, "startup_environment")?;
+    if matches!(
+        key,
+        "PATH"
+            | "LIMUX_WORKSPACE_ID"
+            | "CMUX_WORKSPACE_ID"
+            | "LIMUX_SURFACE_ID"
+            | "CMUX_SURFACE_ID"
+            | "LIMUX_PANE_ID"
+            | "LIMUX_TAB_ID"
+            | "CMUX_TAB_ID"
+            | "LIMUX_SOCKET"
+            | "LIMUX_SOCKET_PATH"
+            | "CMUX_SOCKET"
+            | "CMUX_SOCKET_PATH"
+            | "LIMUX_CLI"
+            | "CMUX_CLI"
+            | "LIMUX_CODEX_WRAPPER_SHIM"
+            | "CMUX_CODEX_WRAPPER_SHIM"
+            | "LIMUX_CODEX_WRAPPER_SHIM_ROOT"
+            | "CMUX_CODEX_WRAPPER_SHIM_ROOT"
+    ) {
+        return Err(BridgeError::invalid_params(format!(
+            "startup_environment cannot override managed key `{key}`"
+        )));
+    }
+    Ok(())
+}
+
+// purpose: Validate shell environment variable name shape.
+// inputs: Candidate key and error label.
+// returns/effects: Returns invalid_params for empty, NUL-containing, or malformed names.
+fn validate_env_key_shape(key: &str, label: &str) -> Result<(), BridgeError> {
+    if key.contains('\0') {
+        return Err(BridgeError::invalid_params(format!(
+            "{label} keys must not contain NUL"
+        )));
+    }
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(BridgeError::invalid_params(format!(
+            "{label} keys must not be empty"
+        )));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(BridgeError::invalid_params(format!(
+            "invalid {label} key `{key}`"
+        )));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(BridgeError::invalid_params(format!(
+            "invalid {label} key `{key}`"
+        )));
+    }
+    Ok(())
 }
 
 fn required_workspace_id(params: &Map<String, Value>, method: &str) -> Result<String, BridgeError> {
@@ -3180,6 +3284,20 @@ fn handle_method(
                     Ok(value) => value,
                     Err(error) => return error_response(id, error),
                 };
+            let startup_environment = match parse_startup_environment(params) {
+                Ok(environment) => environment,
+                Err(error) => return error_response(id, error),
+            };
+            let command = optional_string(params, &["command"]);
+            let initial_command = optional_string(params, &["initial_command", "initialCommand"]);
+            if command.is_some() && initial_command.is_some() {
+                return error_response(
+                    id,
+                    BridgeError::invalid_params(
+                        "surface.split accepts command or initial_command, not both",
+                    ),
+                );
+            }
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::CreatePane {
@@ -3189,7 +3307,13 @@ fn handle_method(
                         source_surface_id,
                         direction,
                         pane_type: PaneCreateType::Terminal,
-                        command: optional_string(params, &["command"]),
+                        command,
+                        initial_command,
+                        working_directory: optional_string(
+                            params,
+                            &["working_directory", "workingDirectory"],
+                        ),
+                        startup_environment,
                         url: None,
                     },
                     reply,
@@ -5300,6 +5424,58 @@ mod tests {
         assert_eq!(request.command, Some("claude".to_string()));
     }
 
+    // purpose: Verify CMUX watcher startup fields parse for terminal pane creation.
+    // inputs: Pane create params with initial_command, working_directory, and startup_environment.
+    // returns/effects: Asserts parsed request preserves launch command, cwd, and teams env.
+    #[test]
+    fn pane_create_contract_accepts_cmux_startup_fields() {
+        let params = json!({
+            "workspace_id": "workspace-a",
+            "surface_id": "surface:11:tab-a",
+            "initial_command": "/tmp/cmux-codex-teams.sh",
+            "working_directory": "/tmp/project",
+            "startup_environment": {
+                "CMUX_MANAGED_SUBAGENT": "1",
+                "CMUX_CODEX_TEAMS_DEPTH": "2"
+            }
+        });
+        let request = parse_create_pane_request(params.as_object().expect("object params"))
+            .expect("startup pane.create should parse");
+
+        assert_eq!(
+            request.initial_command,
+            Some("/tmp/cmux-codex-teams.sh".to_string())
+        );
+        assert_eq!(request.working_directory, Some("/tmp/project".to_string()));
+        assert_eq!(
+            request.startup_environment.get("CMUX_MANAGED_SUBAGENT"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            request.startup_environment.get("CMUX_CODEX_TEAMS_DEPTH"),
+            Some(&"2".to_string())
+        );
+    }
+
+    // purpose: Verify startup fields fail loudly for ambiguous or unsafe pane requests.
+    // inputs: Pane create params with command conflicts, browser startup fields, and managed env overrides.
+    // returns/effects: Asserts invalid_params is returned before dispatch.
+    #[test]
+    fn pane_create_contract_rejects_invalid_startup_fields() {
+        for params in [
+            json!({"command": "codex", "initial_command": "codex"}),
+            json!({"type": "browser", "initial_command": "codex"}),
+            json!({"startup_environment": {"PATH": "/tmp/bin"}}),
+            json!({"startup_environment": {"CMUX_SOCKET": "/tmp/socket"}}),
+            json!({"startup_environment": {"BAD-NAME": "1"}}),
+            json!({"startup_environment": {"CMUX_MANAGED_SUBAGENT": 1}}),
+        ] {
+            let error = parse_create_pane_request(params.as_object().expect("object params"))
+                .expect_err("invalid startup field should fail");
+            assert_eq!(error.code, INVALID_PARAMS_CODE);
+        }
+    }
+
     #[test]
     fn pane_create_contract_rejects_invalid_direction_and_type() {
         let bad_direction = json!({ "direction": "diagonal" });
@@ -5357,6 +5533,62 @@ mod tests {
         let result = response.result.expect("pane.create should return a result");
         assert_eq!(result["pane_ref"], "pane:9");
         assert_eq!(result["surface_ref"], "surface:9:tab");
+    }
+
+    // purpose: Verify surface.split forwards CMUX watcher startup fields to pane creation.
+    // inputs: surface.split request with initial_command, working_directory, and startup_environment.
+    // returns/effects: Asserts queued CreatePane request preserves all startup fields.
+    #[test]
+    fn surface_split_route_queues_cmux_startup_fields() {
+        let response = dispatch_request(
+            r#"{
+                "id":1,
+                "method":"surface.split",
+                "params":{
+                    "workspace_id":"codex",
+                    "surface_id":"surface:4:tab",
+                    "direction":"right",
+                    "initial_command":"/tmp/cmux-codex-teams.sh",
+                    "working_directory":"/tmp/project",
+                    "startup_environment":{
+                        "CMUX_MANAGED_SUBAGENT":"1",
+                        "CMUX_CODEX_TEAMS_THREAD_ID":"thread-child"
+                    }
+                }
+            }"#,
+            &|command| match command {
+                ControlCommand::CreatePane { request, reply } => {
+                    assert_eq!(request.target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(request.source_surface_id, Some("4:tab".to_string()));
+                    assert_eq!(request.direction, PaneCreateDirection::Right);
+                    assert_eq!(
+                        request.initial_command.as_deref(),
+                        Some("/tmp/cmux-codex-teams.sh")
+                    );
+                    assert_eq!(request.working_directory.as_deref(), Some("/tmp/project"));
+                    assert_eq!(
+                        request
+                            .startup_environment
+                            .get("CMUX_CODEX_TEAMS_THREAD_ID")
+                            .map(String::as_str),
+                        Some("thread-child")
+                    );
+                    let _ = reply.send(Ok(json!({
+                        "pane_id": "9",
+                        "pane_ref": "pane:9",
+                        "surface_id": "9:tab",
+                        "surface_ref": "surface:9:tab"
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(
+            response.result.expect("surface.split should return result")["surface_ref"],
+            "surface:9:tab"
+        );
     }
 
     #[test]

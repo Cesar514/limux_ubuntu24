@@ -1252,7 +1252,15 @@ struct TerminalTabOptions<'a> {
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
     startup_command: Option<String>,
+    extra_env: Vec<(String, String)>,
     activate: bool,
+}
+
+pub(crate) struct TerminalLaunchOptions {
+    pub command: Option<String>,
+    pub working_directory: Option<String>,
+    pub extra_env: Vec<(String, String)>,
+    pub activate: bool,
 }
 
 struct BrowserTabOptions<'a> {
@@ -1311,6 +1319,7 @@ fn restore_tabs_from_state(
                         cwd: cwd.as_deref().or(working_directory),
                         agent: agent.clone(),
                         startup_command: startup_command.clone(),
+                        extra_env: Vec::new(),
                         activate: restore_active,
                     }),
                 );
@@ -1583,6 +1592,9 @@ fn add_terminal_tab_inner(
         extra_env.push(("CMUX_SOCKET".to_string(), sock.to_string()));
         extra_env.push(("CMUX_SOCKET_PATH".to_string(), sock.to_string()));
     }
+    if let Some(tab_options) = options.as_ref() {
+        extra_env.extend(tab_options.extra_env.iter().cloned());
+    }
     let startup_command = options
         .as_ref()
         .and_then(|value| value.startup_command.clone())
@@ -1851,6 +1863,7 @@ pub fn add_terminal_tab_to_pane_with_command(
             cwd: None,
             agent: None,
             startup_command: command,
+            extra_env: Vec::new(),
             activate,
         })
     } else {
@@ -1874,6 +1887,36 @@ pub fn add_terminal_tab_to_pane_with_command(
         cwd,
         uri,
     })
+}
+
+// purpose: Add a terminal tab with startup cwd, command, and environment.
+// inputs: Pane widget and launch options supplied by the live control bridge.
+// returns/effects: Creates one terminal surface and returns its summary.
+pub fn add_terminal_tab_to_pane_with_launch_options(
+    pane_widget: &gtk::Widget,
+    launch: TerminalLaunchOptions,
+) -> Option<SurfaceSummary> {
+    let internals = find_pane_internals(pane_widget)?;
+    let fallback_dir = internals.working_directory.borrow().clone();
+    let cwd = launch
+        .working_directory
+        .as_deref()
+        .or(fallback_dir.as_deref());
+    let tab_id = add_terminal_tab_inner(
+        &internals,
+        cwd,
+        Some(TerminalTabOptions {
+            id: None,
+            custom_name: None,
+            pinned: false,
+            cwd,
+            agent: None,
+            startup_command: launch.command,
+            extra_env: launch.extra_env,
+            activate: launch.activate,
+        }),
+    );
+    surface_summary_for_tab(&internals, &tab_id)
 }
 
 // purpose: Replace a terminal tab with a new process while preserving its surface ID.
@@ -1928,6 +1971,7 @@ pub fn respawn_terminal_surface(
         cwd: cwd.as_deref(),
         agent: None,
         startup_command: Some(command),
+        extra_env: Vec::new(),
         activate: was_active,
     };
     let working_directory = internals.working_directory.borrow().clone();

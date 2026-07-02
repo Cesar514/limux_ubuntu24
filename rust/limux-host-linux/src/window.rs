@@ -9385,6 +9385,9 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
+            let startup_requested = request.initial_command.is_some()
+                || request.working_directory.is_some()
+                || !request.startup_environment.is_empty();
             let new_pane = split_pane(
                 state,
                 &resolved.workspace_id,
@@ -9397,7 +9400,7 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                             Some(PaneState::browser_only(request.url.as_deref()))
                         }
                     },
-                    skip_default_tab: false,
+                    skip_default_tab: startup_requested,
                     new_pane_first: resolved.placement.new_pane_first,
                     persist: true,
                 },
@@ -9409,7 +9412,20 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 return;
             };
 
-            let Some(surface) = pane::active_surface_summary(&new_pane) else {
+            let surface = if startup_requested {
+                pane::add_terminal_tab_to_pane_with_launch_options(
+                    &new_pane,
+                    pane::TerminalLaunchOptions {
+                        command: request.initial_command.or_else(|| request.command.clone()),
+                        working_directory: request.working_directory,
+                        extra_env: request.startup_environment.into_iter().collect(),
+                        activate: true,
+                    },
+                )
+            } else {
+                pane::active_surface_summary(&new_pane)
+            };
+            let Some(surface) = surface else {
                 let _ = reply.send(Err(BridgeError::internal(
                     "pane.create did not produce a surface",
                 )));
@@ -9420,11 +9436,13 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let response =
                 pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
 
-            if let Some(command) = request.command {
-                send_pane_create_response_after_command(
-                    new_pane, surface_id, command, response, reply,
-                );
-                return;
+            if !startup_requested {
+                if let Some(command) = request.command {
+                    send_pane_create_response_after_command(
+                        new_pane, surface_id, command, response, reply,
+                    );
+                    return;
+                }
             }
 
             let _ = reply.send(Ok(response));
