@@ -22,7 +22,8 @@ use limux_protocol::{parse_v1_command_envelope, V2Request, V2Response};
 use serde_json::{json, Map, Value};
 
 use crate::layout_state::{
-    LayoutNodeState, PaneState, SplitOrientation, SplitState, TabContentState, TabState,
+    LayoutNodeState, PaneState, SplitOrientation, SplitState, SurfaceResumeBindingState,
+    TabContentState, TabState,
 };
 
 const METHODS: &[&str] = &[
@@ -184,6 +185,9 @@ const METHODS: &[&str] = &[
     "surface.respawn",
     "surface.health",
     "surface.trigger_flash",
+    "surface.resume.set",
+    "surface.resume.get",
+    "surface.resume.clear",
     "surface.report_ports",
     "surface.clear_ports",
     "surface.report_tty",
@@ -912,6 +916,24 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    SurfaceResumeSet {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        binding: SurfaceResumeBindingState,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SurfaceResumeGet {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
+    SurfaceResumeClear {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        checkpoint_id: Option<String>,
+        source: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfacePortsKick {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -1135,6 +1157,9 @@ impl ControlCommand {
             | Self::RespawnSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
             | Self::TriggerSurfaceFlash { reply, .. }
+            | Self::SurfaceResumeSet { reply, .. }
+            | Self::SurfaceResumeGet { reply, .. }
+            | Self::SurfaceResumeClear { reply, .. }
             | Self::SurfacePortsKick { reply, .. }
             | Self::SurfaceReportTTY { reply, .. }
             | Self::SurfaceReportPorts { reply, .. }
@@ -1243,6 +1268,33 @@ fn optional_string(params: &Map<String, Value>, keys: &[&str]) -> Option<String>
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
+    })
+}
+
+// purpose: Parse CMUX surface resume binding metadata from JSON-RPC params.
+// inputs: Request params that must include a non-empty command string.
+// returns/effects: Returns validated binding metadata without mutating bridge state.
+fn parse_surface_resume_binding(
+    params: &Map<String, Value>,
+) -> Result<SurfaceResumeBindingState, BridgeError> {
+    let Some(command) = optional_string(params, &["command"]) else {
+        return Err(BridgeError::invalid_params(
+            "surface.resume.set requires command",
+        ));
+    };
+    if command.trim().is_empty() {
+        return Err(BridgeError::invalid_params(
+            "surface.resume.set requires non-empty command",
+        ));
+    }
+
+    Ok(SurfaceResumeBindingState {
+        command,
+        name: optional_string(params, &["name"]),
+        kind: optional_string(params, &["kind"]),
+        checkpoint_id: optional_string(params, &["checkpoint_id", "checkpointId", "checkpoint"]),
+        source: optional_string(params, &["source"]),
+        cwd: optional_string(params, &["cwd"]),
     })
 }
 
@@ -2052,6 +2104,7 @@ fn cmux_terminal_tab(
             cwd: cwd.map(ToOwned::to_owned),
             startup_command: startup_command.map(ToOwned::to_owned),
             agent: None,
+            resume_binding: None,
         },
     }
 }
@@ -4756,6 +4809,85 @@ fn handle_method(
                 rx,
             )
         }
+        "surface.resume.set" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let binding = match parse_surface_resume_binding(params) {
+                Ok(binding) => binding,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceResumeSet {
+                    target,
+                    surface_hint,
+                    binding,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.resume.get" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceResumeGet {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.resume.clear" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::SurfaceResumeClear {
+                    target,
+                    surface_hint,
+                    checkpoint_id: optional_string(
+                        params,
+                        &["checkpoint_id", "checkpointId", "checkpoint"],
+                    ),
+                    source: optional_string(params, &["source"]),
+                    reply,
+                },
+                rx,
+            )
+        }
         "surface.ports_kick" | "surface.ports-kick" | "ports_kick" | "ports-kick" => {
             let target = match parse_optional_workspace_target(params, true) {
                 Ok(target) => target,
@@ -5968,6 +6100,9 @@ mod tests {
         assert!(METHODS.contains(&"surface.clear_ports"));
         assert!(METHODS.contains(&"surface.report_pwd"));
         assert!(METHODS.contains(&"surface.report_shell_state"));
+        assert!(METHODS.contains(&"surface.resume.set"));
+        assert!(METHODS.contains(&"surface.resume.get"));
+        assert!(METHODS.contains(&"surface.resume.clear"));
     }
 
     #[test]
@@ -9825,6 +9960,91 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert_eq!(response.result.as_ref().unwrap()["flashed"], true);
+    }
+
+    #[test]
+    fn surface_resume_routes_preserve_binding_metadata() {
+        let response = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"surface.resume.set","params":{"workspace_id":"codex","#,
+                r#""panel_id":"surface:4:tab","command":"tmux attach","#,
+                r#""kind":"tmux","checkpointId":"ck-1","source":"cli","cwd":"/tmp"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SurfaceResumeSet {
+                    target,
+                    surface_hint,
+                    binding,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(binding.command, "tmux attach");
+                    assert_eq!(binding.kind.as_deref(), Some("tmux"));
+                    assert_eq!(binding.checkpoint_id.as_deref(), Some("ck-1"));
+                    assert_eq!(binding.source.as_deref(), Some("cli"));
+                    assert_eq!(binding.cwd.as_deref(), Some("/tmp"));
+                    let _ = reply.send(Ok(json!({ "updated": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.as_ref().unwrap()["updated"], true);
+
+        let missing = dispatch_request(
+            r#"{"id":1,"method":"surface.resume.set","params":{"panel_id":"surface:4:tab"}}"#,
+            &|command| panic!("missing command should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            missing.error.expect("missing command error").code,
+            INVALID_PARAMS_CODE
+        );
+    }
+
+    #[test]
+    fn surface_resume_get_and_clear_routes_accept_surface_refs() {
+        let get = dispatch_request(
+            r#"{"id":1,"method":"surface.resume.get","params":{"workspace_id":"codex","surface":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::SurfaceResumeGet {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({ "resume_binding": null })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(get.error, None);
+
+        let clear = dispatch_request(
+            concat!(
+                r#"{"id":1,"method":"surface.resume.clear","params":{"workspace_id":"codex","#,
+                r#""panel":"surface:4:tab","checkpoint":"ck-1","source":"cli"}}"#
+            ),
+            &|command| match command {
+                ControlCommand::SurfaceResumeClear {
+                    target,
+                    surface_hint,
+                    checkpoint_id,
+                    source,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    assert_eq!(checkpoint_id.as_deref(), Some("ck-1"));
+                    assert_eq!(source.as_deref(), Some("cli"));
+                    let _ = reply.send(Ok(json!({ "cleared": true })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+        assert_eq!(clear.error, None);
+        assert_eq!(clear.result.as_ref().unwrap()["cleared"], true);
     }
 
     #[test]

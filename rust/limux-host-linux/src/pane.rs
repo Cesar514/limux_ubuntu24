@@ -25,8 +25,8 @@ use webkit6::prelude::*;
 use crate::app_config::AppConfig;
 use crate::keybind_editor;
 use crate::layout_state::{
-    limux_cli_executable, PaneState, RestorableAgentState, TabContentState,
-    TabState as SavedTabState,
+    limux_cli_executable, PaneState, RestorableAgentState, SurfaceResumeBindingState,
+    TabContentState, TabState as SavedTabState,
 };
 use crate::settings_editor;
 use crate::shortcut_config::{NormalizedShortcut, ResolvedShortcutConfig, ShortcutId};
@@ -379,6 +379,7 @@ pub struct PaneCallbacks {
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    resume_binding: Rc<RefCell<Option<SurfaceResumeBindingState>>>,
 }
 
 #[derive(Clone)]
@@ -1293,6 +1294,7 @@ struct TerminalTabOptions<'a> {
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
     startup_command: Option<String>,
+    resume_binding: Option<SurfaceResumeBindingState>,
     extra_env: Vec<(String, String)>,
     activate: bool,
 }
@@ -1356,6 +1358,7 @@ fn restore_tabs_from_state(
                 cwd,
                 startup_command,
                 agent,
+                resume_binding,
             } => {
                 add_terminal_tab_inner(
                     internals,
@@ -1367,6 +1370,7 @@ fn restore_tabs_from_state(
                         cwd: cwd.as_deref().or(working_directory),
                         agent: agent.clone(),
                         startup_command: startup_command.clone(),
+                        resume_binding: resume_binding.as_deref().cloned(),
                         extra_env: Vec::new(),
                         activate: restore_active,
                     }),
@@ -1714,6 +1718,11 @@ fn add_terminal_tab_inner(
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    resume_binding: Rc::new(RefCell::new(
+                        options
+                            .as_ref()
+                            .and_then(|value| value.resume_binding.clone()),
+                    )),
                 },
             },
         });
@@ -2060,6 +2069,7 @@ pub fn add_terminal_tab_to_pane_with_command(
             cwd: dir.as_deref(),
             agent: None,
             startup_command: command,
+            resume_binding: None,
             extra_env: Vec::new(),
             activate,
         })
@@ -2110,6 +2120,7 @@ pub fn add_terminal_tab_to_pane_with_launch_options(
             cwd: cwd.as_deref(),
             agent: None,
             startup_command: launch.command,
+            resume_binding: None,
             extra_env: launch.extra_env,
             activate: launch.activate,
         }),
@@ -2169,6 +2180,7 @@ pub fn respawn_terminal_surface(
         cwd: cwd.as_deref(),
         agent: None,
         startup_command: Some(command),
+        resume_binding: None,
         extra_env: Vec::new(),
         activate: was_active,
     };
@@ -2193,6 +2205,122 @@ pub fn respawn_terminal_surface_for_root(
             let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
             respawn_terminal_surface(&pane_widget, surface_hint, command.clone())
         })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceResumeBindingSummary {
+    pub surface: SurfaceSummary,
+    pub binding: Option<SurfaceResumeBindingState>,
+}
+
+// purpose: Resolve a terminal tab for CMUX surface resume metadata commands.
+// inputs: Pane internals plus an optional surface hint; omitted hints use the active terminal tab.
+// returns/effects: Returns the matching tab id without mutating tab state.
+fn terminal_tab_id_for_resume_binding(
+    internals: &Rc<PaneInternals>,
+    surface_hint: Option<&str>,
+) -> Option<String> {
+    let requested = surface_hint
+        .map(normalize_surface_hint)
+        .filter(|value| !value.is_empty());
+    let tab_state = internals.tab_state.borrow();
+    let active_tab = tab_state.active_tab.as_deref();
+    tab_state
+        .tabs
+        .iter()
+        .find(|entry| {
+            let TabKind::Terminal { .. } = entry.kind else {
+                return false;
+            };
+            let surface_id = composite_surface_id(internals.pane_id, &entry.id);
+            requested
+                .map(|hint| hint == entry.id || hint == surface_id)
+                .unwrap_or(active_tab == Some(entry.id.as_str()))
+        })
+        .map(|entry| entry.id.clone())
+}
+
+// purpose: Set a CMUX resume binding on an addressed or active terminal surface.
+// inputs: Workspace root, optional surface hint, and validated binding metadata.
+// returns/effects: Mutates the matching terminal tab binding and returns current surface metadata.
+pub fn set_surface_resume_binding_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+    binding: SurfaceResumeBindingState,
+) -> Option<SurfaceResumeBindingSummary> {
+    for internals in pane_internals_for_root(root) {
+        let Some(tab_id) = terminal_tab_id_for_resume_binding(&internals, surface_hint) else {
+            continue;
+        };
+        {
+            let mut tab_state = internals.tab_state.borrow_mut();
+            let entry = tab_state.find_tab_mut(&tab_id)?;
+            let TabKind::Terminal { state } = &entry.kind else {
+                return None;
+            };
+            *state.resume_binding.borrow_mut() = Some(binding.clone());
+        }
+        (internals.callbacks.on_state_changed)();
+        let surface = surface_summary_for_tab(&internals, &tab_id)?;
+        return Some(SurfaceResumeBindingSummary {
+            surface,
+            binding: Some(binding),
+        });
+    }
+    None
+}
+
+// purpose: Read a CMUX resume binding from an addressed or active terminal surface.
+// inputs: Workspace root and optional surface hint.
+// returns/effects: Returns the matching surface and its binding without mutation.
+pub fn get_surface_resume_binding_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<SurfaceResumeBindingSummary> {
+    for internals in pane_internals_for_root(root) {
+        let Some(tab_id) = terminal_tab_id_for_resume_binding(&internals, surface_hint) else {
+            continue;
+        };
+        let binding = {
+            let tab_state = internals.tab_state.borrow();
+            let entry = tab_state.tabs.iter().find(|entry| entry.id == tab_id)?;
+            let TabKind::Terminal { state } = &entry.kind else {
+                return None;
+            };
+            let binding = state.resume_binding.borrow().clone();
+            binding
+        };
+        let surface = surface_summary_for_tab(&internals, &tab_id)?;
+        return Some(SurfaceResumeBindingSummary { surface, binding });
+    }
+    None
+}
+
+// purpose: Clear a CMUX resume binding from an addressed or active terminal surface.
+// inputs: Workspace root and optional surface hint.
+// returns/effects: Mutates the matching terminal tab binding and returns current surface metadata.
+pub fn clear_surface_resume_binding_for_root(
+    root: &gtk::Widget,
+    surface_hint: Option<&str>,
+) -> Option<SurfaceResumeBindingSummary> {
+    for internals in pane_internals_for_root(root) {
+        let Some(tab_id) = terminal_tab_id_for_resume_binding(&internals, surface_hint) else {
+            continue;
+        };
+        let binding = {
+            let mut tab_state = internals.tab_state.borrow_mut();
+            let entry = tab_state.find_tab_mut(&tab_id)?;
+            let TabKind::Terminal { state } = &entry.kind else {
+                return None;
+            };
+            let binding = state.resume_binding.borrow_mut().take();
+            binding
+        };
+        (internals.callbacks.on_state_changed)();
+        let surface = surface_summary_for_tab(&internals, &tab_id)?;
+        return Some(SurfaceResumeBindingSummary { surface, binding });
+    }
+    None
 }
 
 #[allow(dead_code)]
@@ -2345,6 +2473,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                     cwd: state.cwd.borrow().clone(),
                     startup_command: None,
                     agent: None,
+                    resume_binding: state.resume_binding.borrow().clone().map(Box::new),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),

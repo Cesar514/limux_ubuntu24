@@ -386,6 +386,8 @@ fn full_help_text() -> &'static str {
         "      (--index <n>|--before-surface <id|ref>|--after-surface <id|ref>)\n",
         "  refresh-surfaces [--surface <id|ref>]\n",
         "  trigger-flash [--workspace <id|ref>] [--surface <id|ref>]\n",
+        "  surface resume set [--surface <id|ref>] [--shell <command>|-- <argv...>]\n",
+        "  surface resume show|clear [--surface <id|ref>]\n",
         "  rename-workspace [--workspace <id|ref>] <title>\n",
         "  rename-window [--workspace <id|ref>] <title>\n",
         "  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n",
@@ -408,7 +410,7 @@ fn full_help_text() -> &'static str {
         "  split-window | splitw | select-layout\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
         "  move-surface | split-off | drag-surface-to-split | reorder-surface\n",
-        "  refresh-surfaces | trigger-flash\n",
+        "  refresh-surfaces | trigger-flash | surface resume | surface-resume\n",
         "  list-notifications | dismiss-notification | mark-notification-read\n",
         "  open-notification | jump-to-unread | clear-notifications\n\n",
         "Agent integrations:\n",
@@ -4346,6 +4348,14 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("move-surface", "Usage: limux move-surface"),
     ("split-off", "Usage: limux split-off"),
     ("reorder-surface", "Usage: limux reorder-surface"),
+    (
+        "surface",
+        "Usage: limux surface resume <set|show|get|clear> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
+    (
+        "surface-resume",
+        "Usage: limux surface-resume <set|show|get|clear> [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
     ("reorder-workspace", "Usage: limux reorder-workspace"),
     ("reorder-workspaces", "Usage: limux reorder-workspaces"),
     ("simulate-sidebar-drag", "Usage: limux simulate-sidebar-drag"),
@@ -7937,6 +7947,19 @@ fn default_text_output(payload: &Value) -> String {
         Value::Array(values) if values.is_empty() => "OK".to_string(),
         _ => serde_json::to_string_pretty(payload).unwrap_or_else(|_| "OK".to_string()),
     }
+}
+
+// purpose: Render CMUX surface resume show/get output.
+// inputs: JSON-RPC response containing an optional resume_binding object.
+// returns/effects: Prints the bound command or the CMUX no-binding message.
+fn render_surface_resume_text(payload: &Value) -> String {
+    payload
+        .get("resume_binding")
+        .and_then(|binding| binding.get("command"))
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "No resume binding".to_string())
 }
 
 async fn run_send(client: &mut Client, args: &[String]) -> Result<Value> {
@@ -13926,6 +13949,200 @@ fn build_surface_alias_request(
     Ok(Some((method, Value::Object(params))))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfaceResumeAction {
+    Set,
+    Get,
+    Clear,
+}
+
+#[derive(Debug)]
+struct SurfaceResumeRequest {
+    action: SurfaceResumeAction,
+    method: &'static str,
+    params: Value,
+}
+
+// purpose: Shell-quote argv tokens for CMUX-compatible resume binding commands.
+// inputs: One raw argv token.
+// returns/effects: Returns a POSIX-safe token without executing shell code.
+fn shell_quote_arg(arg: &str) -> String {
+    if arg.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '=' | ',' | '+')
+    }) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+// purpose: Split surface resume args into flags and an argv command after `--`.
+// inputs: Raw args after the surface resume subcommand.
+// returns/effects: Returns option args and command argv without mutating process state.
+fn split_surface_resume_args(args: &[String]) -> (&[String], &[String]) {
+    let Some(index) = args.iter().position(|arg| arg == "--") else {
+        return (args, &[]);
+    };
+    (&args[..index], &args[index + 1..])
+}
+
+// purpose: Build CMUX-compatible surface resume JSON-RPC params.
+// inputs: Top-level command and raw CLI args.
+// returns/effects: Returns set/get/clear request metadata or a loud validation error.
+fn build_surface_resume_request(command: &str, args: &[String]) -> Result<SurfaceResumeRequest> {
+    let (verb, rest) = if command == "surface" && args.first().is_some_and(|arg| arg == "resume") {
+        let subcommand = args.get(1).map(String::as_str).unwrap_or("show");
+        (subcommand, &args[2..])
+    } else if command == "surface-resume" {
+        let subcommand = args.first().map(String::as_str).unwrap_or("show");
+        (subcommand, &args[1..])
+    } else {
+        bail!("unsupported surface resume command: {command}");
+    };
+    let action = match canonical_tmux_command(verb) {
+        "set" => SurfaceResumeAction::Set,
+        "show" | "get" => SurfaceResumeAction::Get,
+        "clear" => SurfaceResumeAction::Clear,
+        other => bail!("unsupported surface resume subcommand: {other}"),
+    };
+
+    let (flag_args, argv_args) = split_surface_resume_args(rest);
+    let mut params = Map::new();
+    if let Some(workspace) =
+        parse_opt(flag_args, "--workspace").or_else(|| context_env_value("LIMUX_WORKSPACE_ID"))
+    {
+        if !workspace.trim().is_empty() {
+            params.insert("workspace_id".to_string(), Value::String(workspace));
+        }
+    }
+    if let Some(window) = parse_opt(flag_args, "--window") {
+        params.insert("window_id".to_string(), Value::String(window));
+    }
+    let surface = if action == SurfaceResumeAction::Set {
+        parse_opt(flag_args, "--surface")
+            .or_else(|| parse_opt(flag_args, "--panel"))
+            .or_else(|| parse_opt(flag_args, "-t"))
+            .or_else(|| parse_opt(flag_args, "--target"))
+            .or_else(|| context_env_value("LIMUX_SURFACE_ID"))
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        surface_arg(flag_args)
+    };
+    if let Some(surface) = surface {
+        params.insert("surface_id".to_string(), Value::String(surface));
+    }
+
+    if action == SurfaceResumeAction::Set {
+        let shell_command = parse_opt(flag_args, "--shell");
+        let command = if let Some(shell_command) = shell_command {
+            if !argv_args.is_empty() {
+                bail!("surface resume set --shell cannot be combined with argv after --");
+            }
+            shell_command
+        } else {
+            let command_args = if argv_args.is_empty() {
+                remaining_surface_resume_command_args(flag_args)
+            } else {
+                argv_args.to_vec()
+            };
+            if command_args.is_empty() {
+                bail!("surface resume set requires --shell <command> or argv after --");
+            }
+            command_args
+                .iter()
+                .map(|arg| shell_quote_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if command.trim().is_empty() {
+            bail!("surface resume set requires a non-empty command");
+        }
+        params.insert("command".to_string(), Value::String(command));
+        for (flag, key) in [
+            ("--name", "name"),
+            ("--kind", "kind"),
+            ("--checkpoint-id", "checkpoint_id"),
+            ("--checkpoint", "checkpoint_id"),
+            ("--source", "source"),
+            ("--cwd", "cwd"),
+        ] {
+            if let Some(value) = parse_opt(flag_args, flag).filter(|value| !value.trim().is_empty())
+            {
+                params.insert(key.to_string(), Value::String(value));
+            }
+        }
+        if !params.contains_key("source") {
+            params.insert("source".to_string(), Value::String("cli".to_string()));
+        }
+        if !params.contains_key("cwd") {
+            let cwd =
+                std::env::current_dir().context("failed to read current working directory")?;
+            params.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+        }
+    }
+    if action == SurfaceResumeAction::Clear {
+        if let Some(checkpoint_id) = parse_opt(flag_args, "--checkpoint-id")
+            .or_else(|| parse_opt(flag_args, "--checkpoint"))
+            .filter(|value| !value.trim().is_empty())
+        {
+            params.insert("checkpoint_id".to_string(), Value::String(checkpoint_id));
+        }
+        if let Some(source) =
+            parse_opt(flag_args, "--source").filter(|value| !value.trim().is_empty())
+        {
+            params.insert("source".to_string(), Value::String(source));
+        }
+    }
+
+    let method = match action {
+        SurfaceResumeAction::Set => "surface.resume.set",
+        SurfaceResumeAction::Get => "surface.resume.get",
+        SurfaceResumeAction::Clear => "surface.resume.clear",
+    };
+    Ok(SurfaceResumeRequest {
+        action,
+        method,
+        params: Value::Object(params),
+    })
+}
+
+// purpose: Collect argv-style resume command tokens when users omit the `--` separator.
+// inputs: Surface resume flag args.
+// returns/effects: Returns trailing non-option tokens after recognized flag/value pairs.
+fn remaining_surface_resume_command_args(args: &[String]) -> Vec<String> {
+    let value_options = [
+        "--workspace",
+        "--surface",
+        "--panel",
+        "--window",
+        "--name",
+        "--kind",
+        "--checkpoint",
+        "--checkpoint-id",
+        "--source",
+        "--cwd",
+        "--shell",
+        "-t",
+        "--target",
+    ];
+    let mut command = Vec::new();
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if value_options.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        if arg.starts_with('-') && command.is_empty() {
+            continue;
+        }
+        command.push(arg.clone());
+    }
+    command
+}
+
 /// purpose: Build a CMUX-compatible window request.
 /// inputs: command is a CMUX window alias and args may include --window or a positional id.
 /// returns/effects: Returns the target Limux method plus JSON params.
@@ -17596,6 +17813,28 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text(default_text_output(&payload))
             }
         }
+        "surface" if args.first().is_some_and(|arg| arg == "resume") => {
+            let request = build_surface_resume_request(command, args)?;
+            let payload = client.call(request.method, request.params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if request.action == SurfaceResumeAction::Get {
+                CommandOutput::Text(render_surface_resume_text(&payload))
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
+        "surface-resume" => {
+            let request = build_surface_resume_request(command, args)?;
+            let payload = client.call(request.method, request.params).await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else if request.action == SurfaceResumeAction::Get {
+                CommandOutput::Text(render_surface_resume_text(&payload))
+            } else {
+                CommandOutput::Text(default_text_output(&payload))
+            }
+        }
         "list-notifications"
         | "dismiss-notification"
         | "mark-notification-read"
@@ -20958,6 +21197,84 @@ mod cli_arg_tests {
             .expect("killp maps");
         assert_eq!(killed.0, "surface.close");
         assert_eq!(killed.1["surface_id"], "surface:7:tab-a");
+    }
+
+    #[test]
+    fn cmux_surface_resume_maps_to_limux_methods() {
+        let set = build_surface_resume_request(
+            "surface",
+            &args(&[
+                "resume",
+                "set",
+                "--workspace",
+                "workspace:7",
+                "--surface",
+                "surface:7:tab-a",
+                "--kind",
+                "tmux",
+                "--checkpoint-id",
+                "ck-1",
+                "--shell",
+                "tmux attach",
+            ]),
+        )
+        .expect("surface resume set parses");
+        assert_eq!(set.action, SurfaceResumeAction::Set);
+        assert_eq!(set.method, "surface.resume.set");
+        assert_eq!(set.params["workspace_id"], "workspace:7");
+        assert_eq!(set.params["surface_id"], "surface:7:tab-a");
+        assert_eq!(set.params["command"], "tmux attach");
+        assert_eq!(set.params["kind"], "tmux");
+        assert_eq!(set.params["checkpoint_id"], "ck-1");
+        assert_eq!(set.params["source"], "cli");
+
+        let argv = build_surface_resume_request(
+            "surface-resume",
+            &args(&["set", "--", "opencode", "--session", "ses 123"]),
+        )
+        .expect("surface-resume argv parses");
+        assert_eq!(argv.method, "surface.resume.set");
+        assert_eq!(argv.params["command"], "opencode --session 'ses 123'");
+
+        let show = build_surface_resume_request(
+            "surface",
+            &args(&["resume", "show", "--panel", "surface:7:tab-a"]),
+        )
+        .expect("surface resume show parses");
+        assert_eq!(show.action, SurfaceResumeAction::Get);
+        assert_eq!(show.method, "surface.resume.get");
+        assert_eq!(show.params["surface_id"], "surface:7:tab-a");
+
+        let clear = build_surface_resume_request(
+            "surface-resume",
+            &args(&[
+                "clear",
+                "--surface",
+                "surface:7:tab-a",
+                "--checkpoint",
+                "ck-1",
+            ]),
+        )
+        .expect("surface-resume clear parses");
+        assert_eq!(clear.action, SurfaceResumeAction::Clear);
+        assert_eq!(clear.method, "surface.resume.clear");
+        assert_eq!(clear.params["checkpoint_id"], "ck-1");
+
+        let missing = build_surface_resume_request("surface-resume", &args(&["set"]));
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn cmux_surface_resume_text_renders_command_or_empty_message() {
+        let bound = serde_json::json!({
+            "resume_binding": {
+                "command": "tmux attach",
+            },
+        });
+        assert_eq!(render_surface_resume_text(&bound), "tmux attach");
+
+        let empty = serde_json::json!({ "resume_binding": null });
+        assert_eq!(render_surface_resume_text(&empty), "No resume binding");
     }
 
     #[test]

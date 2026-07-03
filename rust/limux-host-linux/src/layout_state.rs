@@ -214,6 +214,21 @@ impl RestorableAgentState {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceResumeBindingState {
+    pub command: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default, rename = "checkpointId")]
+    pub checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "tab_kind", rename_all = "snake_case")]
 pub enum TabContentState {
@@ -224,6 +239,8 @@ pub enum TabContentState {
         startup_command: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        #[serde(default, rename = "resumeBinding")]
+        resume_binding: Option<Box<SurfaceResumeBindingState>>,
     },
     Browser {
         #[serde(default)]
@@ -298,6 +315,7 @@ impl TabState {
                 cwd: cwd.map(|value| value.to_string()),
                 startup_command: None,
                 agent: None,
+                resume_binding: None,
             },
         }
     }
@@ -1630,6 +1648,7 @@ mod tests {
                         launch_command: None,
                         restore_on_startup: true,
                     }),
+                    resume_binding: None,
                 },
             }],
         });
@@ -1726,6 +1745,7 @@ mod tests {
                     }),
                     restore_on_startup: true,
                 }),
+                resume_binding: None,
             },
         };
 

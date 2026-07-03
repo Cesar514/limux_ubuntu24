@@ -3336,6 +3336,42 @@ fn surface_trigger_flash_payload(
     payload
 }
 
+// purpose: Serialize CMUX surface resume binding metadata for control responses.
+// inputs: Optional persisted binding for one terminal surface.
+// returns/effects: Returns a JSON object or null without mutating host state.
+fn surface_resume_binding_json(
+    binding: Option<&layout_state::SurfaceResumeBindingState>,
+) -> serde_json::Value {
+    let Some(binding) = binding else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "command": binding.command,
+        "name": binding.name,
+        "kind": binding.kind,
+        "checkpoint_id": binding.checkpoint_id,
+        "checkpointId": binding.checkpoint_id,
+        "source": binding.source,
+        "cwd": binding.cwd,
+    })
+}
+
+// purpose: Build a CMUX surface resume response from a resolved terminal surface.
+// inputs: Workspace metadata, surface summary, and optional resume binding metadata.
+// returns/effects: Returns CMUX-shaped JSON without mutating host state.
+fn surface_resume_binding_payload(
+    workspace_id: &str,
+    workspace_name: &str,
+    summary: pane::SurfaceResumeBindingSummary,
+) -> serde_json::Value {
+    let has_binding = summary.binding.is_some();
+    let mut payload = pane_create_response_payload(workspace_id, workspace_name, summary.surface);
+    payload["resume_binding"] = surface_resume_binding_json(summary.binding.as_ref());
+    payload["resumeBinding"] = payload["resume_binding"].clone();
+    payload["has_resume_binding"] = serde_json::Value::Bool(has_binding);
+    payload
+}
+
 /// purpose: Resolve a CMUX surface ports-kick request and return current discovered ports.
 /// inputs: Workspace, sidebar config, optional surface target, and optional reason.
 /// returns/effects: Scans current workspace ports once or returns explicit target errors.
@@ -16322,6 +16358,155 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 &workspace_name,
                 surface,
             )));
+        }
+        ControlCommand::SurfaceResumeSet {
+            target,
+            surface_hint,
+            binding,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let (_focused_pane_id, focused_surface_id) =
+                focused_ids_for_workspace(state, &workspace_id);
+            let resolved_surface_hint = surface_hint.as_deref().or(focused_surface_id.as_deref());
+            let summary = pane::set_surface_resume_binding_for_root(
+                &workspace_root,
+                resolved_surface_hint,
+                binding,
+            );
+            let Some(summary) = summary else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+            publish_surface_lifecycle_event(
+                "surface.resume_set",
+                &workspace_id,
+                &summary.surface,
+                serde_json::json!({ "origin": "surface.resume.set" }),
+            );
+            request_session_save(state);
+            let mut payload =
+                surface_resume_binding_payload(&workspace_id, &workspace_name, summary);
+            payload["updated"] = serde_json::Value::Bool(true);
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::SurfaceResumeGet {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let (_focused_pane_id, focused_surface_id) =
+                focused_ids_for_workspace(state, &workspace_id);
+            let resolved_surface_hint = surface_hint.as_deref().or(focused_surface_id.as_deref());
+            let summary =
+                pane::get_surface_resume_binding_for_root(&workspace_root, resolved_surface_hint);
+            let Some(summary) = summary else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+            let payload = surface_resume_binding_payload(&workspace_id, &workspace_name, summary);
+            let _ = reply.send(Ok(payload));
+        }
+        ControlCommand::SurfaceResumeClear {
+            target,
+            surface_hint,
+            checkpoint_id,
+            source,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let (_focused_pane_id, focused_surface_id) =
+                focused_ids_for_workspace(state, &workspace_id);
+            let resolved_surface_hint = surface_hint.as_deref().or(focused_surface_id.as_deref());
+            let summary =
+                pane::clear_surface_resume_binding_for_root(&workspace_root, resolved_surface_hint);
+            let Some(summary) = summary else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "terminal surface not found",
+                )));
+                return;
+            };
+            publish_surface_lifecycle_event(
+                "surface.resume_cleared",
+                &workspace_id,
+                &summary.surface,
+                serde_json::json!({
+                    "origin": "surface.resume.clear",
+                    "checkpoint_id": checkpoint_id,
+                    "checkpointId": checkpoint_id,
+                    "source": source,
+                }),
+            );
+            request_session_save(state);
+            let mut payload =
+                surface_resume_binding_payload(&workspace_id, &workspace_name, summary);
+            payload["cleared"] = serde_json::Value::Bool(true);
+            let _ = reply.send(Ok(payload));
         }
         ControlCommand::SurfacePortsKick {
             target,
