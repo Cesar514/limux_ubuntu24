@@ -211,6 +211,48 @@ pub struct AppBehaviorConfig {
     pub keep_workspace_open_when_closing_last_surface: bool,
     pub workspace_inherit_working_directory: bool,
     pub focus_pane_on_first_click: bool,
+    pub window_title_template: String,
+    pub menu_bar_only: bool,
+    pub preferred_editor: String,
+    pub open_supported_files_in_cmux: bool,
+    pub open_markdown_in_cmux_viewer: bool,
+    pub i_message_mode: bool,
+    pub reorder_on_notification: bool,
+    pub send_anonymous_telemetry: bool,
+    pub warn_before_quit: bool,
+    pub warn_before_closing_tab: bool,
+    pub warn_before_closing_tab_x_button: bool,
+    pub hide_tab_close_button: bool,
+    pub rename_selects_existing_name: bool,
+    pub command_palette_searches_all_surfaces: bool,
+    pub workspace_button_fade: WorkspaceButtonFadeMode,
+    pub workspace_titlebar_visibility: bool,
+    pub system_wide_hotkey_enabled: bool,
+    pub dev_window_display: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceButtonFadeMode {
+    Enabled,
+    #[default]
+    Disabled,
+}
+
+impl WorkspaceButtonFadeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AppBehaviorConfig {
@@ -228,6 +270,24 @@ impl AppBehaviorConfig {
             keep_workspace_open_when_closing_last_surface: false,
             workspace_inherit_working_directory: true,
             focus_pane_on_first_click: false,
+            window_title_template: String::new(),
+            menu_bar_only: false,
+            preferred_editor: String::new(),
+            open_supported_files_in_cmux: true,
+            open_markdown_in_cmux_viewer: true,
+            i_message_mode: false,
+            reorder_on_notification: true,
+            send_anonymous_telemetry: true,
+            warn_before_quit: true,
+            warn_before_closing_tab: true,
+            warn_before_closing_tab_x_button: false,
+            hide_tab_close_button: false,
+            rename_selects_existing_name: true,
+            command_palette_searches_all_surfaces: false,
+            workspace_button_fade: WorkspaceButtonFadeMode::Disabled,
+            workspace_titlebar_visibility: true,
+            system_wide_hotkey_enabled: false,
+            dev_window_display: String::new(),
         }
     }
 }
@@ -994,6 +1054,78 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
         .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
         .unwrap_or(app_defaults.keep_workspace_open_when_closing_last_surface);
+    let window_title_template = app
+        .and_then(|app| app.get("windowTitleTemplate"))
+        .map(|value| parse_string_setting(value, "app.windowTitleTemplate"))
+        .unwrap_or(app_defaults.window_title_template);
+    let menu_bar_only = app
+        .and_then(|app| app.get("menuBarOnly"))
+        .map(|value| parse_bool_setting(value, "app.menuBarOnly"))
+        .unwrap_or(app_defaults.menu_bar_only);
+    let preferred_editor = app
+        .and_then(|app| app.get("preferredEditor"))
+        .map(|value| parse_string_setting(value, "app.preferredEditor"))
+        .unwrap_or(app_defaults.preferred_editor);
+    let open_supported_files_in_cmux = app
+        .and_then(|app| app.get("openSupportedFilesInCmux"))
+        .map(|value| parse_bool_setting(value, "app.openSupportedFilesInCmux"))
+        .unwrap_or(app_defaults.open_supported_files_in_cmux);
+    let open_markdown_in_cmux_viewer = app
+        .and_then(|app| app.get("openMarkdownInCmuxViewer"))
+        .map(|value| parse_bool_setting(value, "app.openMarkdownInCmuxViewer"))
+        .unwrap_or(app_defaults.open_markdown_in_cmux_viewer);
+    let i_message_mode = app
+        .and_then(|app| app.get("iMessageMode"))
+        .map(|value| parse_bool_setting(value, "app.iMessageMode"))
+        .unwrap_or(app_defaults.i_message_mode);
+    let reorder_on_notification = app
+        .and_then(|app| app.get("reorderOnNotification"))
+        .map(|value| parse_bool_setting(value, "app.reorderOnNotification"))
+        .unwrap_or(app_defaults.reorder_on_notification);
+    let send_anonymous_telemetry = app
+        .and_then(|app| app.get("sendAnonymousTelemetry"))
+        .map(|value| parse_bool_setting(value, "app.sendAnonymousTelemetry"))
+        .unwrap_or(app_defaults.send_anonymous_telemetry);
+    let warn_before_quit = app
+        .and_then(|app| app.get("warnBeforeQuit"))
+        .map(|value| parse_bool_setting(value, "app.warnBeforeQuit"))
+        .unwrap_or(app_defaults.warn_before_quit);
+    let warn_before_closing_tab = app
+        .and_then(|app| app.get("warnBeforeClosingTab"))
+        .map(|value| parse_bool_setting(value, "app.warnBeforeClosingTab"))
+        .unwrap_or(app_defaults.warn_before_closing_tab);
+    let warn_before_closing_tab_x_button = app
+        .and_then(|app| app.get("warnBeforeClosingTabXButton"))
+        .map(|value| parse_bool_setting(value, "app.warnBeforeClosingTabXButton"))
+        .unwrap_or(app_defaults.warn_before_closing_tab_x_button);
+    let hide_tab_close_button = app
+        .and_then(|app| app.get("hideTabCloseButton"))
+        .map(|value| parse_bool_setting(value, "app.hideTabCloseButton"))
+        .unwrap_or(app_defaults.hide_tab_close_button);
+    let rename_selects_existing_name = app
+        .and_then(|app| app.get("renameSelectsExistingName"))
+        .map(|value| parse_bool_setting(value, "app.renameSelectsExistingName"))
+        .unwrap_or(app_defaults.rename_selects_existing_name);
+    let command_palette_searches_all_surfaces = app
+        .and_then(|app| app.get("commandPaletteSearchesAllSurfaces"))
+        .map(|value| parse_bool_setting(value, "app.commandPaletteSearchesAllSurfaces"))
+        .unwrap_or(app_defaults.command_palette_searches_all_surfaces);
+    let workspace_button_fade = app
+        .and_then(|app| app.get("workspaceButtonFade"))
+        .map(|value| parse_workspace_button_fade(value, "app.workspaceButtonFade"))
+        .unwrap_or(app_defaults.workspace_button_fade);
+    let workspace_titlebar_visibility = app
+        .and_then(|app| app.get("workspaceTitlebarVisibility"))
+        .map(|value| parse_bool_setting(value, "app.workspaceTitlebarVisibility"))
+        .unwrap_or(app_defaults.workspace_titlebar_visibility);
+    let system_wide_hotkey_enabled = app
+        .and_then(|app| app.get("systemWideHotkeyEnabled"))
+        .map(|value| parse_bool_setting(value, "app.systemWideHotkeyEnabled"))
+        .unwrap_or(app_defaults.system_wide_hotkey_enabled);
+    let dev_window_display = app
+        .and_then(|app| app.get("devWindowDisplay"))
+        .map(|value| parse_string_setting(value, "app.devWindowDisplay"))
+        .unwrap_or(app_defaults.dev_window_display);
     let terminal = root.get("terminal").map(|value| {
         value
             .as_object()
@@ -1174,6 +1306,24 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             keep_workspace_open_when_closing_last_surface,
             workspace_inherit_working_directory,
             focus_pane_on_first_click,
+            window_title_template,
+            menu_bar_only,
+            preferred_editor,
+            open_supported_files_in_cmux,
+            open_markdown_in_cmux_viewer,
+            i_message_mode,
+            reorder_on_notification,
+            send_anonymous_telemetry,
+            warn_before_quit,
+            warn_before_closing_tab,
+            warn_before_closing_tab_x_button,
+            hide_tab_close_button,
+            rename_selects_existing_name,
+            command_palette_searches_all_surfaces,
+            workspace_button_fade,
+            workspace_titlebar_visibility,
+            system_wide_hotkey_enabled,
+            dev_window_display,
         },
         terminal: terminal_config,
         custom_sidebars,
@@ -1753,6 +1903,17 @@ fn parse_kiro_notification_level(value: &Value, path: &str) -> KiroNotificationL
         .unwrap_or_else(|| panic!("{path} must be minimal, standard, or verbose"))
 }
 
+// purpose: Parse CMUX workspace button fade mode strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns fade mode or panics for malformed existing config.
+fn parse_workspace_button_fade(value: &Value, path: &str) -> WorkspaceButtonFadeMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be enabled or disabled"));
+    WorkspaceButtonFadeMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be enabled or disabled"))
+}
+
 // purpose: Parse CMUX/Limux appearance strings without silent fallback.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns a color scheme or panics for malformed existing config.
@@ -2140,6 +2301,76 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     app.as_object_mut().expect("app object").insert(
         "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
         json!(config.app.keep_workspace_open_when_closing_last_surface),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "windowTitleTemplate".to_string(),
+        json!(config.app.window_title_template.clone()),
+    );
+    app.as_object_mut()
+        .expect("app object")
+        .insert("menuBarOnly".to_string(), json!(config.app.menu_bar_only));
+    app.as_object_mut().expect("app object").insert(
+        "preferredEditor".to_string(),
+        json!(config.app.preferred_editor.clone()),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "openSupportedFilesInCmux".to_string(),
+        json!(config.app.open_supported_files_in_cmux),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "openMarkdownInCmuxViewer".to_string(),
+        json!(config.app.open_markdown_in_cmux_viewer),
+    );
+    app.as_object_mut()
+        .expect("app object")
+        .insert("iMessageMode".to_string(), json!(config.app.i_message_mode));
+    app.as_object_mut().expect("app object").insert(
+        "reorderOnNotification".to_string(),
+        json!(config.app.reorder_on_notification),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "sendAnonymousTelemetry".to_string(),
+        json!(config.app.send_anonymous_telemetry),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "warnBeforeQuit".to_string(),
+        json!(config.app.warn_before_quit),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "warnBeforeClosingTab".to_string(),
+        json!(config.app.warn_before_closing_tab),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "warnBeforeClosingTabXButton".to_string(),
+        json!(config.app.warn_before_closing_tab_x_button),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "hideTabCloseButton".to_string(),
+        json!(config.app.hide_tab_close_button),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "renameSelectsExistingName".to_string(),
+        json!(config.app.rename_selects_existing_name),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "commandPaletteSearchesAllSurfaces".to_string(),
+        json!(config.app.command_palette_searches_all_surfaces),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "workspaceButtonFade".to_string(),
+        json!(config.app.workspace_button_fade.as_str()),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "workspaceTitlebarVisibility".to_string(),
+        json!(config.app.workspace_titlebar_visibility),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "systemWideHotkeyEnabled".to_string(),
+        json!(config.app.system_wide_hotkey_enabled),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "devWindowDisplay".to_string(),
+        json!(config.app.dev_window_display.clone()),
     );
     let terminal = root
         .entry("terminal".to_string())
@@ -2828,6 +3059,81 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"app":{"focusPaneOnFirstClick":"true"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts additional CMUX app catalog settings.
+    // inputs: Settings JSON with app string, boolean, and enum values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_app_scalar_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "app": {
+    "windowTitleTemplate": "{workspace}",
+    "menuBarOnly": true,
+    "preferredEditor": "code --reuse-window",
+    "openSupportedFilesInCmux": false,
+    "openMarkdownInCmuxViewer": false,
+    "iMessageMode": true,
+    "reorderOnNotification": false,
+    "sendAnonymousTelemetry": false,
+    "warnBeforeQuit": false,
+    "warnBeforeClosingTab": false,
+    "warnBeforeClosingTabXButton": true,
+    "hideTabCloseButton": true,
+    "renameSelectsExistingName": false,
+    "commandPaletteSearchesAllSurfaces": true,
+    "workspaceButtonFade": "enabled",
+    "workspaceTitlebarVisibility": false,
+    "systemWideHotkeyEnabled": true,
+    "devWindowDisplay": "LG HDR 4K"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.app;
+
+        assert_eq!(loaded.window_title_template, "{workspace}");
+        assert!(loaded.menu_bar_only);
+        assert_eq!(loaded.preferred_editor, "code --reuse-window");
+        assert!(!loaded.open_supported_files_in_cmux);
+        assert!(!loaded.open_markdown_in_cmux_viewer);
+        assert!(loaded.i_message_mode);
+        assert!(!loaded.reorder_on_notification);
+        assert!(!loaded.send_anonymous_telemetry);
+        assert!(!loaded.warn_before_quit);
+        assert!(!loaded.warn_before_closing_tab);
+        assert!(loaded.warn_before_closing_tab_x_button);
+        assert!(loaded.hide_tab_close_button);
+        assert!(!loaded.rename_selects_existing_name);
+        assert!(loaded.command_palette_searches_all_surfaces);
+        assert_eq!(
+            loaded.workspace_button_fade,
+            WorkspaceButtonFadeMode::Enabled
+        );
+        assert!(!loaded.workspace_titlebar_visibility);
+        assert!(loaded.system_wide_hotkey_enabled);
+        assert_eq!(loaded.dev_window_display, "LG HDR 4K");
+    }
+
+    // purpose: Verify host loading rejects malformed additional CMUX app settings.
+    // inputs: Settings JSON with invalid workspace button fade mode.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "app.workspaceButtonFade must be enabled or disabled")]
+    fn load_from_path_rejects_invalid_app_scalar_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"app":{"workspaceButtonFade":"maybe"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -3716,6 +4022,24 @@ mod tests {
         config.app.keep_workspace_open_when_closing_last_surface = true;
         config.app.workspace_inherit_working_directory = false;
         config.app.focus_pane_on_first_click = true;
+        config.app.window_title_template = "{workspace}".to_string();
+        config.app.menu_bar_only = true;
+        config.app.preferred_editor = "code --reuse-window".to_string();
+        config.app.open_supported_files_in_cmux = false;
+        config.app.open_markdown_in_cmux_viewer = false;
+        config.app.i_message_mode = true;
+        config.app.reorder_on_notification = false;
+        config.app.send_anonymous_telemetry = false;
+        config.app.warn_before_quit = false;
+        config.app.warn_before_closing_tab = false;
+        config.app.warn_before_closing_tab_x_button = true;
+        config.app.hide_tab_close_button = true;
+        config.app.rename_selects_existing_name = false;
+        config.app.command_palette_searches_all_surfaces = true;
+        config.app.workspace_button_fade = WorkspaceButtonFadeMode::Enabled;
+        config.app.workspace_titlebar_visibility = false;
+        config.app.system_wide_hotkey_enabled = true;
+        config.app.dev_window_display = "LG HDR 4K".to_string();
         save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -3741,6 +4065,42 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["app"]["focusPaneOnFirstClick"], Value::Bool(true));
+        assert_eq!(parsed["app"]["windowTitleTemplate"], "{workspace}");
+        assert_eq!(parsed["app"]["menuBarOnly"], Value::Bool(true));
+        assert_eq!(parsed["app"]["preferredEditor"], "code --reuse-window");
+        assert_eq!(
+            parsed["app"]["openSupportedFilesInCmux"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["app"]["openMarkdownInCmuxViewer"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["app"]["iMessageMode"], Value::Bool(true));
+        assert_eq!(parsed["app"]["reorderOnNotification"], Value::Bool(false));
+        assert_eq!(parsed["app"]["sendAnonymousTelemetry"], Value::Bool(false));
+        assert_eq!(parsed["app"]["warnBeforeQuit"], Value::Bool(false));
+        assert_eq!(parsed["app"]["warnBeforeClosingTab"], Value::Bool(false));
+        assert_eq!(
+            parsed["app"]["warnBeforeClosingTabXButton"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["app"]["hideTabCloseButton"], Value::Bool(true));
+        assert_eq!(
+            parsed["app"]["renameSelectsExistingName"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["app"]["commandPaletteSearchesAllSurfaces"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["app"]["workspaceButtonFade"], "enabled");
+        assert_eq!(
+            parsed["app"]["workspaceTitlebarVisibility"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["app"]["systemWideHotkeyEnabled"], Value::Bool(true));
+        assert_eq!(parsed["app"]["devWindowDisplay"], "LG HDR 4K");
     }
 
     #[test]

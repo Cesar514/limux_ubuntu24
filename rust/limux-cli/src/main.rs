@@ -2159,6 +2159,137 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const WORKSPACE_BUTTON_FADE_MODES: &[&str] = &["enabled", "disabled"];
+
+const APP_WINDOW_TITLE_TEMPLATE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.windowTitleTemplate",
+    section: "app",
+    json_path: &["windowTitleTemplate"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const APP_MENU_BAR_ONLY_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.menuBarOnly",
+    section: "app",
+    json_path: &["menuBarOnly"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_PREFERRED_EDITOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.preferredEditor",
+    section: "app",
+    json_path: &["preferredEditor"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const APP_OPEN_SUPPORTED_FILES_IN_CMUX_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.openSupportedFilesInCmux",
+    section: "app",
+    json_path: &["openSupportedFilesInCmux"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.openMarkdownInCmuxViewer",
+    section: "app",
+    json_path: &["openMarkdownInCmuxViewer"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_I_MESSAGE_MODE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.iMessageMode",
+    section: "app",
+    json_path: &["iMessageMode"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_REORDER_ON_NOTIFICATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.reorderOnNotification",
+    section: "app",
+    json_path: &["reorderOnNotification"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_SEND_ANONYMOUS_TELEMETRY_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.sendAnonymousTelemetry",
+    section: "app",
+    json_path: &["sendAnonymousTelemetry"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_WARN_BEFORE_QUIT_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.warnBeforeQuit",
+    section: "app",
+    json_path: &["warnBeforeQuit"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_WARN_BEFORE_CLOSING_TAB_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.warnBeforeClosingTab",
+    section: "app",
+    json_path: &["warnBeforeClosingTab"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_WARN_BEFORE_CLOSING_TAB_X_BUTTON_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.warnBeforeClosingTabXButton",
+    section: "app",
+    json_path: &["warnBeforeClosingTabXButton"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_HIDE_TAB_CLOSE_BUTTON_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.hideTabCloseButton",
+    section: "app",
+    json_path: &["hideTabCloseButton"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_RENAME_SELECTS_EXISTING_NAME_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.renameSelectsExistingName",
+    section: "app",
+    json_path: &["renameSelectsExistingName"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_COMMAND_PALETTE_SEARCHES_ALL_SURFACES_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.commandPaletteSearchesAllSurfaces",
+    section: "app",
+    json_path: &["commandPaletteSearchesAllSurfaces"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_WORKSPACE_BUTTON_FADE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.workspaceButtonFade",
+    section: "app",
+    json_path: &["workspaceButtonFade"],
+    kind: ScalarSettingKind::Enum {
+        default: "disabled",
+        allowed: WORKSPACE_BUTTON_FADE_MODES,
+    },
+};
+
+const APP_WORKSPACE_TITLEBAR_VISIBILITY_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.workspaceTitlebarVisibility",
+    section: "app",
+    json_path: &["workspaceTitlebarVisibility"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_SYSTEM_WIDE_HOTKEY_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.systemWideHotkeyEnabled",
+    section: "app",
+    json_path: &["systemWideHotkeyEnabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_DEV_WINDOW_DISPLAY_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.devWindowDisplay",
+    section: "app",
+    json_path: &["devWindowDisplay"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
 const ACCOUNT_PII_DISPLAY_MODES: &[&str] = &["visible", "hidden"];
 
 const ACCOUNT_PII_DISPLAY_MODE_SETTING: ScalarSetting = ScalarSetting {
@@ -2617,6 +2748,13 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
+    "app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
+    "app.openSupportedFilesInCmux|app.openMarkdownInCmuxViewer|app.iMessageMode|",
+    "app.reorderOnNotification|app.sendAnonymousTelemetry|app.warnBeforeQuit|",
+    "app.warnBeforeClosingTab|app.warnBeforeClosingTabXButton|app.hideTabCloseButton|",
+    "app.renameSelectsExistingName|app.commandPaletteSearchesAllSurfaces|",
+    "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
+    "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
     "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
     "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
@@ -2668,6 +2806,13 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
+    "app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
+    "app.openSupportedFilesInCmux|app.openMarkdownInCmuxViewer|app.iMessageMode|",
+    "app.reorderOnNotification|app.sendAnonymousTelemetry|app.warnBeforeQuit|",
+    "app.warnBeforeClosingTab|app.warnBeforeClosingTabXButton|app.hideTabCloseButton|",
+    "app.renameSelectsExistingName|app.commandPaletteSearchesAllSurfaces|",
+    "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
+    "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
     "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
     "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
@@ -2822,6 +2967,9 @@ fn numeric_setting(raw: &str) -> Option<NumericSetting> {
 // inputs: Raw config key from CLI arguments.
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    if raw.starts_with("app.") {
+        return app_scalar_setting(raw);
+    }
     if raw.starts_with("account.") {
         return account_scalar_setting(raw);
     }
@@ -2844,6 +2992,35 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
         return canvas_scalar_setting(raw);
     }
     feature_scalar_setting(raw)
+}
+
+// purpose: Map CMUX app catalog keys to nested JSON descriptors.
+// inputs: Raw `app.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown app keys.
+fn app_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "app.windowTitleTemplate" => Some(APP_WINDOW_TITLE_TEMPLATE_SETTING),
+        "app.menuBarOnly" => Some(APP_MENU_BAR_ONLY_SETTING),
+        "app.preferredEditor" => Some(APP_PREFERRED_EDITOR_SETTING),
+        "app.openSupportedFilesInCmux" => Some(APP_OPEN_SUPPORTED_FILES_IN_CMUX_SETTING),
+        "app.openMarkdownInCmuxViewer" => Some(APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING),
+        "app.iMessageMode" => Some(APP_I_MESSAGE_MODE_SETTING),
+        "app.reorderOnNotification" => Some(APP_REORDER_ON_NOTIFICATION_SETTING),
+        "app.sendAnonymousTelemetry" => Some(APP_SEND_ANONYMOUS_TELEMETRY_SETTING),
+        "app.warnBeforeQuit" => Some(APP_WARN_BEFORE_QUIT_SETTING),
+        "app.warnBeforeClosingTab" => Some(APP_WARN_BEFORE_CLOSING_TAB_SETTING),
+        "app.warnBeforeClosingTabXButton" => Some(APP_WARN_BEFORE_CLOSING_TAB_X_BUTTON_SETTING),
+        "app.hideTabCloseButton" => Some(APP_HIDE_TAB_CLOSE_BUTTON_SETTING),
+        "app.renameSelectsExistingName" => Some(APP_RENAME_SELECTS_EXISTING_NAME_SETTING),
+        "app.commandPaletteSearchesAllSurfaces" => {
+            Some(APP_COMMAND_PALETTE_SEARCHES_ALL_SURFACES_SETTING)
+        }
+        "app.workspaceButtonFade" => Some(APP_WORKSPACE_BUTTON_FADE_SETTING),
+        "app.workspaceTitlebarVisibility" => Some(APP_WORKSPACE_TITLEBAR_VISIBILITY_SETTING),
+        "app.systemWideHotkeyEnabled" => Some(APP_SYSTEM_WIDE_HOTKEY_ENABLED_SETTING),
+        "app.devWindowDisplay" => Some(APP_DEV_WINDOW_DISPLAY_SETTING),
+        _ => None,
+    }
 }
 
 // purpose: Map CMUX account catalog keys to nested JSON descriptors.
@@ -20190,6 +20367,73 @@ mod cli_arg_tests {
         let err = render_config_boolean_get(&path, APP_FOCUS_PANE_ON_FIRST_CLICK_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify additional CMUX app catalog keys default and write nested JSON.
+    // inputs: Temporary settings file plus app scalar config descriptors.
+    // returns/effects: Asserts nested writes and unrelated-key preservation.
+    #[test]
+    fn config_app_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, APP_OPEN_SUPPORTED_FILES_IN_CMUX_SETTING)
+            .expect("open supported default");
+        assert!(text.contains("app.openSupportedFilesInCmux = true"));
+        let text = render_config_scalar_get(&path, APP_WORKSPACE_BUTTON_FADE_SETTING)
+            .expect("fade default");
+        assert!(text.contains("app.workspaceButtonFade = disabled"));
+        let text = render_config_scalar_get(&path, APP_WINDOW_TITLE_TEMPLATE_SETTING)
+            .expect("title template default");
+        assert!(text.contains("app.windowTitleTemplate = "));
+
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark","keep":true},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, APP_WINDOW_TITLE_TEMPLATE_SETTING, "{workspace}")
+            .expect("set title template");
+        render_config_scalar_set(&path, APP_PREFERRED_EDITOR_SETTING, "code --reuse-window")
+            .expect("set preferred editor");
+        render_config_scalar_set(&path, APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING, "false")
+            .expect("set markdown viewer");
+        render_config_scalar_set(&path, APP_WORKSPACE_BUTTON_FADE_SETTING, "enabled")
+            .expect("set fade");
+        render_config_scalar_set(&path, APP_DEV_WINDOW_DISPLAY_SETTING, "LG HDR 4K")
+            .expect("set dev display");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["app"]["windowTitleTemplate"], "{workspace}");
+        assert_eq!(parsed["app"]["preferredEditor"], "code --reuse-window");
+        assert_eq!(parsed["app"]["openMarkdownInCmuxViewer"], false);
+        assert_eq!(parsed["app"]["workspaceButtonFade"], "enabled");
+        assert_eq!(parsed["app"]["devWindowDisplay"], "LG HDR 4K");
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["app"]["keep"], true);
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify additional CMUX app catalog keys reject malformed values.
+    // inputs: Invalid enum, invalid boolean, and malformed persisted string.
+    // returns/effects: Asserts loud validation errors.
+    #[test]
+    fn config_app_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, APP_WORKSPACE_BUTTON_FADE_SETTING, "maybe")
+            .expect_err("invalid fade mode");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, APP_HIDE_TAB_CLOSE_BUTTON_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(&path, br#"{"app":{"preferredEditor":false}}"#).expect("write malformed editor");
+        let err = render_config_scalar_get(&path, APP_PREFERRED_EDITOR_SETTING)
+            .expect_err("invalid existing editor");
+        assert!(err.to_string().contains("must be a string"));
     }
 
     // purpose: Verify the CMUX terminal agent auto-resume key defaults and preserves siblings.
