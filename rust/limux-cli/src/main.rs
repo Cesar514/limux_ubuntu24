@@ -385,6 +385,7 @@ fn full_help_text() -> &'static str {
         "  reorder-surface --surface <id|ref>\n",
         "      (--index <n>|--before-surface <id|ref>|--after-surface <id|ref>)\n",
         "  refresh-surfaces [--surface <id|ref>]\n",
+        "  trigger-flash [--workspace <id|ref>] [--surface <id|ref>]\n",
         "  rename-workspace [--workspace <id|ref>] <title>\n",
         "  rename-window [--workspace <id|ref>] <title>\n",
         "  rename-tab [--workspace <id|ref>] [--tab <id|ref>] <title>\n",
@@ -407,7 +408,7 @@ fn full_help_text() -> &'static str {
         "  split-window | splitw | select-layout\n",
         "  list-pane-surfaces | new-split | focus-panel | close-surface\n",
         "  move-surface | split-off | drag-surface-to-split | reorder-surface\n",
-        "  refresh-surfaces\n",
+        "  refresh-surfaces | trigger-flash\n",
         "  list-notifications | dismiss-notification | mark-notification-read\n",
         "  open-notification | jump-to-unread | clear-notifications\n\n",
         "Agent integrations:\n",
@@ -4429,7 +4430,10 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "Usage: limux ports-kick [--workspace <id|ref>] [--surface <id|ref>] [--reason <reason>]",
     ),
     ("debug-terminals", "Usage: limux debug-terminals"),
-    ("trigger-flash", "Usage: limux trigger-flash"),
+    (
+        "trigger-flash",
+        "Usage: limux trigger-flash [--workspace <id|ref>] [--surface <id|ref>]",
+    ),
     ("list-panels", "Usage: limux list-panels"),
     ("focus-panel", "Usage: limux focus-panel"),
     ("close-workspace", "Usage: limux close-workspace"),
@@ -13844,6 +13848,7 @@ fn build_surface_alias_request(
         "split-off" | "drag-surface-to-split" => "surface.drag_to_split",
         "new-split" => "surface.split",
         "refresh-surfaces" => "surface.refresh",
+        "trigger-flash" => "surface.trigger_flash",
         _ => return Ok(None),
     };
 
@@ -17579,7 +17584,8 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
         | "split-off"
         | "drag-surface-to-split"
         | "reorder-surface"
-        | "refresh-surfaces" => {
+        | "refresh-surfaces"
+        | "trigger-flash" => {
             let Some((method, params)) = build_surface_alias_request(command, args)? else {
                 bail!("unsupported surface alias: {}", command);
             };
@@ -20918,6 +20924,16 @@ mod cli_arg_tests {
                 .expect("refresh-surfaces maps");
         assert_eq!(refreshed.0, "surface.refresh");
         assert_eq!(refreshed.1["surface_id"], "surface:7:tab-a");
+
+        let flashed = build_surface_alias_request(
+            "trigger-flash",
+            &args(&["--workspace", "workspace:7", "--panel", "surface:7:tab-a"]),
+        )
+        .expect("trigger-flash parses")
+        .expect("trigger-flash maps");
+        assert_eq!(flashed.0, "surface.trigger_flash");
+        assert_eq!(flashed.1["workspace_id"], "workspace:7");
+        assert_eq!(flashed.1["surface_id"], "surface:7:tab-a");
 
         let split_off = build_surface_alias_request(
             "split-off",

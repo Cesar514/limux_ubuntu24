@@ -183,6 +183,7 @@ const METHODS: &[&str] = &[
     "surface.clear_history",
     "surface.respawn",
     "surface.health",
+    "surface.trigger_flash",
     "surface.report_ports",
     "surface.clear_ports",
     "surface.report_tty",
@@ -906,6 +907,11 @@ pub enum ControlCommand {
         surface_hint: Option<String>,
         reply: mpsc::Sender<BridgeResult>,
     },
+    TriggerSurfaceFlash {
+        target: WorkspaceTarget,
+        surface_hint: Option<String>,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     SurfacePortsKick {
         target: WorkspaceTarget,
         surface_hint: Option<String>,
@@ -1128,6 +1134,7 @@ impl ControlCommand {
             | Self::ClearSurfaceHistory { reply, .. }
             | Self::RespawnSurface { reply, .. }
             | Self::SurfaceHealth { reply, .. }
+            | Self::TriggerSurfaceFlash { reply, .. }
             | Self::SurfacePortsKick { reply, .. }
             | Self::SurfaceReportTTY { reply, .. }
             | Self::SurfaceReportPorts { reply, .. }
@@ -4719,6 +4726,29 @@ fn handle_method(
             let (reply, rx) = mpsc::channel();
             (
                 ControlCommand::SurfaceHealth {
+                    target,
+                    surface_hint,
+                    reply,
+                },
+                rx,
+            )
+        }
+        "surface.trigger_flash" | "trigger-flash" => {
+            let target = match parse_optional_workspace_target(params, true) {
+                Ok(target) => target,
+                Err(error) => return error_response(id, error),
+            };
+            let surface_hint = match optional_ref_handle(
+                params,
+                &["surface_id", "surface", "panel_id", "panel", "id"],
+                "surface:",
+            ) {
+                Ok(surface_hint) => surface_hint,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (
+                ControlCommand::TriggerSurfaceFlash {
                     target,
                     surface_hint,
                     reply,
@@ -9769,6 +9799,32 @@ mod tests {
 
         assert_eq!(response.error, None);
         assert!(response.result.is_some());
+    }
+
+    #[test]
+    fn surface_trigger_flash_route_accepts_cmux_surface_refs() {
+        let response = dispatch_request(
+            r#"{"id":1,"method":"surface.trigger_flash","params":{"workspace_id":"codex","panel_id":"surface:4:tab"}}"#,
+            &|command| match command {
+                ControlCommand::TriggerSurfaceFlash {
+                    target,
+                    surface_hint,
+                    reply,
+                } => {
+                    assert_eq!(target, WorkspaceTarget::Name("codex".to_string()));
+                    assert_eq!(surface_hint, Some("4:tab".to_string()));
+                    let _ = reply.send(Ok(json!({
+                        "ok": true,
+                        "surface_id": "4:tab",
+                        "flashed": true,
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            },
+        );
+
+        assert_eq!(response.error, None);
+        assert_eq!(response.result.as_ref().unwrap()["flashed"], true);
     }
 
     #[test]

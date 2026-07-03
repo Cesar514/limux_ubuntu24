@@ -3310,6 +3310,32 @@ fn surface_health_payload(
     Ok(serde_json::json!({ "surfaces": surfaces }))
 }
 
+// purpose: Build a CMUX trigger-flash response from a resolved live surface.
+// inputs: Workspace metadata and the live surface summary that should receive attention.
+// returns/effects: Marks the workspace unread, publishes a surface lifecycle event, and returns CMUX-shaped JSON.
+fn surface_trigger_flash_payload(
+    state: &State,
+    workspace_id: &str,
+    workspace_name: &str,
+    surface: pane::SurfaceSummary,
+) -> serde_json::Value {
+    mark_workspace_unread_for_tab(state, workspace_id, &surface);
+    publish_surface_lifecycle_event(
+        "surface.flash_triggered",
+        workspace_id,
+        &surface,
+        serde_json::json!({
+            "origin": "surface.trigger_flash",
+            "flashed": true,
+            "flash_count": 1,
+        }),
+    );
+    let mut payload = pane_create_response_payload(workspace_id, workspace_name, surface);
+    payload["flashed"] = serde_json::Value::Bool(true);
+    payload["flash_count"] = serde_json::json!(1);
+    payload
+}
+
 /// purpose: Resolve a CMUX surface ports-kick request and return current discovered ports.
 /// inputs: Workspace, sidebar config, optional surface target, and optional reason.
 /// returns/effects: Scans current workspace ports once or returns explicit target errors.
@@ -16242,6 +16268,60 @@ fn handle_control_command(state: &State, command: ControlCommand) {
                 surface_health_payload(state, &app_state.workspaces[index], surface_hint.as_deref())
             };
             let _ = reply.send(result);
+        }
+        ControlCommand::TriggerSurfaceFlash {
+            target,
+            surface_hint,
+            reply,
+        } => {
+            let resolved = {
+                let app_state = state.borrow();
+                workspace_index_for_target(&app_state, &target)
+            };
+
+            let Some(index) = resolved else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "workspace not found",
+                )));
+                return;
+            };
+
+            let (workspace_id, workspace_name, workspace_root) = {
+                let app_state = state.borrow();
+                let workspace = &app_state.workspaces[index];
+                (
+                    workspace.id.clone(),
+                    workspace.name.clone(),
+                    workspace.root.clone(),
+                )
+            };
+            let (_focused_pane_id, focused_surface_id) =
+                focused_ids_for_workspace(state, &workspace_id);
+            let resolved_surface_hint = surface_hint.as_deref().or(focused_surface_id.as_deref());
+            let Some(resolved_surface_hint) = resolved_surface_hint else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            let surface = pane::surface_summaries_for_root(&workspace_root)
+                .into_iter()
+                .find(|surface| surface_hint_matches(&surface.surface_id, resolved_surface_hint));
+            let Some(surface) = surface else {
+                let _ = reply.send(Err(crate::control_bridge::BridgeError::not_found(
+                    "surface not found",
+                )));
+                return;
+            };
+
+            request_session_save(state);
+            let _ = reply.send(Ok(surface_trigger_flash_payload(
+                state,
+                &workspace_id,
+                &workspace_name,
+                surface,
+            )));
         }
         ControlCommand::SurfacePortsKick {
             target,
