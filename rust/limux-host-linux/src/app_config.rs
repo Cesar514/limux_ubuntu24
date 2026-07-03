@@ -66,6 +66,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub canvas: CanvasConfig,
     #[serde(skip)]
+    pub pane_chrome: PaneChromeConfig,
+    #[serde(skip)]
     pub sidebar: SidebarConfig,
     #[serde(skip)]
     pub notifications: NotificationConfig,
@@ -353,6 +355,12 @@ pub struct FileEditorConfig {
 pub struct CanvasConfig {
     pub pane_gap: i32,
     pub snapping_enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneChromeConfig {
+    pub pane_border_color: String,
+    pub active_pane_border_color: String,
 }
 
 impl Default for MarkdownConfig {
@@ -1285,6 +1293,16 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("canvas")
         .map(parse_canvas_config)
         .unwrap_or_default();
+    let pane_chrome = PaneChromeConfig {
+        pane_border_color: root
+            .get("paneBorderColor")
+            .map(|value| parse_pane_chrome_color(value, "paneBorderColor"))
+            .unwrap_or_default(),
+        active_pane_border_color: root
+            .get("activePaneBorderColor")
+            .map(|value| parse_pane_chrome_color(value, "activePaneBorderColor"))
+            .unwrap_or_default(),
+    };
 
     let font_size = root
         .get("font_size")
@@ -1331,6 +1349,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         markdown,
         file_editor,
         canvas,
+        pane_chrome,
         sidebar: SidebarConfig {
             hide_all_details,
             wrap_workspace_titles,
@@ -1882,6 +1901,35 @@ fn parse_string_setting(value: &Value, path: &str) -> String {
         .to_string()
 }
 
+// purpose: Parse CMUX root pane chrome color settings without silent fallback.
+// inputs: Raw JSON value and user-facing root config key.
+// returns/effects: Returns empty/default or normalized #RRGGBB; panics on malformed config.
+fn parse_pane_chrome_color(value: &Value, path: &str) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a #RRGGBB color or null"));
+    normalize_pane_chrome_color(raw)
+        .unwrap_or_else(|| panic!("{path} must be a #RRGGBB color or null"))
+}
+
+// purpose: Match CMUX WorkspaceTabColorSettings.normalizedHex for pane chrome.
+// inputs: Raw color with optional leading '#'.
+// returns/effects: Returns empty/default, normalized uppercase hex, or None.
+fn normalize_pane_chrome_color(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let body = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if body.len() != 6 || !body.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("#{}", body.to_ascii_uppercase()))
+}
+
 // purpose: Parse CMUX account PII-display strings without silent fallback.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns account PII mode or panics for malformed existing config.
@@ -2248,6 +2296,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "focus".to_string(),
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+    root.insert(
+        "paneBorderColor".to_string(),
+        json!(config.pane_chrome.pane_border_color.clone()),
+    );
+    root.insert(
+        "activePaneBorderColor".to_string(),
+        json!(config.pane_chrome.active_pane_border_color.clone()),
     );
     root.insert(
         "account".to_string(),
@@ -3437,6 +3493,40 @@ mod tests {
         let _ = load_from_path(&path);
     }
 
+    // purpose: Verify host loading accepts CMUX root pane chrome color settings.
+    // inputs: Settings JSON with hex colors and a null clear value.
+    // returns/effects: Asserts colors normalize like CMUX and null clears to default.
+    #[test]
+    fn load_from_path_reads_pane_chrome_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"paneBorderColor":"33aaff","activePaneBorderColor":null}"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.pane_chrome;
+
+        assert_eq!(loaded.pane_border_color, "#33AAFF");
+        assert_eq!(loaded.active_pane_border_color, "");
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX pane chrome colors.
+    // inputs: Settings JSON with an invalid root pane color.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "paneBorderColor must be a #RRGGBB color or null")]
+    fn load_from_path_rejects_invalid_pane_chrome_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"paneBorderColor":"blue"}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
     // purpose: Verify host loading accepts CMUX custom sidebar and beta settings.
     // inputs: Settings JSON with renderer and beta feature toggles.
     // returns/effects: Asserts parsed values override defaults.
@@ -4040,6 +4130,8 @@ mod tests {
         config.app.workspace_titlebar_visibility = false;
         config.app.system_wide_hotkey_enabled = true;
         config.app.dev_window_display = "LG HDR 4K".to_string();
+        config.pane_chrome.pane_border_color = "#33AAFF".to_string();
+        config.pane_chrome.active_pane_border_color = "#FF9500".to_string();
         save(&config).expect("save config");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -4101,6 +4193,8 @@ mod tests {
         );
         assert_eq!(parsed["app"]["systemWideHotkeyEnabled"], Value::Bool(true));
         assert_eq!(parsed["app"]["devWindowDisplay"], "LG HDR 4K");
+        assert_eq!(parsed["paneBorderColor"], "#33AAFF");
+        assert_eq!(parsed["activePaneBorderColor"], "#FF9500");
     }
 
     #[test]

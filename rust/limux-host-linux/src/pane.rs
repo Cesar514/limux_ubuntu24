@@ -1,3 +1,8 @@
+// summary: Provide tabbed GTK pane widgets for terminal, browser, and utility surfaces.
+// purpose: Manage pane tabs, surface focus, drag/drop, and embedded content widgets.
+// inputs: Pane callbacks, shortcut config, saved pane state, and terminal/browser widgets.
+// returns/effects: Builds GTK pane roots, mutates tab state, and emits host callbacks.
+
 //! PaneWidget: a tabbed container with action icons in the tab bar.
 //!
 //! Layout: [tab1 x] [tab2 x] ... ←spacer→ [terminal] [browser] [split-h] [split-v] [close]
@@ -763,6 +768,7 @@ pub fn create_pane(
         .hexpand(true)
         .vexpand(true)
         .build();
+    outer.add_css_class("limux-pane");
     outer.set_size_request(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
 
     // The single header line: tabs (left) + action icons (right)

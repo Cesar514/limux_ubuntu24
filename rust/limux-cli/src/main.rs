@@ -1811,6 +1811,9 @@ enum ScalarSettingKind {
     String {
         default: &'static str,
     },
+    ColorHex {
+        default: &'static str,
+    },
     Enum {
         default: &'static str,
         allowed: &'static [&'static str],
@@ -2157,6 +2160,20 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     section: "remoteTmux",
     json_path: &["beta", "enabled"],
     kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const PANE_BORDER_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "paneBorderColor",
+    section: "",
+    json_path: &["paneBorderColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const ACTIVE_PANE_BORDER_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "activePaneBorderColor",
+    section: "",
+    json_path: &["activePaneBorderColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
 };
 
 const WORKSPACE_BUTTON_FADE_MODES: &[&str] = &["enabled", "disabled"];
@@ -2745,6 +2762,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "notifications.command|notifications.hooksMode|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
+    "paneBorderColor|activePaneBorderColor|",
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
@@ -2803,6 +2821,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "notifications.command|notifications.hooksMode|",
     "notifications.agentPermissionPrompt|notifications.agentTurnComplete|",
     "notifications.agentIdleReminder|notifications.suppressOnlyFocusedSurface|app.appearance|",
+    "paneBorderColor|activePaneBorderColor|",
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
@@ -2967,6 +2986,12 @@ fn numeric_setting(raw: &str) -> Option<NumericSetting> {
 // inputs: Raw config key from CLI arguments.
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    if raw == "paneBorderColor" {
+        return Some(PANE_BORDER_COLOR_SETTING);
+    }
+    if raw == "activePaneBorderColor" {
+        return Some(ACTIVE_PANE_BORDER_COLOR_SETTING);
+    }
     if raw.starts_with("app.") {
         return app_scalar_setting(raw);
     }
@@ -3556,6 +3581,28 @@ fn nested_config_value<'a>(
     section: &str,
     json_path: &[&str],
 ) -> Result<Option<&'a Value>> {
+    if section.is_empty() {
+        let Some((first, rest)) = json_path.split_first() else {
+            bail!("root setting path cannot be empty");
+        };
+        let Some(mut value) = root.get(*first) else {
+            return Ok(None);
+        };
+        for (index, key) in rest.iter().enumerate() {
+            let object = value.as_object().ok_or_else(|| {
+                anyhow!(
+                    "{} must be a JSON object",
+                    dotted_setting_path(section, json_path, index + 1)
+                )
+            })?;
+            let Some(next) = object.get(*key) else {
+                return Ok(None);
+            };
+            value = next;
+        }
+        return Ok(Some(value));
+    }
+
     let Some(mut value) = root.get(section) else {
         return Ok(None);
     };
@@ -3586,6 +3633,34 @@ fn nested_config_insert(
     if json_path.is_empty() {
         bail!("{section} setting path cannot be empty");
     }
+    if section.is_empty() && json_path.len() == 1 {
+        root.insert(json_path[0].to_string(), value);
+        return Ok(());
+    }
+    if section.is_empty() {
+        let mut current = root
+            .entry(json_path[0].to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        for (index, key) in json_path[1..json_path.len() - 1].iter().enumerate() {
+            let object = current.as_object_mut().ok_or_else(|| {
+                anyhow!(
+                    "{} must be a JSON object",
+                    dotted_setting_path(section, json_path, index + 1)
+                )
+            })?;
+            current = object
+                .entry((*key).to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+        }
+        let object = current.as_object_mut().ok_or_else(|| {
+            anyhow!(
+                "{} must be a JSON object",
+                dotted_setting_path(section, json_path, json_path.len() - 1)
+            )
+        })?;
+        object.insert(json_path[json_path.len() - 1].to_string(), value);
+        return Ok(());
+    }
     let mut current = root
         .entry(section.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -3615,7 +3690,9 @@ fn nested_config_insert(
 // returns/effects: Returns a dotted settings path string.
 fn dotted_setting_path(section: &str, json_path: &[&str], index: usize) -> String {
     let mut parts = Vec::with_capacity(index + 2);
-    parts.push(section);
+    if !section.is_empty() {
+        parts.push(section);
+    }
     parts.extend(json_path.iter().take(index));
     parts.join(".")
 }
@@ -3628,9 +3705,9 @@ fn default_scalar_setting_value(setting: ScalarSetting) -> Result<String> {
         ScalarSettingKind::Boolean { default } => Ok(default.to_string()),
         ScalarSettingKind::Integer { default, .. } => Ok(default.to_string()),
         ScalarSettingKind::Decimal { default, .. } => Ok(format_decimal_setting(default)),
-        ScalarSettingKind::String { default } | ScalarSettingKind::Enum { default, .. } => {
-            Ok(default.to_string())
-        }
+        ScalarSettingKind::String { default }
+        | ScalarSettingKind::ColorHex { default }
+        | ScalarSettingKind::Enum { default, .. } => Ok(default.to_string()),
         ScalarSettingKind::StringArray => Ok("[]".to_string()),
     }
 }
@@ -3657,6 +3734,9 @@ fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value>
             Ok(json!(value))
         }
         ScalarSettingKind::String { .. } => Ok(Value::String(raw.to_string())),
+        ScalarSettingKind::ColorHex { .. } => {
+            Ok(Value::String(parse_color_hex_setting(setting.key, raw)?))
+        }
         ScalarSettingKind::Enum { allowed, .. } => {
             if !allowed.contains(&raw) {
                 bail!("{} must be one of: {}", setting.key, allowed.join(", "));
@@ -3694,6 +3774,15 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| anyhow!("{} must be a string", setting.key)),
+        ScalarSettingKind::ColorHex { .. } => {
+            if value.is_null() {
+                return Ok(String::new());
+            }
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be a #RRGGBB color or null", setting.key))?;
+            parse_color_hex_setting(setting.key, raw)
+        }
         ScalarSettingKind::Enum { allowed, .. } => {
             let raw = value
                 .as_str()
@@ -3737,6 +3826,21 @@ fn parse_f64_scalar_setting(key: &str, raw: &str, min: f64, max: f64) -> Result<
         .parse::<f64>()
         .with_context(|| format!("{key} requires a positive number"))?;
     clamp_f64_setting(key, number, min, max)
+}
+
+// purpose: Normalize CMUX pane chrome color strings for config get/set.
+// inputs: User-facing setting key and raw color with optional leading '#'.
+// returns/effects: Returns empty/default or #RRGGBB; rejects malformed colors loudly.
+fn parse_color_hex_setting(key: &str, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let body = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if body.len() != 6 || !body.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("{key} must be a #RRGGBB color or null");
+    }
+    Ok(format!("#{}", body.to_ascii_uppercase()))
 }
 
 // purpose: Clamp a finite positive decimal value.
@@ -20320,6 +20424,62 @@ mod cli_arg_tests {
         let err = render_config_boolean_get(&path, APP_WORKSPACE_INHERIT_WORKING_DIRECTORY_SETTING)
             .expect_err("invalid existing bool");
         assert!(err.to_string().contains("must be a boolean"));
+    }
+
+    // purpose: Verify CMUX root pane chrome color settings default and write root JSON.
+    // inputs: Temporary settings file plus pane chrome scalar descriptors.
+    // returns/effects: Asserts normalized hex writes and unrelated-key preservation.
+    #[test]
+    fn config_pane_chrome_settings_get_defaults_and_write_root_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text =
+            render_config_scalar_get(&path, PANE_BORDER_COLOR_SETTING).expect("pane default");
+        assert!(text.contains("paneBorderColor = "));
+        let text = render_config_scalar_get(&path, ACTIVE_PANE_BORDER_COLOR_SETTING)
+            .expect("active pane default");
+        assert!(text.contains("activePaneBorderColor = "));
+
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark"},"custom":{"keep":true}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, PANE_BORDER_COLOR_SETTING, "33aaff")
+            .expect("set pane border");
+        render_config_scalar_set(&path, ACTIVE_PANE_BORDER_COLOR_SETTING, "#ff9500")
+            .expect("set active pane border");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["paneBorderColor"], "#33AAFF");
+        assert_eq!(parsed["activePaneBorderColor"], "#FF9500");
+        assert_eq!(parsed["app"]["appearance"], "dark");
+        assert_eq!(parsed["custom"]["keep"], true);
+    }
+
+    // purpose: Verify malformed CMUX pane chrome colors fail loudly.
+    // inputs: Invalid CLI color and malformed persisted value.
+    // returns/effects: Asserts loud validation instead of accepting bad CSS.
+    #[test]
+    fn config_pane_chrome_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, PANE_BORDER_COLOR_SETTING, "blue")
+            .expect_err("invalid named color");
+        assert!(err.to_string().contains("must be a #RRGGBB color or null"));
+
+        fs::write(&path, br#"{"activePaneBorderColor":null}"#).expect("write null");
+        let text = render_config_scalar_get(&path, ACTIVE_PANE_BORDER_COLOR_SETTING)
+            .expect("null clears active pane color");
+        assert!(text.contains("activePaneBorderColor = "));
+
+        fs::write(&path, br##"{"paneBorderColor":"#12345"}"##).expect("write malformed color");
+        let err = render_config_scalar_get(&path, PANE_BORDER_COLOR_SETTING)
+            .expect_err("invalid existing color");
+        assert!(err.to_string().contains("must be a #RRGGBB color or null"));
     }
 
     // purpose: Verify the CMUX first-click pane focus key defaults and preserves siblings.

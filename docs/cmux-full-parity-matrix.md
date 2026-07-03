@@ -1,6 +1,6 @@
 # CMUX Full Parity Matrix
 
-Source CMUX commit: `b2bd0f99d126284ae65d797559f2c10c955a6a35` in `/tmp/cmux-audit` `origin/main`.
+Source CMUX commit: `7f94c9352f5267c2c01319d1aaa73b1e2207890e` in `/tmp/cmux-audit` `origin/main`.
 
 Status values:
 
@@ -46,6 +46,7 @@ Primary upstream references:
 
 Recent verified parity updates:
 
+- 2026-07-03: Added CMUX-compatible pane chrome settings parity from upstream `PaneChromeCatalogSection.swift`: root `config get/set` now supports `paneBorderColor` and `activePaneBorderColor`, accepts CMUX hex colors with or without `#`, normalizes to uppercase `#RRGGBB`, treats JSON `null` as clear/default, rejects malformed colors loudly, host settings load/save round-trips both root keys, and the GTK pane root applies configured normal and focused pane border CSS. Verified by `cargo test -p limux-cli config_pane_chrome -- --nocapture`, `cargo test -p limux-host-linux pane_chrome -- --nocapture`, and `cargo test -p limux-host-linux build_window_css_uses_resolved_background_opacity -- --nocapture`.
 - 2026-07-03: Added CMUX-compatible `trigger-flash` / `surface.trigger_flash` parity: CLI parsing maps workspace and surface/panel selectors to the live RPC, the GTK bridge advertises and routes the method, and the host marks the addressed or focused surface's workspace as needing attention while publishing `surface.flash_triggered` lifecycle events and returning `flashed` metadata. Verified by `cargo test -p limux-cli cmux_surface_aliases_map_to_limux_methods -- --nocapture` and `cargo test -p limux-host-linux surface_trigger_flash_route_accepts_cmux_surface_refs -- --nocapture`.
 - 2026-07-02: Added CMUX-compatible `markdown open <path>` / `markdown <path>` / `markdown.open` parity: CLI parsing accepts routing, direction, focus, and bounded font-size flags with loud validation, canonicalizes existing files, and the live GTK bridge opens the markdown file in a real WebKit browser split through an encoded `file://` URL while returning markdown path/URL metadata. Verified by `cargo test -p limux-cli cmux_markdown_open -- --nocapture` and `cargo test -p limux-host-linux markdown_open_route_queues_browser_pane -- --nocapture`.
 - 2026-07-02: Added CMUX-compatible `current-window` / `window.current` live bridge parity and made `new-window` / `window.create` plus `close-window` / `window.close` explicit single-host limitations instead of unknown methods: CLI parsing now rejects `close-window` without `--window`, the live GTK bridge advertises/routes all three window methods, `window.current` returns the current `window:1` metadata, and create/close return `not_supported` until true multi-window GTK support exists. Verified by `cargo test -p limux-cli cmux_window_and_workspace_aliases_map_to_limux_methods -- --nocapture` and `cargo test -p limux-host-linux window_current_create_and_close_routes_are_explicit -- --nocapture`.

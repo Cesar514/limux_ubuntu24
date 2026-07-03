@@ -8649,7 +8649,7 @@ pub fn build_window(app: &adw::Application) {
     let provider = gtk::CssProvider::new();
     let all_css = format!(
         "{}\n{}\n{}\n{}",
-        build_window_css(background_opacity),
+        build_window_css(background_opacity, &config.borrow().pane_chrome),
         pane::PANE_CSS,
         keybind_editor::KEYBIND_EDITOR_CSS,
         crate::settings_editor::SETTINGS_CSS,
@@ -9022,12 +9022,33 @@ pub fn build_window(app: &adw::Application) {
     window.present();
 }
 
-fn build_window_css(background_opacity: f64) -> String {
+fn build_window_css(background_opacity: f64, pane_chrome: &app_config::PaneChromeConfig) -> String {
     let background_opacity = sanitize_background_opacity(background_opacity);
     let (r, g, b) = CONTENT_BACKGROUND_RGB;
+    let pane_chrome_css = pane_chrome_css(pane_chrome);
     format!(
-        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n"
+        "{BASE_CSS}\n.limux-content {{\n    background-color: rgba({r}, {g}, {b}, {background_opacity:.3});\n}}\n{pane_chrome_css}"
     )
+}
+
+// purpose: Build optional CMUX pane chrome color CSS from validated settings.
+// inputs: Loaded pane chrome settings.
+// returns/effects: Returns extra GTK CSS or an empty string when colors are unset.
+fn pane_chrome_css(pane_chrome: &app_config::PaneChromeConfig) -> String {
+    let mut css = String::new();
+    if !pane_chrome.pane_border_color.is_empty() {
+        css.push_str(&format!(
+            ".limux-pane {{\n    border: 1px solid {};\n}}\n",
+            pane_chrome.pane_border_color
+        ));
+    }
+    if !pane_chrome.active_pane_border_color.is_empty() {
+        css.push_str(&format!(
+            ".limux-pane:focus-within {{\n    border: 2px solid {};\n}}\n",
+            pane_chrome.active_pane_border_color
+        ));
+    }
+    css
 }
 
 // purpose: Clamp the right sidebar width with CMUX rightMaxWidth semantics.
@@ -19930,6 +19951,7 @@ mod tests {
         WorkspaceSidebarRenderSource, BASE_CSS, HOST_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
+    use crate::app_config;
     use crate::app_config::{NotificationSound, SidebarBranchLayout, WorkspaceGroupNewPlacement};
     use crate::control_bridge::WorkspaceAction;
     use crate::control_bridge::{BrowserAction, RightSidebarMode, WorkspaceGroupAction};
@@ -20369,12 +20391,23 @@ mod tests {
 
     #[test]
     fn build_window_css_uses_resolved_background_opacity() {
-        let css = build_window_css(0.42);
+        let css = build_window_css(0.42, &app_config::PaneChromeConfig::default());
         assert!(css.contains(".limux-host-entry"));
         assert!(css.contains(".limux-host-entry text"));
         assert!(css.contains(".limux-host-entry text placeholder"));
         assert!(css.contains(".limux-content"));
         assert!(css.contains("background-color: rgba(23, 23, 23, 0.420);"));
+        assert!(!css.contains(".limux-pane {"));
+
+        let css = build_window_css(
+            0.42,
+            &app_config::PaneChromeConfig {
+                pane_border_color: "#33AAFF".to_string(),
+                active_pane_border_color: "#FF9500".to_string(),
+            },
+        );
+        assert!(css.contains(".limux-pane {\n    border: 1px solid #33AAFF;"));
+        assert!(css.contains(".limux-pane:focus-within {\n    border: 2px solid #FF9500;"));
     }
 
     #[test]
