@@ -46,6 +46,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub focus: FocusConfig,
     #[serde(skip)]
+    pub account: AccountConfig,
+    #[serde(skip)]
     pub appearance: AppearanceConfig,
     #[serde(skip)]
     pub app: AppBehaviorConfig,
@@ -83,6 +85,56 @@ pub struct AppearanceConfig {
 pub struct FocusConfig {
     #[serde(default)]
     pub hover_terminal_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PiiDisplayMode {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+impl PiiDisplayMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "visible" => Some(Self::Visible),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountConfig {
+    pub pii_display_mode: PiiDisplayMode,
+    pub selected_team_id: String,
+    pub welcome_shown: bool,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl AccountConfig {
+    // purpose: Return CMUX account catalog defaults.
+    // inputs: None.
+    // returns/effects: Defaults local account-display settings without reading disk.
+    fn cmux_default() -> Self {
+        Self {
+            pii_display_mode: PiiDisplayMode::Visible,
+            selected_team_id: String::new(),
+            welcome_shown: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -827,6 +879,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|focus| focus.get("hover_terminal_focus"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let account = root
+        .get("account")
+        .map(parse_account_config)
+        .unwrap_or_default();
 
     let app = root.get("app").map(|value| {
         value
@@ -1035,6 +1091,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         focus: FocusConfig {
             hover_terminal_focus,
         },
+        account,
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
@@ -1088,6 +1145,28 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         workspace_groups,
         new_workspace_placement,
         font_size,
+    }
+}
+
+// purpose: Parse the CMUX account settings section.
+// inputs: Optional account JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for known account keys.
+fn parse_account_config(value: &Value) -> AccountConfig {
+    let account = required_object_setting(value, "account");
+    let defaults = AccountConfig::cmux_default();
+    AccountConfig {
+        pii_display_mode: account
+            .get("piiDisplayMode")
+            .map(|value| parse_pii_display_mode(value, "account.piiDisplayMode"))
+            .unwrap_or(defaults.pii_display_mode),
+        selected_team_id: account
+            .get("selectedTeamID")
+            .map(|value| parse_string_setting(value, "account.selectedTeamID"))
+            .unwrap_or(defaults.selected_team_id),
+        welcome_shown: account
+            .get("welcomeShown")
+            .map(|value| parse_bool_setting(value, "account.welcomeShown"))
+            .unwrap_or(defaults.welcome_shown),
     }
 }
 
@@ -1506,6 +1585,16 @@ fn parse_string_setting(value: &Value, path: &str) -> String {
         .to_string()
 }
 
+// purpose: Parse CMUX account PII-display strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns account PII mode or panics for malformed existing config.
+fn parse_pii_display_mode(value: &Value, path: &str) -> PiiDisplayMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be visible or hidden"));
+    PiiDisplayMode::from_str(raw).unwrap_or_else(|| panic!("{path} must be visible or hidden"))
+}
+
 // purpose: Parse CMUX/Limux appearance strings without silent fallback.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns a color scheme or panics for malformed existing config.
@@ -1840,6 +1929,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     root.insert(
         "focus".to_string(),
         json!({ "hover_terminal_focus": config.focus.hover_terminal_focus }),
+    );
+    root.insert(
+        "account".to_string(),
+        json!({
+            "piiDisplayMode": config.account.pii_display_mode.as_str(),
+            "selectedTeamID": config.account.selected_team_id.clone(),
+            "welcomeShown": config.account.welcome_shown,
+        }),
     );
     let app = root.entry("app".to_string()).or_insert_with(|| json!({}));
     if !app.is_object() {
@@ -2693,6 +2790,48 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"markdown":{"maxWidth":"wide"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts CMUX account catalog settings.
+    // inputs: Settings JSON with account values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_account_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "account": {
+    "piiDisplayMode": "hidden",
+    "selectedTeamID": "team_123",
+    "welcomeShown": true
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.account;
+
+        assert_eq!(loaded.pii_display_mode, PiiDisplayMode::Hidden);
+        assert_eq!(loaded.selected_team_id, "team_123");
+        assert!(loaded.welcome_shown);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX account settings.
+    // inputs: Settings JSON with an invalid PII display mode.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "account.piiDisplayMode must be visible or hidden")]
+    fn load_from_path_rejects_invalid_account_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"account":{"piiDisplayMode":"redacted"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -3633,6 +3772,9 @@ mod tests {
         config.terminal.scroll_speed = 2.5;
         config.terminal.agent_hibernation.enabled = true;
         config.terminal.resume_commands = vec!["codex".to_string()];
+        config.account.pii_display_mode = PiiDisplayMode::Hidden;
+        config.account.selected_team_id = "team_123".to_string();
+        config.account.welcome_shown = true;
         config.markdown.font_size = 18;
         config.markdown.font_family = "Inter".to_string();
         config.markdown.max_width = 1200;
@@ -3654,6 +3796,9 @@ mod tests {
         );
         assert_eq!(parsed["terminal"]["resumeCommands"][0], "codex");
         assert_eq!(parsed["terminal"]["bell"], Value::Bool(true));
+        assert_eq!(parsed["account"]["piiDisplayMode"], "hidden");
+        assert_eq!(parsed["account"]["selectedTeamID"], "team_123");
+        assert_eq!(parsed["account"]["welcomeShown"], Value::Bool(true));
         assert_eq!(parsed["markdown"]["fontSize"], 18);
         assert_eq!(parsed["markdown"]["fontFamily"], "Inter");
         assert_eq!(parsed["markdown"]["maxWidth"], 1200);

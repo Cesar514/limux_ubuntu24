@@ -2159,6 +2159,32 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const ACCOUNT_PII_DISPLAY_MODES: &[&str] = &["visible", "hidden"];
+
+const ACCOUNT_PII_DISPLAY_MODE_SETTING: ScalarSetting = ScalarSetting {
+    key: "account.piiDisplayMode",
+    section: "account",
+    json_path: &["piiDisplayMode"],
+    kind: ScalarSettingKind::Enum {
+        default: "visible",
+        allowed: ACCOUNT_PII_DISPLAY_MODES,
+    },
+};
+
+const ACCOUNT_SELECTED_TEAM_ID_SETTING: ScalarSetting = ScalarSetting {
+    key: "account.selectedTeamID",
+    section: "account",
+    json_path: &["selectedTeamID"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const ACCOUNT_WELCOME_SHOWN_SETTING: ScalarSetting = ScalarSetting {
+    key: "account.welcomeShown",
+    section: "account",
+    json_path: &["welcomeShown"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
 const MARKDOWN_FONT_SIZE_SETTING: ScalarSetting = ScalarSetting {
     key: "markdown.fontSize",
     section: "markdown",
@@ -2528,6 +2554,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
@@ -2573,6 +2600,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
@@ -2709,6 +2737,9 @@ fn numeric_setting(raw: &str) -> Option<NumericSetting> {
 // inputs: Raw config key from CLI arguments.
 // returns/effects: Returns the supported descriptor or None for unknown keys.
 fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    if raw.starts_with("account.") {
+        return account_scalar_setting(raw);
+    }
     if raw.starts_with("terminal.") {
         return terminal_scalar_setting(raw);
     }
@@ -2725,6 +2756,18 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
         return canvas_scalar_setting(raw);
     }
     feature_scalar_setting(raw)
+}
+
+// purpose: Map CMUX account catalog keys to nested JSON descriptors.
+// inputs: Raw `account.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown account keys.
+fn account_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "account.piiDisplayMode" => Some(ACCOUNT_PII_DISPLAY_MODE_SETTING),
+        "account.selectedTeamID" => Some(ACCOUNT_SELECTED_TEAM_ID_SETTING),
+        "account.welcomeShown" => Some(ACCOUNT_WELCOME_SHOWN_SETTING),
+        _ => None,
+    }
 }
 
 // purpose: Map CMUX terminal catalog keys to nested JSON descriptors.
@@ -20166,6 +20209,70 @@ mod cli_arg_tests {
         let err = render_config_scalar_get(&path, TERMINAL_SCROLL_SPEED_SETTING)
             .expect_err("invalid existing decimal");
         assert!(err.to_string().contains("must be a positive number"));
+    }
+
+    // purpose: Verify CMUX account catalog keys default and write nested JSON.
+    // inputs: Temporary settings file plus account scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and unrelated-key preservation.
+    #[test]
+    fn config_account_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, ACCOUNT_PII_DISPLAY_MODE_SETTING)
+            .expect("pii mode default");
+        assert!(text.contains("account.piiDisplayMode = visible"));
+        let text = render_config_scalar_get(&path, ACCOUNT_SELECTED_TEAM_ID_SETTING)
+            .expect("selected team default");
+        assert!(text.contains("account.selectedTeamID = "));
+        let text = render_config_scalar_get(&path, ACCOUNT_WELCOME_SHOWN_SETTING)
+            .expect("welcome default");
+        assert!(text.contains("account.welcomeShown = false"));
+
+        fs::write(
+            &path,
+            br#"{"account":{"existing":true},"browser":{"theme":"dark"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_scalar_set(&path, ACCOUNT_PII_DISPLAY_MODE_SETTING, "hidden")
+            .expect("set pii mode");
+        assert!(text.contains("account.piiDisplayMode = hidden"));
+        let text = render_config_scalar_set(&path, ACCOUNT_SELECTED_TEAM_ID_SETTING, "team_123")
+            .expect("set selected team");
+        assert!(text.contains("account.selectedTeamID = team_123"));
+        let text = render_config_scalar_set(&path, ACCOUNT_WELCOME_SHOWN_SETTING, "true")
+            .expect("set welcome shown");
+        assert!(text.contains("account.welcomeShown = true"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["account"]["piiDisplayMode"], "hidden");
+        assert_eq!(parsed["account"]["selectedTeamID"], "team_123");
+        assert_eq!(parsed["account"]["welcomeShown"], true);
+        assert_eq!(parsed["account"]["existing"], true);
+        assert_eq!(parsed["browser"]["theme"], "dark");
+    }
+
+    // purpose: Verify CMUX account catalog keys reject malformed persisted and CLI values.
+    // inputs: Invalid enum, invalid boolean, and malformed persisted string.
+    // returns/effects: Asserts loud validation errors rather than silent defaults.
+    #[test]
+    fn config_account_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, ACCOUNT_PII_DISPLAY_MODE_SETTING, "masked")
+            .expect_err("invalid pii mode");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, ACCOUNT_WELCOME_SHOWN_SETTING, "yes")
+            .expect_err("invalid welcome bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(&path, br#"{"account":{"selectedTeamID":123}}"#)
+            .expect("write malformed selected team");
+        let err = render_config_scalar_get(&path, ACCOUNT_SELECTED_TEAM_ID_SETTING)
+            .expect_err("invalid existing selected team");
+        assert!(err.to_string().contains("must be a string"));
     }
 
     // purpose: Verify CMUX markdown config keys expose upstream defaults and nested writes.
