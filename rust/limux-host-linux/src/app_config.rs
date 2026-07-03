@@ -56,6 +56,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub beta_features: BetaFeaturesConfig,
     #[serde(skip)]
+    pub markdown: MarkdownConfig,
+    #[serde(skip)]
     pub sidebar: SidebarConfig,
     #[serde(skip)]
     pub notifications: NotificationConfig,
@@ -148,6 +150,32 @@ pub struct TerminalTitleUpdatesConfig {
 pub struct TerminalRunawayMemoryGuardrailConfig {
     pub enabled: bool,
     pub threshold_gb: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownConfig {
+    pub font_size: i32,
+    pub font_family: String,
+    pub max_width: i32,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl MarkdownConfig {
+    // purpose: Return CMUX markdown viewer defaults from the upstream settings catalog.
+    // inputs: None.
+    // returns/effects: Defaults newly opened markdown viewers without reading disk.
+    fn cmux_default() -> Self {
+        Self {
+            font_size: 15,
+            font_family: String::new(),
+            max_width: 980,
+        }
+    }
 }
 
 impl Default for TerminalBehaviorConfig {
@@ -936,6 +964,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("workspaceGroups")
         .map(parse_workspace_groups_config)
         .unwrap_or_default();
+    let markdown = root
+        .get("markdown")
+        .map(parse_markdown_config)
+        .unwrap_or_default();
 
     let font_size = root
         .get("font_size")
@@ -959,6 +991,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         terminal: terminal_config,
         custom_sidebars,
         beta_features,
+        markdown,
         sidebar: SidebarConfig {
             hide_all_details,
             wrap_workspace_titles,
@@ -997,6 +1030,28 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         workspace_groups,
         new_workspace_placement,
         font_size,
+    }
+}
+
+// purpose: Parse the CMUX markdown viewer settings section.
+// inputs: Optional markdown JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for known markdown keys.
+fn parse_markdown_config(value: &Value) -> MarkdownConfig {
+    let markdown = required_object_setting(value, "markdown");
+    let defaults = MarkdownConfig::cmux_default();
+    MarkdownConfig {
+        font_size: markdown
+            .get("fontSize")
+            .map(|value| parse_positive_i32_setting(value, "markdown.fontSize", 8, 96))
+            .unwrap_or(defaults.font_size),
+        font_family: markdown
+            .get("fontFamily")
+            .map(|value| parse_string_setting(value, "markdown.fontFamily"))
+            .unwrap_or(defaults.font_family),
+        max_width: markdown
+            .get("maxWidth")
+            .map(|value| parse_positive_i32_setting(value, "markdown.maxWidth", 320, 4096))
+            .unwrap_or(defaults.max_width),
     }
 }
 
@@ -1800,6 +1855,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         }),
     );
     root.insert(
+        "markdown".to_string(),
+        json!({
+            "fontSize": config.markdown.font_size,
+            "fontFamily": config.markdown.font_family,
+            "maxWidth": config.markdown.max_width,
+        }),
+    );
+    root.insert(
         "customSidebars".to_string(),
         json!({
             "renderer": config.custom_sidebars.renderer.as_str(),
@@ -2485,6 +2548,48 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"terminal":{"resumeCommands":["codex",1]}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts CMUX markdown viewer settings.
+    // inputs: Settings JSON with markdown font, family, and max-width values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_markdown_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "markdown": {
+    "fontSize": 18,
+    "fontFamily": "Inter",
+    "maxWidth": 1200
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.markdown;
+
+        assert_eq!(loaded.font_size, 18);
+        assert_eq!(loaded.font_family, "Inter");
+        assert_eq!(loaded.max_width, 1200);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX markdown scalar keys.
+    // inputs: Settings JSON with an invalid markdown max-width type.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "markdown.maxWidth must be a positive number")]
+    fn load_from_path_rejects_invalid_markdown_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"markdown":{"maxWidth":"wide"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -3386,6 +3491,9 @@ mod tests {
         config.terminal.scroll_speed = 2.5;
         config.terminal.agent_hibernation.enabled = true;
         config.terminal.resume_commands = vec!["codex".to_string()];
+        config.markdown.font_size = 18;
+        config.markdown.font_family = "Inter".to_string();
+        config.markdown.max_width = 1200;
         config.custom_sidebars.renderer = CustomSidebarRendererMode::Remote;
         config.custom_sidebars.beta_enabled = false;
         config.beta_features.right_sidebar_feed_enabled = true;
@@ -3401,6 +3509,9 @@ mod tests {
         );
         assert_eq!(parsed["terminal"]["resumeCommands"][0], "codex");
         assert_eq!(parsed["terminal"]["bell"], Value::Bool(true));
+        assert_eq!(parsed["markdown"]["fontSize"], 18);
+        assert_eq!(parsed["markdown"]["fontFamily"], "Inter");
+        assert_eq!(parsed["markdown"]["maxWidth"], 1200);
         assert_eq!(parsed["customSidebars"]["renderer"], "remote");
         assert_eq!(
             parsed["customSidebars"]["beta"]["enabled"],

@@ -2159,6 +2159,35 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const MARKDOWN_FONT_SIZE_SETTING: ScalarSetting = ScalarSetting {
+    key: "markdown.fontSize",
+    section: "markdown",
+    json_path: &["fontSize"],
+    kind: ScalarSettingKind::Integer {
+        default: 15,
+        min: 8,
+        max: 96,
+    },
+};
+
+const MARKDOWN_FONT_FAMILY_SETTING: ScalarSetting = ScalarSetting {
+    key: "markdown.fontFamily",
+    section: "markdown",
+    json_path: &["fontFamily"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const MARKDOWN_MAX_WIDTH_SETTING: ScalarSetting = ScalarSetting {
+    key: "markdown.maxWidth",
+    section: "markdown",
+    json_path: &["maxWidth"],
+    kind: ScalarSettingKind::Integer {
+        default: 980,
+        min: 320,
+        max: 4096,
+    },
+};
+
 const BROWSER_SEARCH_ENGINES: &[&str] = &[
     "google",
     "duckduckgo",
@@ -2474,6 +2503,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
     "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
     "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
@@ -2517,6 +2547,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
     "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
     "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
@@ -2657,6 +2688,9 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("browser.") {
         return browser_scalar_setting(raw);
     }
+    if raw.starts_with("markdown.") {
+        return markdown_scalar_setting(raw);
+    }
     feature_scalar_setting(raw)
 }
 
@@ -2768,6 +2802,18 @@ fn feature_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "rightSidebar.beta.dock.enabled" => Some(RIGHT_SIDEBAR_BETA_DOCK_ENABLED_SETTING),
         "extensions.beta.enabled" => Some(EXTENSIONS_BETA_ENABLED_SETTING),
         "remoteTmux.beta.enabled" => Some(REMOTE_TMUX_BETA_ENABLED_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX Markdown catalog keys to nested JSON descriptors.
+// inputs: Raw `markdown.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown markdown keys.
+fn markdown_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "markdown.fontSize" => Some(MARKDOWN_FONT_SIZE_SETTING),
+        "markdown.fontFamily" => Some(MARKDOWN_FONT_FAMILY_SETTING),
+        "markdown.maxWidth" => Some(MARKDOWN_MAX_WIDTH_SETTING),
         _ => None,
     }
 }
@@ -20066,6 +20112,67 @@ mod cli_arg_tests {
         let err = render_config_scalar_get(&path, TERMINAL_SCROLL_SPEED_SETTING)
             .expect_err("invalid existing decimal");
         assert!(err.to_string().contains("must be a positive number"));
+    }
+
+    // purpose: Verify CMUX markdown config keys expose upstream defaults and nested writes.
+    // inputs: Temporary settings file plus markdown scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and unrelated-key preservation.
+    #[test]
+    fn config_markdown_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text =
+            render_config_scalar_get(&path, MARKDOWN_FONT_SIZE_SETTING).expect("font size default");
+        assert!(text.contains("markdown.fontSize = 15"));
+        let text = render_config_scalar_get(&path, MARKDOWN_FONT_FAMILY_SETTING)
+            .expect("font family default");
+        assert!(text.contains("markdown.fontFamily = "));
+        let text =
+            render_config_scalar_get(&path, MARKDOWN_MAX_WIDTH_SETTING).expect("max width default");
+        assert!(text.contains("markdown.maxWidth = 980"));
+
+        fs::write(
+            &path,
+            br#"{"markdown":{"existing":true},"browser":{"theme":"dark"}}"#,
+        )
+        .expect("write settings");
+        let text = render_config_scalar_set(&path, MARKDOWN_FONT_SIZE_SETTING, "18")
+            .expect("set font size");
+        assert!(text.contains("markdown.fontSize = 18"));
+        let text = render_config_scalar_set(&path, MARKDOWN_FONT_FAMILY_SETTING, "Inter")
+            .expect("set font family");
+        assert!(text.contains("markdown.fontFamily = Inter"));
+        let text = render_config_scalar_set(&path, MARKDOWN_MAX_WIDTH_SETTING, "1200")
+            .expect("set max width");
+        assert!(text.contains("markdown.maxWidth = 1200"));
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["markdown"]["fontSize"], 18);
+        assert_eq!(parsed["markdown"]["fontFamily"], "Inter");
+        assert_eq!(parsed["markdown"]["maxWidth"], 1200);
+        assert_eq!(parsed["markdown"]["existing"], true);
+        assert_eq!(parsed["browser"]["theme"], "dark");
+    }
+
+    // purpose: Verify CMUX markdown config keys reject malformed persisted and CLI values.
+    // inputs: Out-of-range and malformed scalar settings.
+    // returns/effects: Asserts loud validation errors rather than silent defaults.
+    #[test]
+    fn config_markdown_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, MARKDOWN_FONT_SIZE_SETTING, "0")
+            .expect_err("invalid font size");
+        assert!(err.to_string().contains("positive number"));
+
+        fs::write(&path, br#"{"markdown":{"maxWidth":"wide"}}"#)
+            .expect("write malformed max width");
+        let err = render_config_scalar_get(&path, MARKDOWN_MAX_WIDTH_SETTING)
+            .expect_err("invalid existing max width");
+        assert!(err.to_string().contains("positive number"));
     }
 
     // purpose: Verify CMUX custom sidebar and beta settings write nested JSON.

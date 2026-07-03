@@ -345,13 +345,15 @@ fn pane_create_response_payload(
 }
 
 // purpose: Add CMUX markdown.open metadata to the generic pane-create response.
-// inputs: Mutable pane-create payload plus canonical markdown path, file URL, and optional font size.
+// inputs: Mutable pane-create payload plus canonical markdown path, file URL, and effective viewer settings.
 // returns/effects: Mutates the response JSON object with viewer metadata.
 fn add_markdown_response_metadata(
     payload: &mut serde_json::Value,
     path: Option<String>,
     url: Option<String>,
-    font_size: Option<f64>,
+    font_size: f64,
+    font_family: &str,
+    max_width: i32,
 ) {
     let object = payload
         .as_object_mut()
@@ -362,9 +364,17 @@ fn add_markdown_response_metadata(
     if let Some(url) = url {
         object.insert("url".to_string(), serde_json::Value::String(url));
     }
-    if let Some(font_size) = font_size {
-        object.insert("font_size".to_string(), serde_json::json!(font_size));
-    }
+    object.insert("font_size".to_string(), serde_json::json!(font_size));
+    object.insert(
+        "fontFamily".to_string(),
+        serde_json::Value::String(font_family.to_string()),
+    );
+    object.insert(
+        "font_family".to_string(),
+        serde_json::Value::String(font_family.to_string()),
+    );
+    object.insert("maxWidth".to_string(), serde_json::json!(max_width));
+    object.insert("max_width".to_string(), serde_json::json!(max_width));
     object.insert("markdown".to_string(), serde_json::Value::Bool(true));
 }
 
@@ -15558,7 +15568,16 @@ fn handle_control_command(state: &State, command: ControlCommand) {
 
             let markdown_path = request.markdown_path.clone();
             let markdown_url = request.url.clone();
-            let markdown_font_size = request.markdown_font_size;
+            let markdown_config = if markdown_path.is_some() {
+                Some(state.borrow().config.borrow().markdown.clone())
+            } else {
+                None
+            };
+            let markdown_font_size = markdown_config.as_ref().map(|config| {
+                request
+                    .markdown_font_size
+                    .unwrap_or(config.font_size as f64)
+            });
             let startup_requested = request.initial_command.is_some()
                 || request.working_directory.is_some()
                 || !request.startup_environment.is_empty();
@@ -15611,11 +15630,15 @@ fn handle_control_command(state: &State, command: ControlCommand) {
             let mut response =
                 pane_create_response_payload(&resolved.workspace_id, &workspace_name, surface);
             if markdown_path.is_some() {
+                let markdown_config =
+                    markdown_config.expect("markdown_path requires markdown_config");
                 add_markdown_response_metadata(
                     &mut response,
                     markdown_path,
                     markdown_url,
-                    markdown_font_size,
+                    markdown_font_size.expect("markdown_path requires markdown font size"),
+                    &markdown_config.font_family,
+                    markdown_config.max_width,
                 );
             }
 
@@ -19852,9 +19875,9 @@ mod tests {
     use super::gtk::gdk;
     use super::ToVariant;
     use super::{
-        append_reported_port_rows, browser_count_script, browser_element_action_script,
-        browser_find_script, browser_required_element_script, browser_scroll_script,
-        browser_snapshot_script, browser_styles_script, build_window_css,
+        add_markdown_response_metadata, append_reported_port_rows, browser_count_script,
+        browser_element_action_script, browser_find_script, browser_required_element_script,
+        browser_scroll_script, browser_snapshot_script, browser_styles_script, build_window_css,
         clamp_workspace_insert_index_for_pinning, clamped_right_sidebar_width,
         custom_sidebar_action_tooltip, custom_sidebar_dispatcher_action, custom_sidebar_font_size,
         custom_sidebar_is_hex_color, custom_sidebar_markup_attrs, custom_sidebar_pango_color,
@@ -19870,23 +19893,23 @@ mod tests {
         limit_text_to_last_lines, load_custom_sidebar_selection_from_dir,
         load_custom_sidebar_selection_with_beta, next_active_workspace_index,
         normalize_workspace_color, notification_command_env, notification_hook_policy_payload,
-        notification_policy_effects_from_value, pane_create_split_placement,
-        pending_exit_plan_request_id, pending_permission_request_id, pending_question_request_id,
-        publish_browser_event, publish_surface_input_sent_event, publish_surface_key_sent_event,
-        publish_surface_lifecycle_event, publish_workspace_lifecycle_event,
-        queue_session_save_request, resolve_pane_create_source_id,
-        resolve_workspace_creation_directory, resolved_system_prefers_dark,
-        right_sidebar_metadata_sections, right_sidebar_mode_description, right_sidebar_mode_title,
-        run_notification_hook_command, sanitize_background_opacity, shell_report_key,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, should_keep_workspace_open_after_empty_pane,
-        should_show_sidebar_notification_message, should_show_unread_visual,
-        sidebar_branch_directory_label, sidebar_branch_directory_tooltip,
-        sidebar_feed_preview_lines_from_value, sidebar_feed_visible_items,
-        sidebar_file_preview_lines, sidebar_git_branch, sidebar_log_preview_lines_from_entries,
-        sidebar_port_link_specs, sidebar_ports_rows, sidebar_progress_preview_line,
-        sidebar_pull_request_link_specs, sidebar_pull_request_rows,
+        notification_policy_effects_from_value, pane_create_response_payload,
+        pane_create_split_placement, pending_exit_plan_request_id, pending_permission_request_id,
+        pending_question_request_id, publish_browser_event, publish_surface_input_sent_event,
+        publish_surface_key_sent_event, publish_surface_lifecycle_event,
+        publish_workspace_lifecycle_event, queue_session_save_request,
+        resolve_pane_create_source_id, resolve_workspace_creation_directory,
+        resolved_system_prefers_dark, right_sidebar_metadata_sections,
+        right_sidebar_mode_description, right_sidebar_mode_title, run_notification_hook_command,
+        sanitize_background_opacity, shell_report_key, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, should_emit_desktop_notification,
+        should_keep_workspace_open_after_empty_pane, should_show_sidebar_notification_message,
+        should_show_unread_visual, sidebar_branch_directory_label,
+        sidebar_branch_directory_tooltip, sidebar_feed_preview_lines_from_value,
+        sidebar_feed_visible_items, sidebar_file_preview_lines, sidebar_git_branch,
+        sidebar_log_preview_lines_from_entries, sidebar_port_link_specs, sidebar_ports_rows,
+        sidebar_progress_preview_line, sidebar_pull_request_link_specs, sidebar_pull_request_rows,
         sidebar_status_preview_lines_from_entries, surface_input_event_payload,
         surface_key_event_payload, surface_lifecycle_event_payload, tab_drag_workspace_seed,
         use_opaque_window_background, validate_workspace_folder_input_with_dirs,
@@ -21972,6 +21995,37 @@ mod tests {
             "one\ntwo"
         );
         assert_eq!(limit_text_to_last_lines("one".to_string(), None), "one");
+    }
+
+    #[test]
+    fn markdown_response_metadata_includes_configured_viewer_defaults() {
+        let surface = crate::pane::SurfaceSummary {
+            pane_id: 11,
+            surface_id: "11:tab-md".to_string(),
+            title: "README.md".to_string(),
+            kind: "browser".to_string(),
+            selected: true,
+            cwd: None,
+            uri: Some("file:///tmp/README.md".to_string()),
+        };
+        let mut payload = pane_create_response_payload("workspace-md", "docs", surface);
+
+        add_markdown_response_metadata(
+            &mut payload,
+            Some("/tmp/README.md".to_string()),
+            Some("file:///tmp/README.md".to_string()),
+            18.0,
+            "Inter",
+            1200,
+        );
+
+        assert_eq!(payload["markdown"], true);
+        assert_eq!(payload["path"], "/tmp/README.md");
+        assert_eq!(payload["font_size"], 18.0);
+        assert_eq!(payload["fontFamily"], "Inter");
+        assert_eq!(payload["font_family"], "Inter");
+        assert_eq!(payload["maxWidth"], 1200);
+        assert_eq!(payload["max_width"], 1200);
     }
 
     #[test]
