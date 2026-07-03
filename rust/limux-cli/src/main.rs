@@ -2188,6 +2188,31 @@ const MARKDOWN_MAX_WIDTH_SETTING: ScalarSetting = ScalarSetting {
     },
 };
 
+const FILE_EDITOR_WORD_WRAP_SETTING: ScalarSetting = ScalarSetting {
+    key: "fileEditor.wordWrap",
+    section: "fileEditor",
+    json_path: &["wordWrap"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const CANVAS_PANE_GAP_SETTING: ScalarSetting = ScalarSetting {
+    key: "canvas.paneGap",
+    section: "canvas",
+    json_path: &["paneGap"],
+    kind: ScalarSettingKind::Integer {
+        default: 16,
+        min: 0,
+        max: 4096,
+    },
+};
+
+const CANVAS_SNAPPING_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "canvas.snappingEnabled",
+    section: "canvas",
+    json_path: &["snappingEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
 const BROWSER_SEARCH_ENGINES: &[&str] = &[
     "google",
     "duckduckgo",
@@ -2504,6 +2529,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
+    "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
     "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
     "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
@@ -2548,6 +2574,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
+    "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
     "browser.customSearchEngineURLTemplate|browser.showSearchSuggestions|browser.theme|",
     "browser.discardHiddenWebViews|browser.hiddenWebViewDiscardDelaySeconds|",
@@ -2691,6 +2718,12 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("markdown.") {
         return markdown_scalar_setting(raw);
     }
+    if raw.starts_with("fileEditor.") {
+        return file_editor_scalar_setting(raw);
+    }
+    if raw.starts_with("canvas.") {
+        return canvas_scalar_setting(raw);
+    }
     feature_scalar_setting(raw)
 }
 
@@ -2814,6 +2847,27 @@ fn markdown_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "markdown.fontSize" => Some(MARKDOWN_FONT_SIZE_SETTING),
         "markdown.fontFamily" => Some(MARKDOWN_FONT_FAMILY_SETTING),
         "markdown.maxWidth" => Some(MARKDOWN_MAX_WIDTH_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX fileEditor catalog keys to nested JSON descriptors.
+// inputs: Raw `fileEditor.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown fileEditor keys.
+fn file_editor_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "fileEditor.wordWrap" => Some(FILE_EDITOR_WORD_WRAP_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX canvas catalog keys to nested JSON descriptors.
+// inputs: Raw `canvas.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown canvas keys.
+fn canvas_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "canvas.paneGap" => Some(CANVAS_PANE_GAP_SETTING),
+        "canvas.snappingEnabled" => Some(CANVAS_SNAPPING_ENABLED_SETTING),
         _ => None,
     }
 }
@@ -20172,6 +20226,63 @@ mod cli_arg_tests {
             .expect("write malformed max width");
         let err = render_config_scalar_get(&path, MARKDOWN_MAX_WIDTH_SETTING)
             .expect_err("invalid existing max width");
+        assert!(err.to_string().contains("positive number"));
+    }
+
+    // purpose: Verify CMUX file editor and canvas config keys default and write nested JSON.
+    // inputs: Temporary settings file plus scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and unrelated-key preservation.
+    #[test]
+    fn config_file_editor_and_canvas_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, FILE_EDITOR_WORD_WRAP_SETTING)
+            .expect("file editor word wrap default");
+        assert!(text.contains("fileEditor.wordWrap = false"));
+        let text =
+            render_config_scalar_get(&path, CANVAS_PANE_GAP_SETTING).expect("pane gap default");
+        assert!(text.contains("canvas.paneGap = 16"));
+        let text = render_config_scalar_get(&path, CANVAS_SNAPPING_ENABLED_SETTING)
+            .expect("snapping default");
+        assert!(text.contains("canvas.snappingEnabled = true"));
+
+        fs::write(
+            &path,
+            br#"{"fileEditor":{"existing":true},"canvas":{"keep":12},"terminal":{"scrollSpeed":1.5}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, FILE_EDITOR_WORD_WRAP_SETTING, "true")
+            .expect("set word wrap");
+        render_config_scalar_set(&path, CANVAS_PANE_GAP_SETTING, "24").expect("set pane gap");
+        render_config_scalar_set(&path, CANVAS_SNAPPING_ENABLED_SETTING, "false")
+            .expect("set snapping");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["fileEditor"]["wordWrap"], true);
+        assert_eq!(parsed["fileEditor"]["existing"], true);
+        assert_eq!(parsed["canvas"]["paneGap"], 24);
+        assert_eq!(parsed["canvas"]["snappingEnabled"], false);
+        assert_eq!(parsed["canvas"]["keep"], 12);
+        assert_eq!(parsed["terminal"]["scrollSpeed"], 1.5);
+    }
+
+    // purpose: Verify CMUX file editor and canvas config keys reject malformed values.
+    // inputs: Invalid boolean and malformed persisted integer.
+    // returns/effects: Asserts loud validation errors.
+    #[test]
+    fn config_file_editor_and_canvas_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, FILE_EDITOR_WORD_WRAP_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(&path, br#"{"canvas":{"paneGap":"wide"}}"#).expect("write malformed pane gap");
+        let err = render_config_scalar_get(&path, CANVAS_PANE_GAP_SETTING)
+            .expect_err("invalid existing pane gap");
         assert!(err.to_string().contains("positive number"));
     }
 

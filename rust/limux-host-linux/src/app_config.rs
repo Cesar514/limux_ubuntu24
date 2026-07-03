@@ -58,6 +58,10 @@ pub struct AppConfig {
     #[serde(skip)]
     pub markdown: MarkdownConfig,
     #[serde(skip)]
+    pub file_editor: FileEditorConfig,
+    #[serde(skip)]
+    pub canvas: CanvasConfig,
+    #[serde(skip)]
     pub sidebar: SidebarConfig,
     #[serde(skip)]
     pub notifications: NotificationConfig,
@@ -159,6 +163,17 @@ pub struct MarkdownConfig {
     pub max_width: i32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEditorConfig {
+    pub word_wrap: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasConfig {
+    pub pane_gap: i32,
+    pub snapping_enabled: bool,
+}
+
 impl Default for MarkdownConfig {
     fn default() -> Self {
         Self::cmux_default()
@@ -174,6 +189,39 @@ impl MarkdownConfig {
             font_size: 15,
             font_family: String::new(),
             max_width: 980,
+        }
+    }
+}
+
+impl Default for FileEditorConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl FileEditorConfig {
+    // purpose: Return CMUX file-editor defaults from the upstream settings catalog.
+    // inputs: None.
+    // returns/effects: Defaults text-editor behavior without reading disk.
+    fn cmux_default() -> Self {
+        Self { word_wrap: false }
+    }
+}
+
+impl Default for CanvasConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl CanvasConfig {
+    // purpose: Return CMUX canvas defaults from the upstream settings catalog.
+    // inputs: None.
+    // returns/effects: Defaults canvas spacing/snapping settings without reading disk.
+    fn cmux_default() -> Self {
+        Self {
+            pane_gap: 16,
+            snapping_enabled: true,
         }
     }
 }
@@ -968,6 +1016,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("markdown")
         .map(parse_markdown_config)
         .unwrap_or_default();
+    let file_editor = root
+        .get("fileEditor")
+        .map(parse_file_editor_config)
+        .unwrap_or_default();
+    let canvas = root
+        .get("canvas")
+        .map(parse_canvas_config)
+        .unwrap_or_default();
 
     let font_size = root
         .get("font_size")
@@ -992,6 +1048,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         custom_sidebars,
         beta_features,
         markdown,
+        file_editor,
+        canvas,
         sidebar: SidebarConfig {
             hide_all_details,
             wrap_workspace_titles,
@@ -1030,6 +1088,38 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         workspace_groups,
         new_workspace_placement,
         font_size,
+    }
+}
+
+// purpose: Parse the CMUX file editor settings section.
+// inputs: Optional fileEditor JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for known file-editor keys.
+fn parse_file_editor_config(value: &Value) -> FileEditorConfig {
+    let file_editor = required_object_setting(value, "fileEditor");
+    let defaults = FileEditorConfig::cmux_default();
+    FileEditorConfig {
+        word_wrap: file_editor
+            .get("wordWrap")
+            .map(|value| parse_bool_setting(value, "fileEditor.wordWrap"))
+            .unwrap_or(defaults.word_wrap),
+    }
+}
+
+// purpose: Parse the CMUX canvas settings section.
+// inputs: Optional canvas JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for known canvas keys.
+fn parse_canvas_config(value: &Value) -> CanvasConfig {
+    let canvas = required_object_setting(value, "canvas");
+    let defaults = CanvasConfig::cmux_default();
+    CanvasConfig {
+        pane_gap: canvas
+            .get("paneGap")
+            .map(|value| parse_positive_i32_setting(value, "canvas.paneGap", 0, 4096))
+            .unwrap_or(defaults.pane_gap),
+        snapping_enabled: canvas
+            .get("snappingEnabled")
+            .map(|value| parse_bool_setting(value, "canvas.snappingEnabled"))
+            .unwrap_or(defaults.snapping_enabled),
     }
 }
 
@@ -1863,6 +1953,19 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         }),
     );
     root.insert(
+        "fileEditor".to_string(),
+        json!({
+            "wordWrap": config.file_editor.word_wrap,
+        }),
+    );
+    root.insert(
+        "canvas".to_string(),
+        json!({
+            "paneGap": config.canvas.pane_gap,
+            "snappingEnabled": config.canvas.snapping_enabled,
+        }),
+    );
+    root.insert(
         "customSidebars".to_string(),
         json!({
             "renderer": config.custom_sidebars.renderer.as_str(),
@@ -2590,6 +2693,45 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"markdown":{"maxWidth":"wide"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts CMUX file editor and canvas settings.
+    // inputs: Settings JSON with fileEditor and canvas values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_file_editor_and_canvas_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "fileEditor": { "wordWrap": true },
+  "canvas": { "paneGap": 24, "snappingEnabled": false }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config;
+
+        assert!(loaded.file_editor.word_wrap);
+        assert_eq!(loaded.canvas.pane_gap, 24);
+        assert!(!loaded.canvas.snapping_enabled);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX file editor and canvas settings.
+    // inputs: Settings JSON with an invalid canvas pane gap.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(expected = "canvas.paneGap must be a positive number")]
+    fn load_from_path_rejects_invalid_file_editor_and_canvas_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"canvas":{"paneGap":"wide"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -3494,6 +3636,9 @@ mod tests {
         config.markdown.font_size = 18;
         config.markdown.font_family = "Inter".to_string();
         config.markdown.max_width = 1200;
+        config.file_editor.word_wrap = true;
+        config.canvas.pane_gap = 24;
+        config.canvas.snapping_enabled = false;
         config.custom_sidebars.renderer = CustomSidebarRendererMode::Remote;
         config.custom_sidebars.beta_enabled = false;
         config.beta_features.right_sidebar_feed_enabled = true;
@@ -3512,6 +3657,9 @@ mod tests {
         assert_eq!(parsed["markdown"]["fontSize"], 18);
         assert_eq!(parsed["markdown"]["fontFamily"], "Inter");
         assert_eq!(parsed["markdown"]["maxWidth"], 1200);
+        assert_eq!(parsed["fileEditor"]["wordWrap"], Value::Bool(true));
+        assert_eq!(parsed["canvas"]["paneGap"], 24);
+        assert_eq!(parsed["canvas"]["snappingEnabled"], Value::Bool(false));
         assert_eq!(parsed["customSidebars"]["renderer"], "remote");
         assert_eq!(
             parsed["customSidebars"]["beta"]["enabled"],
