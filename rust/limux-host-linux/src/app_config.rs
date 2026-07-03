@@ -48,6 +48,8 @@ pub struct AppConfig {
     #[serde(skip)]
     pub account: AccountConfig,
     #[serde(skip)]
+    pub integrations: IntegrationsConfig,
+    #[serde(skip)]
     pub appearance: AppearanceConfig,
     #[serde(skip)]
     pub app: AppBehaviorConfig,
@@ -133,6 +135,73 @@ impl AccountConfig {
             pii_display_mode: PiiDisplayMode::Visible,
             selected_team_id: String::new(),
             welcome_shown: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KiroNotificationLevel {
+    Minimal,
+    #[default]
+    Standard,
+    Verbose,
+}
+
+impl KiroNotificationLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Standard => "standard",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "minimal" => Some(Self::Minimal),
+            "standard" => Some(Self::Standard),
+            "verbose" => Some(Self::Verbose),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationsConfig {
+    pub claude_code_hooks_enabled: bool,
+    pub claude_code_custom_claude_path: String,
+    pub codex_hooks_enabled: bool,
+    pub amp_hooks_enabled: bool,
+    pub cursor_hooks_enabled: bool,
+    pub gemini_hooks_enabled: bool,
+    pub kiro_hooks_enabled: bool,
+    pub kiro_notification_level: KiroNotificationLevel,
+    pub ripgrep_custom_binary_path: String,
+    pub suppress_subagent_notifications: bool,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl IntegrationsConfig {
+    // purpose: Return CMUX integration catalog defaults.
+    // inputs: None.
+    // returns/effects: Defaults integration settings without reading disk.
+    fn cmux_default() -> Self {
+        Self {
+            claude_code_hooks_enabled: true,
+            claude_code_custom_claude_path: String::new(),
+            codex_hooks_enabled: true,
+            amp_hooks_enabled: true,
+            cursor_hooks_enabled: true,
+            gemini_hooks_enabled: true,
+            kiro_hooks_enabled: true,
+            kiro_notification_level: KiroNotificationLevel::Standard,
+            ripgrep_custom_binary_path: String::new(),
+            suppress_subagent_notifications: true,
         }
     }
 }
@@ -883,6 +952,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("account")
         .map(parse_account_config)
         .unwrap_or_default();
+    let integrations = root
+        .get("integrations")
+        .map(parse_integrations_config)
+        .unwrap_or_default();
 
     let app = root.get("app").map(|value| {
         value
@@ -1092,6 +1165,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             hover_terminal_focus,
         },
         account,
+        integrations,
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
@@ -1167,6 +1241,79 @@ fn parse_account_config(value: &Value) -> AccountConfig {
             .get("welcomeShown")
             .map(|value| parse_bool_setting(value, "account.welcomeShown"))
             .unwrap_or(defaults.welcome_shown),
+    }
+}
+
+// purpose: Parse the CMUX integrations settings section.
+// inputs: Optional integrations JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for known integration keys.
+fn parse_integrations_config(value: &Value) -> IntegrationsConfig {
+    let integrations = required_object_setting(value, "integrations");
+    let defaults = IntegrationsConfig::cmux_default();
+    let claude_code = integrations
+        .get("claudeCode")
+        .map(|value| required_object_setting(value, "integrations.claudeCode"));
+    let codex = integrations
+        .get("codex")
+        .map(|value| required_object_setting(value, "integrations.codex"));
+    let amp = integrations
+        .get("amp")
+        .map(|value| required_object_setting(value, "integrations.amp"));
+    let cursor = integrations
+        .get("cursor")
+        .map(|value| required_object_setting(value, "integrations.cursor"));
+    let gemini = integrations
+        .get("gemini")
+        .map(|value| required_object_setting(value, "integrations.gemini"));
+    let kiro = integrations
+        .get("kiro")
+        .map(|value| required_object_setting(value, "integrations.kiro"));
+    let ripgrep = integrations
+        .get("ripgrep")
+        .map(|value| required_object_setting(value, "integrations.ripgrep"));
+    IntegrationsConfig {
+        claude_code_hooks_enabled: claude_code
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.claudeCode.hooksEnabled"))
+            .unwrap_or(defaults.claude_code_hooks_enabled),
+        claude_code_custom_claude_path: claude_code
+            .and_then(|section| section.get("customClaudePath"))
+            .map(|value| parse_string_setting(value, "integrations.claudeCode.customClaudePath"))
+            .unwrap_or(defaults.claude_code_custom_claude_path),
+        codex_hooks_enabled: codex
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.codex.hooksEnabled"))
+            .unwrap_or(defaults.codex_hooks_enabled),
+        amp_hooks_enabled: amp
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.amp.hooksEnabled"))
+            .unwrap_or(defaults.amp_hooks_enabled),
+        cursor_hooks_enabled: cursor
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.cursor.hooksEnabled"))
+            .unwrap_or(defaults.cursor_hooks_enabled),
+        gemini_hooks_enabled: gemini
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.gemini.hooksEnabled"))
+            .unwrap_or(defaults.gemini_hooks_enabled),
+        kiro_hooks_enabled: kiro
+            .and_then(|section| section.get("hooksEnabled"))
+            .map(|value| parse_bool_setting(value, "integrations.kiro.hooksEnabled"))
+            .unwrap_or(defaults.kiro_hooks_enabled),
+        kiro_notification_level: kiro
+            .and_then(|section| section.get("notificationLevel"))
+            .map(|value| {
+                parse_kiro_notification_level(value, "integrations.kiro.notificationLevel")
+            })
+            .unwrap_or(defaults.kiro_notification_level),
+        ripgrep_custom_binary_path: ripgrep
+            .and_then(|section| section.get("customBinaryPath"))
+            .map(|value| parse_string_setting(value, "integrations.ripgrep.customBinaryPath"))
+            .unwrap_or(defaults.ripgrep_custom_binary_path),
+        suppress_subagent_notifications: integrations
+            .get("suppressSubagentNotifications")
+            .map(|value| parse_bool_setting(value, "integrations.suppressSubagentNotifications"))
+            .unwrap_or(defaults.suppress_subagent_notifications),
     }
 }
 
@@ -1595,6 +1742,17 @@ fn parse_pii_display_mode(value: &Value, path: &str) -> PiiDisplayMode {
     PiiDisplayMode::from_str(raw).unwrap_or_else(|| panic!("{path} must be visible or hidden"))
 }
 
+// purpose: Parse CMUX Kiro notification level strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns notification level or panics for malformed existing config.
+fn parse_kiro_notification_level(value: &Value, path: &str) -> KiroNotificationLevel {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be minimal, standard, or verbose"));
+    KiroNotificationLevel::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be minimal, standard, or verbose"))
+}
+
 // purpose: Parse CMUX/Limux appearance strings without silent fallback.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns a color scheme or panics for malformed existing config.
@@ -1936,6 +2094,27 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             "piiDisplayMode": config.account.pii_display_mode.as_str(),
             "selectedTeamID": config.account.selected_team_id.clone(),
             "welcomeShown": config.account.welcome_shown,
+        }),
+    );
+    root.insert(
+        "integrations".to_string(),
+        json!({
+            "claudeCode": {
+                "hooksEnabled": config.integrations.claude_code_hooks_enabled,
+                "customClaudePath": config.integrations.claude_code_custom_claude_path.clone(),
+            },
+            "codex": { "hooksEnabled": config.integrations.codex_hooks_enabled },
+            "amp": { "hooksEnabled": config.integrations.amp_hooks_enabled },
+            "cursor": { "hooksEnabled": config.integrations.cursor_hooks_enabled },
+            "gemini": { "hooksEnabled": config.integrations.gemini_hooks_enabled },
+            "kiro": {
+                "hooksEnabled": config.integrations.kiro_hooks_enabled,
+                "notificationLevel": config.integrations.kiro_notification_level.as_str(),
+            },
+            "ripgrep": {
+                "customBinaryPath": config.integrations.ripgrep_custom_binary_path.clone(),
+            },
+            "suppressSubagentNotifications": config.integrations.suppress_subagent_notifications,
         }),
     );
     let app = root.entry("app".to_string()).or_insert_with(|| json!({}));
@@ -2832,6 +3011,83 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"account":{"piiDisplayMode":"redacted"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading accepts CMUX integrations catalog settings.
+    // inputs: Settings JSON with nested integration values.
+    // returns/effects: Asserts parsed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_integrations_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "integrations": {
+    "claudeCode": { "hooksEnabled": false, "customClaudePath": "/opt/claude" },
+    "codex": { "hooksEnabled": false },
+    "amp": { "hooksEnabled": false },
+    "cursor": { "hooksEnabled": false },
+    "gemini": { "hooksEnabled": false },
+    "kiro": { "hooksEnabled": false, "notificationLevel": "verbose" },
+    "ripgrep": { "customBinaryPath": "/usr/local/bin/rg" },
+    "suppressSubagentNotifications": false
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.integrations;
+
+        assert!(!loaded.claude_code_hooks_enabled);
+        assert_eq!(loaded.claude_code_custom_claude_path, "/opt/claude");
+        assert!(!loaded.codex_hooks_enabled);
+        assert!(!loaded.amp_hooks_enabled);
+        assert!(!loaded.cursor_hooks_enabled);
+        assert!(!loaded.gemini_hooks_enabled);
+        assert!(!loaded.kiro_hooks_enabled);
+        assert_eq!(
+            loaded.kiro_notification_level,
+            KiroNotificationLevel::Verbose
+        );
+        assert_eq!(loaded.ripgrep_custom_binary_path, "/usr/local/bin/rg");
+        assert!(!loaded.suppress_subagent_notifications);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX integrations settings.
+    // inputs: Settings JSON with an invalid Kiro notification level.
+    // returns/effects: Panics with the explicit CMUX key error.
+    #[test]
+    #[should_panic(
+        expected = "integrations.kiro.notificationLevel must be minimal, standard, or verbose"
+    )]
+    fn load_from_path_rejects_invalid_integrations_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"integrations":{"kiro":{"notificationLevel":"chatty"}}}"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX integration subsections.
+    // inputs: Settings JSON with a scalar where integrations.codex object is required.
+    // returns/effects: Panics with the explicit CMUX subsection error.
+    #[test]
+    #[should_panic(expected = "integrations.codex must be an object")]
+    fn load_from_path_rejects_malformed_integration_subsections() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"integrations":{"codex":false}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -3775,6 +4031,11 @@ mod tests {
         config.account.pii_display_mode = PiiDisplayMode::Hidden;
         config.account.selected_team_id = "team_123".to_string();
         config.account.welcome_shown = true;
+        config.integrations.claude_code_hooks_enabled = false;
+        config.integrations.claude_code_custom_claude_path = "/opt/claude".to_string();
+        config.integrations.kiro_notification_level = KiroNotificationLevel::Verbose;
+        config.integrations.ripgrep_custom_binary_path = "/usr/local/bin/rg".to_string();
+        config.integrations.suppress_subagent_notifications = false;
         config.markdown.font_size = 18;
         config.markdown.font_family = "Inter".to_string();
         config.markdown.max_width = 1200;
@@ -3799,6 +4060,26 @@ mod tests {
         assert_eq!(parsed["account"]["piiDisplayMode"], "hidden");
         assert_eq!(parsed["account"]["selectedTeamID"], "team_123");
         assert_eq!(parsed["account"]["welcomeShown"], Value::Bool(true));
+        assert_eq!(
+            parsed["integrations"]["claudeCode"]["hooksEnabled"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["integrations"]["claudeCode"]["customClaudePath"],
+            "/opt/claude"
+        );
+        assert_eq!(
+            parsed["integrations"]["kiro"]["notificationLevel"],
+            "verbose"
+        );
+        assert_eq!(
+            parsed["integrations"]["ripgrep"]["customBinaryPath"],
+            "/usr/local/bin/rg"
+        );
+        assert_eq!(
+            parsed["integrations"]["suppressSubagentNotifications"],
+            Value::Bool(false)
+        );
         assert_eq!(parsed["markdown"]["fontSize"], 18);
         assert_eq!(parsed["markdown"]["fontFamily"], "Inter");
         assert_eq!(parsed["markdown"]["maxWidth"], 1200);

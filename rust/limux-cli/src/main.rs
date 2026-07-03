@@ -2185,6 +2185,81 @@ const ACCOUNT_WELCOME_SHOWN_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const KIRO_NOTIFICATION_LEVELS: &[&str] = &["minimal", "standard", "verbose"];
+
+const INTEGRATIONS_CLAUDE_CODE_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.claudeCode.hooksEnabled",
+    section: "integrations",
+    json_path: &["claudeCode", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_CLAUDE_CODE_CUSTOM_CLAUDE_PATH_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.claudeCode.customClaudePath",
+    section: "integrations",
+    json_path: &["claudeCode", "customClaudePath"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const INTEGRATIONS_CODEX_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.codex.hooksEnabled",
+    section: "integrations",
+    json_path: &["codex", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_AMP_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.amp.hooksEnabled",
+    section: "integrations",
+    json_path: &["amp", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_CURSOR_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.cursor.hooksEnabled",
+    section: "integrations",
+    json_path: &["cursor", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_GEMINI_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.gemini.hooksEnabled",
+    section: "integrations",
+    json_path: &["gemini", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_KIRO_HOOKS_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.kiro.hooksEnabled",
+    section: "integrations",
+    json_path: &["kiro", "hooksEnabled"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const INTEGRATIONS_KIRO_NOTIFICATION_LEVEL_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.kiro.notificationLevel",
+    section: "integrations",
+    json_path: &["kiro", "notificationLevel"],
+    kind: ScalarSettingKind::Enum {
+        default: "standard",
+        allowed: KIRO_NOTIFICATION_LEVELS,
+    },
+};
+
+const INTEGRATIONS_RIPGREP_CUSTOM_BINARY_PATH_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.ripgrep.customBinaryPath",
+    section: "integrations",
+    json_path: &["ripgrep", "customBinaryPath"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const INTEGRATIONS_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING: ScalarSetting = ScalarSetting {
+    key: "integrations.suppressSubagentNotifications",
+    section: "integrations",
+    json_path: &["suppressSubagentNotifications"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
 const MARKDOWN_FONT_SIZE_SETTING: ScalarSetting = ScalarSetting {
     key: "markdown.fontSize",
     section: "markdown",
@@ -2555,6 +2630,11 @@ const CONFIG_GET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
+    "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
+    "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
+    "integrations.cursor.hooksEnabled|integrations.gemini.hooksEnabled|",
+    "integrations.kiro.hooksEnabled|integrations.kiro.notificationLevel|",
+    "integrations.ripgrep.customBinaryPath|integrations.suppressSubagentNotifications|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
@@ -2601,6 +2681,11 @@ const CONFIG_SET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
+    "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
+    "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
+    "integrations.cursor.hooksEnabled|integrations.gemini.hooksEnabled|",
+    "integrations.kiro.hooksEnabled|integrations.kiro.notificationLevel|",
+    "integrations.ripgrep.customBinaryPath|integrations.suppressSubagentNotifications|",
     "markdown.fontSize|markdown.fontFamily|markdown.maxWidth|",
     "fileEditor.wordWrap|canvas.paneGap|canvas.snappingEnabled|",
     "browser.defaultSearchEngine|browser.customSearchEngineName|",
@@ -2740,6 +2825,9 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("account.") {
         return account_scalar_setting(raw);
     }
+    if raw.starts_with("integrations.") {
+        return integrations_scalar_setting(raw);
+    }
     if raw.starts_with("terminal.") {
         return terminal_scalar_setting(raw);
     }
@@ -2766,6 +2854,33 @@ fn account_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "account.piiDisplayMode" => Some(ACCOUNT_PII_DISPLAY_MODE_SETTING),
         "account.selectedTeamID" => Some(ACCOUNT_SELECTED_TEAM_ID_SETTING),
         "account.welcomeShown" => Some(ACCOUNT_WELCOME_SHOWN_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX integrations catalog keys to nested JSON descriptors.
+// inputs: Raw `integrations.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown integration keys.
+fn integrations_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "integrations.claudeCode.hooksEnabled" => {
+            Some(INTEGRATIONS_CLAUDE_CODE_HOOKS_ENABLED_SETTING)
+        }
+        "integrations.claudeCode.customClaudePath" => {
+            Some(INTEGRATIONS_CLAUDE_CODE_CUSTOM_CLAUDE_PATH_SETTING)
+        }
+        "integrations.codex.hooksEnabled" => Some(INTEGRATIONS_CODEX_HOOKS_ENABLED_SETTING),
+        "integrations.amp.hooksEnabled" => Some(INTEGRATIONS_AMP_HOOKS_ENABLED_SETTING),
+        "integrations.cursor.hooksEnabled" => Some(INTEGRATIONS_CURSOR_HOOKS_ENABLED_SETTING),
+        "integrations.gemini.hooksEnabled" => Some(INTEGRATIONS_GEMINI_HOOKS_ENABLED_SETTING),
+        "integrations.kiro.hooksEnabled" => Some(INTEGRATIONS_KIRO_HOOKS_ENABLED_SETTING),
+        "integrations.kiro.notificationLevel" => Some(INTEGRATIONS_KIRO_NOTIFICATION_LEVEL_SETTING),
+        "integrations.ripgrep.customBinaryPath" => {
+            Some(INTEGRATIONS_RIPGREP_CUSTOM_BINARY_PATH_SETTING)
+        }
+        "integrations.suppressSubagentNotifications" => {
+            Some(INTEGRATIONS_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING)
+        }
         _ => None,
     }
 }
@@ -20272,6 +20387,114 @@ mod cli_arg_tests {
             .expect("write malformed selected team");
         let err = render_config_scalar_get(&path, ACCOUNT_SELECTED_TEAM_ID_SETTING)
             .expect_err("invalid existing selected team");
+        assert!(err.to_string().contains("must be a string"));
+    }
+
+    // purpose: Verify CMUX integrations catalog keys default and write nested JSON.
+    // inputs: Temporary settings file plus integrations scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and unrelated-key preservation.
+    #[test]
+    fn config_integrations_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, INTEGRATIONS_CODEX_HOOKS_ENABLED_SETTING)
+            .expect("codex hooks default");
+        assert!(text.contains("integrations.codex.hooksEnabled = true"));
+        let text = render_config_scalar_get(&path, INTEGRATIONS_KIRO_NOTIFICATION_LEVEL_SETTING)
+            .expect("kiro level default");
+        assert!(text.contains("integrations.kiro.notificationLevel = standard"));
+        let text =
+            render_config_scalar_get(&path, INTEGRATIONS_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING)
+                .expect("suppress subagent default");
+        assert!(text.contains("integrations.suppressSubagentNotifications = true"));
+
+        fs::write(
+            &path,
+            br#"{"integrations":{"claudeCode":{"keep":true},"codex":{"keep":1}},"account":{"welcomeShown":true}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(
+            &path,
+            INTEGRATIONS_CLAUDE_CODE_HOOKS_ENABLED_SETTING,
+            "false",
+        )
+        .expect("set claude hooks");
+        render_config_scalar_set(
+            &path,
+            INTEGRATIONS_CLAUDE_CODE_CUSTOM_CLAUDE_PATH_SETTING,
+            "/opt/claude",
+        )
+        .expect("set claude path");
+        render_config_scalar_set(
+            &path,
+            INTEGRATIONS_KIRO_NOTIFICATION_LEVEL_SETTING,
+            "verbose",
+        )
+        .expect("set kiro level");
+        render_config_scalar_set(
+            &path,
+            INTEGRATIONS_RIPGREP_CUSTOM_BINARY_PATH_SETTING,
+            "/usr/local/bin/rg",
+        )
+        .expect("set ripgrep path");
+        render_config_scalar_set(
+            &path,
+            INTEGRATIONS_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING,
+            "false",
+        )
+        .expect("set suppress subagents");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["integrations"]["claudeCode"]["hooksEnabled"], false);
+        assert_eq!(
+            parsed["integrations"]["claudeCode"]["customClaudePath"],
+            "/opt/claude"
+        );
+        assert_eq!(parsed["integrations"]["claudeCode"]["keep"], true);
+        assert_eq!(parsed["integrations"]["codex"]["keep"], 1);
+        assert_eq!(
+            parsed["integrations"]["kiro"]["notificationLevel"],
+            "verbose"
+        );
+        assert_eq!(
+            parsed["integrations"]["ripgrep"]["customBinaryPath"],
+            "/usr/local/bin/rg"
+        );
+        assert_eq!(
+            parsed["integrations"]["suppressSubagentNotifications"],
+            false
+        );
+        assert_eq!(parsed["account"]["welcomeShown"], true);
+    }
+
+    // purpose: Verify CMUX integrations catalog keys reject malformed values.
+    // inputs: Invalid enum, invalid boolean, and malformed persisted string.
+    // returns/effects: Asserts loud validation errors.
+    #[test]
+    fn config_integrations_scalar_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(
+            &path,
+            INTEGRATIONS_KIRO_NOTIFICATION_LEVEL_SETTING,
+            "chatty",
+        )
+        .expect_err("invalid kiro notification level");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, INTEGRATIONS_AMP_HOOKS_ENABLED_SETTING, "yes")
+            .expect_err("invalid amp bool");
+        assert!(err.to_string().contains("requires true or false"));
+
+        fs::write(
+            &path,
+            br#"{"integrations":{"ripgrep":{"customBinaryPath":false}}}"#,
+        )
+        .expect("write malformed ripgrep path");
+        let err = render_config_scalar_get(&path, INTEGRATIONS_RIPGREP_CUSTOM_BINARY_PATH_SETTING)
+            .expect_err("invalid existing ripgrep path");
         assert!(err.to_string().contains("must be a string"));
     }
 
