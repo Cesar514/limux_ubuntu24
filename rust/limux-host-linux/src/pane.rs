@@ -204,6 +204,104 @@ fn prepend_env_path(extra_env: &mut Vec<(String, String)>, directory: &Path) {
     extra_env.push(("PATH".to_string(), format!("{directory}:{base_path}")));
 }
 
+const SANITIZED_LOCALE_ENV_KEYS: [&str; 2] = ["LC_ALL", "LC_CTYPE"];
+
+// purpose: Clear malformed locale overrides before Ghostty spawns a shell.
+// inputs: Mutable terminal environment vector.
+// returns/effects: Adds or updates LC_ALL/LC_CTYPE to empty when the effective value is not POSIX.
+fn append_locale_sanitization_env(extra_env: &mut Vec<(String, String)>) {
+    append_locale_sanitization_env_with(extra_env, |key| std::env::var(key).ok());
+}
+
+// purpose: Apply CMUX-compatible locale sanitization with injectable ambient env.
+// inputs: Mutable terminal env and ambient lookup used by tests.
+// returns/effects: Clears malformed effective LC_ALL/LC_CTYPE so LANG can govern UTF-8.
+fn append_locale_sanitization_env_with<F>(extra_env: &mut Vec<(String, String)>, ambient: F)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for key in SANITIZED_LOCALE_ENV_KEYS {
+        let override_index = extra_env
+            .iter()
+            .rposition(|(entry_key, _)| entry_key == key);
+        let effective = override_index
+            .and_then(|index| extra_env.get(index).map(|(_, value)| value.clone()))
+            .or_else(|| ambient(key));
+        let Some(effective) = effective else {
+            continue;
+        };
+        if effective.is_empty() || is_posix_compatible_locale_name(&effective) {
+            continue;
+        }
+        if let Some(index) = override_index {
+            extra_env[index].1.clear();
+        } else {
+            extra_env.push((key.to_string(), String::new()));
+        }
+    }
+}
+
+// purpose: Identify POSIX locale names that libc can resolve.
+// inputs: Raw locale string from LC_ALL or LC_CTYPE.
+// returns/effects: Returns false for CLDR/BCP-47 locale identifiers.
+fn is_posix_compatible_locale_name(value: &str) -> bool {
+    if value.is_empty() || value == "C" || value == "POSIX" {
+        return true;
+    }
+    let (name, modifier) = match value.split_once('@') {
+        Some((name, modifier)) if !modifier.is_empty() && !modifier.contains('@') => {
+            (name, Some(modifier))
+        }
+        Some(_) => return false,
+        None => (value, None),
+    };
+    if modifier.is_some_and(|modifier| !modifier.chars().all(|ch| ch.is_ascii_alphanumeric())) {
+        return false;
+    }
+    let (base, codeset) = name.split_once('.').unwrap_or((name, ""));
+    if codeset.contains('.') {
+        return false;
+    }
+    if !codeset.is_empty() && !valid_locale_codeset(codeset) {
+        return false;
+    }
+    valid_locale_base(base)
+}
+
+// purpose: Validate the language[_territory[_script]] part of a POSIX locale.
+// inputs: Base locale name before codeset/modifier.
+// returns/effects: Returns false for empty, hyphenated, or overlong components.
+fn valid_locale_base(base: &str) -> bool {
+    let parts = base.split('_').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        return false;
+    }
+    parts.iter().enumerate().all(|(index, part)| {
+        !part.is_empty()
+            && part.len() <= 8
+            && part.chars().all(|ch| {
+                if index == 0 {
+                    ch.is_ascii_alphabetic()
+                } else {
+                    ch.is_ascii_alphanumeric()
+                }
+            })
+    })
+}
+
+// purpose: Validate the optional POSIX locale codeset component.
+// inputs: Codeset string after the first dot.
+// returns/effects: Returns false for values libc cannot treat as a codeset token.
+fn valid_locale_codeset(codeset: &str) -> bool {
+    codeset
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && codeset
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
 type TabDragCallback = dyn Fn(bool);
 
 thread_local! {
@@ -1679,6 +1777,7 @@ fn add_terminal_tab_inner(
     if let Some(tab_options) = options.as_ref() {
         extra_env.extend(tab_options.extra_env.iter().cloned());
     }
+    append_locale_sanitization_env(&mut extra_env);
     let startup_command = options
         .as_ref()
         .and_then(|value| value.startup_command.clone())
@@ -5859,9 +5958,10 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_git_watch_env, browser_diagnostics_snapshot, classify_content_drop_zone,
-        codex_wrapper_root, content_drop_preview_rect, effective_drop_target_dimensions,
-        inherited_terminal_working_directory, install_codex_wrapper_env, is_localhost_input,
+        append_git_watch_env, append_locale_sanitization_env_with, browser_diagnostics_snapshot,
+        classify_content_drop_zone, codex_wrapper_root, content_drop_preview_rect,
+        effective_drop_target_dimensions, inherited_terminal_working_directory,
+        install_codex_wrapper_env, is_localhost_input, is_posix_compatible_locale_name,
         next_active_after_tab_removal, normalize_browser_entry_input,
         normalize_reorder_insert_index, pane_action_tooltip, push_browser_diagnostic,
         surface_hint_matches, write_executable_file, BrowserDiagnosticsBuffer, ContentDropZone,
@@ -6026,6 +6126,70 @@ mod tests {
         append_git_watch_env(&config, &mut env);
         assert_eq!(env_value(&env, "CMUX_NO_GIT_WATCH"), "1");
         assert_eq!(env_value(&env, "CMUX_NO_PR_WATCH"), "1");
+    }
+
+    // purpose: Verify malformed inherited LC_ALL is cleared for spawned terminals.
+    // inputs: Empty terminal env plus malformed ambient LC_ALL.
+    // returns/effects: Adds LC_ALL="" so LANG can govern UTF-8 locale resolution.
+    #[test]
+    fn locale_sanitization_clears_malformed_ambient_lc_all() {
+        let mut env = Vec::new();
+        append_locale_sanitization_env_with(&mut env, |key| match key {
+            "LC_ALL" => Some(
+                "en-US-u-ca-gregory-co-standard-cu-usd-fw-sun-hc-h12-ms-ussystem-tz-usphx"
+                    .to_string(),
+            ),
+            _ => None,
+        });
+
+        assert_eq!(env_value(&env, "LC_ALL"), "");
+    }
+
+    // purpose: Verify malformed startup LC_CTYPE overrides are neutralized.
+    // inputs: Terminal env containing a malformed CLDR/BCP-47 LC_CTYPE.
+    // returns/effects: Clears the override instead of passing it to Ghostty.
+    #[test]
+    fn locale_sanitization_clears_malformed_terminal_override() {
+        let mut env = vec![(
+            "LC_CTYPE".to_string(),
+            "en-US-u-ca-gregory-cu-usd".to_string(),
+        )];
+        append_locale_sanitization_env_with(&mut env, |_| None);
+
+        assert_eq!(env_value(&env, "LC_CTYPE"), "");
+    }
+
+    // purpose: Verify valid POSIX locales are left untouched.
+    // inputs: Ambient and terminal override locale values accepted by libc.
+    // returns/effects: Does not inject clears or alter explicit valid overrides.
+    #[test]
+    fn locale_sanitization_preserves_valid_posix_locales() {
+        let mut env = vec![("LC_CTYPE".to_string(), "fr_FR.UTF-8".to_string())];
+        append_locale_sanitization_env_with(&mut env, |key| match key {
+            "LC_ALL" => Some("ja_JP.UTF-8".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(env_value(&env, "LC_CTYPE"), "fr_FR.UTF-8");
+        assert!(env.iter().all(|(key, _)| key != "LC_ALL"));
+    }
+
+    // purpose: Verify the POSIX locale classifier matches CMUX's CLDR rejection.
+    // inputs: Representative POSIX and CLDR locale names.
+    // returns/effects: Accepts libc-compatible names and rejects malformed identifiers.
+    #[test]
+    fn posix_locale_classifier_rejects_cldr_identifiers() {
+        for value in ["en_US.UTF-8", "C.UTF-8", "POSIX", "fr_FR.UTF-8@euro", ""] {
+            assert!(is_posix_compatible_locale_name(value), "{value}");
+        }
+        for value in [
+            "en-US-u-ca-gregory-co-standard-cu-usd-fw-sun-hc-h12-ms-ussystem-tz-usphx",
+            "en_US@calendar=gregorian;currency=USD",
+            "en-US",
+            "garbage with spaces",
+        ] {
+            assert!(!is_posix_compatible_locale_name(value), "{value}");
+        }
     }
 
     // purpose: Verify CMUX split/new-tab cwd inheritance prefers the active terminal cwd.
