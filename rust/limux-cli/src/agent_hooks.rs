@@ -791,8 +791,10 @@ fn is_resume_selector(kind: AgentKind, arg: &str) -> bool {
         AgentKind::Omp => arg == "--session" || arg.starts_with("--session="),
         AgentKind::Amp => false,
         AgentKind::HermesAgent => arg == "--resume" || arg.starts_with("--resume="),
-        AgentKind::Claude
-        | AgentKind::Cursor
+        AgentKind::Claude => {
+            arg == "-r" || arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
+        }
+        AgentKind::Cursor
         | AgentKind::Gemini
         | AgentKind::Copilot
         | AgentKind::CodeBuddy
@@ -1048,6 +1050,31 @@ mod tests {
                 "'env' 'CODEX_HOME=/tmp/codex home' '/usr/local/bin/codex' 'fork' ",
                 "'new-session' '--model' 'gpt-5.4' '--search'"
             )
+        );
+    }
+
+    #[test]
+    fn claude_fork_command_drops_short_resume_selector() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "claude".to_string(),
+            arguments: vec![
+                "claude".to_string(),
+                "-r".to_string(),
+                "old-session".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 2.0,
+        };
+
+        let command = build_fork_command(AgentKind::Claude, "new-session", Some(&launch), None)
+            .expect("fork command");
+
+        assert_eq!(
+            command,
+            "'claude' '--resume' 'new-session' '--fork-session' '--model' 'sonnet'"
         );
     }
 

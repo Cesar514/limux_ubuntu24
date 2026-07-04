@@ -1027,7 +1027,10 @@ fn is_resume_selector(kind: RestorableAgentKind, arg: &str) -> bool {
             arg == "resume" || arg == "--resume" || arg.starts_with("--resume=")
         }
         RestorableAgentKind::OpenCode => arg == "--session" || arg.starts_with("--session="),
-        RestorableAgentKind::Claude | RestorableAgentKind::Gemini => {
+        RestorableAgentKind::Claude => {
+            arg == "-r" || arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
+        }
+        RestorableAgentKind::Gemini => {
             arg == "--resume" || arg.starts_with("--resume=") || arg == "--continue"
         }
     }
@@ -1790,6 +1793,34 @@ mod tests {
         assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'sess-123'"));
         assert!(command.contains("hooks codex cleanup"));
         assert!(command.contains("exec \"${SHELL:-/bin/sh}\" -l"));
+    }
+
+    #[test]
+    fn restorable_claude_resume_command_drops_short_resume_selector() {
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Claude,
+            session_id: "new-session".to_string(),
+            cwd: None,
+            launch_command: Some(AgentLaunchCommandState {
+                executable: "claude".to_string(),
+                arguments: vec![
+                    "claude".to_string(),
+                    "-r".to_string(),
+                    "old-session".to_string(),
+                    "--model".to_string(),
+                    "sonnet".to_string(),
+                ],
+                cwd: None,
+                environment: Default::default(),
+                captured_at: Some(12.0),
+            }),
+            restore_on_startup: true,
+        };
+
+        let command = agent.resume_command().expect("resume command");
+
+        assert!(command.contains("'claude' '--resume' 'new-session' '--model' 'sonnet'"));
+        assert!(!command.contains("old-session"));
     }
 
     #[test]
