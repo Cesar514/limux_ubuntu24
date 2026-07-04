@@ -50,6 +50,10 @@ pub struct AppConfig {
     #[serde(skip)]
     pub integrations: IntegrationsConfig,
     #[serde(skip)]
+    pub automation: AutomationConfig,
+    #[serde(skip)]
+    pub mobile: MobileConfig,
+    #[serde(skip)]
     pub appearance: AppearanceConfig,
     #[serde(skip)]
     pub app: AppBehaviorConfig,
@@ -182,6 +186,64 @@ pub struct IntegrationsConfig {
     pub suppress_subagent_notifications: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SocketControlMode {
+    Off,
+    #[default]
+    CmuxOnly,
+    Automation,
+    Password,
+    AllowAll,
+}
+
+impl SocketControlMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::CmuxOnly => "cmuxOnly",
+            Self::Automation => "automation",
+            Self::Password => "password",
+            Self::AllowAll => "allowAll",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "cmuxOnly" => Some(Self::CmuxOnly),
+            "automation" => Some(Self::Automation),
+            "password" => Some(Self::Password),
+            "allowAll" => Some(Self::AllowAll),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutomationConfig {
+    pub socket_control_mode: SocketControlMode,
+    pub claude_code_integration: bool,
+    pub claude_binary_path: String,
+    pub workspace_auto_naming: bool,
+    pub auto_naming_agent: String,
+    pub ripgrep_binary_path: String,
+    pub suppress_subagent_notifications: bool,
+    pub amp_integration: bool,
+    pub cursor_integration: bool,
+    pub gemini_integration: bool,
+    pub kiro_integration: bool,
+    pub kiro_notification_level: KiroNotificationLevel,
+    pub port_base: i32,
+    pub port_range: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MobileConfig {
+    pub ios_pairing_host_enabled: bool,
+    pub ios_pairing_host_port: i32,
+    pub ios_pairing_host_display_name: String,
+}
+
 impl Default for IntegrationsConfig {
     fn default() -> Self {
         Self::cmux_default()
@@ -204,6 +266,49 @@ impl IntegrationsConfig {
             kiro_notification_level: KiroNotificationLevel::Standard,
             ripgrep_custom_binary_path: String::new(),
             suppress_subagent_notifications: true,
+        }
+    }
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl AutomationConfig {
+    fn cmux_default() -> Self {
+        Self {
+            socket_control_mode: SocketControlMode::CmuxOnly,
+            claude_code_integration: true,
+            claude_binary_path: String::new(),
+            workspace_auto_naming: false,
+            auto_naming_agent: "auto".to_string(),
+            ripgrep_binary_path: String::new(),
+            suppress_subagent_notifications: true,
+            amp_integration: true,
+            cursor_integration: true,
+            gemini_integration: true,
+            kiro_integration: true,
+            kiro_notification_level: KiroNotificationLevel::Standard,
+            port_base: 9100,
+            port_range: 10,
+        }
+    }
+}
+
+impl Default for MobileConfig {
+    fn default() -> Self {
+        Self::cmux_default()
+    }
+}
+
+impl MobileConfig {
+    fn cmux_default() -> Self {
+        Self {
+            ios_pairing_host_enabled: false,
+            ios_pairing_host_port: 58465,
+            ios_pairing_host_display_name: String::new(),
         }
     }
 }
@@ -1024,6 +1129,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .get("integrations")
         .map(parse_integrations_config)
         .unwrap_or_default();
+    let automation = root
+        .get("automation")
+        .map(parse_automation_config)
+        .unwrap_or_default();
+    let mobile = root
+        .get("mobile")
+        .map(parse_mobile_config)
+        .unwrap_or_default();
 
     let app = root.get("app").map(|value| {
         value
@@ -1316,6 +1429,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         },
         account,
         integrations,
+        automation,
+        mobile,
         appearance: AppearanceConfig {
             color_scheme,
             ghostty_color_scheme,
@@ -1483,6 +1598,97 @@ fn parse_integrations_config(value: &Value) -> IntegrationsConfig {
             .get("suppressSubagentNotifications")
             .map(|value| parse_bool_setting(value, "integrations.suppressSubagentNotifications"))
             .unwrap_or(defaults.suppress_subagent_notifications),
+    }
+}
+
+// purpose: Parse the CMUX automation settings section.
+// inputs: Optional automation JSON value from settings.
+// returns/effects: Returns CMUX defaults plus strict overrides for non-secret automation keys.
+fn parse_automation_config(value: &Value) -> AutomationConfig {
+    let automation = required_object_setting(value, "automation");
+    let defaults = AutomationConfig::cmux_default();
+    AutomationConfig {
+        socket_control_mode: automation
+            .get("socketControlMode")
+            .map(|value| parse_socket_control_mode(value, "automation.socketControlMode"))
+            .unwrap_or(defaults.socket_control_mode),
+        claude_code_integration: automation
+            .get("claudeCodeIntegration")
+            .map(|value| parse_bool_setting(value, "automation.claudeCodeIntegration"))
+            .unwrap_or(defaults.claude_code_integration),
+        claude_binary_path: automation
+            .get("claudeBinaryPath")
+            .map(|value| parse_string_setting(value, "automation.claudeBinaryPath"))
+            .unwrap_or(defaults.claude_binary_path),
+        workspace_auto_naming: automation
+            .get("workspaceAutoNaming")
+            .map(|value| parse_bool_setting(value, "automation.workspaceAutoNaming"))
+            .unwrap_or(defaults.workspace_auto_naming),
+        auto_naming_agent: automation
+            .get("autoNamingAgent")
+            .map(|value| parse_string_setting(value, "automation.autoNamingAgent"))
+            .unwrap_or(defaults.auto_naming_agent),
+        ripgrep_binary_path: automation
+            .get("ripgrepBinaryPath")
+            .map(|value| parse_string_setting(value, "automation.ripgrepBinaryPath"))
+            .unwrap_or(defaults.ripgrep_binary_path),
+        suppress_subagent_notifications: automation
+            .get("suppressSubagentNotifications")
+            .map(|value| parse_bool_setting(value, "automation.suppressSubagentNotifications"))
+            .unwrap_or(defaults.suppress_subagent_notifications),
+        amp_integration: automation
+            .get("ampIntegration")
+            .map(|value| parse_bool_setting(value, "automation.ampIntegration"))
+            .unwrap_or(defaults.amp_integration),
+        cursor_integration: automation
+            .get("cursorIntegration")
+            .map(|value| parse_bool_setting(value, "automation.cursorIntegration"))
+            .unwrap_or(defaults.cursor_integration),
+        gemini_integration: automation
+            .get("geminiIntegration")
+            .map(|value| parse_bool_setting(value, "automation.geminiIntegration"))
+            .unwrap_or(defaults.gemini_integration),
+        kiro_integration: automation
+            .get("kiroIntegration")
+            .map(|value| parse_bool_setting(value, "automation.kiroIntegration"))
+            .unwrap_or(defaults.kiro_integration),
+        kiro_notification_level: automation
+            .get("kiroNotificationLevel")
+            .map(|value| parse_kiro_notification_level(value, "automation.kiroNotificationLevel"))
+            .unwrap_or(defaults.kiro_notification_level),
+        port_base: automation
+            .get("portBase")
+            .map(|value| parse_positive_i32_setting(value, "automation.portBase", 1, 65535))
+            .unwrap_or(defaults.port_base),
+        port_range: automation
+            .get("portRange")
+            .map(|value| parse_positive_i32_setting(value, "automation.portRange", 1, 65535))
+            .unwrap_or(defaults.port_range),
+    }
+}
+
+// purpose: Parse the CMUX mobile settings section.
+// inputs: Optional mobile JSON value from settings.
+// returns/effects: Returns release-mode CMUX defaults plus strict overrides.
+fn parse_mobile_config(value: &Value) -> MobileConfig {
+    let mobile = required_object_setting(value, "mobile");
+    let pairing = mobile
+        .get("iOSPairingHost")
+        .map(|value| required_object_setting(value, "mobile.iOSPairingHost"));
+    let defaults = MobileConfig::cmux_default();
+    MobileConfig {
+        ios_pairing_host_enabled: pairing
+            .and_then(|pairing| pairing.get("enabled"))
+            .map(|value| parse_bool_setting(value, "mobile.iOSPairingHost.enabled"))
+            .unwrap_or(defaults.ios_pairing_host_enabled),
+        ios_pairing_host_port: pairing
+            .and_then(|pairing| pairing.get("port"))
+            .map(|value| parse_positive_i32_setting(value, "mobile.iOSPairingHost.port", 1, 65535))
+            .unwrap_or(defaults.ios_pairing_host_port),
+        ios_pairing_host_display_name: pairing
+            .and_then(|pairing| pairing.get("displayName"))
+            .map(|value| parse_string_setting(value, "mobile.iOSPairingHost.displayName"))
+            .unwrap_or(defaults.ios_pairing_host_display_name),
     }
 }
 
@@ -1873,6 +2079,18 @@ fn parse_custom_sidebar_renderer(value: &Value, path: &str) -> CustomSidebarRend
         .unwrap_or_else(|| panic!("{path} must be inProcess or remote"));
     CustomSidebarRendererMode::from_str(raw)
         .unwrap_or_else(|| panic!("{path} must be inProcess or remote"))
+}
+
+// purpose: Parse CMUX automation socket-control mode values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns mode enum or panics on unsupported values.
+fn parse_socket_control_mode(value: &Value, path: &str) -> SocketControlMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a socket-control mode string"));
+    SocketControlMode::from_str(raw).unwrap_or_else(|| {
+        panic!("{path} must be one of: off, cmuxOnly, automation, password, allowAll")
+    })
 }
 
 // purpose: Parse CMUX sidebar rightMaxWidth while preserving its settings-editor clamp.
@@ -2332,6 +2550,35 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
                 "customBinaryPath": config.integrations.ripgrep_custom_binary_path.clone(),
             },
             "suppressSubagentNotifications": config.integrations.suppress_subagent_notifications,
+        }),
+    );
+    root.insert(
+        "automation".to_string(),
+        json!({
+            "socketControlMode": config.automation.socket_control_mode.as_str(),
+            "claudeCodeIntegration": config.automation.claude_code_integration,
+            "claudeBinaryPath": config.automation.claude_binary_path.clone(),
+            "workspaceAutoNaming": config.automation.workspace_auto_naming,
+            "autoNamingAgent": config.automation.auto_naming_agent.clone(),
+            "ripgrepBinaryPath": config.automation.ripgrep_binary_path.clone(),
+            "suppressSubagentNotifications": config.automation.suppress_subagent_notifications,
+            "ampIntegration": config.automation.amp_integration,
+            "cursorIntegration": config.automation.cursor_integration,
+            "geminiIntegration": config.automation.gemini_integration,
+            "kiroIntegration": config.automation.kiro_integration,
+            "kiroNotificationLevel": config.automation.kiro_notification_level.as_str(),
+            "portBase": config.automation.port_base,
+            "portRange": config.automation.port_range,
+        }),
+    );
+    root.insert(
+        "mobile".to_string(),
+        json!({
+            "iOSPairingHost": {
+                "enabled": config.mobile.ios_pairing_host_enabled,
+                "port": config.mobile.ios_pairing_host_port,
+                "displayName": config.mobile.ios_pairing_host_display_name.clone(),
+            },
         }),
     );
     let app = root.entry("app".to_string()).or_insert_with(|| json!({}));
@@ -3454,6 +3701,100 @@ mod tests {
         let _ = load_from_path(&path);
     }
 
+    // purpose: Verify host loading accepts CMUX automation and mobile catalog settings.
+    // inputs: Settings JSON with automation and mobile sections.
+    // returns/effects: Asserts strict typed values override CMUX defaults.
+    #[test]
+    fn load_from_path_reads_automation_and_mobile_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "automation": {
+    "socketControlMode": "password",
+    "claudeCodeIntegration": false,
+    "claudeBinaryPath": "/opt/claude",
+    "workspaceAutoNaming": true,
+    "autoNamingAgent": "codex",
+    "ripgrepBinaryPath": "/usr/local/bin/rg",
+    "suppressSubagentNotifications": false,
+    "ampIntegration": false,
+    "cursorIntegration": false,
+    "geminiIntegration": false,
+    "kiroIntegration": false,
+    "kiroNotificationLevel": "verbose",
+    "portBase": 9200,
+    "portRange": 24
+  },
+  "mobile": {
+    "iOSPairingHost": {
+      "enabled": true,
+      "port": 58466,
+      "displayName": "Dev Linux"
+    }
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config;
+
+        assert_eq!(
+            loaded.automation.socket_control_mode,
+            SocketControlMode::Password
+        );
+        assert!(!loaded.automation.claude_code_integration);
+        assert_eq!(loaded.automation.claude_binary_path, "/opt/claude");
+        assert!(loaded.automation.workspace_auto_naming);
+        assert_eq!(loaded.automation.auto_naming_agent, "codex");
+        assert_eq!(loaded.automation.ripgrep_binary_path, "/usr/local/bin/rg");
+        assert!(!loaded.automation.suppress_subagent_notifications);
+        assert!(!loaded.automation.amp_integration);
+        assert!(!loaded.automation.cursor_integration);
+        assert!(!loaded.automation.gemini_integration);
+        assert!(!loaded.automation.kiro_integration);
+        assert_eq!(
+            loaded.automation.kiro_notification_level,
+            KiroNotificationLevel::Verbose
+        );
+        assert_eq!(loaded.automation.port_base, 9200);
+        assert_eq!(loaded.automation.port_range, 24);
+        assert!(loaded.mobile.ios_pairing_host_enabled);
+        assert_eq!(loaded.mobile.ios_pairing_host_port, 58466);
+        assert_eq!(loaded.mobile.ios_pairing_host_display_name, "Dev Linux");
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX automation settings.
+    // inputs: Settings JSON with an invalid socket control mode.
+    // returns/effects: Panics with the explicit automation key error.
+    #[test]
+    #[should_panic(expected = "automation.socketControlMode must be one of")]
+    fn load_from_path_rejects_invalid_automation_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"automation":{"socketControlMode":"open"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify host loading rejects malformed CMUX mobile settings.
+    // inputs: Settings JSON with an out-of-range iOS pairing port.
+    // returns/effects: Panics with the explicit mobile key error.
+    #[test]
+    #[should_panic(expected = "mobile.iOSPairingHost.port must be a positive number")]
+    fn load_from_path_rejects_invalid_mobile_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"mobile":{"iOSPairingHost":{"port":0}}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
     // purpose: Verify host loading accepts CMUX file editor and canvas settings.
     // inputs: Settings JSON with fileEditor and canvas values.
     // returns/effects: Asserts parsed values override CMUX defaults.
@@ -4490,6 +4831,14 @@ mod tests {
         config.integrations.kiro_notification_level = KiroNotificationLevel::Verbose;
         config.integrations.ripgrep_custom_binary_path = "/usr/local/bin/rg".to_string();
         config.integrations.suppress_subagent_notifications = false;
+        config.automation.socket_control_mode = SocketControlMode::Password;
+        config.automation.workspace_auto_naming = true;
+        config.automation.auto_naming_agent = "codex".to_string();
+        config.automation.port_base = 9200;
+        config.automation.port_range = 24;
+        config.mobile.ios_pairing_host_enabled = true;
+        config.mobile.ios_pairing_host_port = 58466;
+        config.mobile.ios_pairing_host_display_name = "Dev Linux".to_string();
         config.markdown.font_size = 18;
         config.markdown.font_family = "Inter".to_string();
         config.markdown.max_width = 1200;
@@ -4533,6 +4882,23 @@ mod tests {
         assert_eq!(
             parsed["integrations"]["suppressSubagentNotifications"],
             Value::Bool(false)
+        );
+        assert_eq!(parsed["automation"]["socketControlMode"], "password");
+        assert_eq!(
+            parsed["automation"]["workspaceAutoNaming"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["automation"]["autoNamingAgent"], "codex");
+        assert_eq!(parsed["automation"]["portBase"], 9200);
+        assert_eq!(parsed["automation"]["portRange"], 24);
+        assert_eq!(
+            parsed["mobile"]["iOSPairingHost"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["mobile"]["iOSPairingHost"]["port"], 58466);
+        assert_eq!(
+            parsed["mobile"]["iOSPairingHost"]["displayName"],
+            "Dev Linux"
         );
         assert_eq!(parsed["markdown"]["fontSize"], 18);
         assert_eq!(parsed["markdown"]["fontFamily"], "Inter");

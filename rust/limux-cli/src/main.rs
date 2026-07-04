@@ -2162,6 +2162,145 @@ const REMOTE_TMUX_BETA_ENABLED_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: false },
 };
 
+const SOCKET_CONTROL_MODES: &[&str] = &["off", "cmuxOnly", "automation", "password", "allowAll"];
+
+const AUTOMATION_SOCKET_CONTROL_MODE_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.socketControlMode",
+    section: "automation",
+    json_path: &["socketControlMode"],
+    kind: ScalarSettingKind::Enum {
+        default: "cmuxOnly",
+        allowed: SOCKET_CONTROL_MODES,
+    },
+};
+
+const AUTOMATION_CLAUDE_CODE_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.claudeCodeIntegration",
+    section: "automation",
+    json_path: &["claudeCodeIntegration"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_CLAUDE_BINARY_PATH_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.claudeBinaryPath",
+    section: "automation",
+    json_path: &["claudeBinaryPath"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const AUTOMATION_WORKSPACE_AUTO_NAMING_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.workspaceAutoNaming",
+    section: "automation",
+    json_path: &["workspaceAutoNaming"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const AUTOMATION_AUTO_NAMING_AGENT_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.autoNamingAgent",
+    section: "automation",
+    json_path: &["autoNamingAgent"],
+    kind: ScalarSettingKind::String { default: "auto" },
+};
+
+const AUTOMATION_RIPGREP_BINARY_PATH_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.ripgrepBinaryPath",
+    section: "automation",
+    json_path: &["ripgrepBinaryPath"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
+const AUTOMATION_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.suppressSubagentNotifications",
+    section: "automation",
+    json_path: &["suppressSubagentNotifications"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_AMP_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.ampIntegration",
+    section: "automation",
+    json_path: &["ampIntegration"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_CURSOR_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.cursorIntegration",
+    section: "automation",
+    json_path: &["cursorIntegration"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_GEMINI_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.geminiIntegration",
+    section: "automation",
+    json_path: &["geminiIntegration"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_KIRO_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.kiroIntegration",
+    section: "automation",
+    json_path: &["kiroIntegration"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const AUTOMATION_KIRO_NOTIFICATION_LEVEL_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.kiroNotificationLevel",
+    section: "automation",
+    json_path: &["kiroNotificationLevel"],
+    kind: ScalarSettingKind::Enum {
+        default: "standard",
+        allowed: KIRO_NOTIFICATION_LEVELS,
+    },
+};
+
+const AUTOMATION_PORT_BASE_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.portBase",
+    section: "automation",
+    json_path: &["portBase"],
+    kind: ScalarSettingKind::Integer {
+        default: 9100,
+        min: 1,
+        max: 65535,
+    },
+};
+
+const AUTOMATION_PORT_RANGE_SETTING: ScalarSetting = ScalarSetting {
+    key: "automation.portRange",
+    section: "automation",
+    json_path: &["portRange"],
+    kind: ScalarSettingKind::Integer {
+        default: 10,
+        min: 1,
+        max: 65535,
+    },
+};
+
+const MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING: ScalarSetting = ScalarSetting {
+    key: "mobile.iOSPairingHost.enabled",
+    section: "mobile",
+    json_path: &["iOSPairingHost", "enabled"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const MOBILE_IOS_PAIRING_HOST_PORT_SETTING: ScalarSetting = ScalarSetting {
+    key: "mobile.iOSPairingHost.port",
+    section: "mobile",
+    json_path: &["iOSPairingHost", "port"],
+    kind: ScalarSettingKind::Integer {
+        default: 58465,
+        min: 1,
+        max: 65535,
+    },
+};
+
+const MOBILE_IOS_PAIRING_HOST_DISPLAY_NAME_SETTING: ScalarSetting = ScalarSetting {
+    key: "mobile.iOSPairingHost.displayName",
+    section: "mobile",
+    json_path: &["iOSPairingHost", "displayName"],
+    kind: ScalarSettingKind::String { default: "" },
+};
+
 const PANE_BORDER_COLOR_SETTING: ScalarSetting = ScalarSetting {
     key: "paneBorderColor",
     section: "",
@@ -2785,6 +2924,14 @@ const CONFIG_GET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "automation.socketControlMode|automation.claudeCodeIntegration|",
+    "automation.claudeBinaryPath|automation.workspaceAutoNaming|",
+    "automation.autoNamingAgent|automation.ripgrepBinaryPath|",
+    "automation.suppressSubagentNotifications|automation.ampIntegration|",
+    "automation.cursorIntegration|automation.geminiIntegration|automation.kiroIntegration|",
+    "automation.kiroNotificationLevel|automation.portBase|automation.portRange|",
+    "mobile.iOSPairingHost.enabled|mobile.iOSPairingHost.port|",
+    "mobile.iOSPairingHost.displayName|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
     "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
@@ -2844,6 +2991,14 @@ const CONFIG_SET_USAGE: &str = concat!(
     "terminal.runawayMemoryGuardrail.enabled|terminal.runawayMemoryGuardrail.thresholdGB|",
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
+    "automation.socketControlMode|automation.claudeCodeIntegration|",
+    "automation.claudeBinaryPath|automation.workspaceAutoNaming|",
+    "automation.autoNamingAgent|automation.ripgrepBinaryPath|",
+    "automation.suppressSubagentNotifications|automation.ampIntegration|",
+    "automation.cursorIntegration|automation.geminiIntegration|automation.kiroIntegration|",
+    "automation.kiroNotificationLevel|automation.portBase|automation.portRange|",
+    "mobile.iOSPairingHost.enabled|mobile.iOSPairingHost.port|",
+    "mobile.iOSPairingHost.displayName|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
     "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
@@ -3001,6 +3156,12 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("integrations.") {
         return integrations_scalar_setting(raw);
     }
+    if raw.starts_with("automation.") {
+        return automation_scalar_setting(raw);
+    }
+    if raw.starts_with("mobile.") {
+        return mobile_scalar_setting(raw);
+    }
     if raw.starts_with("terminal.") {
         return terminal_scalar_setting(raw);
     }
@@ -3083,6 +3244,43 @@ fn integrations_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "integrations.suppressSubagentNotifications" => {
             Some(INTEGRATIONS_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING)
         }
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX automation catalog keys to nested JSON descriptors.
+// inputs: Raw `automation.*` config key from CLI arguments.
+// returns/effects: Returns the supported non-secret descriptor or None.
+fn automation_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "automation.socketControlMode" => Some(AUTOMATION_SOCKET_CONTROL_MODE_SETTING),
+        "automation.claudeCodeIntegration" => Some(AUTOMATION_CLAUDE_CODE_INTEGRATION_SETTING),
+        "automation.claudeBinaryPath" => Some(AUTOMATION_CLAUDE_BINARY_PATH_SETTING),
+        "automation.workspaceAutoNaming" => Some(AUTOMATION_WORKSPACE_AUTO_NAMING_SETTING),
+        "automation.autoNamingAgent" => Some(AUTOMATION_AUTO_NAMING_AGENT_SETTING),
+        "automation.ripgrepBinaryPath" => Some(AUTOMATION_RIPGREP_BINARY_PATH_SETTING),
+        "automation.suppressSubagentNotifications" => {
+            Some(AUTOMATION_SUPPRESS_SUBAGENT_NOTIFICATIONS_SETTING)
+        }
+        "automation.ampIntegration" => Some(AUTOMATION_AMP_INTEGRATION_SETTING),
+        "automation.cursorIntegration" => Some(AUTOMATION_CURSOR_INTEGRATION_SETTING),
+        "automation.geminiIntegration" => Some(AUTOMATION_GEMINI_INTEGRATION_SETTING),
+        "automation.kiroIntegration" => Some(AUTOMATION_KIRO_INTEGRATION_SETTING),
+        "automation.kiroNotificationLevel" => Some(AUTOMATION_KIRO_NOTIFICATION_LEVEL_SETTING),
+        "automation.portBase" => Some(AUTOMATION_PORT_BASE_SETTING),
+        "automation.portRange" => Some(AUTOMATION_PORT_RANGE_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX mobile catalog keys to nested JSON descriptors.
+// inputs: Raw `mobile.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown mobile keys.
+fn mobile_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "mobile.iOSPairingHost.enabled" => Some(MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING),
+        "mobile.iOSPairingHost.port" => Some(MOBILE_IOS_PAIRING_HOST_PORT_SETTING),
+        "mobile.iOSPairingHost.displayName" => Some(MOBILE_IOS_PAIRING_HOST_DISPLAY_NAME_SETTING),
         _ => None,
     }
 }
@@ -20900,6 +21098,114 @@ mod cli_arg_tests {
         let err = render_config_scalar_get(&path, INTEGRATIONS_RIPGREP_CUSTOM_BINARY_PATH_SETTING)
             .expect_err("invalid existing ripgrep path");
         assert!(err.to_string().contains("must be a string"));
+    }
+
+    // purpose: Verify CMUX automation catalog settings defaults and nested writes.
+    // inputs: Temporary settings file plus automation scalar config descriptors.
+    // returns/effects: Asserts get/set output, nested JSON shape, and sibling preservation.
+    #[test]
+    fn config_automation_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, AUTOMATION_SOCKET_CONTROL_MODE_SETTING)
+            .expect("get socket mode default");
+        assert!(text.contains("automation.socketControlMode = cmuxOnly"));
+        let text = render_config_scalar_get(&path, AUTOMATION_WORKSPACE_AUTO_NAMING_SETTING)
+            .expect("get auto naming default");
+        assert!(text.contains("automation.workspaceAutoNaming = false"));
+        let text = render_config_scalar_get(&path, AUTOMATION_PORT_BASE_SETTING)
+            .expect("get port base default");
+        assert!(text.contains("automation.portBase = 9100"));
+
+        fs::write(
+            &path,
+            br#"{"automation":{"keep":"yes"},"custom":{"ok":true}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, AUTOMATION_SOCKET_CONTROL_MODE_SETTING, "password")
+            .expect("set socket mode");
+        render_config_scalar_set(&path, AUTOMATION_CLAUDE_CODE_INTEGRATION_SETTING, "false")
+            .expect("set claude integration");
+        render_config_scalar_set(&path, AUTOMATION_AUTO_NAMING_AGENT_SETTING, "codex")
+            .expect("set auto naming agent");
+        render_config_scalar_set(&path, AUTOMATION_KIRO_NOTIFICATION_LEVEL_SETTING, "verbose")
+            .expect("set kiro notification level");
+        render_config_scalar_set(&path, AUTOMATION_PORT_RANGE_SETTING, "24")
+            .expect("set port range");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["automation"]["socketControlMode"], "password");
+        assert_eq!(
+            parsed["automation"]["claudeCodeIntegration"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["automation"]["autoNamingAgent"], "codex");
+        assert_eq!(parsed["automation"]["kiroNotificationLevel"], "verbose");
+        assert_eq!(parsed["automation"]["portRange"], 24);
+        assert_eq!(parsed["automation"]["keep"], "yes");
+        assert_eq!(parsed["custom"]["ok"], Value::Bool(true));
+    }
+
+    // purpose: Verify CMUX mobile catalog settings defaults and nested writes.
+    // inputs: Temporary settings file plus mobile scalar config descriptors.
+    // returns/effects: Asserts release defaults and nested iOSPairingHost writes.
+    #[test]
+    fn config_mobile_scalar_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING)
+            .expect("get pairing enabled default");
+        assert!(text.contains("mobile.iOSPairingHost.enabled = false"));
+        let text = render_config_scalar_get(&path, MOBILE_IOS_PAIRING_HOST_PORT_SETTING)
+            .expect("get pairing port default");
+        assert!(text.contains("mobile.iOSPairingHost.port = 58465"));
+
+        render_config_scalar_set(&path, MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING, "true")
+            .expect("set pairing enabled");
+        render_config_scalar_set(&path, MOBILE_IOS_PAIRING_HOST_PORT_SETTING, "58466")
+            .expect("set pairing port");
+        render_config_scalar_set(
+            &path,
+            MOBILE_IOS_PAIRING_HOST_DISPLAY_NAME_SETTING,
+            "Dev Linux",
+        )
+        .expect("set pairing display name");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(
+            parsed["mobile"]["iOSPairingHost"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["mobile"]["iOSPairingHost"]["port"], 58466);
+        assert_eq!(
+            parsed["mobile"]["iOSPairingHost"]["displayName"],
+            "Dev Linux"
+        );
+    }
+
+    // purpose: Verify malformed CMUX automation and mobile scalar values fail loudly.
+    // inputs: Invalid enum, boolean, and port values.
+    // returns/effects: Asserts config setters reject unsafe or malformed values.
+    #[test]
+    fn config_automation_and_mobile_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, AUTOMATION_SOCKET_CONTROL_MODE_SETTING, "open")
+            .expect_err("invalid socket mode");
+        assert!(err.to_string().contains("must be one of"));
+
+        let err = render_config_scalar_set(&path, AUTOMATION_PORT_BASE_SETTING, "0")
+            .expect_err("invalid port base");
+        assert!(err.to_string().contains("must be a positive number"));
+
+        let err = render_config_scalar_set(&path, MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING, "yes")
+            .expect_err("invalid mobile boolean");
+        assert!(err.to_string().contains("requires true or false"));
     }
 
     // purpose: Verify CMUX markdown config keys expose upstream defaults and nested writes.
