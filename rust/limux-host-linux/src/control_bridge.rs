@@ -36,6 +36,7 @@ const METHODS: &[&str] = &[
     "auth.login",
     "auth.status",
     "agent_hibernation",
+    "mobile.terminal.set_font",
     "reload_config",
     "config.reload",
     "settings.open",
@@ -2991,6 +2992,30 @@ fn parse_agent_hibernation_enabled(params: &Map<String, Value>) -> Result<bool, 
     }
 }
 
+// purpose: Validate CMUX mobile terminal font requests.
+// inputs: JSON params with font_size plus optional surface/workspace targets.
+// returns/effects: Returns a no-device payload until a real mobile device bridge exists.
+fn handle_mobile_terminal_set_font(params: &Map<String, Value>) -> Result<Value, BridgeError> {
+    let font_size = required_f64(params, "font_size", "mobile.terminal.set_font")?;
+    if font_size <= 0.0 {
+        return Err(BridgeError::invalid_params(
+            "mobile.terminal.set_font font_size must be positive",
+        ));
+    }
+    let mut result = Map::new();
+    result.insert("ok".to_string(), json!(true));
+    result.insert("delivered".to_string(), json!(false));
+    result.insert("font_size".to_string(), json!(font_size));
+    result.insert("reason".to_string(), json!("no_mobile_device_connected"));
+    if let Some(surface_id) = optional_string(params, &["surface_id", "surface"]) {
+        result.insert("surface_id".to_string(), json!(surface_id));
+    }
+    if let Some(workspace_id) = optional_string(params, &["workspace_id", "workspace"]) {
+        result.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    Ok(Value::Object(result))
+}
+
 // purpose: Parse CMUX `workspace.reorder` placement target.
 // inputs: Socket params containing one of index, before_workspace_id, or after_workspace_id.
 // returns/effects: Returns a strict reorder target or a loud validation error.
@@ -3327,6 +3352,12 @@ fn handle_method(
             };
             let (reply, rx) = mpsc::channel();
             (ControlCommand::AgentHibernation { enabled, reply }, rx)
+        }
+        "mobile.terminal.set_font" => {
+            return match handle_mobile_terminal_set_font(params) {
+                Ok(result) => V2Response::success(id, result),
+                Err(error) => error_response(id, error),
+            };
         }
         "settings.open" => {
             let target = match parse_settings_target(params) {
@@ -6096,6 +6127,11 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_mobile_terminal_set_font_method() {
+        assert!(METHODS.contains(&"mobile.terminal.set_font"));
+    }
+
+    #[test]
     fn capabilities_include_feed_methods() {
         assert!(METHODS.contains(&"feed.push"));
         assert!(METHODS.contains(&"feed.clear"));
@@ -6412,6 +6448,40 @@ mod tests {
         let invalid = dispatch_request(
             r#"{"id":1,"method":"agent_hibernation","params":{"action":"maybe"}}"#,
             &|command| panic!("invalid agent-hibernation should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
+    }
+
+    #[test]
+    fn mobile_terminal_set_font_returns_no_device_payload() {
+        let request = json!({
+            "id": 1,
+            "method": "mobile.terminal.set_font",
+            "params": {
+                "font_size": 13.5,
+                "surface_id": "surface:1:tab",
+                "workspace_id": "workspace:abc",
+            },
+        })
+        .to_string();
+        let response = dispatch_request(&request, &|command| {
+            panic!("mobile set-font should not dispatch without a mobile backend: {command:?}")
+        });
+        assert_eq!(response.error, None);
+        let result = response.result.expect("mobile result");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["delivered"], false);
+        assert_eq!(result["font_size"], 13.5);
+        assert_eq!(result["reason"], "no_mobile_device_connected");
+        assert_eq!(result["surface_id"], "surface:1:tab");
+        assert_eq!(result["workspace_id"], "workspace:abc");
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"mobile.terminal.set_font","params":{"font_size":0}}"#,
+            &|command| panic!("invalid mobile set-font should not dispatch: {command:?}"),
         );
         assert_eq!(
             invalid.error.as_ref().map(|error| error.code),

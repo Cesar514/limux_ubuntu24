@@ -406,6 +406,7 @@ fn full_help_text() -> &'static str {
         "  config surface-tab-bar-font-size [points]\n",
         "  disable-browser | enable-browser | browser-status\n",
         "  agent-hibernation <on|off>\n",
+        "  mobile set-font <points> [--surface <id>] [--workspace <id>]\n",
         "  shortcuts\n",
         "  themes [list|set|clear]\n",
         "  sessions list [--agent <name>] [--state-dir <path>] [--json]\n",
@@ -9619,6 +9620,93 @@ fn parse_agent_hibernation_args(args: &[String]) -> Result<bool> {
         "on" | "enable" => Ok(true),
         "off" | "disable" => Ok(false),
         _ => bail!("Usage: limux agent-hibernation <on|off> [--json]"),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MobileSetFontRequest {
+    size_arg: String,
+    params: Value,
+}
+
+// purpose: Parse CMUX `mobile set-font` request arguments.
+// inputs: Arguments after the top-level `mobile` command.
+// returns/effects: Returns JSON-RPC params or fails with the CMUX-shaped usage string.
+fn parse_mobile_set_font_args(args: &[String]) -> Result<MobileSetFontRequest> {
+    let usage = "Usage: limux mobile set-font <points> [--surface <id>] [--workspace <id>]";
+    if args.first().map(String::as_str) != Some("set-font") {
+        bail!("{usage}");
+    }
+    let mut size_arg: Option<String> = None;
+    let mut surface_id: Option<String> = None;
+    let mut workspace_id: Option<String> = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--surface=") {
+            surface_id = Some(non_empty_mobile_option(value, usage)?);
+            index += 1;
+        } else if arg == "--surface" {
+            let value = args.get(index + 1).ok_or_else(|| anyhow!("{usage}"))?;
+            surface_id = Some(non_empty_mobile_option(value, usage)?);
+            index += 2;
+        } else if let Some(value) = arg.strip_prefix("--workspace=") {
+            workspace_id = Some(non_empty_mobile_option(value, usage)?);
+            index += 1;
+        } else if arg == "--workspace" {
+            let value = args.get(index + 1).ok_or_else(|| anyhow!("{usage}"))?;
+            workspace_id = Some(non_empty_mobile_option(value, usage)?);
+            index += 2;
+        } else if arg.starts_with("--") {
+            bail!("{usage}");
+        } else if size_arg.is_none() {
+            size_arg = Some(arg.clone());
+            index += 1;
+        } else {
+            bail!("{usage}");
+        }
+    }
+    let size_arg = size_arg.ok_or_else(|| anyhow!("{usage}"))?;
+    let size = size_arg.parse::<f64>().map_err(|_| anyhow!("{usage}"))?;
+    if !size.is_finite() || size <= 0.0 {
+        bail!("{usage}");
+    }
+    let mut params = Map::new();
+    params.insert("font_size".to_string(), json!(size));
+    if let Some(surface_id) = surface_id {
+        params.insert("surface_id".to_string(), json!(surface_id));
+    }
+    if let Some(workspace_id) = workspace_id {
+        params.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    Ok(MobileSetFontRequest {
+        size_arg,
+        params: Value::Object(params),
+    })
+}
+
+// purpose: Validate a non-empty mobile command option value.
+// inputs: Raw value and the full usage string for diagnostics.
+// returns/effects: Returns the value or fails loudly when an option value is missing.
+fn non_empty_mobile_option(value: &str, usage: &str) -> Result<String> {
+    if value.trim().is_empty() || value.starts_with("--") {
+        bail!("{usage}");
+    }
+    Ok(value.to_string())
+}
+
+// purpose: Render CMUX-compatible mobile set-font text.
+// inputs: Original font-size token plus host response payload.
+// returns/effects: Returns CMUX text for delivered and no-device outcomes.
+fn render_mobile_set_font_text(size_arg: &str, payload: &Value) -> String {
+    let delivered = payload
+        .get("delivered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if delivered {
+        format!("Set mobile terminal font to {size_arg}pt on connected device(s).")
+    } else {
+        format!("Set mobile terminal font to {size_arg}pt (no iOS device is currently connected).")
     }
 }
 
@@ -19240,6 +19328,17 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
                 CommandOutput::Text("OK".to_string())
             }
         }
+        "mobile" => {
+            let request = parse_mobile_set_font_args(args)?;
+            let payload = client
+                .call("mobile.terminal.set_font", request.params)
+                .await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text(render_mobile_set_font_text(&request.size_arg, &payload))
+            }
+        }
         "markdown" => return run_markdown(client, args, opts.json_output).await,
         "capabilities" | "current-workspace" | "select-workspace" | "select-window" | "selectw" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
@@ -20403,6 +20502,50 @@ mod cli_arg_tests {
             assert!(error
                 .to_string()
                 .contains("Usage: limux agent-hibernation <on|off> [--json]"));
+        }
+    }
+
+    // purpose: Verify CMUX mobile set-font parser and no-device text rendering.
+    // inputs: Valid surface/workspace options plus malformed font-size and option forms.
+    // returns/effects: Asserts JSON-RPC params and CMUX usage errors without contacting a host.
+    #[test]
+    fn mobile_set_font_args_parse_cmux_surface_and_workspace_options() {
+        let request = parse_mobile_set_font_args(&args(&[
+            "set-font",
+            "13.5",
+            "--surface=surface:1:tab",
+            "--workspace",
+            "workspace:abc",
+        ]))
+        .expect("mobile set-font parses");
+        assert_eq!(request.size_arg, "13.5");
+        assert_eq!(request.params["font_size"], json!(13.5));
+        assert_eq!(request.params["surface_id"], json!("surface:1:tab"));
+        assert_eq!(request.params["workspace_id"], json!("workspace:abc"));
+        assert_eq!(
+            render_mobile_set_font_text(&request.size_arg, &json!({"delivered": false})),
+            "Set mobile terminal font to 13.5pt (no iOS device is currently connected)."
+        );
+        assert_eq!(
+            render_mobile_set_font_text(&request.size_arg, &json!({"delivered": true})),
+            "Set mobile terminal font to 13.5pt on connected device(s)."
+        );
+
+        for invalid in [
+            args(&[]),
+            args(&["status"]),
+            args(&["set-font"]),
+            args(&["set-font", "0"]),
+            args(&["set-font", "nan"]),
+            args(&["set-font", "12", "13"]),
+            args(&["set-font", "12", "--surface"]),
+            args(&["set-font", "12", "--workspace", "--surface", "surface:1"]),
+            args(&["set-font", "12", "--unknown", "x"]),
+        ] {
+            let error = parse_mobile_set_font_args(&invalid).expect_err("invalid args fail");
+            assert!(error.to_string().contains(
+                "Usage: limux mobile set-font <points> [--surface <id>] [--workspace <id>]"
+            ));
         }
     }
 
