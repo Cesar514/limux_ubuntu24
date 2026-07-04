@@ -31,6 +31,7 @@ const CLI_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_STATE_LOCK_RETRY: Duration = Duration::from_millis(25);
 const PRIVATE_CLI_DIR_MODE: u32 = 0o700;
 const WAIT_MARKER_MODE: u32 = 0o600;
+const SECRET_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdFormat {
@@ -1845,6 +1846,12 @@ struct ScalarSetting {
     kind: ScalarSettingKind,
 }
 
+#[derive(Clone, Copy)]
+struct SecretFileSetting {
+    key: &'static str,
+    file_name: &'static str,
+}
+
 const AGENT_PERMISSION_PROMPT_SETTING: NotificationSetting = NotificationSetting {
     key: "notifications.agentPermissionPrompt",
     json_key: "agentPermissionPrompt",
@@ -2188,6 +2195,11 @@ const AUTOMATION_SOCKET_CONTROL_MODE_SETTING: ScalarSetting = ScalarSetting {
         default: "cmuxOnly",
         allowed: SOCKET_CONTROL_MODES,
     },
+};
+
+const AUTOMATION_SOCKET_PASSWORD_SETTING: SecretFileSetting = SecretFileSetting {
+    key: "automation.socketPassword",
+    file_name: "socket-control-password",
 };
 
 const AUTOMATION_CLAUDE_CODE_INTEGRATION_SETTING: ScalarSetting = ScalarSetting {
@@ -3276,7 +3288,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "automation.socketControlMode|automation.claudeCodeIntegration|",
-    "automation.claudeBinaryPath|automation.workspaceAutoNaming|",
+    "automation.socketPassword|automation.claudeBinaryPath|automation.workspaceAutoNaming|",
     "automation.autoNamingAgent|automation.ripgrepBinaryPath|",
     "automation.suppressSubagentNotifications|automation.ampIntegration|",
     "automation.cursorIntegration|automation.geminiIntegration|automation.kiroIntegration|",
@@ -3359,7 +3371,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "customSidebars.renderer|customSidebars.beta.enabled|rightSidebar.beta.feed.enabled|",
     "rightSidebar.beta.dock.enabled|extensions.beta.enabled|remoteTmux.beta.enabled|",
     "automation.socketControlMode|automation.claudeCodeIntegration|",
-    "automation.claudeBinaryPath|automation.workspaceAutoNaming|",
+    "automation.socketPassword|automation.claudeBinaryPath|automation.workspaceAutoNaming|",
     "automation.autoNamingAgent|automation.ripgrepBinaryPath|",
     "automation.suppressSubagentNotifications|automation.ampIntegration|",
     "automation.cursorIntegration|automation.geminiIntegration|automation.kiroIntegration|",
@@ -3520,6 +3532,16 @@ fn numeric_setting(raw: &str) -> Option<NumericSetting> {
     match raw {
         "sidebar.rightMaxWidth" => Some(SIDEBAR_RIGHT_MAX_WIDTH_SETTING),
         "sidebar.rightMaxWidth.remembered" => Some(SIDEBAR_REMEMBERED_RIGHT_MAX_WIDTH_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX secret-file settings to local descriptors.
+// inputs: Raw config key from CLI arguments.
+// returns/effects: Returns supported secret settings without exposing values in JSON config.
+fn secret_file_setting(raw: &str) -> Option<SecretFileSetting> {
+    match raw {
+        "automation.socketPassword" => Some(AUTOMATION_SOCKET_PASSWORD_SETTING),
         _ => None,
     }
 }
@@ -5023,6 +5045,85 @@ fn render_config_scalar_set(path: &Path, setting: ScalarSetting, raw: &str) -> R
     ))
 }
 
+// purpose: Render CMUX-compatible secret-file config status without printing the secret.
+// inputs: Secret descriptor and runtime auth password path.
+// returns/effects: Returns configured/unset state plus backing path.
+fn render_config_secret_file_get(setting: SecretFileSetting) -> Result<String> {
+    let path = secret_file_setting_path(setting)?;
+    let configured = match fs::read_to_string(&path) {
+        Ok(value) => !value.trim_matches(['\n', '\r']).is_empty(),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let status = if configured { "configured" } else { "unset" };
+    Ok(format!(
+        "{} = {}\npath: {}",
+        setting.key,
+        status,
+        path.display()
+    ))
+}
+
+// purpose: Write or clear a CMUX-compatible secret-file setting.
+// inputs: Secret descriptor and raw password value from config set.
+// returns/effects: Writes a private 0600 file or deletes it for an empty value.
+fn render_config_secret_file_set(setting: SecretFileSetting, raw: &str) -> Result<String> {
+    let path = secret_file_setting_path(setting)?;
+    let value = raw.trim_matches(['\n', '\r']);
+    if value.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+        return Ok(format!(
+            "OK {} = unset (cleared)\nRun `limux config reload` to apply it.\npath: {}",
+            setting.key,
+            path.display()
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("secret path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(PRIVATE_CLI_DIR_MODE))
+        .with_context(|| format!("failed to lock down {}", parent.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(SECRET_FILE_MODE)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(value.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("failed to terminate {}", path.display()))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .with_context(|| format!("failed to lock down {}", path.display()))?;
+    Ok(format!(
+        "OK {} = configured (saved)\nRun `limux config reload` to apply it.\npath: {}",
+        setting.key,
+        path.display()
+    ))
+}
+
+// purpose: Resolve the backing path for a CMUX secret-file setting.
+// inputs: Secret descriptor.
+// returns/effects: Returns Limux runtime auth's socket-password path or errors loudly.
+fn secret_file_setting_path(setting: SecretFileSetting) -> Result<PathBuf> {
+    match setting.file_name {
+        "socket-control-password" => {
+            auth::socket_password_file_path().context("failed to resolve socket password file path")
+        }
+        other => bail!("unsupported secret file setting {}", other),
+    }
+}
+
 // purpose: Return the CMUX default value for supported notification config keys.
 // inputs: Supported notification setting descriptor.
 // returns/effects: Returns the default as rendered text.
@@ -6286,6 +6387,9 @@ fn run_config_command(args: &[String], json_output: bool) -> Result<CommandOutpu
             if let Some(setting) = numeric_setting(key) {
                 return Ok(CommandOutput::Text(render_config_numeric_get(&path, setting)?));
             }
+            if let Some(setting) = secret_file_setting(key) {
+                return Ok(CommandOutput::Text(render_config_secret_file_get(setting)?));
+            }
             if let Some(setting) = scalar_setting(key) {
                 return Ok(CommandOutput::Text(render_config_scalar_get(&path, setting)?));
             }
@@ -6333,6 +6437,11 @@ fn run_config_command(args: &[String], json_output: bool) -> Result<CommandOutpu
             if let Some(setting) = numeric_setting(key) {
                 return Ok(CommandOutput::Text(render_config_numeric_set(
                     &path, setting, value,
+                )?));
+            }
+            if let Some(setting) = secret_file_setting(key) {
+                return Ok(CommandOutput::Text(render_config_secret_file_set(
+                    setting, value,
                 )?));
             }
             if let Some(setting) = scalar_setting(key) {
@@ -21985,6 +22094,50 @@ mod cli_arg_tests {
         assert_eq!(parsed["automation"]["portRange"], 24);
         assert_eq!(parsed["automation"]["keep"], "yes");
         assert_eq!(parsed["custom"]["ok"], Value::Bool(true));
+    }
+
+    // purpose: Verify CMUX automation.socketPassword uses a private secret file.
+    // inputs: Temporary XDG state home and the secret-file config renderer.
+    // returns/effects: Writes, reads through runtime auth, and clears the 0600 password file.
+    #[test]
+    fn config_automation_socket_password_uses_secret_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_home = dir.path().join("state");
+        let state_home_text = state_home.to_str().expect("state home");
+        let _state = EnvGuard::set("XDG_STATE_HOME", state_home_text);
+        let _password = EnvGuard::set("CMUX_SOCKET_PASSWORD", "");
+
+        let text = render_config_secret_file_get(AUTOMATION_SOCKET_PASSWORD_SETTING)
+            .expect("get unset socket password");
+        assert!(text.contains("automation.socketPassword = unset"));
+
+        let text = render_config_secret_file_set(AUTOMATION_SOCKET_PASSWORD_SETTING, "hunter2")
+            .expect("set socket password");
+        assert!(text.contains("automation.socketPassword = configured"));
+        let password_path = state_home.join("limux/socket-control-password");
+        assert_eq!(
+            fs::read_to_string(&password_path).expect("read secret"),
+            "hunter2\n"
+        );
+        assert_eq!(
+            fs::metadata(&password_path)
+                .expect("secret metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            SECRET_FILE_MODE
+        );
+        assert_eq!(
+            auth::socket_password_from_env_or_file(None)
+                .expect("runtime auth reads secret")
+                .as_deref(),
+            Some("hunter2")
+        );
+
+        let text = render_config_secret_file_set(AUTOMATION_SOCKET_PASSWORD_SETTING, "")
+            .expect("clear socket password");
+        assert!(text.contains("automation.socketPassword = unset"));
+        assert!(!password_path.exists());
     }
 
     // purpose: Verify CMUX mobile catalog settings defaults and nested writes.
