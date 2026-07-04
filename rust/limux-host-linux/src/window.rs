@@ -7815,15 +7815,39 @@ fn sidebar_branch_directory_label(
     path: &str,
     branch: &str,
     layout: app_config::SidebarBranchLayout,
+    stack_branch_directory: bool,
+    path_last_segment_only: bool,
 ) -> String {
-    let display_path = abbreviate_path(path);
+    let display_path = if path_last_segment_only {
+        sidebar_path_last_segment(path)
+    } else {
+        abbreviate_path(path)
+    };
     if branch == "none" || branch.is_empty() {
         return display_path;
+    }
+    if stack_branch_directory {
+        return format!("branch: {branch}\n{display_path}");
     }
     match layout {
         app_config::SidebarBranchLayout::Vertical => format!("branch: {branch}\n{display_path}"),
         app_config::SidebarBranchLayout::Inline => format!("{branch} - {display_path}"),
     }
+}
+
+/// purpose: Render the trailing folder segment for CMUX sidebar path-last-segment mode.
+/// inputs: Workspace path string from session or workspace metadata.
+/// returns/effects: Returns a display-only segment without touching filesystem state.
+fn sidebar_path_last_segment(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return path.to_string();
+    }
+    trimmed
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// purpose: Render the full tooltip for a sidebar branch/directory row.
@@ -11062,7 +11086,13 @@ fn apply_sidebar_detail_labels(
     }
     if let Some(path) = folder_path.filter(|_| show_details) {
         let branch = sidebar_git_branch(Some(path));
-        let label = sidebar_branch_directory_label(path, &branch, sidebar.branch_layout);
+        let label = sidebar_branch_directory_label(
+            path,
+            &branch,
+            sidebar.branch_layout,
+            sidebar.stack_branch_directory,
+            sidebar.path_last_segment_only,
+        );
         let tooltip = sidebar_branch_directory_tooltip(path, &branch);
         path_label.set_label(&label);
         path_label.set_tooltip_text(Some(&tooltip));
@@ -21260,17 +21290,41 @@ mod tests {
             sidebar_branch_directory_label(
                 "/tmp/project",
                 "feature/demo",
-                SidebarBranchLayout::Vertical
+                SidebarBranchLayout::Vertical,
+                false,
+                false,
             ),
             "branch: feature/demo\n/tmp/project"
         );
         assert_eq!(
-            sidebar_branch_directory_label("/tmp/project", "main", SidebarBranchLayout::Inline),
+            sidebar_branch_directory_label(
+                "/tmp/project",
+                "main",
+                SidebarBranchLayout::Inline,
+                false,
+                false,
+            ),
             "main - /tmp/project"
         );
         assert_eq!(
-            sidebar_branch_directory_label("/tmp/project", "none", SidebarBranchLayout::Inline),
+            sidebar_branch_directory_label(
+                "/tmp/project",
+                "none",
+                SidebarBranchLayout::Inline,
+                false,
+                false,
+            ),
             "/tmp/project"
+        );
+        assert_eq!(
+            sidebar_branch_directory_label(
+                "/tmp/parent/project",
+                "main",
+                SidebarBranchLayout::Inline,
+                true,
+                true,
+            ),
+            "branch: main\nproject"
         );
         assert_eq!(
             sidebar_branch_directory_tooltip("/tmp/project", "main"),

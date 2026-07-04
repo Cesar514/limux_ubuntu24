@@ -3078,6 +3078,27 @@ const SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING: BooleanSetting = BooleanSettin
     default: true,
 };
 
+const SIDEBAR_BRANCH_VERTICAL_LAYOUT_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.branchVerticalLayout",
+    section: "sidebar",
+    json_key: "branchVerticalLayout",
+    default: true,
+};
+
+const SIDEBAR_STACK_BRANCH_DIRECTORY_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.stackBranchDirectory",
+    section: "sidebar",
+    json_key: "stackBranchDirectory",
+    default: false,
+};
+
+const SIDEBAR_PATH_LAST_SEGMENT_ONLY_SETTING: BooleanSetting = BooleanSetting {
+    key: "sidebar.pathLastSegmentOnly",
+    section: "sidebar",
+    json_key: "pathLastSegmentOnly",
+    default: false,
+};
+
 const SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING: BooleanSetting = BooleanSetting {
     key: "sidebar.showNotificationMessage",
     section: "sidebar",
@@ -3177,6 +3198,36 @@ const SIDEBAR_RIGHT_MAX_WIDTH_SETTING: NumericSetting = NumericSetting {
     max: 4096,
 };
 
+const SIDEBAR_REMEMBERED_RIGHT_MAX_WIDTH_SETTING: NumericSetting = NumericSetting {
+    key: "sidebar.rightMaxWidth.remembered",
+    section: "sidebar",
+    json_key: "rightMaxWidth.remembered",
+    default: 1200,
+    min: 276,
+    max: 4096,
+};
+
+const SIDEBAR_ACTIVE_TAB_INDICATOR_STYLE_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebar.activeTabIndicatorStyle",
+    section: "sidebar",
+    json_path: &["activeTabIndicatorStyle"],
+    kind: ScalarSettingKind::WorkspaceIndicatorStyle,
+};
+
+const SIDEBAR_SELECTION_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebar.selectionColor",
+    section: "sidebar",
+    json_path: &["selectionColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const SIDEBAR_NOTIFICATION_BADGE_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebar.notificationBadgeColor",
+    section: "sidebar",
+    json_path: &["notificationBadgeColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
 const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = PlacementSetting {
     key: "workspaceGroups.newWorkspacePlacement",
     section: "workspaceGroups",
@@ -3266,6 +3317,10 @@ const CONFIG_GET_USAGE: &str = concat!(
     "sidebar.openPullRequestLinksInCmuxBrowser|",
     "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.branchVerticalLayout|sidebar.stackBranchDirectory|",
+    "sidebar.pathLastSegmentOnly|sidebar.rightMaxWidth.remembered|",
+    "sidebar.activeTabIndicatorStyle|sidebar.selectionColor|",
+    "sidebar.notificationBadgeColor|",
     "workspaceGroups.anchorCloseSuppressed|",
     "workspaceGroups.newWorkspacePlacement>"
 );
@@ -3345,6 +3400,10 @@ const CONFIG_SET_USAGE: &str = concat!(
     "sidebar.openPullRequestLinksInCmuxBrowser|",
     "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "sidebar.branchVerticalLayout|sidebar.stackBranchDirectory|",
+    "sidebar.pathLastSegmentOnly|sidebar.rightMaxWidth.remembered|",
+    "sidebar.activeTabIndicatorStyle|sidebar.selectionColor|",
+    "sidebar.notificationBadgeColor|",
     "workspaceGroups.anchorCloseSuppressed|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
@@ -3428,6 +3487,9 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.hideAllDetails" => Some(SIDEBAR_HIDE_ALL_DETAILS_SETTING),
         "sidebar.wrapWorkspaceTitles" => Some(SIDEBAR_WRAP_WORKSPACE_TITLES_SETTING),
         "sidebar.showWorkspaceDescription" => Some(SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING),
+        "sidebar.branchVerticalLayout" => Some(SIDEBAR_BRANCH_VERTICAL_LAYOUT_SETTING),
+        "sidebar.stackBranchDirectory" => Some(SIDEBAR_STACK_BRANCH_DIRECTORY_SETTING),
+        "sidebar.pathLastSegmentOnly" => Some(SIDEBAR_PATH_LAST_SEGMENT_ONLY_SETTING),
         "sidebar.showNotificationMessage" => Some(SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING),
         "sidebar.showBranchDirectory" => Some(SIDEBAR_SHOW_BRANCH_DIRECTORY_SETTING),
         "sidebar.showPullRequests" => Some(SIDEBAR_SHOW_PULL_REQUESTS_SETTING),
@@ -3457,6 +3519,7 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
 fn numeric_setting(raw: &str) -> Option<NumericSetting> {
     match raw {
         "sidebar.rightMaxWidth" => Some(SIDEBAR_RIGHT_MAX_WIDTH_SETTING),
+        "sidebar.rightMaxWidth.remembered" => Some(SIDEBAR_REMEMBERED_RIGHT_MAX_WIDTH_SETTING),
         _ => None,
     }
 }
@@ -3510,7 +3573,22 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("canvas.") {
         return canvas_scalar_setting(raw);
     }
+    if raw.starts_with("sidebar.") {
+        return sidebar_scalar_setting(raw);
+    }
     feature_scalar_setting(raw)
+}
+
+// purpose: Map CMUX Sidebar catalog scalar keys to nested JSON descriptors.
+// inputs: Raw `sidebar.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown sidebar keys.
+fn sidebar_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "sidebar.activeTabIndicatorStyle" => Some(SIDEBAR_ACTIVE_TAB_INDICATOR_STYLE_SETTING),
+        "sidebar.selectionColor" => Some(SIDEBAR_SELECTION_COLOR_SETTING),
+        "sidebar.notificationBadgeColor" => Some(SIDEBAR_NOTIFICATION_BADGE_COLOR_SETTING),
+        _ => None,
+    }
 }
 
 // purpose: Map CMUX shortcuts catalog keys to nested JSON descriptors.
@@ -22357,6 +22435,15 @@ mod cli_arg_tests {
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING)
             .expect("get default sidebar workspace description");
         assert!(text.contains("sidebar.showWorkspaceDescription = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_BRANCH_VERTICAL_LAYOUT_SETTING)
+            .expect("get default sidebar branch vertical layout");
+        assert!(text.contains("sidebar.branchVerticalLayout = true"));
+        let text = render_config_boolean_get(&path, SIDEBAR_STACK_BRANCH_DIRECTORY_SETTING)
+            .expect("get default sidebar branch directory stacking");
+        assert!(text.contains("sidebar.stackBranchDirectory = false"));
+        let text = render_config_boolean_get(&path, SIDEBAR_PATH_LAST_SEGMENT_ONLY_SETTING)
+            .expect("get default sidebar path truncation");
+        assert!(text.contains("sidebar.pathLastSegmentOnly = false"));
         let text = render_config_boolean_get(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING)
             .expect("get default sidebar notification message");
         assert!(text.contains("sidebar.showNotificationMessage = true"));
@@ -22403,6 +22490,18 @@ mod cli_arg_tests {
         let text = render_config_numeric_get(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING)
             .expect("get default sidebar right max width");
         assert!(text.contains("sidebar.rightMaxWidth = 1200"));
+        let text = render_config_numeric_get(&path, SIDEBAR_REMEMBERED_RIGHT_MAX_WIDTH_SETTING)
+            .expect("get default remembered sidebar right max width");
+        assert!(text.contains("sidebar.rightMaxWidth.remembered = 1200"));
+        let text = render_config_scalar_get(&path, SIDEBAR_ACTIVE_TAB_INDICATOR_STYLE_SETTING)
+            .expect("get default active tab indicator style");
+        assert!(text.contains("sidebar.activeTabIndicatorStyle = leftRail"));
+        let text = render_config_scalar_get(&path, SIDEBAR_SELECTION_COLOR_SETTING)
+            .expect("get default sidebar selection color");
+        assert!(text.contains("sidebar.selectionColor = "));
+        let text = render_config_scalar_get(&path, SIDEBAR_NOTIFICATION_BADGE_COLOR_SETTING)
+            .expect("get default sidebar notification badge color");
+        assert!(text.contains("sidebar.notificationBadgeColor = "));
 
         fs::write(
             &path,
@@ -22419,6 +22518,16 @@ mod cli_arg_tests {
             render_config_boolean_set(&path, SIDEBAR_SHOW_WORKSPACE_DESCRIPTION_SETTING, "false")
                 .expect("set sidebar workspace description");
         assert!(text.contains("sidebar.showWorkspaceDescription = false"));
+        let text =
+            render_config_boolean_set(&path, SIDEBAR_BRANCH_VERTICAL_LAYOUT_SETTING, "false")
+                .expect("set sidebar branch vertical layout");
+        assert!(text.contains("sidebar.branchVerticalLayout = false"));
+        let text = render_config_boolean_set(&path, SIDEBAR_STACK_BRANCH_DIRECTORY_SETTING, "true")
+            .expect("set sidebar branch directory stacking");
+        assert!(text.contains("sidebar.stackBranchDirectory = true"));
+        let text = render_config_boolean_set(&path, SIDEBAR_PATH_LAST_SEGMENT_ONLY_SETTING, "true")
+            .expect("set sidebar path truncation");
+        assert!(text.contains("sidebar.pathLastSegmentOnly = true"));
         let text =
             render_config_boolean_set(&path, SIDEBAR_SHOW_NOTIFICATION_MESSAGE_SETTING, "false")
                 .expect("set sidebar notification message");
@@ -22471,6 +22580,24 @@ mod cli_arg_tests {
         let text = render_config_numeric_set(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING, "10000")
             .expect("set sidebar right max width");
         assert!(text.contains("sidebar.rightMaxWidth = 4096"));
+        let text =
+            render_config_numeric_set(&path, SIDEBAR_REMEMBERED_RIGHT_MAX_WIDTH_SETTING, "10000")
+                .expect("set remembered sidebar right max width");
+        assert!(text.contains("sidebar.rightMaxWidth.remembered = 4096"));
+        let text = render_config_scalar_set(
+            &path,
+            SIDEBAR_ACTIVE_TAB_INDICATOR_STYLE_SETTING,
+            "washRail",
+        )
+        .expect("set active tab indicator style alias");
+        assert!(text.contains("sidebar.activeTabIndicatorStyle = solidFill"));
+        let text = render_config_scalar_set(&path, SIDEBAR_SELECTION_COLOR_SETTING, "336699")
+            .expect("set sidebar selection color");
+        assert!(text.contains("sidebar.selectionColor = #336699"));
+        let text =
+            render_config_scalar_set(&path, SIDEBAR_NOTIFICATION_BADGE_COLOR_SETTING, "#aa5500")
+                .expect("set sidebar notification badge color");
+        assert!(text.contains("sidebar.notificationBadgeColor = #AA5500"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
@@ -22478,6 +22605,9 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["hideAllDetails"], true);
         assert_eq!(parsed["sidebar"]["wrapWorkspaceTitles"], true);
         assert_eq!(parsed["sidebar"]["showWorkspaceDescription"], false);
+        assert_eq!(parsed["sidebar"]["branchVerticalLayout"], false);
+        assert_eq!(parsed["sidebar"]["stackBranchDirectory"], true);
+        assert_eq!(parsed["sidebar"]["pathLastSegmentOnly"], true);
         assert_eq!(parsed["sidebar"]["showNotificationMessage"], false);
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], false);
         assert_eq!(parsed["sidebar"]["showPullRequests"], false);
@@ -22495,6 +22625,10 @@ mod cli_arg_tests {
         assert_eq!(parsed["sidebar"]["showProgress"], false);
         assert_eq!(parsed["sidebar"]["showLog"], false);
         assert_eq!(parsed["sidebar"]["rightMaxWidth"], 4096);
+        assert_eq!(parsed["sidebar"]["rightMaxWidth.remembered"], 4096);
+        assert_eq!(parsed["sidebar"]["activeTabIndicatorStyle"], "solidFill");
+        assert_eq!(parsed["sidebar"]["selectionColor"], "#336699");
+        assert_eq!(parsed["sidebar"]["notificationBadgeColor"], "#AA5500");
         assert_eq!(parsed["notifications"]["sound"], "Ping");
     }
 
@@ -22528,6 +22662,13 @@ mod cli_arg_tests {
         let err = render_config_numeric_set(&path, SIDEBAR_RIGHT_MAX_WIDTH_SETTING, "0")
             .expect_err("invalid width");
         assert!(err.to_string().contains("must be a positive number"));
+        let err =
+            render_config_scalar_set(&path, SIDEBAR_ACTIVE_TAB_INDICATOR_STYLE_SETTING, "dot")
+                .expect_err("invalid active tab indicator style");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, SIDEBAR_SELECTION_COLOR_SETTING, "blue")
+            .expect_err("invalid selection color");
+        assert!(err.to_string().contains("must be a #RRGGBB color"));
 
         fs::write(&path, br#"{"sidebar":{"rightMaxWidth":"1200"}}"#)
             .expect("write malformed width");

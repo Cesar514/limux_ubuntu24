@@ -1064,6 +1064,9 @@ pub struct SidebarConfig {
     pub hide_all_details: bool,
     pub wrap_workspace_titles: bool,
     pub show_workspace_description: bool,
+    pub branch_vertical_layout: bool,
+    pub stack_branch_directory: bool,
+    pub path_last_segment_only: bool,
     pub show_notification_message: bool,
     pub show_branch_directory: bool,
     pub branch_layout: SidebarBranchLayout,
@@ -1078,6 +1081,10 @@ pub struct SidebarConfig {
     pub show_progress: bool,
     pub show_log: bool,
     pub right_max_width: Option<i32>,
+    pub remembered_right_max_width: i32,
+    pub active_tab_indicator_style: WorkspaceIndicatorStyle,
+    pub selection_color: String,
+    pub notification_badge_color: String,
 }
 
 impl Default for SidebarConfig {
@@ -1086,6 +1093,9 @@ impl Default for SidebarConfig {
             hide_all_details: false,
             wrap_workspace_titles: false,
             show_workspace_description: true,
+            branch_vertical_layout: true,
+            stack_branch_directory: false,
+            path_last_segment_only: false,
             show_notification_message: true,
             show_branch_directory: true,
             branch_layout: SidebarBranchLayout::default(),
@@ -1100,6 +1110,10 @@ impl Default for SidebarConfig {
             show_progress: true,
             show_log: true,
             right_max_width: None,
+            remembered_right_max_width: 1200,
+            active_tab_indicator_style: WorkspaceIndicatorStyle::LeftRail,
+            selection_color: String::new(),
+            notification_badge_color: String::new(),
         }
     }
 }
@@ -1769,6 +1783,18 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|sidebar| sidebar.get("showWorkspaceDescription"))
         .map(|value| parse_bool_setting(value, "sidebar.showWorkspaceDescription"))
         .unwrap_or(sidebar_defaults.show_workspace_description);
+    let branch_vertical_layout = sidebar
+        .and_then(|sidebar| sidebar.get("branchVerticalLayout"))
+        .map(|value| parse_bool_setting(value, "sidebar.branchVerticalLayout"))
+        .unwrap_or(sidebar_defaults.branch_vertical_layout);
+    let stack_branch_directory = sidebar
+        .and_then(|sidebar| sidebar.get("stackBranchDirectory"))
+        .map(|value| parse_bool_setting(value, "sidebar.stackBranchDirectory"))
+        .unwrap_or(sidebar_defaults.stack_branch_directory);
+    let path_last_segment_only = sidebar
+        .and_then(|sidebar| sidebar.get("pathLastSegmentOnly"))
+        .map(|value| parse_bool_setting(value, "sidebar.pathLastSegmentOnly"))
+        .unwrap_or(sidebar_defaults.path_last_segment_only);
     let show_notification_message = sidebar
         .and_then(|sidebar| sidebar.get("showNotificationMessage"))
         .map(|value| parse_bool_setting(value, "sidebar.showNotificationMessage"))
@@ -1780,7 +1806,13 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
     let branch_layout = sidebar
         .and_then(|sidebar| sidebar.get("branchLayout"))
         .map(|value| parse_sidebar_branch_layout(value, "sidebar.branchLayout"))
-        .unwrap_or(sidebar_defaults.branch_layout);
+        .unwrap_or_else(|| {
+            if branch_vertical_layout {
+                SidebarBranchLayout::Vertical
+            } else {
+                SidebarBranchLayout::Inline
+            }
+        });
     let show_pull_requests = sidebar
         .and_then(|sidebar| sidebar.get("showPullRequests"))
         .map(|value| parse_bool_setting(value, "sidebar.showPullRequests"))
@@ -1824,6 +1856,22 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
     let right_max_width = sidebar
         .and_then(|sidebar| sidebar.get("rightMaxWidth"))
         .map(|value| parse_sidebar_right_max_width(value, "sidebar.rightMaxWidth"));
+    let remembered_right_max_width = sidebar
+        .and_then(|sidebar| sidebar.get("rightMaxWidth.remembered"))
+        .map(|value| parse_sidebar_right_max_width(value, "sidebar.rightMaxWidth.remembered"))
+        .unwrap_or(sidebar_defaults.remembered_right_max_width);
+    let active_tab_indicator_style = sidebar
+        .and_then(|sidebar| sidebar.get("activeTabIndicatorStyle"))
+        .map(|value| parse_workspace_indicator_style(value, "sidebar.activeTabIndicatorStyle"))
+        .unwrap_or(sidebar_defaults.active_tab_indicator_style);
+    let selection_color = sidebar
+        .and_then(|sidebar| sidebar.get("selectionColor"))
+        .map(|value| parse_optional_color_hex_setting(value, "sidebar.selectionColor"))
+        .unwrap_or(sidebar_defaults.selection_color);
+    let notification_badge_color = sidebar
+        .and_then(|sidebar| sidebar.get("notificationBadgeColor"))
+        .map(|value| parse_optional_color_hex_setting(value, "sidebar.notificationBadgeColor"))
+        .unwrap_or(sidebar_defaults.notification_badge_color);
 
     let notifications = root.get("notifications").and_then(Value::as_object);
     let notification_defaults = NotificationConfig::default();
@@ -1983,6 +2031,9 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             hide_all_details,
             wrap_workspace_titles,
             show_workspace_description,
+            branch_vertical_layout,
+            stack_branch_directory,
+            path_last_segment_only,
             show_notification_message,
             show_branch_directory,
             branch_layout,
@@ -1997,6 +2048,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             show_progress,
             show_log,
             right_max_width,
+            remembered_right_max_width,
+            active_tab_indicator_style,
+            selection_color,
+            notification_badge_color,
         },
         notifications: NotificationConfig {
             enabled: notifications_enabled,
@@ -3729,6 +3784,18 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.sidebar.show_workspace_description),
         ),
         (
+            "branchVerticalLayout".to_string(),
+            json!(config.sidebar.branch_vertical_layout),
+        ),
+        (
+            "stackBranchDirectory".to_string(),
+            json!(config.sidebar.stack_branch_directory),
+        ),
+        (
+            "pathLastSegmentOnly".to_string(),
+            json!(config.sidebar.path_last_segment_only),
+        ),
+        (
             "showNotificationMessage".to_string(),
             json!(config.sidebar.show_notification_message),
         ),
@@ -3771,6 +3838,22 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
             json!(config.sidebar.show_progress),
         ),
         ("showLog".to_string(), json!(config.sidebar.show_log)),
+        (
+            "rightMaxWidth.remembered".to_string(),
+            json!(config.sidebar.remembered_right_max_width),
+        ),
+        (
+            "activeTabIndicatorStyle".to_string(),
+            json!(config.sidebar.active_tab_indicator_style.as_str()),
+        ),
+        (
+            "selectionColor".to_string(),
+            json!(config.sidebar.selection_color),
+        ),
+        (
+            "notificationBadgeColor".to_string(),
+            json!(config.sidebar.notification_badge_color),
+        ),
     ]);
     if let Some(width) = config.sidebar.right_max_width {
         sidebar.insert("rightMaxWidth".to_string(), json!(width));
@@ -5014,11 +5097,14 @@ mod tests {
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(
             &path,
-            r#"{
+            r##"{
   "sidebar": {
     "hideAllDetails": true,
     "wrapWorkspaceTitles": true,
     "showWorkspaceDescription": false,
+    "branchVerticalLayout": false,
+    "stackBranchDirectory": true,
+    "pathLastSegmentOnly": true,
     "showNotificationMessage": false,
     "showBranchDirectory": false,
     "branchLayout": "inline",
@@ -5032,10 +5118,14 @@ mod tests {
     "showCustomMetadata": false,
     "showProgress": false,
     "showLog": false,
-    "rightMaxWidth": 10000
+    "rightMaxWidth": 10000,
+    "rightMaxWidth.remembered": 10000,
+    "activeTabIndicatorStyle": "washRail",
+    "selectionColor": "336699",
+    "notificationBadgeColor": "#aa5500"
   }
 }
-"#,
+"##,
         )
         .expect("write config");
 
@@ -5045,6 +5135,9 @@ mod tests {
         assert!(loaded.config.sidebar.hide_all_details);
         assert!(loaded.config.sidebar.wrap_workspace_titles);
         assert!(!loaded.config.sidebar.show_workspace_description);
+        assert!(!loaded.config.sidebar.branch_vertical_layout);
+        assert!(loaded.config.sidebar.stack_branch_directory);
+        assert!(loaded.config.sidebar.path_last_segment_only);
         assert!(!loaded.config.sidebar.show_notification_message);
         assert!(!loaded.config.sidebar.show_branch_directory);
         assert_eq!(
@@ -5067,6 +5160,13 @@ mod tests {
         assert!(!loaded.config.sidebar.show_progress);
         assert!(!loaded.config.sidebar.show_log);
         assert_eq!(loaded.config.sidebar.right_max_width, Some(4096));
+        assert_eq!(loaded.config.sidebar.remembered_right_max_width, 4096);
+        assert_eq!(
+            loaded.config.sidebar.active_tab_indicator_style,
+            WorkspaceIndicatorStyle::SolidFill
+        );
+        assert_eq!(loaded.config.sidebar.selection_color, "#336699");
+        assert_eq!(loaded.config.sidebar.notification_badge_color, "#AA5500");
     }
 
     #[test]
@@ -5150,6 +5250,34 @@ mod tests {
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
         fs::write(&path, r#"{"sidebar":{"rightMaxWidth":0}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed additional CMUX sidebar catalog settings fail loudly.
+    // inputs: Settings JSON with an unsupported sidebar active-tab indicator style.
+    // returns/effects: Panics with the explicit CMUX sidebar key error.
+    #[test]
+    #[should_panic(expected = "sidebar.activeTabIndicatorStyle must be one of")]
+    fn load_from_path_rejects_invalid_sidebar_active_tab_indicator_style() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"activeTabIndicatorStyle":"dot"}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed additional CMUX sidebar color settings fail loudly.
+    // inputs: Settings JSON with an invalid sidebar selection color.
+    // returns/effects: Panics with the explicit CMUX sidebar color key error.
+    #[test]
+    #[should_panic(expected = "sidebar.selectionColor must be a #RRGGBB color or null")]
+    fn load_from_path_rejects_invalid_sidebar_selection_color() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"sidebar":{"selectionColor":"blue"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -5882,6 +6010,9 @@ mod tests {
         config.sidebar.hide_all_details = true;
         config.sidebar.wrap_workspace_titles = true;
         config.sidebar.show_workspace_description = false;
+        config.sidebar.branch_vertical_layout = false;
+        config.sidebar.stack_branch_directory = true;
+        config.sidebar.path_last_segment_only = true;
         config.sidebar.show_notification_message = false;
         config.sidebar.show_branch_directory = false;
         config.sidebar.branch_layout = SidebarBranchLayout::Inline;
@@ -5895,6 +6026,10 @@ mod tests {
         config.sidebar.show_custom_metadata = false;
         config.sidebar.show_progress = false;
         config.sidebar.show_log = false;
+        config.sidebar.remembered_right_max_width = 1500;
+        config.sidebar.active_tab_indicator_style = WorkspaceIndicatorStyle::SolidFill;
+        config.sidebar.selection_color = "#336699".to_string();
+        config.sidebar.notification_badge_color = "#AA5500".to_string();
         save_to_path(&path, &config).expect("save sidebar");
 
         let raw = fs::read_to_string(&path).expect("read config");
@@ -5913,6 +6048,12 @@ mod tests {
             parsed["sidebar"]["showWorkspaceDescription"],
             Value::Bool(false)
         );
+        assert_eq!(
+            parsed["sidebar"]["branchVerticalLayout"],
+            Value::Bool(false)
+        );
+        assert_eq!(parsed["sidebar"]["stackBranchDirectory"], Value::Bool(true));
+        assert_eq!(parsed["sidebar"]["pathLastSegmentOnly"], Value::Bool(true));
         assert_eq!(parsed["sidebar"]["showBranchDirectory"], Value::Bool(false));
         assert_eq!(
             parsed["sidebar"]["branchLayout"],
@@ -5937,6 +6078,22 @@ mod tests {
         assert_eq!(parsed["sidebar"]["showCustomMetadata"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showProgress"], Value::Bool(false));
         assert_eq!(parsed["sidebar"]["showLog"], Value::Bool(false));
+        assert_eq!(
+            parsed["sidebar"]["rightMaxWidth.remembered"],
+            Value::Number(1500.into())
+        );
+        assert_eq!(
+            parsed["sidebar"]["activeTabIndicatorStyle"],
+            Value::String("solidFill".to_string())
+        );
+        assert_eq!(
+            parsed["sidebar"]["selectionColor"],
+            Value::String("#336699".to_string())
+        );
+        assert_eq!(
+            parsed["sidebar"]["notificationBadgeColor"],
+            Value::String("#AA5500".to_string())
+        );
     }
 
     // purpose: Verify saving writes optional CMUX right sidebar maximum width.
