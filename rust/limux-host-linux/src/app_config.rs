@@ -1169,6 +1169,7 @@ impl WorkspaceGroupNewPlacement {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkspaceGroupsConfig {
+    pub anchor_close_suppressed: bool,
     pub new_workspace_placement: WorkspaceGroupNewPlacement,
     pub by_cwd: Vec<WorkspaceGroupCwdConfig>,
 }
@@ -3062,11 +3063,16 @@ fn parse_workspace_groups_config(value: &Value) -> WorkspaceGroupsConfig {
         .get("newWorkspacePlacement")
         .map(|value| parse_workspace_new_placement(value, "workspaceGroups.newWorkspacePlacement"))
         .unwrap_or_default();
+    let anchor_close_suppressed = object
+        .get("anchorCloseSuppressed")
+        .map(|value| parse_bool_setting(value, "workspaceGroups.anchorCloseSuppressed"))
+        .unwrap_or_default();
     let by_cwd = object
         .get("byCwd")
         .map(parse_workspace_group_cwd_configs)
         .unwrap_or_default();
     WorkspaceGroupsConfig {
+        anchor_close_suppressed,
         new_workspace_placement,
         by_cwd,
     }
@@ -3808,6 +3814,13 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     if !workspace_groups.is_object() {
         *workspace_groups = json!({});
     }
+    workspace_groups
+        .as_object_mut()
+        .expect("workspaceGroups object")
+        .insert(
+            "anchorCloseSuppressed".to_string(),
+            json!(config.workspace_groups.anchor_close_suppressed),
+        );
     workspace_groups
         .as_object_mut()
         .expect("workspaceGroups object")
@@ -5450,6 +5463,7 @@ mod tests {
             &path,
             r#"{
   "workspaceGroups": {
+    "anchorCloseSuppressed": true,
     "newWorkspacePlacement": "end",
     "byCwd": {
       "/tmp/projects": {
@@ -5471,6 +5485,7 @@ mod tests {
         let loaded = load_from_path(&path);
         let groups = &loaded.config.workspace_groups;
 
+        assert!(groups.anchor_close_suppressed);
         assert_eq!(
             groups.new_workspace_placement,
             WorkspaceGroupNewPlacement::End
@@ -5502,6 +5517,26 @@ mod tests {
             r#"{
   "workspaceGroups": {
     "newWorkspacePlacement": "middle"
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "workspaceGroups.anchorCloseSuppressed must be a boolean")]
+    fn load_from_path_rejects_invalid_workspace_group_anchor_close_suppression() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "workspaceGroups": {
+    "anchorCloseSuppressed": "true"
   }
 }
 "#,
@@ -6157,11 +6192,16 @@ mod tests {
         .expect("write config");
 
         let mut config = load_from_path(&path).config;
+        config.workspace_groups.anchor_close_suppressed = true;
         config.workspace_groups.new_workspace_placement = WorkspaceGroupNewPlacement::End;
         save_to_path(&path, &config).expect("save workspace groups");
 
         let raw = fs::read_to_string(&path).expect("read config");
         let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["workspaceGroups"]["anchorCloseSuppressed"],
+            Value::Bool(true)
+        );
         assert_eq!(
             parsed["workspaceGroups"]["newWorkspacePlacement"],
             Value::String("end".to_string())

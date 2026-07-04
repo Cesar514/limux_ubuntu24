@@ -3183,6 +3183,13 @@ const WORKSPACE_GROUP_NEW_WORKSPACE_PLACEMENT_SETTING: PlacementSetting = Placem
     json_key: "newWorkspacePlacement",
 };
 
+const WORKSPACE_GROUP_ANCHOR_CLOSE_SUPPRESSED_SETTING: BooleanSetting = BooleanSetting {
+    key: "workspaceGroups.anchorCloseSuppressed",
+    section: "workspaceGroups",
+    json_key: "anchorCloseSuppressed",
+    default: false,
+};
+
 const CONFIG_GET_USAGE: &str = concat!(
     "Usage: limux config get <sidebar-font-size|surface-tab-bar-font-size|",
     "notifications.dockBadge|notifications.showInMenuBar|",
@@ -3259,6 +3266,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "sidebar.openPullRequestLinksInCmuxBrowser|",
     "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "workspaceGroups.anchorCloseSuppressed|",
     "workspaceGroups.newWorkspacePlacement>"
 );
 const CONFIG_SET_USAGE: &str = concat!(
@@ -3337,6 +3345,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "sidebar.openPullRequestLinksInCmuxBrowser|",
     "sidebar.openPortLinksInCmuxBrowser|sidebar.showCustomMetadata|",
     "sidebar.showProgress|sidebar.showLog|sidebar.rightMaxWidth|",
+    "workspaceGroups.anchorCloseSuppressed|",
     "workspaceGroups.newWorkspacePlacement> <value>"
 );
 
@@ -3435,6 +3444,9 @@ fn boolean_setting(raw: &str) -> Option<BooleanSetting> {
         "sidebar.showCustomMetadata" => Some(SIDEBAR_SHOW_CUSTOM_METADATA_SETTING),
         "sidebar.showProgress" => Some(SIDEBAR_SHOW_PROGRESS_SETTING),
         "sidebar.showLog" => Some(SIDEBAR_SHOW_LOG_SETTING),
+        "workspaceGroups.anchorCloseSuppressed" => {
+            Some(WORKSPACE_GROUP_ANCHOR_CLOSE_SUPPRESSED_SETTING)
+        }
         _ => None,
     }
 }
@@ -21040,6 +21052,10 @@ mod cli_arg_tests {
         let text = render_config_placement_get(&path, APP_NEW_WORKSPACE_PLACEMENT_SETTING)
             .expect("get default app placement");
         assert!(text.contains("app.newWorkspacePlacement = afterCurrent"));
+        let text =
+            render_config_boolean_get(&path, WORKSPACE_GROUP_ANCHOR_CLOSE_SUPPRESSED_SETTING)
+                .expect("get default anchor close suppression");
+        assert!(text.contains("workspaceGroups.anchorCloseSuppressed = false"));
 
         fs::write(
             &path,
@@ -21056,12 +21072,20 @@ mod cli_arg_tests {
         )
         .expect("set workspace group placement");
         assert!(text.contains("workspaceGroups.newWorkspacePlacement = top"));
+        let text = render_config_boolean_set(
+            &path,
+            WORKSPACE_GROUP_ANCHOR_CLOSE_SUPPRESSED_SETTING,
+            "true",
+        )
+        .expect("set anchor close suppression");
+        assert!(text.contains("workspaceGroups.anchorCloseSuppressed = true"));
 
         let parsed: Value =
             serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
         assert_eq!(parsed["notifications"]["agentIdleReminder"], false);
         assert_eq!(parsed["app"]["newWorkspacePlacement"], "end");
         assert_eq!(parsed["workspaceGroups"]["newWorkspacePlacement"], "top");
+        assert_eq!(parsed["workspaceGroups"]["anchorCloseSuppressed"], true);
         assert_eq!(
             parsed["workspaceGroups"]["byCwd"]["/tmp/project"]["newWorkspacePlacement"],
             "top"
@@ -21082,6 +21106,13 @@ mod cli_arg_tests {
         assert!(err
             .to_string()
             .contains("must be afterCurrent, top, or end"));
+        let err = render_config_boolean_set(
+            &path,
+            WORKSPACE_GROUP_ANCHOR_CLOSE_SUPPRESSED_SETTING,
+            "yes",
+        )
+        .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
 
         fs::write(&path, br#"{"app":{"newWorkspacePlacement":false}}"#)
             .expect("write malformed settings");
