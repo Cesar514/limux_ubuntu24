@@ -10353,6 +10353,34 @@ fn reload_config_for_control(state: &State) -> Result<serde_json::Value, BridgeE
     Ok(payload)
 }
 
+// purpose: Apply CMUX agent-hibernation runtime toggle and persist it to settings.
+// inputs: Shared app state and requested enabled state.
+// returns/effects: Updates live config, saves settings JSON, and returns CMUX-shaped status.
+fn set_agent_hibernation_for_control(
+    state: &State,
+    enabled: bool,
+) -> Result<serde_json::Value, BridgeError> {
+    let previous = {
+        let app_state = state.borrow();
+        let config = app_state.config.borrow().clone();
+        config
+    };
+    let mut updated = previous;
+    updated.terminal.agent_hibernation.enabled = enabled;
+    app_config::save(&updated).map_err(|error| {
+        BridgeError::internal(format!("failed to save Limux settings: {error}"))
+    })?;
+    state.borrow().config.borrow_mut().clone_from(&updated);
+    let settings_path = app_config::settings_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unavailable>".to_string());
+    Ok(serde_json::json!({
+        "ok": true,
+        "enabled": enabled,
+        "settings_path": settings_path,
+    }))
+}
+
 // purpose: Present the live host settings dialog for CMUX `settings open` parity.
 // inputs: Shared app state plus optional CMUX settings target and activation flag.
 // returns/effects: Opens a modal settings dialog and returns an acknowledgement.
@@ -14076,6 +14104,10 @@ fn handle_control_command(state: &State, command: ControlCommand) {
         }
         ControlCommand::ReloadConfig { reply } => {
             let result = reload_config_for_control(state);
+            let _ = reply.send(result);
+        }
+        ControlCommand::AgentHibernation { enabled, reply } => {
+            let result = set_agent_hibernation_for_control(state, enabled);
             let _ = reply.send(result);
         }
         ControlCommand::OpenSettings {

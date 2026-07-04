@@ -405,6 +405,7 @@ fn full_help_text() -> &'static str {
         "  config sidebar-font-size [points]\n",
         "  config surface-tab-bar-font-size [points]\n",
         "  disable-browser | enable-browser | browser-status\n",
+        "  agent-hibernation <on|off>\n",
         "  shortcuts\n",
         "  themes [list|set|clear]\n",
         "  sessions list [--agent <name>] [--state-dir <path>] [--json]\n",
@@ -5977,6 +5978,10 @@ const CMUX_HELP_USAGES: &[(&str, &str)] = &[
         "Usage: limux codex <install-hooks|uninstall-hooks>",
     ),
     (
+        "agent-hibernation",
+        "Usage: limux agent-hibernation <on|off> [--json]",
+    ),
+    (
         "codex-teams",
         "Usage: limux codex-teams [codex-args...]\n\n\
          Launch Codex with cmux-managed subagent panes.\n\n\
@@ -9600,6 +9605,20 @@ fn process_count_text(count: u64) -> String {
         "1 process".to_string()
     } else {
         format!("{count} processes")
+    }
+}
+
+// purpose: Parse CMUX agent-hibernation CLI state names.
+// inputs: Arguments after `agent-hibernation`.
+// returns/effects: Returns enabled state or fails with CMUX usage on malformed input.
+fn parse_agent_hibernation_args(args: &[String]) -> Result<bool> {
+    if args.len() != 1 {
+        bail!("Usage: limux agent-hibernation <on|off> [--json]");
+    }
+    match args[0].to_ascii_lowercase().as_str() {
+        "on" | "enable" => Ok(true),
+        "off" | "disable" => Ok(false),
+        _ => bail!("Usage: limux agent-hibernation <on|off> [--json]"),
     }
 }
 
@@ -19210,6 +19229,17 @@ async fn execute_command(client: &mut Client, opts: &GlobalOptions) -> Result<Co
             return run_codex_teams(client, args, client.password.clone()).await;
         }
         "__codex-teams-watch" => return run_codex_teams_watcher(client, args).await,
+        "agent-hibernation" => {
+            let enabled = parse_agent_hibernation_args(args)?;
+            let payload = client
+                .call("agent_hibernation", json!({ "enabled": enabled }))
+                .await?;
+            if opts.json_output {
+                CommandOutput::Json(payload)
+            } else {
+                CommandOutput::Text("OK".to_string())
+            }
+        }
         "markdown" => return run_markdown(client, args, opts.json_output).await,
         "capabilities" | "current-workspace" | "select-workspace" | "select-window" | "selectw" => {
             let Some((method, params)) = build_workspace_alias_request(command, args)? else {
@@ -20356,6 +20386,24 @@ mod cli_arg_tests {
         let panel_params =
             build_ports_kick_params(&args(&["--panel", "panel-1"])).expect("panel alias parses");
         assert_eq!(panel_params["panel_id"], json!("panel-1"));
+    }
+
+    // purpose: Verify CMUX agent-hibernation state aliases parse and malformed forms fail loudly.
+    // inputs: Valid on/off aliases plus missing/extra/unknown CLI args.
+    // returns/effects: Asserts parser output and CMUX usage errors without contacting a host.
+    #[test]
+    fn agent_hibernation_args_parse_cmux_state_aliases() {
+        assert!(parse_agent_hibernation_args(&args(&["on"])).expect("on parses"));
+        assert!(parse_agent_hibernation_args(&args(&["enable"])).expect("enable parses"));
+        assert!(!parse_agent_hibernation_args(&args(&["off"])).expect("off parses"));
+        assert!(!parse_agent_hibernation_args(&args(&["disable"])).expect("disable parses"));
+
+        for invalid in [args(&[]), args(&["on", "extra"]), args(&["maybe"])] {
+            let error = parse_agent_hibernation_args(&invalid).expect_err("invalid args fail");
+            assert!(error
+                .to_string()
+                .contains("Usage: limux agent-hibernation <on|off> [--json]"));
+        }
     }
 
     #[test]

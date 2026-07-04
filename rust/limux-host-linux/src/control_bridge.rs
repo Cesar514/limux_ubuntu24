@@ -35,6 +35,7 @@ const METHODS: &[&str] = &[
     "system.tree",
     "auth.login",
     "auth.status",
+    "agent_hibernation",
     "reload_config",
     "config.reload",
     "settings.open",
@@ -746,6 +747,10 @@ pub enum ControlCommand {
     ReloadConfig {
         reply: mpsc::Sender<BridgeResult>,
     },
+    AgentHibernation {
+        enabled: bool,
+        reply: mpsc::Sender<BridgeResult>,
+    },
     OpenSettings {
         target: Option<String>,
         activate: bool,
@@ -1125,6 +1130,7 @@ impl ControlCommand {
             | Self::MoveWorkspaceToWindow { reply, .. }
             | Self::SimulateSidebarDrag { reply, .. }
             | Self::ReloadConfig { reply }
+            | Self::AgentHibernation { reply, .. }
             | Self::OpenSettings { reply, .. }
             | Self::CurrentWorkspace { reply }
             | Self::ListWorkspaces { reply }
@@ -2964,6 +2970,27 @@ fn parse_workspace_action(params: &Map<String, Value>) -> Result<WorkspaceAction
     }
 }
 
+// purpose: Parse CMUX agent_hibernation socket params.
+// inputs: JSON params with enabled boolean or on/off action aliases.
+// returns/effects: Returns requested enabled state or a usage-shaped validation error.
+fn parse_agent_hibernation_enabled(params: &Map<String, Value>) -> Result<bool, BridgeError> {
+    if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
+        return Ok(enabled);
+    }
+    let Some(raw) = optional_string(params, &["action", "state", "value"]) else {
+        return Err(BridgeError::invalid_params(
+            "Usage: limux agent-hibernation <on|off> [--json]",
+        ));
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "enable" | "true" | "1" => Ok(true),
+        "off" | "disable" | "false" | "0" => Ok(false),
+        _ => Err(BridgeError::invalid_params(
+            "Usage: limux agent-hibernation <on|off> [--json]",
+        )),
+    }
+}
+
 // purpose: Parse CMUX `workspace.reorder` placement target.
 // inputs: Socket params containing one of index, before_workspace_id, or after_workspace_id.
 // returns/effects: Returns a strict reorder target or a loud validation error.
@@ -3292,6 +3319,14 @@ fn handle_method(
         "reload_config" | "config.reload" => {
             let (reply, rx) = mpsc::channel();
             (ControlCommand::ReloadConfig { reply }, rx)
+        }
+        "agent_hibernation" | "agent-hibernation" => {
+            let enabled = match parse_agent_hibernation_enabled(params) {
+                Ok(enabled) => enabled,
+                Err(error) => return error_response(id, error),
+            };
+            let (reply, rx) = mpsc::channel();
+            (ControlCommand::AgentHibernation { enabled, reply }, rx)
         }
         "settings.open" => {
             let target = match parse_settings_target(params) {
@@ -6056,6 +6091,11 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_include_agent_hibernation_method() {
+        assert!(METHODS.contains(&"agent_hibernation"));
+    }
+
+    #[test]
     fn capabilities_include_feed_methods() {
         assert!(METHODS.contains(&"feed.push"));
         assert!(METHODS.contains(&"feed.clear"));
@@ -6338,6 +6378,45 @@ mod tests {
             assert_eq!(response.error, None);
             assert_eq!(response.result.expect("reload result")["reloaded"], true);
         }
+    }
+
+    #[test]
+    fn agent_hibernation_routes_queue_live_command() {
+        for (method, params, expected) in [
+            ("agent_hibernation", json!({"enabled": true}), true),
+            ("agent-hibernation", json!({"action": "off"}), false),
+        ] {
+            let request = json!({
+                "id": 1,
+                "method": method,
+                "params": params,
+            })
+            .to_string();
+            let response = dispatch_request(&request, &|command| match command {
+                ControlCommand::AgentHibernation { enabled, reply } => {
+                    assert_eq!(enabled, expected);
+                    let _ = reply.send(Ok(json!({
+                        "ok": true,
+                        "enabled": enabled,
+                    })));
+                }
+                other => panic!("unexpected command: {other:?}"),
+            });
+            assert_eq!(response.error, None);
+            assert_eq!(
+                response.result.expect("agent hibernation result")["enabled"],
+                expected
+            );
+        }
+
+        let invalid = dispatch_request(
+            r#"{"id":1,"method":"agent_hibernation","params":{"action":"maybe"}}"#,
+            &|command| panic!("invalid agent-hibernation should not dispatch: {command:?}"),
+        );
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code),
+            Some(INVALID_PARAMS_CODE)
+        );
     }
 
     #[test]
