@@ -404,6 +404,7 @@ fn full_help_text() -> &'static str {
         "  config <doctor|check|validate|path|paths|docs|documentation|reload|get|set>\n",
         "  config sidebar-font-size [points]\n",
         "  config surface-tab-bar-font-size [points]\n",
+        "  disable-browser | enable-browser | browser-status\n",
         "  shortcuts\n",
         "  themes [list|set|clear]\n",
         "  sessions list [--agent <name>] [--state-dir <path>] [--json]\n",
@@ -5359,6 +5360,12 @@ fn run_local_command(opts: &GlobalOptions) -> Result<Option<CommandOutput>> {
     }
     let out = match command {
         "docs" => Some(run_docs_command(args, opts.json_output)?),
+        "disable-browser" | "enable-browser" | "browser-status" => Some(
+            run_browser_availability_command(command, args, opts.json_output)?,
+        ),
+        "browser" if is_browser_availability_subcommand(args) => Some(
+            run_browser_availability_command(command, args, opts.json_output)?,
+        ),
         "settings" if settings_command_is_local(args) => {
             Some(run_settings_command(args, opts.json_output)?)
         }
@@ -5487,6 +5494,111 @@ fn remove_feed_history_files(path: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(removed)
+}
+
+// purpose: Detect CMUX browser availability subcommands that are local settings writes.
+// inputs: Browser command arguments after the top-level `browser` command.
+// returns/effects: Returns true only for disable/enable/status availability probes.
+fn is_browser_availability_subcommand(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("disable" | "enable" | "status")
+    )
+}
+
+// purpose: Implement CMUX browser availability commands using Limux settings storage.
+// inputs: Top-level command, remaining args, and JSON output preference.
+// returns/effects: Reads or writes browser.disabled and renders CMUX-compatible status.
+fn run_browser_availability_command(
+    command: &str,
+    args: &[String],
+    json_output: bool,
+) -> Result<CommandOutput> {
+    let (action, remaining) = browser_availability_action(command, args)?;
+    if let Some(extra) = remaining.first() {
+        bail!("Unexpected argument: {extra}");
+    }
+
+    let path = limux_settings_path()?;
+    apply_browser_availability_action(&path, action)?;
+    let disabled = read_browser_disabled(&path)?;
+    browser_availability_output(action, disabled, json_output)
+}
+
+// purpose: Resolve the CMUX availability action from top-level or `browser` command forms.
+// inputs: Top-level command and remaining args.
+// returns/effects: Returns the normalized action plus unconsumed args for arity validation.
+fn browser_availability_action<'a>(
+    command: &'a str,
+    args: &'a [String],
+) -> Result<(&'a str, &'a [String])> {
+    if command == "browser" {
+        let action = args
+            .first()
+            .ok_or_else(|| anyhow!("browser requires a subcommand"))?;
+        return Ok((action.as_str(), &args[1..]));
+    }
+    Ok((command, args))
+}
+
+// purpose: Persist the requested browser availability action.
+// inputs: Settings path and CMUX action name.
+// returns/effects: Writes browser.disabled for mutating actions or fails on unknown actions.
+fn apply_browser_availability_action(path: &Path, action: &str) -> Result<()> {
+    match action {
+        "disable" | "disable-browser" => {
+            set_config_scalar_setting_at(path, BROWSER_DISABLED_SETTING, "true")?;
+        }
+        "enable" | "enable-browser" => {
+            set_config_scalar_setting_at(path, BROWSER_DISABLED_SETTING, "false")?;
+        }
+        "status" | "browser-status" => {}
+        _ => bail!("Unknown browser availability command: {action}"),
+    }
+    Ok(())
+}
+
+// purpose: Read Limux's CMUX-compatible browser availability setting as a boolean.
+// inputs: Settings path.
+// returns/effects: Fails loudly if the persisted setting cannot be parsed as a boolean.
+fn read_browser_disabled(path: &Path) -> Result<bool> {
+    let (disabled_text, _) = get_config_scalar_setting_at(path, BROWSER_DISABLED_SETTING)?;
+    let disabled = match disabled_text.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => bail!("browser.disabled must be true or false"),
+    };
+    Ok(disabled)
+}
+
+// purpose: Render CMUX-compatible browser availability output.
+// inputs: Action name, disabled state, and JSON output preference.
+// returns/effects: Returns text status or JSON payload with CMUX-shaped fields.
+fn browser_availability_output(
+    action: &str,
+    disabled: bool,
+    json_output: bool,
+) -> Result<CommandOutput> {
+    if json_output {
+        return Ok(CommandOutput::Json(json!({
+            "enabled": !disabled,
+            "disabled": disabled,
+            "domain": "limux.settings",
+            "key": BROWSER_DISABLED_SETTING.key,
+        })));
+    }
+    if matches!(action, "status" | "browser-status") {
+        return Ok(CommandOutput::Text(if disabled {
+            "disabled".to_string()
+        } else {
+            "enabled".to_string()
+        }));
+    }
+    Ok(CommandOutput::Text(if disabled {
+        "limux browser disabled".to_string()
+    } else {
+        "limux browser enabled".to_string()
+    }))
 }
 
 // purpose: Build CMUX `remote`/`remotes` registry request shapes.
@@ -5850,6 +5962,9 @@ fn is_unsupported_remote_cli_command(command: &str) -> bool {
 
 const CMUX_HELP_USAGES: &[(&str, &str)] = &[
     ("restore-session", "Usage: limux restore-session"),
+    ("disable-browser", "Usage: limux disable-browser [--json]"),
+    ("enable-browser", "Usage: limux enable-browser [--json]"),
+    ("browser-status", "Usage: limux browser-status [--json]"),
     ("open", "Usage: limux open <path-or-url>..."),
     ("feedback", "Usage: limux feedback"),
     ("feed", "Usage: limux feed tui [--opentui|--legacy]"),
@@ -20801,6 +20916,66 @@ mod cli_arg_tests {
         assert!(run_local_command(&default_opts(args(&["reload-config"])))
             .expect("reload-config local check")
             .is_none());
+    }
+
+    // purpose: Verify CMUX browser availability commands manage the Limux disabled setting.
+    // inputs: Isolated config root plus top-level and browser subcommand availability commands.
+    // returns/effects: Asserts text/JSON output, persisted setting shape, and strict arity errors.
+    #[test]
+    fn browser_availability_commands_manage_disabled_setting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_root = dir.path().join("xdg-config");
+        let _xdg_config = EnvGuard::set(
+            "XDG_CONFIG_HOME",
+            config_root.to_str().expect("utf8 xdg config path"),
+        );
+
+        let output = run_local_command(&default_opts(args(&["browser-status"])))
+            .expect("browser status succeeds")
+            .expect("browser status is local");
+        let CommandOutput::Text(text) = output else {
+            panic!("browser-status should render text");
+        };
+        assert_eq!(text, "enabled");
+
+        let output = run_local_command(&default_opts(args(&["disable-browser"])))
+            .expect("disable browser succeeds")
+            .expect("disable browser is local");
+        let CommandOutput::Text(text) = output else {
+            panic!("disable-browser should render text");
+        };
+        assert_eq!(text, "limux browser disabled");
+
+        let settings_path = config_root.join("limux/settings.json");
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&settings_path).expect("read settings"))
+                .expect("settings json");
+        assert_eq!(parsed["browser"]["disabled"], true);
+
+        let output = run_local_command(&default_opts(args(&["browser", "status"])))
+            .expect("browser status subcommand succeeds")
+            .expect("browser status subcommand is local");
+        let CommandOutput::Text(text) = output else {
+            panic!("browser status should render text");
+        };
+        assert_eq!(text, "disabled");
+
+        let mut enable_opts = default_opts(args(&["browser", "enable"]));
+        enable_opts.json_output = true;
+        let output = run_local_command(&enable_opts)
+            .expect("browser enable json succeeds")
+            .expect("browser enable is local");
+        let CommandOutput::Json(payload) = output else {
+            panic!("browser enable --json should render json");
+        };
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["disabled"], false);
+        assert_eq!(payload["domain"], "limux.settings");
+        assert_eq!(payload["key"], "browser.disabled");
+
+        let err = run_local_command(&default_opts(args(&["browser-status", "extra"])))
+            .expect_err("unexpected browser status argument");
+        assert!(err.to_string().contains("Unexpected argument: extra"));
     }
 
     // purpose: Verify CMUX-compatible JSON path output for config path aliases.
