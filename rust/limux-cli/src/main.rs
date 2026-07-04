@@ -1831,6 +1831,8 @@ enum ScalarSettingKind {
     },
     WorkspaceIndicatorStyle,
     StringArray,
+    JsonObject,
+    StringMap,
     ColorHexArray,
     ColorHexMap,
 }
@@ -2511,6 +2513,27 @@ const APP_CONFIRM_QUIT_MODES: &[&str] = &["always", "dirty-only", "never"];
 const APP_FILE_DROP_DEFAULT_BEHAVIORS: &[&str] = &["text", "preview"];
 const WORKSPACE_BUTTON_FADE_MODES: &[&str] = &["enabled", "disabled"];
 
+const SHORTCUT_SHOW_MODIFIER_HOLD_HINTS_SETTING: ScalarSetting = ScalarSetting {
+    key: "shortcuts.showModifierHoldHints",
+    section: "shortcuts",
+    json_path: &["showModifierHoldHints"],
+    kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const SHORTCUT_BINDINGS_SETTING: ScalarSetting = ScalarSetting {
+    key: "shortcuts.bindings",
+    section: "shortcuts",
+    json_path: &["bindings"],
+    kind: ScalarSettingKind::JsonObject,
+};
+
+const SHORTCUT_WHEN_SETTING: ScalarSetting = ScalarSetting {
+    key: "shortcuts.when",
+    section: "shortcuts",
+    json_path: &["when"],
+    kind: ScalarSettingKind::StringMap,
+};
+
 const APP_LANGUAGE_SETTING: ScalarSetting = ScalarSetting {
     key: "app.language",
     section: "app",
@@ -3181,6 +3204,7 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.fileDropDefaultBehavior|app.titlebarControlsStyle|",
     "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
     "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
+    "shortcuts.showModifierHoldHints|shortcuts.bindings|shortcuts.when|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
     "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
     "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
@@ -3258,6 +3282,7 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.fileDropDefaultBehavior|app.titlebarControlsStyle|",
     "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
     "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
+    "shortcuts.showModifierHoldHints|shortcuts.bindings|shortcuts.when|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
     "terminal.agentHibernation.enabled|terminal.agentHibernation.idleSeconds|",
     "terminal.agentHibernation.maxLiveTerminals|terminal.rendererRealization.enabled|",
@@ -3455,6 +3480,9 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("sidebarAppearance.") {
         return sidebar_appearance_scalar_setting(raw);
     }
+    if raw.starts_with("shortcuts.") {
+        return shortcuts_scalar_setting(raw);
+    }
     if raw.starts_with("terminal.") {
         return terminal_scalar_setting(raw);
     }
@@ -3471,6 +3499,18 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
         return canvas_scalar_setting(raw);
     }
     feature_scalar_setting(raw)
+}
+
+// purpose: Map CMUX shortcuts catalog keys to nested JSON descriptors.
+// inputs: Raw `shortcuts.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown shortcut keys.
+fn shortcuts_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "shortcuts.showModifierHoldHints" => Some(SHORTCUT_SHOW_MODIFIER_HOLD_HINTS_SETTING),
+        "shortcuts.bindings" => Some(SHORTCUT_BINDINGS_SETTING),
+        "shortcuts.when" => Some(SHORTCUT_WHEN_SETTING),
+        _ => None,
+    }
 }
 
 // purpose: Map CMUX app catalog keys to nested JSON descriptors.
@@ -4255,7 +4295,9 @@ fn default_scalar_setting_value(setting: ScalarSetting) -> Result<String> {
         | ScalarSettingKind::Enum { default, .. } => Ok(default.to_string()),
         ScalarSettingKind::WorkspaceIndicatorStyle => Ok("leftRail".to_string()),
         ScalarSettingKind::StringArray | ScalarSettingKind::ColorHexArray => Ok("[]".to_string()),
-        ScalarSettingKind::ColorHexMap => Ok("{}".to_string()),
+        ScalarSettingKind::JsonObject
+        | ScalarSettingKind::StringMap
+        | ScalarSettingKind::ColorHexMap => Ok("{}".to_string()),
     }
 }
 
@@ -4302,6 +4344,8 @@ fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value>
             parse_workspace_indicator_style(setting.key, raw)?,
         )),
         ScalarSettingKind::StringArray => parse_string_array_setting(setting.key, raw),
+        ScalarSettingKind::JsonObject => parse_json_object_setting(setting.key, raw),
+        ScalarSettingKind::StringMap => parse_string_map_setting(setting.key, raw),
         ScalarSettingKind::ColorHexArray => parse_color_hex_array_setting(setting.key, raw),
         ScalarSettingKind::ColorHexMap => parse_color_hex_map_setting(setting.key, raw),
     }
@@ -4389,6 +4433,8 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
             }
             serde_json::to_string(&strings).context("serialize string array setting")
         }
+        ScalarSettingKind::JsonObject => render_json_object_setting(setting.key, value),
+        ScalarSettingKind::StringMap => render_string_map_setting(setting.key, value),
         ScalarSettingKind::ColorHexArray => render_color_hex_array_setting(setting.key, value),
         ScalarSettingKind::ColorHexMap => render_color_hex_map_setting(setting.key, value),
     }
@@ -4492,6 +4538,24 @@ fn parse_string_array_setting(key: &str, raw: &str) -> Result<Value> {
     Ok(value)
 }
 
+// purpose: Parse CMUX JSON object settings from CLI input.
+// inputs: User-facing key and raw JSON object text.
+// returns/effects: Returns the object or rejects malformed/non-object JSON loudly.
+fn parse_json_object_setting(key: &str, raw: &str) -> Result<Value> {
+    let value: Value =
+        serde_json::from_str(raw).with_context(|| format!("{key} requires a JSON object"))?;
+    render_json_object_value(key, &value)
+}
+
+// purpose: Parse CMUX string-map settings from CLI input.
+// inputs: User-facing key and raw JSON object text.
+// returns/effects: Returns the object or rejects non-string map values loudly.
+fn parse_string_map_setting(key: &str, raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .with_context(|| format!("{key} requires a JSON object of strings"))?;
+    render_string_map_value(key, &value)
+}
+
 // purpose: Normalize CMUX workspace indicator style strings including legacy aliases.
 // inputs: User-facing key and raw style.
 // returns/effects: Returns a modern style or rejects unknown names loudly.
@@ -4538,6 +4602,45 @@ fn render_color_hex_array_setting(key: &str, value: &Value) -> Result<String> {
 fn render_color_hex_map_setting(key: &str, value: &Value) -> Result<String> {
     serde_json::to_string(&render_color_hex_map_value(key, value)?)
         .context("serialize color map setting")
+}
+
+// purpose: Render and validate a stored CMUX JSON object setting.
+// inputs: User-facing key and stored JSON value.
+// returns/effects: Returns compact JSON object text or rejects malformed settings.
+fn render_json_object_setting(key: &str, value: &Value) -> Result<String> {
+    serde_json::to_string(&render_json_object_value(key, value)?)
+        .context("serialize JSON object setting")
+}
+
+// purpose: Render and validate a stored CMUX string-map setting.
+// inputs: User-facing key and stored JSON value.
+// returns/effects: Returns compact JSON object text or rejects non-string entries.
+fn render_string_map_setting(key: &str, value: &Value) -> Result<String> {
+    serde_json::to_string(&render_string_map_value(key, value)?)
+        .context("serialize string-map setting")
+}
+
+// purpose: Validate generic CMUX JSON object settings.
+// inputs: User-facing key and JSON value.
+// returns/effects: Returns the object unchanged or rejects non-object values.
+fn render_json_object_value(key: &str, value: &Value) -> Result<Value> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow!("{key} must be a JSON object"))?;
+    Ok(value.clone())
+}
+
+// purpose: Validate CMUX JSON object settings whose values must be strings.
+// inputs: User-facing key and JSON value.
+// returns/effects: Returns the object unchanged or rejects non-string map values.
+fn render_string_map_value(key: &str, value: &Value) -> Result<Value> {
+    let map = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{key} must be a JSON object of strings"))?;
+    if map.values().any(|item| !item.is_string()) {
+        bail!("{key} must be a JSON object of strings");
+    }
+    Ok(value.clone())
 }
 
 // purpose: Validate and normalize a CMUX JSON color array.
@@ -21342,6 +21445,83 @@ mod cli_arg_tests {
         let err = render_config_scalar_get(&path, APP_CONFIRM_QUIT_SETTING)
             .expect_err("invalid existing confirm quit");
         assert!(err.to_string().contains("must be one of"));
+    }
+
+    // purpose: Verify CMUX shortcuts catalog keys default and write nested settings JSON.
+    // inputs: Temporary settings file plus shortcuts scalar descriptors.
+    // returns/effects: Asserts nested writes and unrelated settings preservation.
+    #[test]
+    fn config_shortcuts_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, SHORTCUT_SHOW_MODIFIER_HOLD_HINTS_SETTING)
+            .expect("hold hints default");
+        assert!(text.contains("shortcuts.showModifierHoldHints = true"));
+        let text =
+            render_config_scalar_get(&path, SHORTCUT_BINDINGS_SETTING).expect("bindings default");
+        assert!(text.contains("shortcuts.bindings = {}"));
+        let text = render_config_scalar_get(&path, SHORTCUT_WHEN_SETTING).expect("when default");
+        assert!(text.contains("shortcuts.when = {}"));
+
+        fs::write(
+            &path,
+            br#"{"shortcuts":{"legacy":true},"app":{"appearance":"dark"}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, SHORTCUT_SHOW_MODIFIER_HOLD_HINTS_SETTING, "false")
+            .expect("set hold hints");
+        render_config_scalar_set(
+            &path,
+            SHORTCUT_BINDINGS_SETTING,
+            r#"{"split_right":{"first":{"key":"l","command":true}}}"#,
+        )
+        .expect("set bindings");
+        render_config_scalar_set(
+            &path,
+            SHORTCUT_WHEN_SETTING,
+            r#"{"browser.back":"focusedBrowser"}"#,
+        )
+        .expect("set when");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["shortcuts"]["showModifierHoldHints"], false);
+        assert_eq!(
+            parsed["shortcuts"]["bindings"]["split_right"]["first"]["key"],
+            "l"
+        );
+        assert_eq!(
+            parsed["shortcuts"]["when"]["browser.back"],
+            "focusedBrowser"
+        );
+        assert_eq!(parsed["shortcuts"]["legacy"], true);
+        assert_eq!(parsed["app"]["appearance"], "dark");
+    }
+
+    // purpose: Verify CMUX shortcuts catalog settings reject malformed values loudly.
+    // inputs: Invalid boolean, invalid JSON object, and malformed persisted string map.
+    // returns/effects: Asserts explicit validation errors.
+    #[test]
+    fn config_shortcuts_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, SHORTCUT_SHOW_MODIFIER_HOLD_HINTS_SETTING, "yes")
+            .expect_err("invalid bool");
+        assert!(err.to_string().contains("requires true or false"));
+        let err = render_config_scalar_set(&path, SHORTCUT_BINDINGS_SETTING, "[]")
+            .expect_err("invalid bindings");
+        assert!(err.to_string().contains("must be a JSON object"));
+        let err = render_config_scalar_set(&path, SHORTCUT_WHEN_SETTING, r#"{"a":1}"#)
+            .expect_err("invalid when");
+        assert!(err.to_string().contains("must be a JSON object of strings"));
+
+        fs::write(&path, br#"{"shortcuts":{"when":{"browser.back":false}}}"#)
+            .expect("write malformed when");
+        let err = render_config_scalar_get(&path, SHORTCUT_WHEN_SETTING)
+            .expect_err("invalid persisted when");
+        assert!(err.to_string().contains("must be a JSON object of strings"));
     }
 
     // purpose: Verify the CMUX terminal agent auto-resume key defaults and preserves siblings.

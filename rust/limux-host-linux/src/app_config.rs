@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::shortcut_config;
 
@@ -80,6 +80,8 @@ pub struct AppConfig {
     pub sidebar: SidebarConfig,
     #[serde(skip)]
     pub notifications: NotificationConfig,
+    #[serde(skip)]
+    pub shortcuts: ShortcutSettingsConfig,
     #[serde(skip)]
     pub workspace_groups: WorkspaceGroupsConfig,
     #[serde(skip)]
@@ -1414,6 +1416,23 @@ pub struct NotificationHookConfig {
     pub timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutSettingsConfig {
+    pub show_modifier_hold_hints: bool,
+    pub bindings: Map<String, Value>,
+    pub when: Map<String, Value>,
+}
+
+impl Default for ShortcutSettingsConfig {
+    fn default() -> Self {
+        Self {
+            show_modifier_hold_hints: true,
+            bindings: Map::new(),
+            when: Map::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotificationHooksMode {
     #[default]
@@ -1863,6 +1882,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|notifications| notifications.get("suppressOnlyFocusedSurface"))
         .map(|value| parse_bool_setting(value, "notifications.suppressOnlyFocusedSurface"))
         .unwrap_or(notification_defaults.suppress_only_focused_surface);
+    let shortcuts = root
+        .get("shortcuts")
+        .map(parse_shortcut_settings_config)
+        .unwrap_or_default();
     let workspace_groups = root
         .get("workspaceGroups")
         .map(parse_workspace_groups_config)
@@ -1990,6 +2013,7 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             agent_idle_reminder,
             suppress_only_focused_surface,
         },
+        shortcuts,
         workspace_groups,
         new_workspace_placement,
         font_size,
@@ -3154,6 +3178,54 @@ fn parse_notification_hooks(value: &Value) -> Vec<NotificationHookConfig> {
         .collect()
 }
 
+// purpose: Parse CMUX shortcuts catalog settings from settings JSON.
+// inputs: Raw shortcuts section value.
+// returns/effects: Returns strict shortcut settings or panics on malformed values.
+fn parse_shortcut_settings_config(value: &Value) -> ShortcutSettingsConfig {
+    let shortcuts = value
+        .as_object()
+        .unwrap_or_else(|| panic!("shortcuts must be an object"));
+    let defaults = ShortcutSettingsConfig::default();
+    let show_modifier_hold_hints = shortcuts
+        .get("showModifierHoldHints")
+        .map(|value| parse_bool_setting(value, "shortcuts.showModifierHoldHints"))
+        .unwrap_or(defaults.show_modifier_hold_hints);
+    let bindings = shortcuts
+        .get("bindings")
+        .map(|value| parse_json_object_setting(value, "shortcuts.bindings"))
+        .unwrap_or_default();
+    let when = shortcuts
+        .get("when")
+        .map(|value| parse_string_map_setting(value, "shortcuts.when"))
+        .unwrap_or_default();
+    ShortcutSettingsConfig {
+        show_modifier_hold_hints,
+        bindings,
+        when,
+    }
+}
+
+// purpose: Parse generic CMUX JSON object settings.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the object or panics on malformed config.
+fn parse_json_object_setting(value: &Value, path: &str) -> Map<String, Value> {
+    value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path} must be a JSON object"))
+        .clone()
+}
+
+// purpose: Parse CMUX string-map JSON settings.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the object or panics if any value is not a string.
+fn parse_string_map_setting(value: &Value, path: &str) -> Map<String, Value> {
+    let map = parse_json_object_setting(value, path);
+    if map.values().any(|item| !item.is_string()) {
+        panic!("{path} must be a JSON object of strings");
+    }
+    map
+}
+
 // purpose: Expand a leading tilde while preserving glob characters.
 // inputs: Raw cwd key from workspaceGroups.byCwd.
 // returns/effects: Returns a comparable path pattern without filesystem access.
@@ -3720,6 +3792,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
                 "enabled": hook.enabled,
                 "timeoutSeconds": hook.timeout_seconds,
             })).collect::<Vec<_>>(),
+        }),
+    );
+    root.insert(
+        "shortcuts".to_string(),
+        json!({
+            "showModifierHoldHints": config.shortcuts.show_modifier_hold_hints,
+            "bindings": config.shortcuts.bindings.clone(),
+            "when": config.shortcuts.when.clone(),
         }),
     );
     let workspace_groups = root
@@ -5271,6 +5351,52 @@ mod tests {
         assert_eq!(hook.timeout_seconds, 7);
     }
 
+    // purpose: Verify CMUX shortcuts catalog settings load from settings JSON.
+    // inputs: Shortcuts section with hold hints, bindings, and when maps.
+    // returns/effects: Asserts strict parsed shortcut settings.
+    #[test]
+    fn load_from_path_reads_shortcuts_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{
+  "shortcuts": {
+    "showModifierHoldHints": false,
+    "bindings": {
+      "split_right": { "first": { "key": "l", "command": true } }
+    },
+    "when": {
+      "browser.back": "focusedBrowser"
+    }
+  }
+}
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path).config.shortcuts;
+
+        assert!(!loaded.show_modifier_hold_hints);
+        assert_eq!(loaded.bindings["split_right"]["first"]["key"], "l");
+        assert_eq!(loaded.when["browser.back"], "focusedBrowser");
+    }
+
+    // purpose: Verify malformed CMUX shortcuts string maps fail loudly.
+    // inputs: shortcuts.when with a non-string value.
+    // returns/effects: Panics with the explicit shortcuts.when error.
+    #[test]
+    #[should_panic(expected = "shortcuts.when must be a JSON object of strings")]
+    fn load_from_path_rejects_invalid_shortcuts_when() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"shortcuts":{"when":{"browser.back":false}}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
     #[test]
     fn load_from_path_reads_app_new_workspace_placement() {
         let dir = TempDir::new().expect("temp dir");
@@ -5670,6 +5796,43 @@ mod tests {
         assert_eq!(
             parsed["notifications"]["suppressOnlyFocusedSurface"],
             Value::Bool(true)
+        );
+    }
+
+    // purpose: Verify CMUX shortcuts catalog settings save to settings JSON.
+    // inputs: AppConfig with non-default shortcuts catalog values.
+    // returns/effects: Asserts host save writes the nested shortcuts section.
+    #[test]
+    fn save_to_path_writes_shortcuts_settings() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+
+        let mut config = AppConfig::default();
+        config.shortcuts.show_modifier_hold_hints = false;
+        config.shortcuts.bindings.insert(
+            "split_right".to_string(),
+            json!({ "first": { "key": "l", "command": true } }),
+        );
+        config
+            .shortcuts
+            .when
+            .insert("browser.back".to_string(), json!("focusedBrowser"));
+        save_to_path(&path, &config).expect("save shortcuts");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(
+            parsed["shortcuts"]["showModifierHoldHints"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            parsed["shortcuts"]["bindings"]["split_right"]["first"]["key"],
+            "l"
+        );
+        assert_eq!(
+            parsed["shortcuts"]["when"]["browser.back"],
+            "focusedBrowser"
         );
     }
 
