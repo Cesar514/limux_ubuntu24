@@ -1803,6 +1803,12 @@ enum ScalarSettingKind {
         min: i32,
         max: i32,
     },
+    SteppedInteger {
+        default: i32,
+        min: i32,
+        max: i32,
+        step: i32,
+    },
     Decimal {
         default: f64,
         min: f64,
@@ -2495,7 +2501,35 @@ const SIDEBAR_APPEARANCE_STATE_SETTING: ScalarSetting = ScalarSetting {
     },
 };
 
+const APP_LANGUAGES: &[&str] = &[
+    "system", "en", "ar", "bs", "zh-Hans", "zh-Hant", "da", "de", "es", "fr", "it", "ja", "ko",
+    "nb", "pl", "pt-BR", "ru", "th", "tr", "vi",
+];
+const APP_ICON_MODES: &[&str] = &["automatic", "light", "dark"];
+const APP_PRESENTATION_MODES: &[&str] = &["standard", "minimal"];
+const APP_CONFIRM_QUIT_MODES: &[&str] = &["always", "dirty-only", "never"];
+const APP_FILE_DROP_DEFAULT_BEHAVIORS: &[&str] = &["text", "preview"];
 const WORKSPACE_BUTTON_FADE_MODES: &[&str] = &["enabled", "disabled"];
+
+const APP_LANGUAGE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.language",
+    section: "app",
+    json_path: &["language"],
+    kind: ScalarSettingKind::Enum {
+        default: "system",
+        allowed: APP_LANGUAGES,
+    },
+};
+
+const APP_ICON_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.appIcon",
+    section: "app",
+    json_path: &["appIcon"],
+    kind: ScalarSettingKind::Enum {
+        default: "automatic",
+        allowed: APP_ICON_MODES,
+    },
+};
 
 const APP_WINDOW_TITLE_TEMPLATE_SETTING: ScalarSetting = ScalarSetting {
     key: "app.windowTitleTemplate",
@@ -2532,6 +2566,28 @@ const APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING: ScalarSetting = ScalarSetting {
     kind: ScalarSettingKind::Boolean { default: true },
 };
 
+const APP_MINIMAL_MODE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.minimalMode",
+    section: "app",
+    json_path: &["minimalMode"],
+    kind: ScalarSettingKind::Enum {
+        default: "standard",
+        allowed: APP_PRESENTATION_MODES,
+    },
+};
+
+const APP_GLOBAL_FONT_MAGNIFICATION_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.globalFontMagnification",
+    section: "app",
+    json_path: &["globalFontMagnification"],
+    kind: ScalarSettingKind::SteppedInteger {
+        default: 100,
+        min: 50,
+        max: 200,
+        step: 10,
+    },
+};
+
 const APP_I_MESSAGE_MODE_SETTING: ScalarSetting = ScalarSetting {
     key: "app.iMessageMode",
     section: "app",
@@ -2551,6 +2607,16 @@ const APP_SEND_ANONYMOUS_TELEMETRY_SETTING: ScalarSetting = ScalarSetting {
     section: "app",
     json_path: &["sendAnonymousTelemetry"],
     kind: ScalarSettingKind::Boolean { default: true },
+};
+
+const APP_CONFIRM_QUIT_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.confirmQuit",
+    section: "app",
+    json_path: &["confirmQuit"],
+    kind: ScalarSettingKind::Enum {
+        default: "always",
+        allowed: APP_CONFIRM_QUIT_MODES,
+    },
 };
 
 const APP_WARN_BEFORE_QUIT_SETTING: ScalarSetting = ScalarSetting {
@@ -2593,6 +2659,27 @@ const APP_COMMAND_PALETTE_SEARCHES_ALL_SURFACES_SETTING: ScalarSetting = ScalarS
     section: "app",
     json_path: &["commandPaletteSearchesAllSurfaces"],
     kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const APP_FILE_DROP_DEFAULT_BEHAVIOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.fileDropDefaultBehavior",
+    section: "app",
+    json_path: &["fileDropDefaultBehavior"],
+    kind: ScalarSettingKind::Enum {
+        default: "text",
+        allowed: APP_FILE_DROP_DEFAULT_BEHAVIORS,
+    },
+};
+
+const APP_TITLEBAR_CONTROLS_STYLE_SETTING: ScalarSetting = ScalarSetting {
+    key: "app.titlebarControlsStyle",
+    section: "app",
+    json_path: &["titlebarControlsStyle"],
+    kind: ScalarSettingKind::Integer {
+        default: 0,
+        min: 0,
+        max: 4,
+    },
 };
 
 const APP_WORKSPACE_BUTTON_FADE_SETTING: ScalarSetting = ScalarSetting {
@@ -3085,11 +3172,13 @@ const CONFIG_GET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
+    "app.language|app.appIcon|app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
     "app.openSupportedFilesInCmux|app.openMarkdownInCmuxViewer|app.iMessageMode|",
-    "app.reorderOnNotification|app.sendAnonymousTelemetry|app.warnBeforeQuit|",
+    "app.minimalMode|app.globalFontMagnification|app.reorderOnNotification|",
+    "app.sendAnonymousTelemetry|app.confirmQuit|app.warnBeforeQuit|",
     "app.warnBeforeClosingTab|app.warnBeforeClosingTabXButton|app.hideTabCloseButton|",
     "app.renameSelectsExistingName|app.commandPaletteSearchesAllSurfaces|",
+    "app.fileDropDefaultBehavior|app.titlebarControlsStyle|",
     "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
     "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
@@ -3160,11 +3249,13 @@ const CONFIG_SET_USAGE: &str = concat!(
     "app.workspaceInheritWorkingDirectory|",
     "app.focusPaneOnFirstClick|",
     "app.keepWorkspaceOpenWhenClosingLastSurface|app.newWorkspacePlacement|",
-    "app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
+    "app.language|app.appIcon|app.windowTitleTemplate|app.menuBarOnly|app.preferredEditor|",
     "app.openSupportedFilesInCmux|app.openMarkdownInCmuxViewer|app.iMessageMode|",
-    "app.reorderOnNotification|app.sendAnonymousTelemetry|app.warnBeforeQuit|",
+    "app.minimalMode|app.globalFontMagnification|app.reorderOnNotification|",
+    "app.sendAnonymousTelemetry|app.confirmQuit|app.warnBeforeQuit|",
     "app.warnBeforeClosingTab|app.warnBeforeClosingTabXButton|app.hideTabCloseButton|",
     "app.renameSelectsExistingName|app.commandPaletteSearchesAllSurfaces|",
+    "app.fileDropDefaultBehavior|app.titlebarControlsStyle|",
     "app.workspaceButtonFade|app.workspaceTitlebarVisibility|",
     "app.systemWideHotkeyEnabled|app.devWindowDisplay|",
     "terminal.autoResumeAgentSessions|terminal.showScrollBar|terminal.copyOnSelect|",
@@ -3387,14 +3478,19 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
 // returns/effects: Returns the supported descriptor or None for unknown app keys.
 fn app_scalar_setting(raw: &str) -> Option<ScalarSetting> {
     match raw {
+        "app.language" => Some(APP_LANGUAGE_SETTING),
+        "app.appIcon" => Some(APP_ICON_SETTING),
         "app.windowTitleTemplate" => Some(APP_WINDOW_TITLE_TEMPLATE_SETTING),
         "app.menuBarOnly" => Some(APP_MENU_BAR_ONLY_SETTING),
         "app.preferredEditor" => Some(APP_PREFERRED_EDITOR_SETTING),
         "app.openSupportedFilesInCmux" => Some(APP_OPEN_SUPPORTED_FILES_IN_CMUX_SETTING),
         "app.openMarkdownInCmuxViewer" => Some(APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING),
+        "app.minimalMode" => Some(APP_MINIMAL_MODE_SETTING),
+        "app.globalFontMagnification" => Some(APP_GLOBAL_FONT_MAGNIFICATION_SETTING),
         "app.iMessageMode" => Some(APP_I_MESSAGE_MODE_SETTING),
         "app.reorderOnNotification" => Some(APP_REORDER_ON_NOTIFICATION_SETTING),
         "app.sendAnonymousTelemetry" => Some(APP_SEND_ANONYMOUS_TELEMETRY_SETTING),
+        "app.confirmQuit" => Some(APP_CONFIRM_QUIT_SETTING),
         "app.warnBeforeQuit" => Some(APP_WARN_BEFORE_QUIT_SETTING),
         "app.warnBeforeClosingTab" => Some(APP_WARN_BEFORE_CLOSING_TAB_SETTING),
         "app.warnBeforeClosingTabXButton" => Some(APP_WARN_BEFORE_CLOSING_TAB_X_BUTTON_SETTING),
@@ -3403,6 +3499,8 @@ fn app_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "app.commandPaletteSearchesAllSurfaces" => {
             Some(APP_COMMAND_PALETTE_SEARCHES_ALL_SURFACES_SETTING)
         }
+        "app.fileDropDefaultBehavior" => Some(APP_FILE_DROP_DEFAULT_BEHAVIOR_SETTING),
+        "app.titlebarControlsStyle" => Some(APP_TITLEBAR_CONTROLS_STYLE_SETTING),
         "app.workspaceButtonFade" => Some(APP_WORKSPACE_BUTTON_FADE_SETTING),
         "app.workspaceTitlebarVisibility" => Some(APP_WORKSPACE_TITLEBAR_VISIBILITY_SETTING),
         "app.systemWideHotkeyEnabled" => Some(APP_SYSTEM_WIDE_HOTKEY_ENABLED_SETTING),
@@ -4146,7 +4244,8 @@ fn dotted_setting_path(section: &str, json_path: &[&str], index: usize) -> Strin
 fn default_scalar_setting_value(setting: ScalarSetting) -> Result<String> {
     match setting.kind {
         ScalarSettingKind::Boolean { default } => Ok(default.to_string()),
-        ScalarSettingKind::Integer { default, .. } => Ok(default.to_string()),
+        ScalarSettingKind::Integer { default, .. }
+        | ScalarSettingKind::SteppedInteger { default, .. } => Ok(default.to_string()),
         ScalarSettingKind::Decimal { default, .. }
         | ScalarSettingKind::DecimalAllowZero { default, .. } => {
             Ok(format_decimal_setting(default))
@@ -4176,6 +4275,10 @@ fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value>
         ScalarSettingKind::Integer { min, max, .. } => {
             let value = parse_i32_scalar_setting(setting.key, raw, min, max)?;
             Ok(json!(value))
+        }
+        ScalarSettingKind::SteppedInteger { min, max, step, .. } => {
+            let value = parse_i32_scalar_setting(setting.key, raw, min, max)?;
+            Ok(json!(round_i32_to_step(value, min, max, step)?))
         }
         ScalarSettingKind::Decimal { min, max, .. } => {
             let value = parse_f64_scalar_setting(setting.key, raw, min, max)?;
@@ -4215,6 +4318,13 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
                 .as_f64()
                 .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
             Ok(clamp_f64_to_i32(setting.key, number, min, max)?.to_string())
+        }
+        ScalarSettingKind::SteppedInteger { min, max, step, .. } => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
+            let value = clamp_f64_to_i32(setting.key, number, min, max)?;
+            Ok(round_i32_to_step(value, min, max, step)?.to_string())
         }
         ScalarSettingKind::Decimal { min, max, .. } => {
             let number = value
@@ -4354,6 +4464,17 @@ fn clamp_non_negative_f64_setting(key: &str, value: f64, min: f64, max: f64) -> 
 // returns/effects: Returns rounded/clamped integer or a loud validation error.
 fn clamp_f64_to_i32(key: &str, value: f64, min: i32, max: i32) -> Result<i32> {
     Ok(clamp_f64_setting(key, value, min as f64, max as f64)?.round() as i32)
+}
+
+// purpose: Round a clamped integer setting to the nearest CMUX settings-editor step.
+// inputs: Clamped integer value, accepted range, and positive step size.
+// returns/effects: Returns rounded/clamped integer or a loud validation error for invalid descriptors.
+fn round_i32_to_step(value: i32, min: i32, max: i32, step: i32) -> Result<i32> {
+    if step <= 0 {
+        bail!("stepped integer settings require a positive step");
+    }
+    let rounded = ((value - min) as f64 / step as f64).round() as i32 * step + min;
+    Ok(rounded.clamp(min, max))
 }
 
 // purpose: Parse terminal.resumeCommands as explicit JSON string arrays.
@@ -21134,6 +21255,11 @@ mod cli_arg_tests {
         let text = render_config_scalar_get(&path, APP_WORKSPACE_BUTTON_FADE_SETTING)
             .expect("fade default");
         assert!(text.contains("app.workspaceButtonFade = disabled"));
+        let text = render_config_scalar_get(&path, APP_GLOBAL_FONT_MAGNIFICATION_SETTING)
+            .expect("font default");
+        assert!(text.contains("app.globalFontMagnification = 100"));
+        let text = render_config_scalar_get(&path, APP_LANGUAGE_SETTING).expect("language default");
+        assert!(text.contains("app.language = system"));
         let text = render_config_scalar_get(&path, APP_WINDOW_TITLE_TEMPLATE_SETTING)
             .expect("title template default");
         assert!(text.contains("app.windowTitleTemplate = "));
@@ -21149,6 +21275,18 @@ mod cli_arg_tests {
             .expect("set preferred editor");
         render_config_scalar_set(&path, APP_OPEN_MARKDOWN_IN_CMUX_VIEWER_SETTING, "false")
             .expect("set markdown viewer");
+        render_config_scalar_set(&path, APP_LANGUAGE_SETTING, "pt-BR").expect("set language");
+        render_config_scalar_set(&path, APP_ICON_SETTING, "dark").expect("set app icon");
+        render_config_scalar_set(&path, APP_MINIMAL_MODE_SETTING, "minimal")
+            .expect("set minimal mode");
+        render_config_scalar_set(&path, APP_GLOBAL_FONT_MAGNIFICATION_SETTING, "175")
+            .expect("set global font");
+        render_config_scalar_set(&path, APP_CONFIRM_QUIT_SETTING, "dirty-only")
+            .expect("set confirm quit");
+        render_config_scalar_set(&path, APP_FILE_DROP_DEFAULT_BEHAVIOR_SETTING, "preview")
+            .expect("set file drop");
+        render_config_scalar_set(&path, APP_TITLEBAR_CONTROLS_STYLE_SETTING, "4")
+            .expect("set titlebar controls");
         render_config_scalar_set(&path, APP_WORKSPACE_BUTTON_FADE_SETTING, "enabled")
             .expect("set fade");
         render_config_scalar_set(&path, APP_DEV_WINDOW_DISPLAY_SETTING, "LG HDR 4K")
@@ -21159,6 +21297,13 @@ mod cli_arg_tests {
         assert_eq!(parsed["app"]["windowTitleTemplate"], "{workspace}");
         assert_eq!(parsed["app"]["preferredEditor"], "code --reuse-window");
         assert_eq!(parsed["app"]["openMarkdownInCmuxViewer"], false);
+        assert_eq!(parsed["app"]["language"], "pt-BR");
+        assert_eq!(parsed["app"]["appIcon"], "dark");
+        assert_eq!(parsed["app"]["minimalMode"], "minimal");
+        assert_eq!(parsed["app"]["globalFontMagnification"], 180);
+        assert_eq!(parsed["app"]["confirmQuit"], "dirty-only");
+        assert_eq!(parsed["app"]["fileDropDefaultBehavior"], "preview");
+        assert_eq!(parsed["app"]["titlebarControlsStyle"], 4);
         assert_eq!(parsed["app"]["workspaceButtonFade"], "enabled");
         assert_eq!(parsed["app"]["devWindowDisplay"], "LG HDR 4K");
         assert_eq!(parsed["app"]["appearance"], "dark");
@@ -21180,11 +21325,23 @@ mod cli_arg_tests {
         let err = render_config_scalar_set(&path, APP_HIDE_TAB_CLOSE_BUTTON_SETTING, "yes")
             .expect_err("invalid bool");
         assert!(err.to_string().contains("requires true or false"));
+        let err = render_config_scalar_set(&path, APP_LANGUAGE_SETTING, "zz")
+            .expect_err("invalid language");
+        assert!(err.to_string().contains("must be one of"));
+        let err = render_config_scalar_set(&path, APP_TITLEBAR_CONTROLS_STYLE_SETTING, "-1")
+            .expect_err("invalid titlebar");
+        assert!(err.to_string().contains("app.titlebarControlsStyle"));
 
         fs::write(&path, br#"{"app":{"preferredEditor":false}}"#).expect("write malformed editor");
         let err = render_config_scalar_get(&path, APP_PREFERRED_EDITOR_SETTING)
             .expect_err("invalid existing editor");
         assert!(err.to_string().contains("must be a string"));
+
+        fs::write(&path, br#"{"app":{"confirmQuit":"sometimes"}}"#)
+            .expect("write malformed confirm quit");
+        let err = render_config_scalar_get(&path, APP_CONFIRM_QUIT_SETTING)
+            .expect_err("invalid existing confirm quit");
+        assert!(err.to_string().contains("must be one of"));
     }
 
     // purpose: Verify the CMUX terminal agent auto-resume key defaults and preserves siblings.

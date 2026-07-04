@@ -323,24 +323,211 @@ pub struct AppBehaviorConfig {
     pub keep_workspace_open_when_closing_last_surface: bool,
     pub workspace_inherit_working_directory: bool,
     pub focus_pane_on_first_click: bool,
+    pub language: AppLanguage,
+    pub app_icon: AppIconMode,
     pub window_title_template: String,
     pub menu_bar_only: bool,
     pub preferred_editor: String,
     pub open_supported_files_in_cmux: bool,
     pub open_markdown_in_cmux_viewer: bool,
+    pub minimal_mode: WorkspacePresentationMode,
+    pub global_font_magnification: i32,
     pub i_message_mode: bool,
     pub reorder_on_notification: bool,
     pub send_anonymous_telemetry: bool,
+    pub confirm_quit: ConfirmQuitMode,
     pub warn_before_quit: bool,
     pub warn_before_closing_tab: bool,
     pub warn_before_closing_tab_x_button: bool,
     pub hide_tab_close_button: bool,
     pub rename_selects_existing_name: bool,
     pub command_palette_searches_all_surfaces: bool,
+    pub file_drop_default_behavior: FileDropDefaultBehavior,
+    pub titlebar_controls_style: i32,
     pub workspace_button_fade: WorkspaceButtonFadeMode,
     pub workspace_titlebar_visibility: bool,
     pub system_wide_hotkey_enabled: bool,
     pub dev_window_display: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppLanguage {
+    #[default]
+    System,
+    En,
+    Ar,
+    Bs,
+    ZhHans,
+    ZhHant,
+    Da,
+    De,
+    Es,
+    Fr,
+    It,
+    Ja,
+    Ko,
+    Nb,
+    Pl,
+    PtBr,
+    Ru,
+    Th,
+    Tr,
+    Vi,
+}
+
+impl AppLanguage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::En => "en",
+            Self::Ar => "ar",
+            Self::Bs => "bs",
+            Self::ZhHans => "zh-Hans",
+            Self::ZhHant => "zh-Hant",
+            Self::Da => "da",
+            Self::De => "de",
+            Self::Es => "es",
+            Self::Fr => "fr",
+            Self::It => "it",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::Nb => "nb",
+            Self::Pl => "pl",
+            Self::PtBr => "pt-BR",
+            Self::Ru => "ru",
+            Self::Th => "th",
+            Self::Tr => "tr",
+            Self::Vi => "vi",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "system" => Some(Self::System),
+            "en" => Some(Self::En),
+            "ar" => Some(Self::Ar),
+            "bs" => Some(Self::Bs),
+            "zh-Hans" => Some(Self::ZhHans),
+            "zh-Hant" => Some(Self::ZhHant),
+            "da" => Some(Self::Da),
+            "de" => Some(Self::De),
+            "es" => Some(Self::Es),
+            "fr" => Some(Self::Fr),
+            "it" => Some(Self::It),
+            "ja" => Some(Self::Ja),
+            "ko" => Some(Self::Ko),
+            "nb" => Some(Self::Nb),
+            "pl" => Some(Self::Pl),
+            "pt-BR" => Some(Self::PtBr),
+            "ru" => Some(Self::Ru),
+            "th" => Some(Self::Th),
+            "tr" => Some(Self::Tr),
+            "vi" => Some(Self::Vi),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppIconMode {
+    #[default]
+    Automatic,
+    Light,
+    Dark,
+}
+
+impl AppIconMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "automatic" => Some(Self::Automatic),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspacePresentationMode {
+    #[default]
+    Standard,
+    Minimal,
+}
+
+impl WorkspacePresentationMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Minimal => "minimal",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "standard" => Some(Self::Standard),
+            "minimal" => Some(Self::Minimal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfirmQuitMode {
+    #[default]
+    Always,
+    DirtyOnly,
+    Never,
+}
+
+impl ConfirmQuitMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::DirtyOnly => "dirty-only",
+            Self::Never => "never",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "always" => Some(Self::Always),
+            "dirty-only" => Some(Self::DirtyOnly),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileDropDefaultBehavior {
+    #[default]
+    Text,
+    Preview,
+}
+
+impl FileDropDefaultBehavior {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Preview => "preview",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "text" => Some(Self::Text),
+            "preview" => Some(Self::Preview),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -382,20 +569,27 @@ impl AppBehaviorConfig {
             keep_workspace_open_when_closing_last_surface: false,
             workspace_inherit_working_directory: true,
             focus_pane_on_first_click: false,
+            language: AppLanguage::System,
+            app_icon: AppIconMode::Automatic,
             window_title_template: String::new(),
             menu_bar_only: false,
             preferred_editor: String::new(),
             open_supported_files_in_cmux: true,
             open_markdown_in_cmux_viewer: true,
+            minimal_mode: WorkspacePresentationMode::Standard,
+            global_font_magnification: 100,
             i_message_mode: false,
             reorder_on_notification: true,
             send_anonymous_telemetry: true,
+            confirm_quit: ConfirmQuitMode::Always,
             warn_before_quit: true,
             warn_before_closing_tab: true,
             warn_before_closing_tab_x_button: false,
             hide_tab_close_button: false,
             rename_selects_existing_name: true,
             command_palette_searches_all_surfaces: false,
+            file_drop_default_behavior: FileDropDefaultBehavior::Text,
+            titlebar_controls_style: 0,
             workspace_button_fade: WorkspaceButtonFadeMode::Disabled,
             workspace_titlebar_visibility: true,
             system_wide_hotkey_enabled: false,
@@ -1426,6 +1620,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("keepWorkspaceOpenWhenClosingLastSurface"))
         .map(|value| parse_bool_setting(value, "app.keepWorkspaceOpenWhenClosingLastSurface"))
         .unwrap_or(app_defaults.keep_workspace_open_when_closing_last_surface);
+    let language = app
+        .and_then(|app| app.get("language"))
+        .map(|value| parse_app_language(value, "app.language"))
+        .unwrap_or(app_defaults.language);
+    let app_icon = app
+        .and_then(|app| app.get("appIcon"))
+        .map(|value| parse_app_icon(value, "app.appIcon"))
+        .unwrap_or(app_defaults.app_icon);
     let window_title_template = app
         .and_then(|app| app.get("windowTitleTemplate"))
         .map(|value| parse_string_setting(value, "app.windowTitleTemplate"))
@@ -1446,6 +1648,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("openMarkdownInCmuxViewer"))
         .map(|value| parse_bool_setting(value, "app.openMarkdownInCmuxViewer"))
         .unwrap_or(app_defaults.open_markdown_in_cmux_viewer);
+    let minimal_mode = app
+        .and_then(|app| app.get("minimalMode"))
+        .map(|value| parse_workspace_presentation_mode(value, "app.minimalMode"))
+        .unwrap_or(app_defaults.minimal_mode);
+    let global_font_magnification = app
+        .and_then(|app| app.get("globalFontMagnification"))
+        .map(|value| parse_global_font_magnification(value, "app.globalFontMagnification"))
+        .unwrap_or(app_defaults.global_font_magnification);
     let i_message_mode = app
         .and_then(|app| app.get("iMessageMode"))
         .map(|value| parse_bool_setting(value, "app.iMessageMode"))
@@ -1458,6 +1668,10 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("sendAnonymousTelemetry"))
         .map(|value| parse_bool_setting(value, "app.sendAnonymousTelemetry"))
         .unwrap_or(app_defaults.send_anonymous_telemetry);
+    let confirm_quit = app
+        .and_then(|app| app.get("confirmQuit"))
+        .map(|value| parse_confirm_quit(value, "app.confirmQuit"))
+        .unwrap_or(app_defaults.confirm_quit);
     let warn_before_quit = app
         .and_then(|app| app.get("warnBeforeQuit"))
         .map(|value| parse_bool_setting(value, "app.warnBeforeQuit"))
@@ -1482,6 +1696,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         .and_then(|app| app.get("commandPaletteSearchesAllSurfaces"))
         .map(|value| parse_bool_setting(value, "app.commandPaletteSearchesAllSurfaces"))
         .unwrap_or(app_defaults.command_palette_searches_all_surfaces);
+    let file_drop_default_behavior = app
+        .and_then(|app| app.get("fileDropDefaultBehavior"))
+        .map(|value| parse_file_drop_default_behavior(value, "app.fileDropDefaultBehavior"))
+        .unwrap_or(app_defaults.file_drop_default_behavior);
+    let titlebar_controls_style = app
+        .and_then(|app| app.get("titlebarControlsStyle"))
+        .map(|value| parse_titlebar_controls_style(value, "app.titlebarControlsStyle"))
+        .unwrap_or(app_defaults.titlebar_controls_style);
     let workspace_button_fade = app
         .and_then(|app| app.get("workspaceButtonFade"))
         .map(|value| parse_workspace_button_fade(value, "app.workspaceButtonFade"))
@@ -1698,20 +1920,27 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             keep_workspace_open_when_closing_last_surface,
             workspace_inherit_working_directory,
             focus_pane_on_first_click,
+            language,
+            app_icon,
             window_title_template,
             menu_bar_only,
             preferred_editor,
             open_supported_files_in_cmux,
             open_markdown_in_cmux_viewer,
+            minimal_mode,
+            global_font_magnification,
             i_message_mode,
             reorder_on_notification,
             send_anonymous_telemetry,
+            confirm_quit,
             warn_before_quit,
             warn_before_closing_tab,
             warn_before_closing_tab_x_button,
             hide_tab_close_button,
             rename_selects_existing_name,
             command_palette_searches_all_surfaces,
+            file_drop_default_behavior,
+            titlebar_controls_style,
             workspace_button_fade,
             workspace_titlebar_visibility,
             system_wide_hotkey_enabled,
@@ -2652,6 +2881,74 @@ fn parse_kiro_notification_level(value: &Value, path: &str) -> KiroNotificationL
         .unwrap_or_else(|| panic!("{path} must be minimal, standard, or verbose"))
 }
 
+// purpose: Parse CMUX app language strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns language mode or panics for malformed existing config.
+fn parse_app_language(value: &Value, path: &str) -> AppLanguage {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a supported app language"));
+    AppLanguage::from_str(raw).unwrap_or_else(|| panic!("{path} must be a supported app language"))
+}
+
+// purpose: Parse CMUX app icon mode strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns icon mode or panics for malformed existing config.
+fn parse_app_icon(value: &Value, path: &str) -> AppIconMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be automatic, light, or dark"));
+    AppIconMode::from_str(raw).unwrap_or_else(|| panic!("{path} must be automatic, light, or dark"))
+}
+
+// purpose: Parse CMUX minimal-mode presentation strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns presentation mode or panics for malformed existing config.
+fn parse_workspace_presentation_mode(value: &Value, path: &str) -> WorkspacePresentationMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be standard or minimal"));
+    WorkspacePresentationMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be standard or minimal"))
+}
+
+// purpose: Parse CMUX app global font magnification percent.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns rounded/clamped 50..200 percent or panics on malformed config.
+fn parse_global_font_magnification(value: &Value, path: &str) -> i32 {
+    let clamped = parse_positive_i32_setting(value, path, 50, 200);
+    ((clamped - 50) as f64 / 10.0).round() as i32 * 10 + 50
+}
+
+// purpose: Parse CMUX quit-confirmation mode strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns confirm-quit mode or panics for malformed existing config.
+fn parse_confirm_quit(value: &Value, path: &str) -> ConfirmQuitMode {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be always, dirty-only, or never"));
+    ConfirmQuitMode::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be always, dirty-only, or never"))
+}
+
+// purpose: Parse CMUX file-drop default behavior strings without silent fallback.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns file-drop behavior or panics for malformed existing config.
+fn parse_file_drop_default_behavior(value: &Value, path: &str) -> FileDropDefaultBehavior {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be text or preview"));
+    FileDropDefaultBehavior::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be text or preview"))
+}
+
+// purpose: Parse CMUX titlebar-controls style raw integer.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns rounded/clamped 0..4 style index or panics on malformed config.
+fn parse_titlebar_controls_style(value: &Value, path: &str) -> i32 {
+    parse_non_negative_i32_setting(value, path, 4)
+}
+
 // purpose: Parse CMUX workspace button fade mode strings without silent fallback.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns fade mode or panics for malformed existing config.
@@ -3088,6 +3385,12 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "keepWorkspaceOpenWhenClosingLastSurface".to_string(),
         json!(config.app.keep_workspace_open_when_closing_last_surface),
     );
+    app.as_object_mut()
+        .expect("app object")
+        .insert("language".to_string(), json!(config.app.language.as_str()));
+    app.as_object_mut()
+        .expect("app object")
+        .insert("appIcon".to_string(), json!(config.app.app_icon.as_str()));
     app.as_object_mut().expect("app object").insert(
         "windowTitleTemplate".to_string(),
         json!(config.app.window_title_template.clone()),
@@ -3107,6 +3410,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         "openMarkdownInCmuxViewer".to_string(),
         json!(config.app.open_markdown_in_cmux_viewer),
     );
+    app.as_object_mut().expect("app object").insert(
+        "minimalMode".to_string(),
+        json!(config.app.minimal_mode.as_str()),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "globalFontMagnification".to_string(),
+        json!(config.app.global_font_magnification),
+    );
     app.as_object_mut()
         .expect("app object")
         .insert("iMessageMode".to_string(), json!(config.app.i_message_mode));
@@ -3117,6 +3428,10 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     app.as_object_mut().expect("app object").insert(
         "sendAnonymousTelemetry".to_string(),
         json!(config.app.send_anonymous_telemetry),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "confirmQuit".to_string(),
+        json!(config.app.confirm_quit.as_str()),
     );
     app.as_object_mut().expect("app object").insert(
         "warnBeforeQuit".to_string(),
@@ -3141,6 +3456,14 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
     app.as_object_mut().expect("app object").insert(
         "commandPaletteSearchesAllSurfaces".to_string(),
         json!(config.app.command_palette_searches_all_surfaces),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "fileDropDefaultBehavior".to_string(),
+        json!(config.app.file_drop_default_behavior.as_str()),
+    );
+    app.as_object_mut().expect("app object").insert(
+        "titlebarControlsStyle".to_string(),
+        json!(config.app.titlebar_controls_style),
     );
     app.as_object_mut().expect("app object").insert(
         "workspaceButtonFade".to_string(),
@@ -3888,20 +4211,27 @@ mod tests {
             &path,
             r#"{
   "app": {
+    "language": "pt-BR",
+    "appIcon": "dark",
     "windowTitleTemplate": "{workspace}",
     "menuBarOnly": true,
     "preferredEditor": "code --reuse-window",
     "openSupportedFilesInCmux": false,
     "openMarkdownInCmuxViewer": false,
+    "minimalMode": "minimal",
+    "globalFontMagnification": 175,
     "iMessageMode": true,
     "reorderOnNotification": false,
     "sendAnonymousTelemetry": false,
+    "confirmQuit": "dirty-only",
     "warnBeforeQuit": false,
     "warnBeforeClosingTab": false,
     "warnBeforeClosingTabXButton": true,
     "hideTabCloseButton": true,
     "renameSelectsExistingName": false,
     "commandPaletteSearchesAllSurfaces": true,
+    "fileDropDefaultBehavior": "preview",
+    "titlebarControlsStyle": 4,
     "workspaceButtonFade": "enabled",
     "workspaceTitlebarVisibility": false,
     "systemWideHotkeyEnabled": true,
@@ -3914,20 +4244,30 @@ mod tests {
 
         let loaded = load_from_path(&path).config.app;
 
+        assert_eq!(loaded.language, AppLanguage::PtBr);
+        assert_eq!(loaded.app_icon, AppIconMode::Dark);
         assert_eq!(loaded.window_title_template, "{workspace}");
         assert!(loaded.menu_bar_only);
         assert_eq!(loaded.preferred_editor, "code --reuse-window");
         assert!(!loaded.open_supported_files_in_cmux);
         assert!(!loaded.open_markdown_in_cmux_viewer);
+        assert_eq!(loaded.minimal_mode, WorkspacePresentationMode::Minimal);
+        assert_eq!(loaded.global_font_magnification, 180);
         assert!(loaded.i_message_mode);
         assert!(!loaded.reorder_on_notification);
         assert!(!loaded.send_anonymous_telemetry);
+        assert_eq!(loaded.confirm_quit, ConfirmQuitMode::DirtyOnly);
         assert!(!loaded.warn_before_quit);
         assert!(!loaded.warn_before_closing_tab);
         assert!(loaded.warn_before_closing_tab_x_button);
         assert!(loaded.hide_tab_close_button);
         assert!(!loaded.rename_selects_existing_name);
         assert!(loaded.command_palette_searches_all_surfaces);
+        assert_eq!(
+            loaded.file_drop_default_behavior,
+            FileDropDefaultBehavior::Preview
+        );
+        assert_eq!(loaded.titlebar_controls_style, 4);
         assert_eq!(
             loaded.workspace_button_fade,
             WorkspaceButtonFadeMode::Enabled
@@ -3938,15 +4278,15 @@ mod tests {
     }
 
     // purpose: Verify host loading rejects malformed additional CMUX app settings.
-    // inputs: Settings JSON with invalid workspace button fade mode.
+    // inputs: Settings JSON with invalid confirm quit mode.
     // returns/effects: Panics with the explicit CMUX key error.
     #[test]
-    #[should_panic(expected = "app.workspaceButtonFade must be enabled or disabled")]
+    #[should_panic(expected = "app.confirmQuit must be always, dirty-only, or never")]
     fn load_from_path_rejects_invalid_app_scalar_settings() {
         let dir = TempDir::new().expect("temp dir");
         let path = settings_path_in(dir.path());
         fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
-        fs::write(&path, r#"{"app":{"workspaceButtonFade":"maybe"}}"#).expect("write config");
+        fs::write(&path, r#"{"app":{"confirmQuit":"sometimes"}}"#).expect("write config");
 
         let _ = load_from_path(&path);
     }
@@ -5080,20 +5420,27 @@ mod tests {
         config.app.keep_workspace_open_when_closing_last_surface = true;
         config.app.workspace_inherit_working_directory = false;
         config.app.focus_pane_on_first_click = true;
+        config.app.language = AppLanguage::PtBr;
+        config.app.app_icon = AppIconMode::Dark;
         config.app.window_title_template = "{workspace}".to_string();
         config.app.menu_bar_only = true;
         config.app.preferred_editor = "code --reuse-window".to_string();
         config.app.open_supported_files_in_cmux = false;
         config.app.open_markdown_in_cmux_viewer = false;
+        config.app.minimal_mode = WorkspacePresentationMode::Minimal;
+        config.app.global_font_magnification = 180;
         config.app.i_message_mode = true;
         config.app.reorder_on_notification = false;
         config.app.send_anonymous_telemetry = false;
+        config.app.confirm_quit = ConfirmQuitMode::DirtyOnly;
         config.app.warn_before_quit = false;
         config.app.warn_before_closing_tab = false;
         config.app.warn_before_closing_tab_x_button = true;
         config.app.hide_tab_close_button = true;
         config.app.rename_selects_existing_name = false;
         config.app.command_palette_searches_all_surfaces = true;
+        config.app.file_drop_default_behavior = FileDropDefaultBehavior::Preview;
+        config.app.titlebar_controls_style = 4;
         config.app.workspace_button_fade = WorkspaceButtonFadeMode::Enabled;
         config.app.workspace_titlebar_visibility = false;
         config.app.system_wide_hotkey_enabled = true;
@@ -5125,6 +5472,8 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(parsed["app"]["focusPaneOnFirstClick"], Value::Bool(true));
+        assert_eq!(parsed["app"]["language"], "pt-BR");
+        assert_eq!(parsed["app"]["appIcon"], "dark");
         assert_eq!(parsed["app"]["windowTitleTemplate"], "{workspace}");
         assert_eq!(parsed["app"]["menuBarOnly"], Value::Bool(true));
         assert_eq!(parsed["app"]["preferredEditor"], "code --reuse-window");
@@ -5136,9 +5485,12 @@ mod tests {
             parsed["app"]["openMarkdownInCmuxViewer"],
             Value::Bool(false)
         );
+        assert_eq!(parsed["app"]["minimalMode"], "minimal");
+        assert_eq!(parsed["app"]["globalFontMagnification"], 180);
         assert_eq!(parsed["app"]["iMessageMode"], Value::Bool(true));
         assert_eq!(parsed["app"]["reorderOnNotification"], Value::Bool(false));
         assert_eq!(parsed["app"]["sendAnonymousTelemetry"], Value::Bool(false));
+        assert_eq!(parsed["app"]["confirmQuit"], "dirty-only");
         assert_eq!(parsed["app"]["warnBeforeQuit"], Value::Bool(false));
         assert_eq!(parsed["app"]["warnBeforeClosingTab"], Value::Bool(false));
         assert_eq!(
@@ -5154,6 +5506,8 @@ mod tests {
             parsed["app"]["commandPaletteSearchesAllSurfaces"],
             Value::Bool(true)
         );
+        assert_eq!(parsed["app"]["fileDropDefaultBehavior"], "preview");
+        assert_eq!(parsed["app"]["titlebarControlsStyle"], 4);
         assert_eq!(parsed["app"]["workspaceButtonFade"], "enabled");
         assert_eq!(
             parsed["app"]["workspaceTitlebarVisibility"],
