@@ -3,6 +3,7 @@
 // inputs: XDG config paths and JSON settings files.
 // returns/effects: Creates first-run defaults, rejects corrupt persisted settings, and writes settings atomically.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,6 +72,10 @@ pub struct AppConfig {
     pub canvas: CanvasConfig,
     #[serde(skip)]
     pub pane_chrome: PaneChromeConfig,
+    #[serde(skip)]
+    pub workspace_colors: WorkspaceColorsConfig,
+    #[serde(skip)]
+    pub sidebar_appearance: SidebarAppearanceConfig,
     #[serde(skip)]
     pub sidebar: SidebarConfig,
     #[serde(skip)]
@@ -466,6 +471,252 @@ pub struct CanvasConfig {
 pub struct PaneChromeConfig {
     pub pane_border_color: String,
     pub active_pane_border_color: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceColorsConfig {
+    pub indicator_style: WorkspaceIndicatorStyle,
+    pub selection_color: String,
+    pub notification_badge_color: String,
+    pub colors: BTreeMap<String, String>,
+    pub palette_overrides: BTreeMap<String, String>,
+    pub custom_colors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceIndicatorStyle {
+    #[default]
+    LeftRail,
+    SolidFill,
+}
+
+impl WorkspaceIndicatorStyle {
+    // purpose: Serialize the CMUX workspace indicator style.
+    // inputs: Parsed or default workspace indicator style.
+    // returns/effects: Returns the canonical JSON string.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LeftRail => "leftRail",
+            Self::SolidFill => "solidFill",
+        }
+    }
+
+    // purpose: Parse CMUX workspace indicator strings including legacy aliases.
+    // inputs: Raw JSON string from workspaceColors.indicatorStyle.
+    // returns/effects: Returns None for unsupported indicator names.
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "leftRail" | "rail" => Some(Self::LeftRail),
+            "solidFill" | "border" | "wash" | "lift" | "typography" | "washRail"
+            | "blueWashColorRail" => Some(Self::SolidFill),
+            _ => None,
+        }
+    }
+}
+
+impl Default for WorkspaceColorsConfig {
+    fn default() -> Self {
+        Self {
+            indicator_style: WorkspaceIndicatorStyle::LeftRail,
+            selection_color: String::new(),
+            notification_badge_color: String::new(),
+            colors: BTreeMap::new(),
+            palette_overrides: BTreeMap::new(),
+            custom_colors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarAppearanceConfig {
+    pub match_terminal_background: bool,
+    pub tint_color: String,
+    pub light_mode_tint_color: String,
+    pub dark_mode_tint_color: String,
+    pub tint_opacity: f64,
+    pub blur_opacity: f64,
+    pub corner_radius: f64,
+    pub preset: SidebarPresetOption,
+    pub material: SidebarMaterialOption,
+    pub blend_mode: SidebarBlendModeOption,
+    pub state: SidebarStateOption,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarPresetOption {
+    #[default]
+    NativeSidebar,
+    NativeTitlebar,
+    Translucent,
+    OpaqueDark,
+    OpaqueLight,
+    Custom,
+}
+
+impl SidebarPresetOption {
+    // purpose: Serialize CMUX sidebar appearance presets.
+    // inputs: Parsed or default preset.
+    // returns/effects: Returns the canonical JSON string.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeSidebar => "nativeSidebar",
+            Self::NativeTitlebar => "nativeTitlebar",
+            Self::Translucent => "translucent",
+            Self::OpaqueDark => "opaqueDark",
+            Self::OpaqueLight => "opaqueLight",
+            Self::Custom => "custom",
+        }
+    }
+
+    // purpose: Parse CMUX sidebar appearance preset strings.
+    // inputs: Raw JSON string from sidebarAppearance.preset.
+    // returns/effects: Returns None for unsupported preset names.
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "nativeSidebar" => Some(Self::NativeSidebar),
+            "nativeTitlebar" => Some(Self::NativeTitlebar),
+            "translucent" => Some(Self::Translucent),
+            "opaqueDark" => Some(Self::OpaqueDark),
+            "opaqueLight" => Some(Self::OpaqueLight),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarMaterialOption {
+    #[default]
+    Sidebar,
+    Titlebar,
+    Selection,
+    Menu,
+    Popover,
+    HeaderView,
+    Sheet,
+    WindowBackground,
+    HudWindow,
+    FullScreenUi,
+    ToolTip,
+    ContentBackground,
+    UnderWindowBackground,
+    UnderPageBackground,
+}
+
+impl SidebarMaterialOption {
+    // purpose: Serialize CMUX sidebar material options.
+    // inputs: Parsed or default material.
+    // returns/effects: Returns the canonical JSON string.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sidebar => "sidebar",
+            Self::Titlebar => "titlebar",
+            Self::Selection => "selection",
+            Self::Menu => "menu",
+            Self::Popover => "popover",
+            Self::HeaderView => "headerView",
+            Self::Sheet => "sheet",
+            Self::WindowBackground => "windowBackground",
+            Self::HudWindow => "hudWindow",
+            Self::FullScreenUi => "fullScreenUI",
+            Self::ToolTip => "toolTip",
+            Self::ContentBackground => "contentBackground",
+            Self::UnderWindowBackground => "underWindowBackground",
+            Self::UnderPageBackground => "underPageBackground",
+        }
+    }
+
+    // purpose: Parse CMUX sidebar material option strings.
+    // inputs: Raw JSON string from sidebarAppearance.material.
+    // returns/effects: Returns None for unsupported material names.
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "sidebar" => Some(Self::Sidebar),
+            "titlebar" => Some(Self::Titlebar),
+            "selection" => Some(Self::Selection),
+            "menu" => Some(Self::Menu),
+            "popover" => Some(Self::Popover),
+            "headerView" => Some(Self::HeaderView),
+            "sheet" => Some(Self::Sheet),
+            "windowBackground" => Some(Self::WindowBackground),
+            "hudWindow" => Some(Self::HudWindow),
+            "fullScreenUI" => Some(Self::FullScreenUi),
+            "toolTip" => Some(Self::ToolTip),
+            "contentBackground" => Some(Self::ContentBackground),
+            "underWindowBackground" => Some(Self::UnderWindowBackground),
+            "underPageBackground" => Some(Self::UnderPageBackground),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarBlendModeOption {
+    BehindWindow,
+    #[default]
+    WithinWindow,
+}
+
+impl SidebarBlendModeOption {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BehindWindow => "behindWindow",
+            Self::WithinWindow => "withinWindow",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "behindWindow" => Some(Self::BehindWindow),
+            "withinWindow" => Some(Self::WithinWindow),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarStateOption {
+    Active,
+    Inactive,
+    #[default]
+    FollowsWindowActiveState,
+}
+
+impl SidebarStateOption {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+            Self::FollowsWindowActiveState => "followsWindowActiveState",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(Self::Active),
+            "inactive" => Some(Self::Inactive),
+            "followsWindowActiveState" => Some(Self::FollowsWindowActiveState),
+            _ => None,
+        }
+    }
+}
+
+impl Default for SidebarAppearanceConfig {
+    fn default() -> Self {
+        Self {
+            match_terminal_background: false,
+            tint_color: "#000000".to_string(),
+            light_mode_tint_color: String::new(),
+            dark_mode_tint_color: String::new(),
+            tint_opacity: 0.18,
+            blur_opacity: 1.0,
+            corner_radius: 0.0,
+            preset: SidebarPresetOption::NativeSidebar,
+            material: SidebarMaterialOption::Sidebar,
+            blend_mode: SidebarBlendModeOption::WithinWindow,
+            state: SidebarStateOption::FollowsWindowActiveState,
+        }
+    }
 }
 
 impl Default for MarkdownConfig {
@@ -1416,6 +1667,14 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
             .map(|value| parse_pane_chrome_color(value, "activePaneBorderColor"))
             .unwrap_or_default(),
     };
+    let workspace_colors = root
+        .get("workspaceColors")
+        .map(parse_workspace_colors_config)
+        .unwrap_or_default();
+    let sidebar_appearance = root
+        .get("sidebarAppearance")
+        .map(parse_sidebar_appearance_config)
+        .unwrap_or_default();
 
     let font_size = root
         .get("font_size")
@@ -1465,6 +1724,8 @@ fn parse_app_config_value(root: &Value) -> AppConfig {
         file_editor,
         canvas,
         pane_chrome,
+        workspace_colors,
+        sidebar_appearance,
         sidebar: SidebarConfig {
             hide_all_details,
             wrap_workspace_titles,
@@ -1721,6 +1982,106 @@ fn parse_canvas_config(value: &Value) -> CanvasConfig {
             .get("snappingEnabled")
             .map(|value| parse_bool_setting(value, "canvas.snappingEnabled"))
             .unwrap_or(defaults.snapping_enabled),
+    }
+}
+
+// purpose: Parse the CMUX workspace color settings section.
+// inputs: Optional workspaceColors JSON value from settings.
+// returns/effects: Returns strict palette, custom color, and indicator settings.
+fn parse_workspace_colors_config(value: &Value) -> WorkspaceColorsConfig {
+    let workspace_colors = required_object_setting(value, "workspaceColors");
+    let defaults = WorkspaceColorsConfig::default();
+    WorkspaceColorsConfig {
+        indicator_style: workspace_colors
+            .get("indicatorStyle")
+            .map(|value| parse_workspace_indicator_style(value, "workspaceColors.indicatorStyle"))
+            .unwrap_or(defaults.indicator_style),
+        selection_color: workspace_colors
+            .get("selectionColor")
+            .map(|value| parse_optional_color_hex_setting(value, "workspaceColors.selectionColor"))
+            .unwrap_or(defaults.selection_color),
+        notification_badge_color: workspace_colors
+            .get("notificationBadgeColor")
+            .map(|value| {
+                parse_optional_color_hex_setting(value, "workspaceColors.notificationBadgeColor")
+            })
+            .unwrap_or(defaults.notification_badge_color),
+        colors: workspace_colors
+            .get("colors")
+            .map(|value| parse_color_hex_map_setting(value, "workspaceColors.colors"))
+            .unwrap_or(defaults.colors),
+        palette_overrides: workspace_colors
+            .get("paletteOverrides")
+            .map(|value| parse_color_hex_map_setting(value, "workspaceColors.paletteOverrides"))
+            .unwrap_or(defaults.palette_overrides),
+        custom_colors: workspace_colors
+            .get("customColors")
+            .map(|value| parse_color_hex_array_setting(value, "workspaceColors.customColors"))
+            .unwrap_or(defaults.custom_colors),
+    }
+}
+
+// purpose: Parse the CMUX sidebar appearance settings section.
+// inputs: Optional sidebarAppearance JSON value from settings.
+// returns/effects: Returns strict tint, material, blend, state, and opacity settings.
+fn parse_sidebar_appearance_config(value: &Value) -> SidebarAppearanceConfig {
+    let sidebar_appearance = required_object_setting(value, "sidebarAppearance");
+    let defaults = SidebarAppearanceConfig::default();
+    SidebarAppearanceConfig {
+        match_terminal_background: sidebar_appearance
+            .get("matchTerminalBackground")
+            .map(|value| parse_bool_setting(value, "sidebarAppearance.matchTerminalBackground"))
+            .unwrap_or(defaults.match_terminal_background),
+        tint_color: sidebar_appearance
+            .get("tintColor")
+            .map(|value| parse_required_color_hex_setting(value, "sidebarAppearance.tintColor"))
+            .unwrap_or(defaults.tint_color),
+        light_mode_tint_color: sidebar_appearance
+            .get("lightModeTintColor")
+            .map(|value| {
+                parse_optional_color_hex_setting(value, "sidebarAppearance.lightModeTintColor")
+            })
+            .unwrap_or(defaults.light_mode_tint_color),
+        dark_mode_tint_color: sidebar_appearance
+            .get("darkModeTintColor")
+            .map(|value| {
+                parse_optional_color_hex_setting(value, "sidebarAppearance.darkModeTintColor")
+            })
+            .unwrap_or(defaults.dark_mode_tint_color),
+        tint_opacity: sidebar_appearance
+            .get("tintOpacity")
+            .map(|value| {
+                parse_non_negative_f64_setting(value, "sidebarAppearance.tintOpacity", 1.0)
+            })
+            .unwrap_or(defaults.tint_opacity),
+        blur_opacity: sidebar_appearance
+            .get("blurOpacity")
+            .map(|value| {
+                parse_non_negative_f64_setting(value, "sidebarAppearance.blurOpacity", 1.0)
+            })
+            .unwrap_or(defaults.blur_opacity),
+        corner_radius: sidebar_appearance
+            .get("cornerRadius")
+            .map(|value| {
+                parse_non_negative_f64_setting(value, "sidebarAppearance.cornerRadius", 4096.0)
+            })
+            .unwrap_or(defaults.corner_radius),
+        preset: sidebar_appearance
+            .get("preset")
+            .map(|value| parse_sidebar_preset(value, "sidebarAppearance.preset"))
+            .unwrap_or(defaults.preset),
+        material: sidebar_appearance
+            .get("material")
+            .map(|value| parse_sidebar_material(value, "sidebarAppearance.material"))
+            .unwrap_or(defaults.material),
+        blend_mode: sidebar_appearance
+            .get("blendMode")
+            .map(|value| parse_sidebar_blend_mode(value, "sidebarAppearance.blendMode"))
+            .unwrap_or(defaults.blend_mode),
+        state: sidebar_appearance
+            .get("state")
+            .map(|value| parse_sidebar_state(value, "sidebarAppearance.state"))
+            .unwrap_or(defaults.state),
     }
 }
 
@@ -2053,6 +2414,19 @@ fn parse_non_negative_i32_setting(value: &Value, path: &str, max: i32) -> i32 {
     number.round().clamp(0.0, max as f64) as i32
 }
 
+// purpose: Parse finite non-negative decimal settings with an upper clamp.
+// inputs: Raw JSON value, user-facing path, and accepted maximum.
+// returns/effects: Returns clamped decimal or panics on malformed/negative values.
+fn parse_non_negative_f64_setting(value: &Value, path: &str, max: f64) -> f64 {
+    let number = value
+        .as_f64()
+        .unwrap_or_else(|| panic!("{path} must be a non-negative number"));
+    if !number.is_finite() || number < 0.0 {
+        panic!("{path} must be a non-negative number");
+    }
+    number.clamp(0.0, max)
+}
+
 // purpose: Parse required JSON arrays of strings.
 // inputs: Raw JSON value and user-facing config path.
 // returns/effects: Returns owned strings or panics on malformed arrays.
@@ -2146,6 +2520,115 @@ fn normalize_pane_chrome_color(raw: &str) -> Option<String> {
         return None;
     }
     Some(format!("#{}", body.to_ascii_uppercase()))
+}
+
+// purpose: Parse optional CMUX color strings that may be null or empty.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns empty/default or normalized #RRGGBB; panics on malformed config.
+fn parse_optional_color_hex_setting(value: &Value, path: &str) -> String {
+    parse_pane_chrome_color(value, path)
+}
+
+// purpose: Parse required CMUX color strings.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns normalized #RRGGBB or panics on empty/malformed config.
+fn parse_required_color_hex_setting(value: &Value, path: &str) -> String {
+    let color = parse_optional_color_hex_setting(value, path);
+    if color.is_empty() {
+        panic!("{path} must be a #RRGGBB color");
+    }
+    color
+}
+
+// purpose: Parse CMUX color-map settings.
+// inputs: Raw JSON object and user-facing config path.
+// returns/effects: Returns normalized color values or panics on malformed entries.
+fn parse_color_hex_map_setting(value: &Value, path: &str) -> BTreeMap<String, String> {
+    let object = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path} must be an object of #RRGGBB colors"));
+    object
+        .iter()
+        .map(|(key, value)| {
+            let entry_path = format!("{path}.{key}");
+            (
+                key.clone(),
+                parse_required_color_hex_setting(value, &entry_path),
+            )
+        })
+        .collect()
+}
+
+// purpose: Parse CMUX custom color arrays.
+// inputs: Raw JSON array and user-facing config path.
+// returns/effects: Returns normalized color list or panics on malformed entries.
+fn parse_color_hex_array_setting(value: &Value, path: &str) -> Vec<String> {
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("{path} must be a JSON array of #RRGGBB colors"));
+    array
+        .iter()
+        .map(|value| parse_required_color_hex_setting(value, path))
+        .collect()
+}
+
+// purpose: Parse CMUX workspace indicator style values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the modern enum value or panics on unsupported names.
+fn parse_workspace_indicator_style(value: &Value, path: &str) -> WorkspaceIndicatorStyle {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    WorkspaceIndicatorStyle::from_str(raw).unwrap_or_else(|| {
+        panic!(
+            "{path} must be one of leftRail, solidFill, rail, border, wash, lift, typography, washRail, or blueWashColorRail"
+        )
+    })
+}
+
+// purpose: Parse CMUX sidebar appearance preset values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the preset enum value or panics on unsupported names.
+fn parse_sidebar_preset(value: &Value, path: &str) -> SidebarPresetOption {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    SidebarPresetOption::from_str(raw).unwrap_or_else(|| {
+        panic!("{path} must be one of nativeSidebar, nativeTitlebar, translucent, opaqueDark, opaqueLight, or custom")
+    })
+}
+
+// purpose: Parse CMUX sidebar material values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the material enum value or panics on unsupported names.
+fn parse_sidebar_material(value: &Value, path: &str) -> SidebarMaterialOption {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    SidebarMaterialOption::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be a supported sidebar material"))
+}
+
+// purpose: Parse CMUX sidebar blend-mode values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the blend enum value or panics on unsupported names.
+fn parse_sidebar_blend_mode(value: &Value, path: &str) -> SidebarBlendModeOption {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    SidebarBlendModeOption::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be behindWindow or withinWindow"))
+}
+
+// purpose: Parse CMUX sidebar state values.
+// inputs: Raw JSON value and user-facing config path.
+// returns/effects: Returns the state enum value or panics on unsupported names.
+fn parse_sidebar_state(value: &Value, path: &str) -> SidebarStateOption {
+    let raw = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{path} must be a string"));
+    SidebarStateOption::from_str(raw)
+        .unwrap_or_else(|| panic!("{path} must be active, inactive, or followsWindowActiveState"))
 }
 
 // purpose: Parse CMUX account PII-display strings without silent fallback.
@@ -2804,6 +3287,33 @@ fn save_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
         &["remoteTmux", "beta", "enabled"],
         config.beta_features.remote_tmux_enabled,
     )?;
+    root.insert(
+        "workspaceColors".to_string(),
+        json!({
+            "indicatorStyle": config.workspace_colors.indicator_style.as_str(),
+            "selectionColor": config.workspace_colors.selection_color,
+            "notificationBadgeColor": config.workspace_colors.notification_badge_color,
+            "colors": config.workspace_colors.colors,
+            "paletteOverrides": config.workspace_colors.palette_overrides,
+            "customColors": config.workspace_colors.custom_colors,
+        }),
+    );
+    root.insert(
+        "sidebarAppearance".to_string(),
+        json!({
+            "matchTerminalBackground": config.sidebar_appearance.match_terminal_background,
+            "tintColor": config.sidebar_appearance.tint_color,
+            "lightModeTintColor": config.sidebar_appearance.light_mode_tint_color,
+            "darkModeTintColor": config.sidebar_appearance.dark_mode_tint_color,
+            "tintOpacity": config.sidebar_appearance.tint_opacity,
+            "blurOpacity": config.sidebar_appearance.blur_opacity,
+            "cornerRadius": config.sidebar_appearance.corner_radius,
+            "preset": config.sidebar_appearance.preset.as_str(),
+            "material": config.sidebar_appearance.material.as_str(),
+            "blendMode": config.sidebar_appearance.blend_mode.as_str(),
+            "state": config.sidebar_appearance.state.as_str(),
+        }),
+    );
     let mut sidebar = serde_json::Map::from_iter([
         (
             "hideAllDetails".to_string(),
@@ -4211,6 +4721,123 @@ mod tests {
         let _ = load_from_path(&path);
     }
 
+    // purpose: Verify CMUX workspace color and sidebar appearance settings load strictly.
+    // inputs: Settings JSON with workspaceColors and sidebarAppearance sections.
+    // returns/effects: Asserts normalized colors, legacy indicator aliases, and enum parsing.
+    #[test]
+    fn load_from_path_reads_workspace_colors_and_sidebar_appearance() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r##"{
+  "workspaceColors": {
+    "indicatorStyle": "blueWashColorRail",
+    "selectionColor": "336699",
+    "notificationBadgeColor": "#aa5500",
+    "colors": {"Red": "c0392b"},
+    "paletteOverrides": {"Blue": "#1565c0"},
+    "customColors": ["112233"]
+  },
+  "sidebarAppearance": {
+    "matchTerminalBackground": true,
+    "tintColor": "102030",
+    "lightModeTintColor": "",
+    "darkModeTintColor": "#445566",
+    "tintOpacity": 0,
+    "blurOpacity": 0.6,
+    "cornerRadius": 12.5,
+    "preset": "custom",
+    "material": "hudWindow",
+    "blendMode": "behindWindow",
+    "state": "inactive"
+  }
+}
+"##,
+        )
+        .expect("write config");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(
+            loaded.config.workspace_colors.indicator_style,
+            WorkspaceIndicatorStyle::SolidFill
+        );
+        assert_eq!(loaded.config.workspace_colors.selection_color, "#336699");
+        assert_eq!(
+            loaded.config.workspace_colors.notification_badge_color,
+            "#AA5500"
+        );
+        assert_eq!(
+            loaded.config.workspace_colors.colors.get("Red"),
+            Some(&"#C0392B".to_string())
+        );
+        assert_eq!(
+            loaded.config.workspace_colors.palette_overrides.get("Blue"),
+            Some(&"#1565C0".to_string())
+        );
+        assert_eq!(loaded.config.workspace_colors.custom_colors, ["#112233"]);
+        assert!(loaded.config.sidebar_appearance.match_terminal_background);
+        assert_eq!(loaded.config.sidebar_appearance.tint_color, "#102030");
+        assert_eq!(loaded.config.sidebar_appearance.light_mode_tint_color, "");
+        assert_eq!(
+            loaded.config.sidebar_appearance.dark_mode_tint_color,
+            "#445566"
+        );
+        assert_eq!(loaded.config.sidebar_appearance.tint_opacity, 0.0);
+        assert_eq!(loaded.config.sidebar_appearance.blur_opacity, 0.6);
+        assert_eq!(loaded.config.sidebar_appearance.corner_radius, 12.5);
+        assert_eq!(
+            loaded.config.sidebar_appearance.preset,
+            SidebarPresetOption::Custom
+        );
+        assert_eq!(
+            loaded.config.sidebar_appearance.material,
+            SidebarMaterialOption::HudWindow
+        );
+        assert_eq!(
+            loaded.config.sidebar_appearance.blend_mode,
+            SidebarBlendModeOption::BehindWindow
+        );
+        assert_eq!(
+            loaded.config.sidebar_appearance.state,
+            SidebarStateOption::Inactive
+        );
+    }
+
+    // purpose: Verify malformed CMUX workspace color map settings fail loudly.
+    // inputs: Settings JSON with a non-string workspaceColors.colors entry.
+    // returns/effects: Panics instead of accepting an invalid palette.
+    #[test]
+    #[should_panic(expected = "workspaceColors.colors.Red must be a #RRGGBB color")]
+    fn load_from_path_rejects_invalid_workspace_color_map() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(&path, r#"{"workspaceColors":{"colors":{"Red":7}}}"#).expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
+    // purpose: Verify malformed CMUX sidebar appearance values fail loudly.
+    // inputs: Settings JSON with an unsupported sidebar material.
+    // returns/effects: Panics instead of accepting an invalid material setting.
+    #[test]
+    #[should_panic(expected = "sidebarAppearance.material must be a supported sidebar material")]
+    fn load_from_path_rejects_invalid_sidebar_appearance_material() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            r#"{"sidebarAppearance":{"material":"transparentGlass"}}"#,
+        )
+        .expect("write config");
+
+        let _ = load_from_path(&path);
+    }
+
     #[test]
     fn agent_notification_gate_follows_cmux_decision_table() {
         let mut config = NotificationConfig::default();
@@ -4780,6 +5407,78 @@ mod tests {
             parsed["sidebar"]["rightMaxWidth"],
             Value::Number(1500.into())
         );
+    }
+
+    // purpose: Verify saving writes CMUX workspace color and sidebar appearance sections.
+    // inputs: AppConfig with non-default workspace color and sidebar appearance settings.
+    // returns/effects: Persists sections while preserving unrelated sibling config.
+    #[test]
+    fn save_to_path_writes_workspace_colors_and_sidebar_appearance() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = settings_path_in(dir.path());
+        fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
+        fs::write(
+            &path,
+            br#"{"app":{"appearance":"dark"},"custom":{"keep":true}}"#,
+        )
+        .expect("write config");
+
+        let mut config = AppConfig::default();
+        config.workspace_colors.indicator_style = WorkspaceIndicatorStyle::SolidFill;
+        config.workspace_colors.selection_color = "#336699".to_string();
+        config.workspace_colors.notification_badge_color = "#AA5500".to_string();
+        config
+            .workspace_colors
+            .colors
+            .insert("Red".to_string(), "#C0392B".to_string());
+        config
+            .workspace_colors
+            .palette_overrides
+            .insert("Blue".to_string(), "#1565C0".to_string());
+        config
+            .workspace_colors
+            .custom_colors
+            .push("#112233".to_string());
+        config.sidebar_appearance.match_terminal_background = true;
+        config.sidebar_appearance.tint_color = "#102030".to_string();
+        config.sidebar_appearance.dark_mode_tint_color = "#445566".to_string();
+        config.sidebar_appearance.tint_opacity = 0.0;
+        config.sidebar_appearance.blur_opacity = 0.6;
+        config.sidebar_appearance.corner_radius = 12.5;
+        config.sidebar_appearance.preset = SidebarPresetOption::Custom;
+        config.sidebar_appearance.material = SidebarMaterialOption::HudWindow;
+        config.sidebar_appearance.blend_mode = SidebarBlendModeOption::BehindWindow;
+        config.sidebar_appearance.state = SidebarStateOption::Inactive;
+        save_to_path(&path, &config).expect("save sidebar appearance");
+
+        let raw = fs::read_to_string(&path).expect("read config");
+        let parsed: Value = serde_json::from_str(&raw).expect("parse config");
+        assert_eq!(parsed["workspaceColors"]["indicatorStyle"], "solidFill");
+        assert_eq!(parsed["workspaceColors"]["selectionColor"], "#336699");
+        assert_eq!(
+            parsed["workspaceColors"]["notificationBadgeColor"],
+            "#AA5500"
+        );
+        assert_eq!(parsed["workspaceColors"]["colors"]["Red"], "#C0392B");
+        assert_eq!(
+            parsed["workspaceColors"]["paletteOverrides"]["Blue"],
+            "#1565C0"
+        );
+        assert_eq!(parsed["workspaceColors"]["customColors"][0], "#112233");
+        assert_eq!(
+            parsed["sidebarAppearance"]["matchTerminalBackground"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["sidebarAppearance"]["tintColor"], "#102030");
+        assert_eq!(parsed["sidebarAppearance"]["darkModeTintColor"], "#445566");
+        assert_eq!(parsed["sidebarAppearance"]["tintOpacity"], 0.0);
+        assert_eq!(parsed["sidebarAppearance"]["blurOpacity"], 0.6);
+        assert_eq!(parsed["sidebarAppearance"]["cornerRadius"], 12.5);
+        assert_eq!(parsed["sidebarAppearance"]["preset"], "custom");
+        assert_eq!(parsed["sidebarAppearance"]["material"], "hudWindow");
+        assert_eq!(parsed["sidebarAppearance"]["blendMode"], "behindWindow");
+        assert_eq!(parsed["sidebarAppearance"]["state"], "inactive");
+        assert_eq!(parsed["custom"]["keep"], Value::Bool(true));
     }
 
     // purpose: Verify saving writes the CMUX terminal auto-resume setting without dropping siblings.

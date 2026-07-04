@@ -1808,6 +1808,11 @@ enum ScalarSettingKind {
         min: f64,
         max: f64,
     },
+    DecimalAllowZero {
+        default: f64,
+        min: f64,
+        max: f64,
+    },
     String {
         default: &'static str,
     },
@@ -1818,7 +1823,10 @@ enum ScalarSettingKind {
         default: &'static str,
         allowed: &'static [&'static str],
     },
+    WorkspaceIndicatorStyle,
     StringArray,
+    ColorHexArray,
+    ColorHexMap,
 }
 
 #[derive(Clone, Copy)]
@@ -2313,6 +2321,178 @@ const ACTIVE_PANE_BORDER_COLOR_SETTING: ScalarSetting = ScalarSetting {
     section: "",
     json_path: &["activePaneBorderColor"],
     kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const WORKSPACE_INDICATOR_STYLE_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.indicatorStyle",
+    section: "workspaceColors",
+    json_path: &["indicatorStyle"],
+    kind: ScalarSettingKind::WorkspaceIndicatorStyle,
+};
+
+const WORKSPACE_SELECTION_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.selectionColor",
+    section: "workspaceColors",
+    json_path: &["selectionColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const WORKSPACE_NOTIFICATION_BADGE_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.notificationBadgeColor",
+    section: "workspaceColors",
+    json_path: &["notificationBadgeColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const WORKSPACE_COLORS_MAP_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.colors",
+    section: "workspaceColors",
+    json_path: &["colors"],
+    kind: ScalarSettingKind::ColorHexMap,
+};
+
+const WORKSPACE_PALETTE_OVERRIDES_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.paletteOverrides",
+    section: "workspaceColors",
+    json_path: &["paletteOverrides"],
+    kind: ScalarSettingKind::ColorHexMap,
+};
+
+const WORKSPACE_CUSTOM_COLORS_SETTING: ScalarSetting = ScalarSetting {
+    key: "workspaceColors.customColors",
+    section: "workspaceColors",
+    json_path: &["customColors"],
+    kind: ScalarSettingKind::ColorHexArray,
+};
+
+const SIDEBAR_APPEARANCE_PRESETS: &[&str] = &[
+    "nativeSidebar",
+    "nativeTitlebar",
+    "translucent",
+    "opaqueDark",
+    "opaqueLight",
+    "custom",
+];
+
+const SIDEBAR_APPEARANCE_MATERIALS: &[&str] = &[
+    "sidebar",
+    "titlebar",
+    "selection",
+    "menu",
+    "popover",
+    "headerView",
+    "sheet",
+    "windowBackground",
+    "hudWindow",
+    "fullScreenUI",
+    "toolTip",
+    "contentBackground",
+    "underWindowBackground",
+    "underPageBackground",
+];
+
+const SIDEBAR_APPEARANCE_BLEND_MODES: &[&str] = &["behindWindow", "withinWindow"];
+const SIDEBAR_APPEARANCE_STATES: &[&str] = &["active", "inactive", "followsWindowActiveState"];
+
+const SIDEBAR_APPEARANCE_MATCH_TERMINAL_BACKGROUND_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.matchTerminalBackground",
+    section: "sidebarAppearance",
+    json_path: &["matchTerminalBackground"],
+    kind: ScalarSettingKind::Boolean { default: false },
+};
+
+const SIDEBAR_APPEARANCE_TINT_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.tintColor",
+    section: "sidebarAppearance",
+    json_path: &["tintColor"],
+    kind: ScalarSettingKind::ColorHex { default: "#000000" },
+};
+
+const SIDEBAR_APPEARANCE_LIGHT_MODE_TINT_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.lightModeTintColor",
+    section: "sidebarAppearance",
+    json_path: &["lightModeTintColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const SIDEBAR_APPEARANCE_DARK_MODE_TINT_COLOR_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.darkModeTintColor",
+    section: "sidebarAppearance",
+    json_path: &["darkModeTintColor"],
+    kind: ScalarSettingKind::ColorHex { default: "" },
+};
+
+const SIDEBAR_APPEARANCE_TINT_OPACITY_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.tintOpacity",
+    section: "sidebarAppearance",
+    json_path: &["tintOpacity"],
+    kind: ScalarSettingKind::DecimalAllowZero {
+        default: 0.18,
+        min: 0.0,
+        max: 1.0,
+    },
+};
+
+const SIDEBAR_APPEARANCE_BLUR_OPACITY_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.blurOpacity",
+    section: "sidebarAppearance",
+    json_path: &["blurOpacity"],
+    kind: ScalarSettingKind::DecimalAllowZero {
+        default: 1.0,
+        min: 0.0,
+        max: 1.0,
+    },
+};
+
+const SIDEBAR_APPEARANCE_CORNER_RADIUS_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.cornerRadius",
+    section: "sidebarAppearance",
+    json_path: &["cornerRadius"],
+    kind: ScalarSettingKind::DecimalAllowZero {
+        default: 0.0,
+        min: 0.0,
+        max: 4096.0,
+    },
+};
+
+const SIDEBAR_APPEARANCE_PRESET_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.preset",
+    section: "sidebarAppearance",
+    json_path: &["preset"],
+    kind: ScalarSettingKind::Enum {
+        default: "nativeSidebar",
+        allowed: SIDEBAR_APPEARANCE_PRESETS,
+    },
+};
+
+const SIDEBAR_APPEARANCE_MATERIAL_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.material",
+    section: "sidebarAppearance",
+    json_path: &["material"],
+    kind: ScalarSettingKind::Enum {
+        default: "sidebar",
+        allowed: SIDEBAR_APPEARANCE_MATERIALS,
+    },
+};
+
+const SIDEBAR_APPEARANCE_BLEND_MODE_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.blendMode",
+    section: "sidebarAppearance",
+    json_path: &["blendMode"],
+    kind: ScalarSettingKind::Enum {
+        default: "withinWindow",
+        allowed: SIDEBAR_APPEARANCE_BLEND_MODES,
+    },
+};
+
+const SIDEBAR_APPEARANCE_STATE_SETTING: ScalarSetting = ScalarSetting {
+    key: "sidebarAppearance.state",
+    section: "sidebarAppearance",
+    json_path: &["state"],
+    kind: ScalarSettingKind::Enum {
+        default: "followsWindowActiveState",
+        allowed: SIDEBAR_APPEARANCE_STATES,
+    },
 };
 
 const WORKSPACE_BUTTON_FADE_MODES: &[&str] = &["enabled", "disabled"];
@@ -2932,6 +3112,14 @@ const CONFIG_GET_USAGE: &str = concat!(
     "automation.kiroNotificationLevel|automation.portBase|automation.portRange|",
     "mobile.iOSPairingHost.enabled|mobile.iOSPairingHost.port|",
     "mobile.iOSPairingHost.displayName|",
+    "workspaceColors.indicatorStyle|workspaceColors.selectionColor|",
+    "workspaceColors.notificationBadgeColor|workspaceColors.colors|",
+    "workspaceColors.paletteOverrides|workspaceColors.customColors|",
+    "sidebarAppearance.matchTerminalBackground|sidebarAppearance.tintColor|",
+    "sidebarAppearance.lightModeTintColor|sidebarAppearance.darkModeTintColor|",
+    "sidebarAppearance.tintOpacity|sidebarAppearance.blurOpacity|",
+    "sidebarAppearance.cornerRadius|sidebarAppearance.preset|",
+    "sidebarAppearance.material|sidebarAppearance.blendMode|sidebarAppearance.state|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
     "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
@@ -2999,6 +3187,14 @@ const CONFIG_SET_USAGE: &str = concat!(
     "automation.kiroNotificationLevel|automation.portBase|automation.portRange|",
     "mobile.iOSPairingHost.enabled|mobile.iOSPairingHost.port|",
     "mobile.iOSPairingHost.displayName|",
+    "workspaceColors.indicatorStyle|workspaceColors.selectionColor|",
+    "workspaceColors.notificationBadgeColor|workspaceColors.colors|",
+    "workspaceColors.paletteOverrides|workspaceColors.customColors|",
+    "sidebarAppearance.matchTerminalBackground|sidebarAppearance.tintColor|",
+    "sidebarAppearance.lightModeTintColor|sidebarAppearance.darkModeTintColor|",
+    "sidebarAppearance.tintOpacity|sidebarAppearance.blurOpacity|",
+    "sidebarAppearance.cornerRadius|sidebarAppearance.preset|",
+    "sidebarAppearance.material|sidebarAppearance.blendMode|sidebarAppearance.state|",
     "account.piiDisplayMode|account.selectedTeamID|account.welcomeShown|",
     "integrations.claudeCode.hooksEnabled|integrations.claudeCode.customClaudePath|",
     "integrations.codex.hooksEnabled|integrations.amp.hooksEnabled|",
@@ -3162,6 +3358,12 @@ fn scalar_setting(raw: &str) -> Option<ScalarSetting> {
     if raw.starts_with("mobile.") {
         return mobile_scalar_setting(raw);
     }
+    if raw.starts_with("workspaceColors.") {
+        return workspace_colors_scalar_setting(raw);
+    }
+    if raw.starts_with("sidebarAppearance.") {
+        return sidebar_appearance_scalar_setting(raw);
+    }
     if raw.starts_with("terminal.") {
         return terminal_scalar_setting(raw);
     }
@@ -3281,6 +3483,49 @@ fn mobile_scalar_setting(raw: &str) -> Option<ScalarSetting> {
         "mobile.iOSPairingHost.enabled" => Some(MOBILE_IOS_PAIRING_HOST_ENABLED_SETTING),
         "mobile.iOSPairingHost.port" => Some(MOBILE_IOS_PAIRING_HOST_PORT_SETTING),
         "mobile.iOSPairingHost.displayName" => Some(MOBILE_IOS_PAIRING_HOST_DISPLAY_NAME_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX workspace color catalog keys to nested JSON descriptors.
+// inputs: Raw `workspaceColors.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn workspace_colors_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "workspaceColors.indicatorStyle" => Some(WORKSPACE_INDICATOR_STYLE_SETTING),
+        "workspaceColors.selectionColor" => Some(WORKSPACE_SELECTION_COLOR_SETTING),
+        "workspaceColors.notificationBadgeColor" => {
+            Some(WORKSPACE_NOTIFICATION_BADGE_COLOR_SETTING)
+        }
+        "workspaceColors.colors" => Some(WORKSPACE_COLORS_MAP_SETTING),
+        "workspaceColors.paletteOverrides" => Some(WORKSPACE_PALETTE_OVERRIDES_SETTING),
+        "workspaceColors.customColors" => Some(WORKSPACE_CUSTOM_COLORS_SETTING),
+        _ => None,
+    }
+}
+
+// purpose: Map CMUX sidebar appearance catalog keys to nested JSON descriptors.
+// inputs: Raw `sidebarAppearance.*` config key from CLI arguments.
+// returns/effects: Returns the supported descriptor or None for unknown keys.
+fn sidebar_appearance_scalar_setting(raw: &str) -> Option<ScalarSetting> {
+    match raw {
+        "sidebarAppearance.matchTerminalBackground" => {
+            Some(SIDEBAR_APPEARANCE_MATCH_TERMINAL_BACKGROUND_SETTING)
+        }
+        "sidebarAppearance.tintColor" => Some(SIDEBAR_APPEARANCE_TINT_COLOR_SETTING),
+        "sidebarAppearance.lightModeTintColor" => {
+            Some(SIDEBAR_APPEARANCE_LIGHT_MODE_TINT_COLOR_SETTING)
+        }
+        "sidebarAppearance.darkModeTintColor" => {
+            Some(SIDEBAR_APPEARANCE_DARK_MODE_TINT_COLOR_SETTING)
+        }
+        "sidebarAppearance.tintOpacity" => Some(SIDEBAR_APPEARANCE_TINT_OPACITY_SETTING),
+        "sidebarAppearance.blurOpacity" => Some(SIDEBAR_APPEARANCE_BLUR_OPACITY_SETTING),
+        "sidebarAppearance.cornerRadius" => Some(SIDEBAR_APPEARANCE_CORNER_RADIUS_SETTING),
+        "sidebarAppearance.preset" => Some(SIDEBAR_APPEARANCE_PRESET_SETTING),
+        "sidebarAppearance.material" => Some(SIDEBAR_APPEARANCE_MATERIAL_SETTING),
+        "sidebarAppearance.blendMode" => Some(SIDEBAR_APPEARANCE_BLEND_MODE_SETTING),
+        "sidebarAppearance.state" => Some(SIDEBAR_APPEARANCE_STATE_SETTING),
         _ => None,
     }
 }
@@ -3902,11 +4147,16 @@ fn default_scalar_setting_value(setting: ScalarSetting) -> Result<String> {
     match setting.kind {
         ScalarSettingKind::Boolean { default } => Ok(default.to_string()),
         ScalarSettingKind::Integer { default, .. } => Ok(default.to_string()),
-        ScalarSettingKind::Decimal { default, .. } => Ok(format_decimal_setting(default)),
+        ScalarSettingKind::Decimal { default, .. }
+        | ScalarSettingKind::DecimalAllowZero { default, .. } => {
+            Ok(format_decimal_setting(default))
+        }
         ScalarSettingKind::String { default }
         | ScalarSettingKind::ColorHex { default }
         | ScalarSettingKind::Enum { default, .. } => Ok(default.to_string()),
-        ScalarSettingKind::StringArray => Ok("[]".to_string()),
+        ScalarSettingKind::WorkspaceIndicatorStyle => Ok("leftRail".to_string()),
+        ScalarSettingKind::StringArray | ScalarSettingKind::ColorHexArray => Ok("[]".to_string()),
+        ScalarSettingKind::ColorHexMap => Ok("{}".to_string()),
     }
 }
 
@@ -3931,6 +4181,10 @@ fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value>
             let value = parse_f64_scalar_setting(setting.key, raw, min, max)?;
             Ok(json!(value))
         }
+        ScalarSettingKind::DecimalAllowZero { min, max, .. } => {
+            let value = parse_non_negative_f64_scalar_setting(setting.key, raw, min, max)?;
+            Ok(json!(value))
+        }
         ScalarSettingKind::String { .. } => Ok(Value::String(raw.to_string())),
         ScalarSettingKind::ColorHex { .. } => {
             Ok(Value::String(parse_color_hex_setting(setting.key, raw)?))
@@ -3941,7 +4195,12 @@ fn scalar_setting_json_value(setting: ScalarSetting, raw: &str) -> Result<Value>
             }
             Ok(Value::String(raw.to_string()))
         }
+        ScalarSettingKind::WorkspaceIndicatorStyle => Ok(Value::String(
+            parse_workspace_indicator_style(setting.key, raw)?,
+        )),
         ScalarSettingKind::StringArray => parse_string_array_setting(setting.key, raw),
+        ScalarSettingKind::ColorHexArray => parse_color_hex_array_setting(setting.key, raw),
+        ScalarSettingKind::ColorHexMap => parse_color_hex_map_setting(setting.key, raw),
     }
 }
 
@@ -3962,6 +4221,17 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
                 .as_f64()
                 .ok_or_else(|| anyhow!("{} must be a positive number", setting.key))?;
             Ok(format_decimal_setting(clamp_f64_setting(
+                setting.key,
+                number,
+                min,
+                max,
+            )?))
+        }
+        ScalarSettingKind::DecimalAllowZero { min, max, .. } => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{} must be a non-negative number", setting.key))?;
+            Ok(format_decimal_setting(clamp_non_negative_f64_setting(
                 setting.key,
                 number,
                 min,
@@ -3990,6 +4260,12 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
             }
             Ok(raw.to_string())
         }
+        ScalarSettingKind::WorkspaceIndicatorStyle => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{} must be one of: leftRail, solidFill", setting.key))?;
+            parse_workspace_indicator_style(setting.key, raw)
+        }
         ScalarSettingKind::StringArray => {
             let values = value
                 .as_array()
@@ -4003,6 +4279,8 @@ fn render_scalar_setting_json_value(setting: ScalarSetting, value: &Value) -> Re
             }
             serde_json::to_string(&strings).context("serialize string array setting")
         }
+        ScalarSettingKind::ColorHexArray => render_color_hex_array_setting(setting.key, value),
+        ScalarSettingKind::ColorHexMap => render_color_hex_map_setting(setting.key, value),
     }
 }
 
@@ -4024,6 +4302,16 @@ fn parse_f64_scalar_setting(key: &str, raw: &str, min: f64, max: f64) -> Result<
         .parse::<f64>()
         .with_context(|| format!("{key} requires a positive number"))?;
     clamp_f64_setting(key, number, min, max)
+}
+
+// purpose: Parse and clamp a non-negative decimal-valued CMUX scalar.
+// inputs: User-facing key, raw CLI value, and accepted range.
+// returns/effects: Returns clamped decimal or a loud validation error.
+fn parse_non_negative_f64_scalar_setting(key: &str, raw: &str, min: f64, max: f64) -> Result<f64> {
+    let number = raw
+        .parse::<f64>()
+        .with_context(|| format!("{key} requires a non-negative number"))?;
+    clamp_non_negative_f64_setting(key, number, min, max)
 }
 
 // purpose: Normalize CMUX pane chrome color strings for config get/set.
@@ -4051,6 +4339,16 @@ fn clamp_f64_setting(key: &str, value: f64, min: f64, max: f64) -> Result<f64> {
     Ok(value.clamp(min, max))
 }
 
+// purpose: Clamp a finite non-negative decimal value.
+// inputs: User-facing key, numeric value, and accepted range.
+// returns/effects: Returns clamped value or a loud validation error.
+fn clamp_non_negative_f64_setting(key: &str, value: f64, min: f64, max: f64) -> Result<f64> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{key} must be a non-negative number");
+    }
+    Ok(value.clamp(min, max))
+}
+
 // purpose: Clamp a finite positive decimal into an integer setting.
 // inputs: User-facing key, numeric value, and accepted integer range.
 // returns/effects: Returns rounded/clamped integer or a loud validation error.
@@ -4071,6 +4369,101 @@ fn parse_string_array_setting(key: &str, raw: &str) -> Result<Value> {
         bail!("{key} must be a JSON array of strings");
     }
     Ok(value)
+}
+
+// purpose: Normalize CMUX workspace indicator style strings including legacy aliases.
+// inputs: User-facing key and raw style.
+// returns/effects: Returns a modern style or rejects unknown names loudly.
+fn parse_workspace_indicator_style(key: &str, raw: &str) -> Result<String> {
+    match raw {
+        "leftRail" | "rail" => Ok("leftRail".to_string()),
+        "solidFill" | "border" | "wash" | "lift" | "typography" | "washRail"
+        | "blueWashColorRail" => Ok("solidFill".to_string()),
+        _ => bail!(
+            "{key} must be one of: leftRail, solidFill, rail, border, wash, lift, typography, washRail, blueWashColorRail"
+        ),
+    }
+}
+
+// purpose: Parse CMUX color arrays from CLI JSON.
+// inputs: User-facing key and raw JSON array.
+// returns/effects: Returns normalized color strings or rejects malformed entries loudly.
+fn parse_color_hex_array_setting(key: &str, raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .with_context(|| format!("{key} requires a JSON array of colors"))?;
+    render_color_hex_array_value(key, &value)
+}
+
+// purpose: Parse CMUX color maps from CLI JSON.
+// inputs: User-facing key and raw JSON object.
+// returns/effects: Returns normalized color values or rejects malformed entries loudly.
+fn parse_color_hex_map_setting(key: &str, raw: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(raw)
+        .with_context(|| format!("{key} requires a JSON object of colors"))?;
+    render_color_hex_map_value(key, &value)
+}
+
+// purpose: Render and validate a stored CMUX color array setting.
+// inputs: User-facing key and stored JSON value.
+// returns/effects: Returns compact JSON text with normalized color strings.
+fn render_color_hex_array_setting(key: &str, value: &Value) -> Result<String> {
+    serde_json::to_string(&render_color_hex_array_value(key, value)?)
+        .context("serialize color array setting")
+}
+
+// purpose: Render and validate a stored CMUX color map setting.
+// inputs: User-facing key and stored JSON value.
+// returns/effects: Returns compact JSON text with normalized color values.
+fn render_color_hex_map_setting(key: &str, value: &Value) -> Result<String> {
+    serde_json::to_string(&render_color_hex_map_value(key, value)?)
+        .context("serialize color map setting")
+}
+
+// purpose: Validate and normalize a CMUX JSON color array.
+// inputs: User-facing key and JSON value.
+// returns/effects: Returns a JSON array of #RRGGBB strings.
+fn render_color_hex_array_value(key: &str, value: &Value) -> Result<Value> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{key} must be a JSON array of #RRGGBB colors"))?;
+    let mut normalized = Vec::with_capacity(values.len());
+    for item in values {
+        let raw = item
+            .as_str()
+            .ok_or_else(|| anyhow!("{key} must be a JSON array of #RRGGBB colors"))?;
+        let color = parse_required_color_hex_setting(key, raw)?;
+        normalized.push(Value::String(color));
+    }
+    Ok(Value::Array(normalized))
+}
+
+// purpose: Validate and normalize a CMUX JSON color map.
+// inputs: User-facing key and JSON value.
+// returns/effects: Returns a JSON object with #RRGGBB string values.
+fn render_color_hex_map_value(key: &str, value: &Value) -> Result<Value> {
+    let values = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{key} must be a JSON object of #RRGGBB colors"))?;
+    let mut normalized = serde_json::Map::new();
+    for (name, item) in values {
+        let raw = item
+            .as_str()
+            .ok_or_else(|| anyhow!("{key}.{name} must be a #RRGGBB color"))?;
+        let color = parse_required_color_hex_setting(&format!("{key}.{name}"), raw)?;
+        normalized.insert(name.to_string(), Value::String(color));
+    }
+    Ok(Value::Object(normalized))
+}
+
+// purpose: Normalize required CMUX color strings.
+// inputs: User-facing setting key and raw color.
+// returns/effects: Returns #RRGGBB; rejects empty/null-like values loudly.
+fn parse_required_color_hex_setting(key: &str, raw: &str) -> Result<String> {
+    let color = parse_color_hex_setting(key, raw)?;
+    if color.is_empty() {
+        bail!("{key} must be a #RRGGBB color");
+    }
+    Ok(color)
 }
 
 // purpose: Format decimal settings without noisy trailing zeroes.
@@ -21185,6 +21578,158 @@ mod cli_arg_tests {
             parsed["mobile"]["iOSPairingHost"]["displayName"],
             "Dev Linux"
         );
+    }
+
+    // purpose: Verify CMUX workspace color config keys default and write nested JSON.
+    // inputs: Temporary settings file plus workspaceColors scalar config descriptors.
+    // returns/effects: Asserts alias normalization, color normalization, and sibling preservation.
+    #[test]
+    fn config_workspace_color_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text = render_config_scalar_get(&path, WORKSPACE_INDICATOR_STYLE_SETTING)
+            .expect("get indicator default");
+        assert!(text.contains("workspaceColors.indicatorStyle = leftRail"));
+        let text = render_config_scalar_get(&path, WORKSPACE_COLORS_MAP_SETTING)
+            .expect("get colors default");
+        assert!(text.contains("workspaceColors.colors = {}"));
+        let text = render_config_scalar_get(&path, WORKSPACE_CUSTOM_COLORS_SETTING)
+            .expect("get custom colors default");
+        assert!(text.contains("workspaceColors.customColors = []"));
+
+        fs::write(
+            &path,
+            br#"{"workspaceColors":{"keep":true},"app":{"appearance":"dark"}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(&path, WORKSPACE_INDICATOR_STYLE_SETTING, "washRail")
+            .expect("set legacy indicator alias");
+        render_config_scalar_set(&path, WORKSPACE_SELECTION_COLOR_SETTING, "336699")
+            .expect("set selection color");
+        render_config_scalar_set(&path, WORKSPACE_NOTIFICATION_BADGE_COLOR_SETTING, "#aa5500")
+            .expect("set badge color");
+        render_config_scalar_set(
+            &path,
+            WORKSPACE_COLORS_MAP_SETTING,
+            r##"{"Red":"c0392b","Team":"#00aaee"}"##,
+        )
+        .expect("set color map");
+        render_config_scalar_set(&path, WORKSPACE_CUSTOM_COLORS_SETTING, r##"["112233"]"##)
+            .expect("set custom colors");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(parsed["workspaceColors"]["indicatorStyle"], "solidFill");
+        assert_eq!(parsed["workspaceColors"]["selectionColor"], "#336699");
+        assert_eq!(
+            parsed["workspaceColors"]["notificationBadgeColor"],
+            "#AA5500"
+        );
+        assert_eq!(parsed["workspaceColors"]["colors"]["Red"], "#C0392B");
+        assert_eq!(parsed["workspaceColors"]["colors"]["Team"], "#00AAEE");
+        assert_eq!(parsed["workspaceColors"]["customColors"][0], "#112233");
+        assert_eq!(parsed["workspaceColors"]["keep"], true);
+        assert_eq!(parsed["app"]["appearance"], "dark");
+    }
+
+    // purpose: Verify CMUX sidebar appearance config keys default and write nested JSON.
+    // inputs: Temporary settings file plus sidebarAppearance scalar config descriptors.
+    // returns/effects: Asserts enum, opacity, color, and sibling-preservation behavior.
+    #[test]
+    fn config_sidebar_appearance_settings_get_defaults_and_write_nested_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let text =
+            render_config_scalar_get(&path, SIDEBAR_APPEARANCE_MATCH_TERMINAL_BACKGROUND_SETTING)
+                .expect("get match terminal default");
+        assert!(text.contains("sidebarAppearance.matchTerminalBackground = false"));
+        let text = render_config_scalar_get(&path, SIDEBAR_APPEARANCE_TINT_OPACITY_SETTING)
+            .expect("get tint opacity default");
+        assert!(text.contains("sidebarAppearance.tintOpacity = 0.18"));
+        let text = render_config_scalar_get(&path, SIDEBAR_APPEARANCE_STATE_SETTING)
+            .expect("get sidebar state default");
+        assert!(text.contains("sidebarAppearance.state = followsWindowActiveState"));
+
+        fs::write(
+            &path,
+            br#"{"sidebarAppearance":{"keep":1},"notifications":{"sound":"Ping"}}"#,
+        )
+        .expect("write settings");
+        render_config_scalar_set(
+            &path,
+            SIDEBAR_APPEARANCE_MATCH_TERMINAL_BACKGROUND_SETTING,
+            "true",
+        )
+        .expect("set match terminal");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_TINT_COLOR_SETTING, "102030")
+            .expect("set tint");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_LIGHT_MODE_TINT_COLOR_SETTING, "")
+            .expect("clear light tint");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_TINT_OPACITY_SETTING, "0")
+            .expect("set tint opacity");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_BLUR_OPACITY_SETTING, "0.6")
+            .expect("set blur opacity");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_CORNER_RADIUS_SETTING, "12.5")
+            .expect("set corner radius");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_PRESET_SETTING, "custom")
+            .expect("set preset");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_MATERIAL_SETTING, "hudWindow")
+            .expect("set material");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_BLEND_MODE_SETTING, "behindWindow")
+            .expect("set blend mode");
+        render_config_scalar_set(&path, SIDEBAR_APPEARANCE_STATE_SETTING, "inactive")
+            .expect("set state");
+
+        let parsed: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings")).expect("json");
+        assert_eq!(
+            parsed["sidebarAppearance"]["matchTerminalBackground"],
+            Value::Bool(true)
+        );
+        assert_eq!(parsed["sidebarAppearance"]["tintColor"], "#102030");
+        assert_eq!(parsed["sidebarAppearance"]["lightModeTintColor"], "");
+        assert_eq!(parsed["sidebarAppearance"]["tintOpacity"], 0.0);
+        assert_eq!(parsed["sidebarAppearance"]["blurOpacity"], 0.6);
+        assert_eq!(parsed["sidebarAppearance"]["cornerRadius"], 12.5);
+        assert_eq!(parsed["sidebarAppearance"]["preset"], "custom");
+        assert_eq!(parsed["sidebarAppearance"]["material"], "hudWindow");
+        assert_eq!(parsed["sidebarAppearance"]["blendMode"], "behindWindow");
+        assert_eq!(parsed["sidebarAppearance"]["state"], "inactive");
+        assert_eq!(parsed["sidebarAppearance"]["keep"], 1);
+        assert_eq!(parsed["notifications"]["sound"], "Ping");
+    }
+
+    // purpose: Verify malformed workspace color and sidebar appearance settings fail loudly.
+    // inputs: Invalid enum, color map, color array, and non-negative decimal values.
+    // returns/effects: Asserts config setters/getters reject malformed CMUX values.
+    #[test]
+    fn config_workspace_color_and_sidebar_appearance_settings_reject_invalid_values_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+
+        let err = render_config_scalar_set(&path, WORKSPACE_INDICATOR_STYLE_SETTING, "unknown")
+            .expect_err("invalid indicator");
+        assert!(err.to_string().contains("must be one of"));
+
+        let err = render_config_scalar_set(&path, WORKSPACE_COLORS_MAP_SETTING, r#"{"Red":7}"#)
+            .expect_err("invalid color map");
+        assert!(err.to_string().contains("workspaceColors.colors.Red"));
+
+        let err = render_config_scalar_set(&path, WORKSPACE_CUSTOM_COLORS_SETTING, r#"["bad"]"#)
+            .expect_err("invalid custom color");
+        assert!(err.to_string().contains("must be a #RRGGBB color"));
+
+        let err = render_config_scalar_set(&path, SIDEBAR_APPEARANCE_TINT_OPACITY_SETTING, "-1")
+            .expect_err("invalid opacity");
+        assert!(err.to_string().contains("must be a non-negative number"));
+
+        fs::write(&path, br#"{"sidebarAppearance":{"material":"unknown"}}"#)
+            .expect("write malformed material");
+        let err = render_config_scalar_get(&path, SIDEBAR_APPEARANCE_MATERIAL_SETTING)
+            .expect_err("invalid existing material");
+        assert!(err.to_string().contains("must be one of"));
     }
 
     // purpose: Verify malformed CMUX automation and mobile scalar values fail loudly.
