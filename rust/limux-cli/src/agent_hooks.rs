@@ -376,6 +376,44 @@ pub(crate) fn sanitize_launch_arguments(kind: AgentKind, arguments: &[String]) -
     }
 }
 
+pub(crate) const CODEX_UPDATE_CHECK_SUPPRESSION: [&str; 2] =
+    ["-c", "check_for_update_on_startup=false"];
+
+// purpose: Detect explicit Codex startup update-check config overrides.
+// inputs: Preserved command-line arguments from a captured Codex launch.
+// returns/effects: Returns true when the user or a previous restore already set the key.
+pub(crate) fn has_codex_update_check_override(arguments: &[String]) -> bool {
+    for (index, argument) in arguments.iter().enumerate() {
+        if matches!(argument.as_str(), "-c" | "--config")
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| value.starts_with("check_for_update_on_startup="))
+        {
+            return true;
+        }
+        if argument.starts_with("-c=check_for_update_on_startup=")
+            || argument.starts_with("--config=check_for_update_on_startup=")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// purpose: Build CMUX-compatible Codex update-check suppression tokens.
+// inputs: Preserved Codex arguments after launch sanitization.
+// returns/effects: Returns the per-invocation override unless an explicit setting exists.
+pub(crate) fn codex_update_check_suppression_args(preserved: &[String]) -> Vec<String> {
+    if has_codex_update_check_override(preserved) {
+        Vec::new()
+    } else {
+        CODEX_UPDATE_CHECK_SUPPRESSION
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn build_resume_command(
     kind: AgentKind,
@@ -403,8 +441,9 @@ pub(crate) fn build_resume_command(
     match kind {
         AgentKind::Codex => {
             parts.push("resume".to_string());
-            parts.extend(preserved_tail);
             parts.push(session_id);
+            parts.extend(codex_update_check_suppression_args(&preserved_tail));
+            parts.extend(preserved_tail);
         }
         AgentKind::OpenCode => {
             parts.push("--session".to_string());
@@ -1014,7 +1053,53 @@ mod tests {
 
         assert_eq!(
             command,
-            "cd '/tmp/project one' && 'codex' 'resume' '--model' 'gpt-5.5' '--config' 'profile=work' 'sess-123'"
+            concat!(
+                "cd '/tmp/project one' && 'codex' 'resume' 'sess-123' ",
+                "'-c' 'check_for_update_on_startup=false' '--model' 'gpt-5.5' ",
+                "'--config' 'profile=work'"
+            )
+        );
+    }
+
+    #[test]
+    fn codex_resume_command_suppresses_startup_update_prompt_idempotently() {
+        let launch = AgentLaunchCommandRecord {
+            executable: "codex".to_string(),
+            arguments: vec![
+                "codex".to_string(),
+                "-c".to_string(),
+                "check_for_update_on_startup=true".to_string(),
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 20.0,
+        };
+
+        let command = build_resume_command(AgentKind::Codex, "sess-123", Some(&launch), None)
+            .expect("resume command");
+
+        assert_eq!(
+            command,
+            "'codex' 'resume' 'sess-123' '-c' 'check_for_update_on_startup=true' '--model' 'gpt-5.5'"
+        );
+
+        let launch = AgentLaunchCommandRecord {
+            executable: "codex".to_string(),
+            arguments: vec![
+                "codex".to_string(),
+                "--config=check_for_update_on_startup=false".to_string(),
+            ],
+            cwd: None,
+            environment: Default::default(),
+            captured_at: 20.0,
+        };
+        let command = build_resume_command(AgentKind::Codex, "sess-123", Some(&launch), None)
+            .expect("resume command");
+        assert_eq!(
+            command,
+            "'codex' 'resume' 'sess-123' '--config=check_for_update_on_startup=false'"
         );
     }
 

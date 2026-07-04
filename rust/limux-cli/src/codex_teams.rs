@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+use crate::agent_hooks::codex_update_check_suppression_args;
+
 const PARAM_STRING_LIMIT: usize = 4_096;
 const PARAM_COLLECTION_LIMIT: usize = 50;
 const PARAM_DEPTH_LIMIT: usize = 5;
@@ -115,6 +117,7 @@ pub fn resume_command_text(
         app_server_url.to_string(),
         thread_id.to_string(),
     ]);
+    parts.extend(codex_update_check_suppression_args(&[]));
     parts
         .iter()
         .map(|part| shell_quote(part))
@@ -1291,9 +1294,10 @@ mod tests {
         assert!(command.contains("'PATH=/tmp/bin:/usr/bin'"));
         assert!(command.contains("'CMUX_CODEX_TEAMS_APP_SERVER_URL=ws://127.0.0.1:2345'"));
         assert!(command.contains("'CMUX_AGENT_MANAGED_SUBAGENT=1'"));
-        assert!(command.contains(
-            "'/usr/local/bin/codex' 'resume' '--remote' 'ws://127.0.0.1:2345' 'thread-child'"
-        ));
+        assert!(command.contains(concat!(
+            "'/usr/local/bin/codex' 'resume' '--remote' 'ws://127.0.0.1:2345' ",
+            "'thread-child' '-c' 'check_for_update_on_startup=false'"
+        )));
     }
 
     #[test]

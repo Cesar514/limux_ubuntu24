@@ -1,6 +1,6 @@
 # CMUX Full Parity Matrix
 
-Source CMUX commit: `5a7c1475f5ca9f48b78cf966c9a7ebe5ffb3b97f` in `/tmp/cmux-audit` `origin/main`.
+Source CMUX commit: `3eabcfa5cd973756aa16cbf5c7c01639d50f9773` in `/tmp/cmux-audit` `origin/main`.
 
 Status values:
 
@@ -49,6 +49,7 @@ Primary upstream references:
 
 Recent verified parity updates:
 
+- 2026-07-04: Added CMUX-compatible Codex resume update-prompt suppression parity from upstream `3eabcfa5cd973756aa16cbf5c7c01639d50f9773`: CLI-generated Codex resume commands, host auto-restored Codex panes, and Codex Teams managed subagent resumes now add `-c check_for_update_on_startup=false` unless captured launch args already set `check_for_update_on_startup`, preserving explicit user choices and preventing duplicate overrides. Verified by focused `limux-cli` and `limux-host-linux` tests.
 - 2026-07-04: Added CMUX-compatible Claude short `-r <session>` resume-selector parity from upstream agent-session observation changes in `5a7c1475f5ca9f48b78cf966c9a7ebe5ffb3b97f`: both the CLI session fork builder and host restored-agent startup command sanitizer now strip old `claude -r <old-session>` selectors before appending the new `--resume <session>` command. Verified by focused `limux-cli` and `limux-host-linux` tests.
 - 2026-07-04: Added CMUX-compatible `automation.socketPassword` secret-file config parity from upstream `AutomationCatalogSection.swift` and `SecretFileKey.swift`: local `config get automation.socketPassword` reports only configured/unset state, `config set automation.socketPassword <value>` writes the private Limux runtime auth password file with `0600` permissions, and setting an empty value clears it. The secret is never stored in `settings.json` or printed by `config get`, and the CLI uses the same path that socket authentication already reads. Verified by `cargo test -p limux-cli config_automation_socket_password -- --nocapture` and the upstream settings catalog diff showing zero missing CLI setting IDs.
 - 2026-07-04: Added CMUX-compatible remaining Sidebar catalog config parity from upstream `SidebarCatalogSection.swift`: local `config get/set` now supports `sidebar.branchVerticalLayout`, `sidebar.stackBranchDirectory`, `sidebar.pathLastSegmentOnly`, `sidebar.rightMaxWidth.remembered`, `sidebar.activeTabIndicatorStyle`, `sidebar.selectionColor`, and `sidebar.notificationBadgeColor`; host settings load/save validates and preserves the same keys; CMUX branch-vertical layout feeds Limux branch layout when `sidebar.branchLayout` is absent; and rendered sidebar branch/directory rows honor stack and last-segment display settings. Verified by focused CLI, host app-config, and sidebar formatter tests.

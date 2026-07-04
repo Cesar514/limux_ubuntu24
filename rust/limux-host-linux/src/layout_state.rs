@@ -18,6 +18,7 @@ pub const DEFAULT_SIDEBAR_WIDTH: i32 = 220;
 pub const DEFAULT_SPLIT_RATIO: f64 = 0.5;
 const MIN_SPLIT_RATIO: f64 = 0.02;
 const MAX_SPLIT_RATIO: f64 = 0.98;
+const CODEX_UPDATE_CHECK_SUPPRESSION: [&str; 2] = ["-c", "check_for_update_on_startup=false"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionLoadSource {
@@ -894,8 +895,9 @@ fn build_resume_command(
     match kind {
         RestorableAgentKind::Codex => {
             parts.push("resume".to_string());
-            parts.extend(preserved_tail);
             parts.push(session_id.clone());
+            parts.extend(codex_update_check_suppression_args(&preserved_tail));
+            parts.extend(preserved_tail);
         }
         RestorableAgentKind::OpenCode => {
             parts.push("--session".to_string());
@@ -924,6 +926,41 @@ fn build_resume_command(
         None => command,
     };
     Some(wrap_restored_agent_command(kind, &session_id, &run_command))
+}
+
+// purpose: Detect explicit Codex startup update-check config overrides.
+// inputs: Preserved command-line arguments from a captured Codex launch.
+// returns/effects: Returns true when the user or a previous restore already set the key.
+fn has_codex_update_check_override(arguments: &[String]) -> bool {
+    for (index, argument) in arguments.iter().enumerate() {
+        if matches!(argument.as_str(), "-c" | "--config")
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| value.starts_with("check_for_update_on_startup="))
+        {
+            return true;
+        }
+        if argument.starts_with("-c=check_for_update_on_startup=")
+            || argument.starts_with("--config=check_for_update_on_startup=")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// purpose: Build CMUX-compatible Codex update-check suppression tokens.
+// inputs: Preserved Codex arguments after launch sanitization.
+// returns/effects: Returns the per-invocation override unless an explicit setting exists.
+fn codex_update_check_suppression_args(preserved: &[String]) -> Vec<String> {
+    if has_codex_update_check_override(preserved) {
+        Vec::new()
+    } else {
+        CODEX_UPDATE_CHECK_SUPPRESSION
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
 }
 
 fn wrap_restored_agent_command(
@@ -1398,7 +1435,10 @@ mod tests {
                 assert_eq!(agent.kind, RestorableAgentKind::Codex);
                 assert_eq!(agent.session_id, "session-a");
                 let command = agent.resume_command().expect("resume command");
-                assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'session-a'"));
+                assert!(command.contains(concat!(
+                    "cd '/tmp/project' && 'codex' 'resume' 'session-a' ",
+                    "'-c' 'check_for_update_on_startup=false'"
+                )));
                 assert!(command.contains("hooks codex cleanup"));
             }
             other => panic!("expected terminal tab, got {other:?}"),
@@ -1790,9 +1830,42 @@ mod tests {
         };
 
         let command = agent.resume_command().expect("resume command");
-        assert!(command.contains("cd '/tmp/project' && 'codex' 'resume' 'sess-123'"));
+        assert!(command.contains(concat!(
+            "cd '/tmp/project' && 'codex' 'resume' 'sess-123' ",
+            "'-c' 'check_for_update_on_startup=false'"
+        )));
         assert!(command.contains("hooks codex cleanup"));
         assert!(command.contains("exec \"${SHELL:-/bin/sh}\" -l"));
+    }
+
+    #[test]
+    fn restorable_codex_resume_respects_explicit_update_check_override() {
+        let agent = RestorableAgentState {
+            kind: RestorableAgentKind::Codex,
+            session_id: "sess-123".to_string(),
+            cwd: None,
+            launch_command: Some(AgentLaunchCommandState {
+                executable: "codex".to_string(),
+                arguments: vec![
+                    "codex".to_string(),
+                    "--config".to_string(),
+                    "check_for_update_on_startup=true".to_string(),
+                    "--model".to_string(),
+                    "gpt-5.5".to_string(),
+                ],
+                cwd: None,
+                environment: Default::default(),
+                captured_at: Some(12.0),
+            }),
+            restore_on_startup: true,
+        };
+
+        let command = agent.resume_command().expect("resume command");
+        assert!(command.contains(concat!(
+            "'codex' 'resume' 'sess-123' '--config' ",
+            "'check_for_update_on_startup=true' '--model' 'gpt-5.5'"
+        )));
+        assert!(!command.contains("'check_for_update_on_startup=false'"));
     }
 
     #[test]
